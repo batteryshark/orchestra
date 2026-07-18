@@ -69,12 +69,30 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline) -> tuple[
     """Start one worker process; wait with timeout + early session-ref capture.
     Returns (outcome, exit_code) where outcome is 'exit'|'timeout'."""
     with open(log_path, "ab") as log:
+        latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+        if latest and latest["status"] in db.RUN_TERMINAL:
+            return "exit", None
         log.write((" ".join(cmd[:6]) + " ...\n").encode())
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT,
                                 cwd=workdir, env=env, start_new_session=True)
-        con.execute("UPDATE runs SET pid=?, status='running' WHERE id=?", (proc.pid, run_id))
+        cur = con.execute(
+            "UPDATE runs SET pid=?, status='running' "
+            "WHERE id=? AND status NOT IN ('done','failed','timeout','killed')",
+            (proc.pid, run_id))
         con.commit()
+        if cur.rowcount == 0:
+            latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if latest and latest["status"] in db.RUN_TERMINAL:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=15)
+                except Exception:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+            return "exit", proc.poll()
         started = time.time()
         have_ref = bool(run["session_ref"])
         while True:
@@ -181,6 +199,11 @@ def supervise(root: Path, run_id: int) -> int:
             status, exit_code, handoff_body = "done", 0, ho["body"]
         elif status == "done":
             status = "timeout"
+
+    latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+    if latest and latest["status"] == "killed":
+        status = "killed"
+        exit_code = None
 
     session_ref, last_text = runners.parse_log(run["log_path"])
     if last_msg_file and Path(last_msg_file).is_file():

@@ -6,7 +6,7 @@
   A local control plane for people who delegate software work across Codex, Claude Code, and OpenCode agents.
 </p>
 
-Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocking your terminal, keep each worker's session available for follow-ups, and watch every project from one read-only dashboard. Runs survive the orchestrator session that created them, while inboxes, findings, and optional [slash-work](https://github.com/batteryshark/slash-work) items keep the handoff durable.
+Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocking your terminal, keep each worker's session available for follow-ups, and watch every project from one dashboard. Runs survive the orchestrator session that created them, while inboxes, findings, and optional [slash-work](https://github.com/batteryshark/slash-work) items keep the handoff durable.
 
 ![Orchestra dashboard showing fictional projects and runs](docs/screenshots/dashboard.jpg)
 
@@ -86,7 +86,7 @@ Use the project picker in the header to switch roots. The UI only accepts projec
 orchestra ui --tailscale
 ```
 
-This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, and logs. Review [SECURITY.md](SECURITY.md) before enabling it.
+This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, logs, and stop active runs. Review [SECURITY.md](SECURITY.md) before enabling it.
 
 Port `4764` is preferred. An implicit port may safely fall back when busy; an explicit `--port` is pinned and fails instead. `--tailscale` cannot be combined with an explicit `--host`.
 
@@ -113,7 +113,7 @@ Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and o
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.
 
-The dashboard is intentionally read-only. Dispatch, reply, interrupt, registry changes, and other mutations stay in the CLI.
+The dashboard is read-mostly. Dispatch, reply, interrupt, registry changes, and most mutations stay in the CLI; the run details pane can stop an active run using the same cancellation path as `orchestra kill`.
 
 ## Development
 

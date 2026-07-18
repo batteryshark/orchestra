@@ -1,5 +1,9 @@
 """`orchestra ui` — zero-dependency live web dashboard for a project's runs,
-inboxes, findings feed, and teams. Reads the project SQLite; no writes.
+inboxes, findings feed, and teams.
+
+The UI is read-mostly: normal refresh routes read project SQLite state, while
+the details pane exposes a POST-only stop action that uses the same run
+cancellation semantics as the CLI.
 
 The HTML page lives in ui.html next to this module and is read from disk on
 every request, so UI edits only need a browser refresh (no server restart).
@@ -27,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import db, host, projects, tailscale
+from orchestra_cli import cancel, db, host, projects, tailscale
 from orchestra_cli.usage import default_service
 
 DEFAULT_UI_PORT = 4764
@@ -345,6 +349,35 @@ def make_handler(root: Path, registry: list[dict] | None = None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _read_json_post(self) -> tuple[bool, dict | None]:
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                self._json({"error": "Content-Type must be application/json"}, 415)
+                return False, None
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return False, None
+            if length < 0:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return False, None
+            if length > 2048:
+                self._json({"error": "request body too large"}, 413)
+                return False, None
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                return True, {}
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self._json({"error": "invalid JSON body"}, 400)
+                return False, None
+            if not isinstance(payload, dict):
+                self._json({"error": "JSON body must be an object"}, 400)
+                return False, None
+            return True, payload
+
         # --- project selection ------------------------------------------
         def _requested_project(self, url) -> str | None:
             """The client's project id, from header or query. Header wins."""
@@ -527,6 +560,36 @@ def make_handler(root: Path, registry: list[dict] | None = None):
             else:
                 self._json({"error": "not found"}, 404)
 
+        def do_POST(self):
+            url = urlparse(self.path)
+            path = url.path
+            if path.startswith("/api/runs/") and path.endswith("/stop"):
+                ok, _payload = self._read_json_post()
+                if not ok:
+                    return
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    return self._json({"error": "not found"}, 404)
+                try:
+                    run_id = int(parts[2])
+                except ValueError:
+                    return self._json({"error": "bad id"}, 400)
+                project = self._resolve_project(url)
+                if project is None:
+                    return
+                con = db.connect(project)
+                try:
+                    result = cancel.stop_run(con, run_id)
+                finally:
+                    con.close()
+                if not result:
+                    return self._json({"error": "no such run"}, 404)
+                return self._json({
+                    **result.as_dict(),
+                    "label": "stopped by user" if result.status == "killed" else result.status,
+                })
+            self.send_error(501, "Unsupported method ('POST')")
+
     return Handler
 
 
@@ -577,14 +640,13 @@ def _pick_free_port(host: str) -> int:
 def tailscale_warning(bind_host: str) -> str:
     """The exact one-line warning orchestra prints when Tailscale is the
     bind mode. Returned (not printed) so tests can assert on it without
-    spinning up a real server against a non-routable interface. The string
-    explicitly describes the dashboard as read-only and ACL-scoped to
-    avoid the misleading "use and modify" wording."""
+    spinning up a real server against a non-routable interface. The string is
+    explicit that Tailnet viewers can read dashboard data and stop active runs,
+    so operators do not mistake the POST stop action for a passive view."""
     return (
         "[orchestra] Tailnet access is enabled. Members permitted by "
-        "your Tailscale ACLs can view this Orchestra dashboard — its "
-        "runs, inboxes, transcript feeds, and project status — from "
-        "your Tailnet."
+        "your Tailscale ACLs can view this Orchestra dashboard and stop "
+        "active runs from your Tailnet."
     )
 
 

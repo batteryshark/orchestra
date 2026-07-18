@@ -10,6 +10,7 @@ from pathlib import Path
 
 from orchestra_cli import (
     brief,
+    cancel,
     config,
     db,
     docs,
@@ -516,20 +517,16 @@ def cmd_interrupt(args):
 def cmd_kill(args):
     root = paths.find_root()
     con = db.connect(root)
-    r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
-    if not r:
+    result = cancel.stop_run(con, args.run_id)
+    if not result:
         raise SystemExit(f"orchestra: no run {args.run_id}")
-    if r["status"] in db.RUN_TERMINAL:
-        print(f"run {args.run_id} already {r['status']}")
+    if not result.stopped:
+        print(f"run {args.run_id} already {result.status}")
         return
-    con.execute("UPDATE runs SET status='killed' WHERE id=?", (args.run_id,))
-    con.commit()
-    if r["pid"]:
-        try:
-            os.killpg(r["pid"], signal.SIGTERM)
-            print(f"sent SIGTERM to run {args.run_id} (pgid {r['pid']})")
-        except ProcessLookupError:
-            print(f"run {args.run_id} process already gone; marked killed")
+    if result.signal_sent:
+        print(f"sent SIGTERM to run {args.run_id} (pgid {result.pid})")
+    else:
+        print(f"run {args.run_id} marked killed ({result.reason})")
 
 
 def cmd_note(args):
@@ -928,7 +925,7 @@ def main():
     s.add_argument("--refresh", action="store_true", help="force a fresh quota snapshot")
     s.set_defaults(fn=cmd_usage)
 
-    s = sub.add_parser("ui", help="shared read-only dashboard for registered projects")
+    s = sub.add_parser("ui", help="shared dashboard for registered projects")
     s.add_argument("--port", type=int, default=None,
                    help="UI port; defaults to a 4764 preference (falls back to OS-chosen when 4764 is busy). "
                         "Any other explicit value is pinned — a busy port fails clearly.")

@@ -326,7 +326,7 @@ class PickerBoundaryTests(_UIBase):
 
     def test_no_create_endpoint_exists(self) -> None:
         # Nothing on the server accepts a path or creates a project
-        # entry via HTTP. POST is not implemented at all.
+        # entry via HTTP. The only supported POST stops an existing run.
         conn = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=4)
         conn.request("POST", "/api/projects", body=json.dumps({"root": "/tmp"}),
                      headers={"content-type": "application/json"})

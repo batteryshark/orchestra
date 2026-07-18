@@ -100,7 +100,7 @@ for orchestration sessions. Claude Code needs no special handling.
 ## Cheatsheet
 
 ```
-orchestra ui                          # shared read-only dashboard (:4764; project picker)
+orchestra ui                          # shared dashboard (:4764; project picker)
 orchestra ui --tailscale              # bind only to this machine's Tailnet IPv4
 orchestra project list                # roots registered with the shared dashboard
 orchestra project register /path      # add a root while the dashboard is running
