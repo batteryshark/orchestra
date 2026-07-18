@@ -90,6 +90,59 @@ If a run's supervisor is gone (machine reboot, crash) or predates a code upgrade
 reply resumes the same worker session under a freshly spawned supervisor; no work is lost.
 Never run `orchestra _supervise` against a live run (it would spawn a duplicate worker).
 
+## Handing off to a different orchestrator session or harness
+
+If this session is about to end (planned or abrupt — provider quota, IDE reload,
+machine going down) and you want a successor to keep the wave moving, write a
+checkpoint first:
+
+```sh
+orchestra checkpoint --as claude --work W-0010 \
+  --objective "land W-0010; review diff before merge" \
+  --next "merge the worktree branch after review" \
+  --next "run the full test suite"
+```
+
+`--work` anchors recovery: the checkpoint persists the item id and infers
+the objective from `work show W-0010 --json` (bounded, fail-open). When
+`--work` is omitted the objective falls back to the highest-priority
+active work item from `work list`. Explicit `--objective` always wins.
+
+The checkpoint is durable intent plus high-water marks (the largest run /
+message / feed IDs at write time). It contains no provider session id, no
+process PID, no worker transcript path, no runner argv, no environment
+variable, and no raw summary. Every free-text field (objective, next
+steps, run titles, work titles, feed tags, bodies) is redacted for
+credential patterns before it lands on disk AND re-sanitized on render
+as defense in depth. The file is excluded from `git` via
+`.orchestra/.gitignore`.
+
+The successor (a fresh Claude / Codex / OpenCode session, or a different
+orchestrator entirely) picks it up:
+
+```sh
+orchestra takeover --as <target>                  # latest checkpoint
+orchestra takeover --from claude --as glm         # only claude's checkpoints
+orchestra takeover --checkpoint <path> --as glm   # explicit path
+```
+
+`takeover` opens the project DB in SQLite URI `mode=ro` — no schema
+executes, no migrations run, no WAL writes touch the source file — and
+re-queries it for everything that happened after the checkpoint's
+high-water marks (active runs, post-watermark messages addressed to the
+source, fresh feed findings). It renders a markdown cold-start brief
+suitable for pasting into a fresh harness. It is strictly read-only: no
+source row is inserted, updated, or marked read. The sensitive-fields
+note at the bottom of the brief lists every surface intentionally
+excluded.
+
+For an **abrupt** handoff (you don't have time to think through objective
+and next steps), `orchestra checkpoint --as <you> --work W-XXXX` is still
+useful: `--work` anchors the objective via `work show --json`, the saved
+source-inbox snapshot preserves your last HANDOFF even if you already
+marked it read, and the high-water marks give the successor visibility
+into anything that landed between your write and their read.
+
 ## Codex-as-orchestrator sandbox note
 
 `orchestra dispatch` spawns other agent CLIs that need network access and write to their own
@@ -118,6 +171,8 @@ orchestra broadcast "stop touching db.py" --team core --as claude
 orchestra note "auth flow uses PKCE, not implicit" --as claude --tags arch
 orchestra feed                        # what everyone has been finding
 orchestra logs 7 --pretty             # full worker transcript
+orchestra checkpoint --as claude --work W-0010 --objective "..." --next "..."   # write a handoff checkpoint (--work anchors)
+orchestra takeover --from claude --as glm                         # resume from a checkpoint (read-only via SQLite mode=ro)
 orchestra kill 7
 ```
 """
@@ -147,6 +202,7 @@ STATE_GITIGNORE = """\
 logs/
 worktrees/
 briefs/
+checkpoints/
 *.db
 *.db-shm
 *.db-wal

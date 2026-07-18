@@ -119,3 +119,30 @@ def connect(root: Path) -> sqlite3.Connection:
     con.executescript(SCHEMA)
     _apply_migrations(con)
     return con
+
+
+def connect_readonly(root: Path) -> sqlite3.Connection:
+    """Open the project DB in strict read-only mode.
+
+    Used by ``orchestra takeover`` and any other operation that must
+    never mutate source rows or schema: no schema executes, no migrations
+    run, no journal-mode switch is performed, and any write attempt raises
+    ``sqlite3.OperationalError: attempt to write a readonly database``.
+
+    SQLite may still materialize WAL/SHM bookkeeping sidecars when the
+    database is already in WAL mode. That is SQLite's read protocol; the
+    database file and its logical contents remain unchanged.
+
+    SQLite's URI ``mode=ro`` is honored at the protocol layer; we set
+    ``row_factory`` + ``busy_timeout`` for parity with :func:`connect`,
+    and otherwise leave the connection untouched.
+    """
+    db_file = paths.db_path(root).resolve()
+    uri = db_file.as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=15)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=10000")
+    # Sanity probe — a write would fail loudly here if the URI was
+    # silently downgraded. We don't roll back; we just observe.
+    con.execute("SELECT 1").fetchone()
+    return con

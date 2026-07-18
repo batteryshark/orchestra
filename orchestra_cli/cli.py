@@ -11,6 +11,7 @@ from pathlib import Path
 from orchestra_cli import (
     brief,
     cancel,
+    checkpoint,
     config,
     db,
     docs,
@@ -603,6 +604,111 @@ def cmd_status(args):
             pass
 
 
+def cmd_checkpoint(args):
+    """Write a durable, backend-neutral checkpoint under ``.orchestra/checkpoints/``.
+
+    The checkpoint is intent + high-water marks: the source identity,
+    objective, next steps, the anchored ``--work`` item (when supplied),
+    and the largest run/message/feed IDs observed at write time.
+    Takeover re-queries the live DB for everything after those marks so
+    the brief stays current even if a long time passes between
+    checkpoint and takeover.
+
+    Free-text fields (objective, next steps, run titles, work titles,
+    feed tags, bodies) are redacted for credential patterns before
+    serialization. Process / session / transcript surfaces
+    (``session_ref``, ``pid``, ``log_path``, ``brief_path``, ``workdir``,
+    ``branch``, argv, env) are never written — only ``SAFE_*`` field
+    whitelists make it onto disk.
+    """
+    root = paths.find_root()
+    cfg = config.load(root)
+    source = _identity(args, cfg)
+    if not source:
+        raise SystemExit("orchestra: checkpoint needs --as <identity> "
+                         "(or $ORCHESTRA_SELF / settings.default_requester)")
+    objective = (getattr(args, "objective", None) or "").strip() or None
+    next_steps = list(getattr(args, "next", None) or [])
+    work_item = (getattr(args, "work", None) or "").strip() or None
+    path = checkpoint.write_checkpoint(
+        root, source=source, objective=objective,
+        next_steps=next_steps, work_item=work_item,
+    )
+    print(f"checkpoint: {source} -> {path}")
+    if work_item:
+        _work_log(root, work_item,
+                  f"checkpoint written by {source} -> {path.name}")
+
+
+def cmd_takeover(args):
+    """Print a cold-start continuation brief from a saved checkpoint.
+
+    Read-only by contract: ``takeover`` never INSERTs, UPDATEs, or
+    DELETEs anything in the source DB. Selection precedence:
+    ``--checkpoint <path>`` > ``--from <source>`` > latest of all
+    checkpoints. The brief advertises both ``source`` (who handed off)
+    and ``target`` (who is taking over) explicitly.
+    """
+    root = paths.find_root()
+    cfg = config.load(root)
+    target = _identity(args, cfg)
+    if not target:
+        raise SystemExit("orchestra: takeover needs --as <identity>")
+
+    ck = None
+    if getattr(args, "checkpoint", None):
+        try:
+            ck = checkpoint.load_checkpoint(Path(args.checkpoint))
+        except checkpoint.CheckpointError as exc:
+            raise SystemExit(f"orchestra: {exc}") from exc
+    elif getattr(args, "from_", None):
+        try:
+            ck = checkpoint.latest_checkpoint(root, source=args.from_)
+        except checkpoint.CheckpointError as exc:
+            raise SystemExit(f"orchestra: {exc}") from exc
+        if not ck:
+            raise SystemExit(
+                f"orchestra: no checkpoints found for source {args.from_!r}"
+            )
+    else:
+        try:
+            ck = checkpoint.latest_checkpoint(root)
+        except checkpoint.CheckpointError as exc:
+            raise SystemExit(f"orchestra: {exc}") from exc
+        if not ck:
+            raise SystemExit(
+                "orchestra: no checkpoints found — "
+                "have the source orchestrator run `orchestra checkpoint --as <source>` first"
+            )
+
+    checkpoint_project = ck.data.get("project") or {}
+    expected_project_id = projects.project_id(root)
+    if checkpoint_project.get("id") != expected_project_id:
+        raise SystemExit(
+            "orchestra: checkpoint belongs to a different project; "
+            "run takeover from the checkpoint's Orchestra root"
+        )
+
+    brief_text = checkpoint.render_takeover_brief(root, ck, target=target)
+
+    if args.json:
+        print(json.dumps({
+            "checkpoint_path": str(ck.path),
+            "source": ck.source,
+            "created_at": ck.data.get("created_at"),
+            "objective": ck.objective,
+            "next_steps": ck.next_steps,
+            "work_item": ck.work_item,
+            "objective_source": ck.data.get("objective_source"),
+            "high_water": ck.high_water,
+            "target": target,
+            "brief": brief_text,
+        }, indent=2))
+        return
+
+    sys.stdout.write(brief_text)
+
+
 def cmd_doctor(args):
     root = _maybe_root()
     cfg = config.load(root)
@@ -988,6 +1094,35 @@ def main():
 
     s = sub.add_parser("status", help="project snapshot: runs, inboxes, feed, tracker")
     s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("checkpoint",
+                       help="write a durable, backend-neutral handoff "
+                            "checkpoint under .orchestra/checkpoints/")
+    s.add_argument("--objective", help="one-line statement of what this "
+                                       "wave is trying to accomplish. "
+                                       "Resolution order: --objective > "
+                                       "--work anchor (work show --json) > "
+                                       "active-items fallback")
+    s.add_argument("--next", action="append", default=[],
+                   help="next step the successor should take (repeatable)")
+    s.add_argument("--work", help="anchor work item (W-XXXX); the "
+                                  "checkpoint persists it and infers the "
+                                  "objective from `work show ITEM --json`. "
+                                  "Also progress-logged like --work on dispatch.")
+    ident(s)
+    s.set_defaults(fn=cmd_checkpoint)
+
+    s = sub.add_parser("takeover",
+                       help="render a cold-start continuation brief from a "
+                            "saved checkpoint (strictly read-only)")
+    s.add_argument("--from", dest="from_",
+                   help="resume from the latest checkpoint whose filename prefix "
+                        "matches this source identity (e.g. 'codex')")
+    s.add_argument("--checkpoint", help="explicit checkpoint path (overrides --from)")
+    s.add_argument("--json", action="store_true",
+                   help="print the brief + metadata as JSON instead of markdown")
+    ident(s)
+    s.set_defaults(fn=cmd_takeover)
 
     s = sub.add_parser("_supervise")
     s.add_argument("run_id", type=int)

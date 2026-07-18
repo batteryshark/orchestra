@@ -50,6 +50,19 @@ def worktrees_dir(root: Path) -> Path:
     return d
 
 
+def checkpoints_dir(root: Path, *, create: bool = False) -> Path:
+    """Durable handoff artifacts written by ``orchestra checkpoint``.
+
+    Read-only callers (e.g. ``takeover`` without a checkpoint) MUST pass
+    ``create=False`` so a missing checkpoint surfaces as "no checkpoints
+    found" instead of silently instantiating an empty directory.
+    """
+    d = state_dir(root) / "checkpoints"
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def global_config_path() -> Path:
     return Path(os.environ.get("ORCHESTRA_CONFIG", "~/.config/orchestra/config.toml")).expanduser()
 
