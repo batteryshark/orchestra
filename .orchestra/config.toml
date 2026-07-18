@@ -1,0 +1,8 @@
+# Project-level orchestra overrides (merged over ~/.config/orchestra/config.toml).
+# [agents.myagent]
+# backend = "opencode"
+# model = "provider/model"
+# role = "..."
+
+[settings]
+# timeout = 3600

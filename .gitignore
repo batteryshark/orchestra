@@ -1,0 +1,6 @@
+.orchestra/logs/
+.orchestra/worktrees/
+.orchestra/briefs/
+.orchestra/*.db*
+__pycache__/
+*.egg-info/
