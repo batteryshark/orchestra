@@ -64,6 +64,7 @@ orchestra inbox claude --unread --mark-read     # HANDOFF messages + completion 
 orchestra feed                     # findings/decisions workers logged along the way
 orchestra reply 7 "good — now add tests"        # resume the SAME worker session
 orchestra status                   # runs, inboxes, feed, work board snapshot
+orchestra ui                       # live web dashboard at http://localhost:4764
 ```
 
 Workers are briefed with a standard coordination protocol: check inbox → log progress to the

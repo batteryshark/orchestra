@@ -487,6 +487,11 @@ def cmd_host(args):
               + f"\nlog: {host.LOG_FILE}")
 
 
+def cmd_ui(args):
+    from orchestra_cli import ui
+    ui.serve(paths.find_root(), port=args.port, open_browser=not args.no_open)
+
+
 def cmd_supervise(args):
     sys.exit(supervise.supervise(Path(args.root), args.run_id))
 
@@ -595,6 +600,11 @@ def main():
     s = sub.add_parser("host", help="manage the persistent opencode host (used by ensemble runs)")
     s.add_argument("host_cmd", nargs="?", default="status", choices=["status", "start", "stop"])
     s.set_defaults(fn=cmd_host)
+
+    s = sub.add_parser("ui", help="live web dashboard for this project (runs, inboxes, feed)")
+    s.add_argument("--port", type=int, default=4764)
+    s.add_argument("--no-open", action="store_true", help="don't open a browser")
+    s.set_defaults(fn=cmd_ui)
 
     s = sub.add_parser("kill", help="terminate a running worker")
     s.add_argument("run_id", type=int)

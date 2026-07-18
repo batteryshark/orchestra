@@ -72,6 +72,7 @@ for orchestration sessions. Claude Code needs no special handling.
 ## Cheatsheet
 
 ```
+orchestra ui                          # live web dashboard (:4764)
 orchestra status                      # snapshot: runs, inboxes, feed
 orchestra dispatch --to glm --work W-0001 --as claude "mission"
 orchestra dispatch --to glm --to minimax --as claude "same mission, two takes"
