@@ -78,11 +78,13 @@ button { font:inherit; font-size:12px; border:1px solid var(--line); background:
   display:inline-block; margin-left:6px }
 </style></head><body>
 <header><h1>orchestra<span id="beat"></span></h1><span class="root" id="root"></span>
-<nav><a href="http://localhost:4747" target="_blank">ensemble dashboard</a>
-<a href="http://localhost:43170" target="_blank">work tracker</a></nav></header>
+<nav><a href="http://localhost:43170" target="_blank">work tracker</a></nav></header>
 <main>
 <div class="cols">
-  <div class="card"><h2>Runs</h2><div id="runlist"></div></div>
+  <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+    <div class="card"><h2>Runs</h2><div id="runlist"></div></div>
+    <div class="card" id="enscard" style="display:none"><h2>Ensemble teams</h2><div id="ensteams"></div></div>
+  </div>
   <div class="card" id="panel">
     <div id="phead"><span class="muted">select a run</span></div>
     <div id="pbody"></div>
@@ -96,7 +98,7 @@ button { font:inherit; font-size:12px; border:1px solid var(--line); background:
 </main>
 <script>
 const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let state = null, selected = null, userPicked = false, tEtag = null;
+let state = null, selected = null, selTm = null, userPicked = false, tEtag = null;
 let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
 
 function elapsed(start, end){
@@ -124,7 +126,7 @@ function setIfChanged(id, html){
 
 function renderRuns(){
   const html = [...state.runs].reverse().map(r => `
-    <div class="runitem ${r.id===selected?'sel':''}" onclick="pick(${r.id})">
+    <div class="runitem ${!selTm&&r.id===selected?'sel':''}" onclick="pick(${r.id})">
       <div class="top"><span class="mono">#${r.id}</span><b>${esc(r.agent)}</b>
         <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
         <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
@@ -137,10 +139,38 @@ function renderRuns(){
 
 function pick(id){ userPicked = true; select(id); }
 function select(id){
-  if (selected === id) return;
-  selected = id; tEtag = null; lastHash.pbody = null;
+  if (selected === id && !selTm) return;
+  selected = id; selTm = null; tEtag = null; lastHash.pbody = null;
   document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
-  renderRuns(); refreshTranscript(true);
+  renderRuns(); renderEnsemble(); refreshTranscript(true);
+}
+function pickTm(sid, team, label, model, status){
+  userPicked = true;
+  selTm = {sid, team, label, model, status}; selected = null; tEtag = null; lastHash.pbody = null;
+  document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
+  renderRuns(); renderEnsemble(); refreshTranscript(true);
+}
+function tmChip(m){
+  const cls = m.status === 'busy' ? 's-running' : m.status === 'ready' ? 's-done' : 's-killed';
+  return `<span class="chip ${cls}">${esc(m.status)}${m.execution_status?'/'+esc(m.execution_status):''}</span>`;
+}
+function renderEnsemble(){
+  const card = document.getElementById('enscard');
+  const teams = state.ensemble || [];
+  card.style.display = teams.length ? '' : 'none';
+  if (!teams.length) return;
+  const html = teams.map(t => {
+    const doneN = t.tasks.filter(x=>x.status==='completed').length;
+    return `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
+      <div><b>${esc(t.name)}</b> <span class="chip ${t.status==='active'?'s-running':'s-killed'}">${esc(t.status)}</span>
+        <span class="muted mono">${doneN}/${t.tasks.length} tasks</span></div>
+      ${t.members.map(m => `<div class="runitem ${selTm&&selTm.sid===m.session_id?'sel':''}" style="border:none;padding:4px 0 4px 8px"
+        onclick="pickTm('${esc(m.session_id)}','${esc(t.id)}','${esc(m.name)}','${esc(m.model||'')}')">
+        <div class="top"><b>${esc(m.name)}</b> ${tmChip(m)}
+          <span class="mono muted" style="margin-left:auto">${esc((m.model||'').split('/').pop())}</span></div>
+      </div>`).join('')}</div>`;
+  }).join('');
+  setIfChanged('ensteams', html);
 }
 
 function itemHtml(it, i){
@@ -152,6 +182,7 @@ function itemHtml(it, i){
 }
 
 async function refreshTranscript(force){
+  if (selTm) return refreshTmTranscript(force);
   if (selected == null) return;
   let res;
   try { res = await (await fetch(`api/transcript/${selected}${tEtag&&!force?`?etag=${tEtag}`:''}`)).json(); }
@@ -176,6 +207,38 @@ async function refreshTranscript(force){
   body.querySelectorAll('details').forEach(d => { if (open.has(d.dataset.k)) d.open = true; });
   if (follow && (nearBottom || force)) body.scrollTop = body.scrollHeight;
   tickElapsed();
+}
+
+async function refreshTmTranscript(force){
+  const tm = selTm;
+  let res;
+  try { res = await (await fetch(`api/teammate/${tm.sid}?team=${encodeURIComponent(tm.team)}${tEtag&&!force?`&etag=${tEtag}`:''}`)).json(); }
+  catch(e){ return; }
+  if (res.unchanged || selTm !== tm) return;
+  tEtag = res.etag;
+  const team = (state.ensemble||[]).find(t=>t.id===tm.team);
+  const mem = team?.members.find(m=>m.session_id===tm.sid);
+  setIfChanged('phead', `<b>${esc(tm.label)}</b> ${mem?tmChip(mem):''}
+    <span class="mono muted">${esc(tm.model)}</span>
+    <span class="muted">ensemble teammate · ${esc(team?.name||'')}</span>
+    <label id="follow"><input type="checkbox" id="followcb" checked> follow tail</label>`);
+  const body = document.getElementById('pbody');
+  const open = new Set([...body.querySelectorAll('details[open]')].map(d=>d.dataset.k));
+  const follow = document.getElementById('followcb')?.checked ?? true;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  let html = '';
+  if (team?.tasks.length) html += `<details data-k="board"><summary>&#128203; team board
+    <span class="muted">· ${team.tasks.filter(x=>x.status==='completed').length}/${team.tasks.length} done</span></summary>
+    <div class="inner">${team.tasks.map(x=>`<div>[${esc(x.status)}] ${esc(x.content)}
+      ${x.assignee?`<span class="muted">→ ${esc(x.assignee)}</span>`:''}</div>`).join('')}</div></details>`;
+  if (res.messages?.length) html += `<details data-k="msgs"><summary>&#128172; team messages
+    <span class="muted">· ${res.messages.length}</span></summary>
+    <div class="inner">${res.messages.map(m=>`<div class="msg"><div class="meta">${esc(m.from_name)} → ${esc(m.to_name)}</div>
+      <div class="body">${esc(m.content)}</div></div>`).join('')}</div></details>`;
+  html += res.items.map(itemHtml).join('') || '<span class="muted">no output yet…</span>';
+  body.innerHTML = html;
+  body.querySelectorAll('details').forEach(d => { if (open.has(d.dataset.k)) d.open = true; });
+  if (follow && (nearBottom || force)) body.scrollTop = body.scrollHeight;
 }
 
 function renderBottom(){
@@ -207,11 +270,11 @@ async function refresh(){
   catch(e){ document.getElementById('beat').style.background='var(--red)'; return; }
   document.getElementById('beat').style.background='var(--green)';
   document.getElementById('root').textContent = state.root;
-  if (selected == null && !userPicked && state.runs.length){
+  if (selected == null && !selTm && !userPicked && state.runs.length){
     const active = state.runs.filter(r=>['running','spawning'].includes(r.status));
     select((active.length ? active[active.length-1] : state.runs[state.runs.length-1]).id);
   }
-  renderRuns(); renderBottom();
+  renderRuns(); renderEnsemble(); renderBottom();
 }
 refresh(); setInterval(refresh, 2500); setInterval(()=>refreshTranscript(false), 2000);
 </script></body></html>

@@ -4,16 +4,20 @@ inboxes, findings feed, and teams. Reads the project SQLite; no writes.
 The HTML page lives in ui.html next to this module and is read from disk on
 every request, so UI edits only need a browser refresh (no server restart).
 """
+import hashlib
 import json
+import sqlite3
 import threading
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import db
+from orchestra_cli import db, host
 
 UI_FILE = Path(__file__).with_name("ui.html")
+ENSEMBLE_DB = Path("~/.config/opencode/ensemble.db").expanduser()
 
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
@@ -153,6 +157,91 @@ def parse_transcript(text: str) -> list[dict]:
     return items
 
 
+def _ensemble_con():
+    if not ENSEMBLE_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{ENSEMBLE_DB}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        return con
+    except sqlite3.Error:
+        return None
+
+
+def ensemble_teams(root: Path) -> list[dict]:
+    """Teams for this project, straight from ensemble's own SQLite (read-only)."""
+    con = _ensemble_con()
+    if not con:
+        return []
+    try:
+        teams = []
+        for t in con.execute("SELECT * FROM team WHERE project_id=? "
+                             "ORDER BY time_created DESC LIMIT 8", (str(root),)):
+            members = [dict(m) for m in con.execute(
+                "SELECT name, model, status, execution_status, session_id "
+                "FROM team_member WHERE team_id=?", (t["id"],))]
+            tasks = [dict(x) for x in con.execute(
+                "SELECT content, status, priority, assignee FROM team_task "
+                "WHERE team_id=? ORDER BY time_created", (t["id"],))]
+            teams.append({"id": t["id"], "name": t["name"], "status": t["status"],
+                          "lead_session": t["lead_session_id"],
+                          "members": members, "tasks": tasks})
+        return teams
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def team_messages(team_id: str) -> list[dict]:
+    con = _ensemble_con()
+    if not con:
+        return []
+    try:
+        return [dict(m) for m in con.execute(
+            "SELECT from_name, to_name, content, time_created FROM team_message "
+            "WHERE team_id=? ORDER BY time_created LIMIT 200", (team_id,))]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def teammate_transcript(session_id: str) -> tuple[list[dict], str]:
+    """Teammate session parts via the orchestra host API -> transcript items."""
+    u = host.url()
+    if not u:
+        return ([{"kind": "error", "body": "orchestra host is not running — teammate "
+                  "transcripts are served from it (`orchestra host start`)"}], "nohost")
+    try:
+        raw = urllib.request.urlopen(f"{u}/session/{session_id}/message", timeout=6).read()
+        msgs = json.loads(raw)
+    except Exception as e:
+        return ([{"kind": "error", "body": f"could not fetch session from host: {e}"}], "err")
+    items = []
+    for m in msgs:
+        info = m.get("info") or {}
+        for p in m.get("parts") or []:
+            pt = p.get("type")
+            if info.get("role") == "user":
+                if pt == "text":
+                    body = p.get("text", "")
+                    items.append({"kind": "meta", "body": "» " + body[:400]
+                                  + (" …" if len(body) > 400 else "")})
+                continue
+            if pt == "text":
+                items.append({"kind": "text", "body": p.get("text", "")})
+            elif pt == "reasoning":
+                items.append({"kind": "thinking", "body": p.get("text", "")})
+            elif pt == "tool":
+                st = p.get("state") or {}
+                items.append({"kind": "tool", "name": p.get("tool", "tool"),
+                              "status": st.get("status", ""),
+                              "input": _fmt(st.get("input"), MAX_INPUT),
+                              "output": _fmt(st.get("output") or st.get("error") or "")})
+    return items, hashlib.md5(raw).hexdigest()
+
+
 def make_handler(root: Path):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
@@ -194,9 +283,19 @@ def make_handler(root: Path):
                                "members": [m["agent"] for m in con.execute(
                                    "SELECT agent FROM members WHERE team_id=?", (t["id"],))]}
                               for t in con.execute("SELECT * FROM teams")],
+                    "ensemble": ensemble_teams(root),
                 }
                 con.close()
                 self._json(state)
+            elif path.startswith("/api/teammate/"):
+                sid = path.rsplit("/", 1)[1]
+                q = parse_qs(url.query)
+                items, etag = teammate_transcript(sid)
+                if (q.get("etag") or [None])[0] == etag:
+                    return self._json({"etag": etag, "unchanged": True})
+                team_id = (q.get("team") or [None])[0]
+                self._json({"etag": etag, "items": items,
+                            "messages": team_messages(team_id) if team_id else []})
             elif path.startswith("/api/transcript/"):
                 try:
                     run_id = int(path.rsplit("/", 1)[1])

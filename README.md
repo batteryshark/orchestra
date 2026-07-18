@@ -100,7 +100,9 @@ everywhere (including ensemble's own worktrees).
 Installed globally in `~/.config/opencode/opencode.json` (`@hueyexe/opencode-ensemble`),
 model pool configured in `~/.config/opencode/ensemble.json`. Dispatching `--to ensemble`
 sends an opencode lead that uses `team_*` tools to spawn teammates across the pool
-(GLM-5.2 / MiniMax-M3), with its own dashboard at `http://localhost:4747`.
+(GLM-5.2 / MiniMax-M3). Ensemble's own dashboard (:4747) is redundant: `orchestra ui`
+reads ensemble's SQLite and the host API directly, showing teams, the team task board,
+team messages, and full teammate transcripts in the same pane as everything else.
 
 **Ensemble runs go through a persistent host.** Teammates live inside the lead's opencode
 process, so a one-shot `opencode run` would kill the team the moment the lead's turn ends.
