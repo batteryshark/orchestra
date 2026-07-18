@@ -64,9 +64,12 @@ def ensure(port: int = DEFAULT_PORT) -> str:
         return u
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    # server-side turns (async lead wake-ups) have no client to answer
-    # permission prompts; this server exists only to run orchestra workers
-    env.setdefault("OPENCODE_PERMISSION", '{"*": "allow"}')
+    # server-side sessions (teammates, async lead wake-ups) have no client to
+    # answer permission asks — a blocked ask hangs the team forever. This server
+    # exists only to run orchestra workers, so allow everything on it.
+    # OPENCODE_CONFIG_CONTENT merges over global/project config (docs: config).
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+        {"permission": {"*": "allow", "external_directory": "allow"}})
     with open(LOG_FILE, "ab") as log:
         proc = subprocess.Popen(
             [shutil.which("opencode") or "opencode", "serve", "--port", str(port)],
