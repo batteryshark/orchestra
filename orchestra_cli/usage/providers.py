@@ -661,6 +661,7 @@ def read_codex_app_server(
     except OSError as exc:
         raise ProviderRequestError("Could not start the Codex app server") from exc
 
+    selector: selectors.BaseSelector | None = None
     try:
         assert process.stdin is not None
         assert process.stdout is not None
@@ -704,6 +705,10 @@ def read_codex_app_server(
             return result
         raise ProviderRequestError("Codex quota request timed out")
     finally:
+        if selector is not None:
+            selector.close()
+        if process.stdin is not None:
+            process.stdin.close()
         if process.poll() is None:
             process.terminate()
             try:
@@ -711,6 +716,8 @@ def read_codex_app_server(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=1)
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def _tail_bytes(path: Path, limit: int = 1_048_576) -> str:

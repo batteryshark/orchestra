@@ -928,7 +928,7 @@ def main():
     s.add_argument("--refresh", action="store_true", help="force a fresh quota snapshot")
     s.set_defaults(fn=cmd_usage)
 
-    s = sub.add_parser("ui", help="live web dashboard for this project (runs, inboxes, feed)")
+    s = sub.add_parser("ui", help="shared read-only dashboard for registered projects")
     s.add_argument("--port", type=int, default=None,
                    help="UI port; defaults to a 4764 preference (falls back to OS-chosen when 4764 is busy). "
                         "Any other explicit value is pinned — a busy port fails clearly.")

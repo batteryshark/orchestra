@@ -77,19 +77,18 @@
         <svg viewBox="0 0 24 24"><path d="M12 3 5.5 5.8v5.3c0 4.2 2.7 8 6.5 9.9 3.8-1.9 6.5-5.7 6.5-9.9V5.8L12 3Z"/><path d="m9.2 12 1.8 1.8 3.9-4"/></svg>
       </div>
       <div>
-        <h2 id="security-title">Local by design</h2>
-        <p>Credentials stay server-side and are reused from OpenCode, Codex, and Claude Code. The browser receives quota percentages only—never keys or tokens.</p>
+        <h2 id="security-title">Credentials stay server-side</h2>
+        <p>OpenCode, Codex, and Claude Code credentials never enter browser responses. This remains true over loopback and the explicit Tailscale listener.</p>
       </div>
-      <span class="loopback-pill">127.0.0.1</span>
+      <span class="loopback-pill" id="network-scope">server-side only</span>
     </section>
   </main>
 
   <footer>
-    <span>Provider runway prototype</span>
+    <span>Orchestra · provider runway</span>
     <span id="footer-status">No snapshot yet</span>
   </footer>
 
   <script src="/runway-assets/app.js" defer></script>
 </body>
 </html>
-

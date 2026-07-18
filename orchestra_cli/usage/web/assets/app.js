@@ -4,6 +4,12 @@ const liveState = document.getElementById('live-state');
 const updatedAt = document.getElementById('updated-at');
 const recommendation = document.getElementById('recommendation');
 const footerStatus = document.getElementById('footer-status');
+const networkScope = document.getElementById('network-scope');
+
+if (networkScope) {
+  const host = window.location.hostname;
+  networkScope.textContent = host.startsWith('100.') ? 'tailnet' : 'loopback';
+}
 
 const monograms = { minimax: 'MM', claude: 'CL', zai: 'Z', codex: 'CX' };
 const statusLabels = {

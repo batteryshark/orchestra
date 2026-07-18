@@ -53,7 +53,7 @@ def project_id(root: Path) -> str:
     """Stable 16-char id derived from the realpath-resolved project root.
 
     Symlinks are resolved before hashing so a project reached via
-    ``~/Code/foo`` and ``/Users/me/Code/foo`` (one a symlink to the
+    ``~/Code/foo`` and ``/workspace/foo`` (one a symlink to the
     other) collapses to a single canonical identity.
     """
     return hashlib.sha256(str(_canonical(root)).encode("utf-8")).hexdigest()[:16]

@@ -100,7 +100,10 @@ for orchestration sessions. Claude Code needs no special handling.
 ## Cheatsheet
 
 ```
-orchestra ui                          # live web dashboard (:4764; --port N, auto-falls-back if busy; prints the project root)
+orchestra ui                          # shared read-only dashboard (:4764; project picker)
+orchestra ui --tailscale              # bind only to this machine's Tailnet IPv4
+orchestra project list                # roots registered with the shared dashboard
+orchestra project register /path      # add a root while the dashboard is running
 orchestra host start --port 4763      # persistent opencode host for ensemble runs (--port configurable)
 orchestra status                      # snapshot: runs, inboxes, feed
 orchestra dispatch --to glm --work W-0001 --as claude "mission"

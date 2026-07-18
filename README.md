@@ -1,157 +1,127 @@
-# orchestra
+<p align="center">
+  <img src="docs/assets/orchestra-logo.svg" alt="Orchestra" width="420">
+</p>
 
-Multi-agent orchestration for heterogeneous coding agents. An interactive orchestrator
-(**Claude Code** or **Codex** — both drive it the same way) delegates missions to a roster of
-worker agents running on other CLIs/models, with real task tracking, async supervision,
-teams, and per-agent inboxes.
+<p align="center">
+  A local control plane for people who delegate software work across Codex, Claude Code, and OpenCode agents.
+</p>
 
-```
-                 ┌────────────────────────────┐
-                 │  ORCHESTRATOR (interactive)│
-                 │  Claude Code  or  Codex    │
-                 └──────────┬─────────────────┘
-                            │  orchestra CLI  +  work CLI
-        ┌───────────┬───────┴──────┬─────────────┬──────────────┐
-        ▼           ▼              ▼             ▼              ▼
-   glm (opencode) minimax        codex CLI       claude -p
-   GLM-5.2        MiniMax-M3     gpt-5.6/5.5     worker
-        │
-        ▼
-   ensemble lead (opencode + opencode-ensemble plugin)
-   → spawns its own teammate sessions over a model pool
-```
+Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocking your terminal, keep each worker's session available for follow-ups, and watch every project from one read-only dashboard. Runs survive the orchestrator session that created them, while inboxes, findings, and optional [slash-work](https://github.com/batteryshark/slash-work) items keep the handoff durable.
 
-## The two layers
+![Orchestra dashboard showing fictional projects and runs](docs/screenshots/dashboard.jpg)
 
-- **[slash-work](https://github.com/batteryshark/slash-work) (`work`)** — durable source of
-  truth: tasks (`W-XXXX`), notes, decisions, progress logs. Survives sessions; long projects
-  resume cold from the tracker.
-- **`orchestra`** (this repo) — the execution layer: agent roster, async dispatch, detached
-  run supervision, session resume, teams, inboxes, and a shared findings feed. State lives in
-  `.orchestra/` (SQLite) at the project root.
+> Screenshots use fictional projects, prompts, and provider balances. They contain no private workspace information.
 
-Every dispatched run can be pinned to a work item (`--work W-0003`): dispatch and completion
-are logged to the item automatically, and the worker's brief instructs it to `work log`
-progress and `VERIFIED:` evidence for acceptance criteria.
+## What it does
 
-## Install
+- Dispatches independent or parallel runs to Codex, Claude Code, and OpenCode backends.
+- Gives every run a memorable name such as `brisk_otter`; numeric run IDs remain the authoritative reference.
+- Resumes the same agent session with `reply`, or redirects it immediately with `interrupt`.
+- Coordinates workers through inboxes, teams, and a shared findings feed.
+- Keeps backend and model configuration visible in the run details pane.
+- Registers many project roots behind one long-running dashboard and project picker.
+- Shows normalized coding-plan headroom on a separate provider runway without sending credentials to the browser.
+- Serves on loopback by default or on the machine's Tailscale address when explicitly requested.
+
+## Install from source
+
+Orchestra requires Python 3.11 or newer, [uv](https://docs.astral.sh/uv/), and at least one authenticated agent CLI.
 
 ```sh
-uv tool install -e /path/to/orchestra     # provides `orchestra` on PATH
+git clone https://github.com/batteryshark/orchestra.git
+cd orchestra
+uv tool install --editable .
+orchestra doctor
 ```
 
-Roster/config: `~/.config/orchestra/config.toml` (global), `.orchestra/config.toml`
-(per-project overlay). Run `orchestra doctor` to check backends, models, and plugins.
-
-## Per-project setup
+Initialize a project from its root:
 
 ```sh
-cd your-project
-orchestra init --work    # .orchestra/ + ORCHESTRA.md + AGENTS.md/CLAUDE.md pointers + work tracker
+cd /path/to/project
+orchestra init
 ```
 
-`ORCHESTRA.md` is the orchestrator playbook; `AGENTS.md`/`CLAUDE.md` get a pointer section so
-whichever agent opens the project knows it is the orchestrator.
+Add `--work` if the optional `work` CLI is installed and you want Orchestra to initialize its tracker too. `init` creates local `.orchestra/` state and an orchestrator playbook; it also registers the root with the shared dashboard registry.
 
-## Core flow
+## Dispatch and coordinate
 
 ```sh
-orchestra dispatch --to glm --work W-0003 --as claude "implement the parser per W-0003"
-orchestra dispatch --to glm --to minimax --as claude "same mission, two independent takes"
-orchestra dispatch --to ensemble --as claude "big mission — lead spawns a model-pool team"
-orchestra wait                     # block until runs finish (run in a background shell)
-orchestra inbox claude --unread --mark-read     # HANDOFF messages + completion notices
-orchestra feed                     # findings/decisions workers logged along the way
-orchestra reply 7 "good — now add tests"        # resume the SAME worker session
-orchestra status                   # runs, inboxes, feed, work board snapshot
-orchestra ui                       # live web dashboard at http://localhost:4764
-orchestra usage                    # cached provider runway + per-agent token burn
+orchestra dispatch --to glm --as codex "implement the parser and add tests"
+orchestra dispatch --to glm --to minimax --as codex "review this independently"
+orchestra status
+orchestra wait
+orchestra inbox codex --unread --mark-read
+orchestra reply 7 "good; now cover malformed input"
+orchestra interrupt 8 "stop—the schema changed" --as codex
+orchestra logs 7 --pretty
 ```
 
-The dashboard has a top-level **provider runway** link in the header; clicking
-it opens `/runway`, a dedicated page that visualises cached coding-plan quota
-for MiniMax, Claude, Z.AI, and Codex (multi-bucket, with Codex rate-limit
-reset-credit count + expiry and per-window reset countdowns). The dashboard
-itself does not render quota cards — they live on `/runway`.
+Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion events are then logged to that item, and the worker brief asks the agent to record progress and verification evidence there.
 
-Workers are briefed with a standard coordination protocol: check inbox → log progress to the
-work item → post findings to the feed → message peers → end with a `HANDOFF` to the requester.
-Supervisors are detached processes: dispatches survive the orchestrator session ending, and
-completions land in the requester's inbox (plus the work item log).
+Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
 
-## Backends
+## One dashboard, many projects
 
-| roster entry | backend | model | notes |
-|---|---|---|---|
-| `minimax` | opencode | minimax-coding-plan/MiniMax-M3 | default workhorse ("Sonnet" tier) |
-| `glm` | opencode | zhipuai-coding-plan/glm-5.2 | standard tier |
-| `glm-max` | opencode | glm-5.2 `--variant max` | heavy reasoning tier |
-| `codex-55` | codex exec | gpt-5.5 (effort high) | medium tasks |
-| `codex` | codex exec | gpt-5.6-sol (xhigh) | toughest problems only |
-| `claude` | claude -p | default | for when Codex orchestrates |
-| `ensemble` | opencode | glm-5.2 lead | opencode-ensemble team over a model pool |
+Start the UI from any initialized project:
 
-Session refs (opencode `ses_…`, codex thread id, claude session id) are parsed from run logs
-so `orchestra reply` can resume any worker's session with follow-up instructions.
+```sh
+orchestra ui
+```
 
-## Isolation & skills
+The process reads a user-level project registry on every request, so projects can be added while it is already running:
 
-`--worktree` runs a worker in a fresh git worktree on branch `orchestra/run-N`. Because
-worktrees only carry tracked files, orchestra mirrors the project's skills folders
-(`.agents/`, `.claude/`, `.codex/`, `.opencode/`) and agent docs into the worktree so
-delegated tools keep their skills. Committing those folders to git makes this automatic
-everywhere (including ensemble's own worktrees).
+```sh
+orchestra project register /path/to/another-project
+orchestra project list
+orchestra project forget PROJECT_ID
+```
 
-## opencode-ensemble
+Use the project picker in the header to switch roots. The UI only accepts projects already present in the registry; browsers cannot submit arbitrary filesystem paths. Forgetting a project removes the registry entry and never deletes project files or `.orchestra/` data.
 
-Installed globally in `~/.config/opencode/opencode.json` (`@hueyexe/opencode-ensemble`),
-model pool configured in `~/.config/opencode/ensemble.json`. Dispatching `--to ensemble`
-sends an opencode lead that uses `team_*` tools to spawn teammates across the pool
-(GLM-5.2 / MiniMax-M3). Ensemble's own dashboard (:4747) is redundant: `orchestra ui`
-reads ensemble's SQLite and the host API directly, showing teams, the team task board,
-team messages, and full teammate transcripts in the same pane as everything else.
+![Orchestra dashboard at phone width](docs/screenshots/dashboard-mobile.jpg)
 
-**Ensemble runs go through a persistent host.** Teammates live inside the lead's opencode
-process, so a one-shot `opencode run` would kill the team the moment the lead's turn ends.
-Orchestra therefore keeps a long-lived `opencode serve` (managed via `orchestra host
-status|start|stop`, state in `~/.local/state/orchestra/`) and dispatches leads with
-`--attach`: the team survives client exits, teammate reports wake the lead server-side, and
-the supervisor treats the lead's `HANDOFF` message — not process exit — as mission
-completion. Killing an ensemble run's client does not stop the server-side team; use
-`orchestra reply <run> "team_shutdown and team_cleanup"` or `orchestra host stop`.
+### Tailnet access
+
+```sh
+orchestra ui --tailscale
+```
+
+This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, and logs. Review [SECURITY.md](SECURITY.md) before enabling it.
+
+Port `4764` is preferred. An implicit port may safely fall back when busy; an explicit `--port` is pinned and fails instead. `--tailscale` cannot be combined with an explicit `--host`.
 
 ## Provider runway
 
-`orchestra usage` and `GET /api/usage` (served by `orchestra ui`) both read
-from a single per-process `UsageService` cache. The cache fans out to four
-server-side collectors that never expose credentials to the browser:
+The dashboard links to `/runway`, which combines cached coding-plan quota from configured MiniMax, Claude, Z.AI, and Codex accounts. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
 
-| Provider | Quota source | Credential discovery |
-|---|---|---|
-| MiniMax | `GET /v1/token_plan/remains` | `MINIMAX_API_KEY` / OpenCode `minimax-coding-plan` |
-| Z.AI | `GET /api/monitor/usage/quota/limit` | `ZAI_API_KEY` / OpenCode `zhipuai-coding-plan` |
-| Codex | `account/rateLimits/read` via the installed `codex` CLI | existing Codex login |
-| Claude | Claude Code's `/usage` cache (`~/.claude.json`) | existing Claude Code login |
+![Provider runway with fictional balances](docs/screenshots/provider-runway.jpg)
 
-The runway page is served at `/runway` (linked from the dashboard header) and
-reads its dashboard, recommendation, and reset-credit card from the
-self-same `/api/usage` endpoint. Burn rates sample in memory and only show
-after the same reset window has been observed for ≥5 minutes — they vanish
-on process restart so we never write account telemetry to disk. Codex
-multi-bucket limits (e.g. Codex Spark) are preserved as separate rows, and
-when an account has rate-limit reset credits the Codex card shows the count
-and earliest known expiry; credit IDs and descriptions are discarded.
+`orchestra usage` prints the same state in the terminal. Before dispatch, Orchestra can warn when a target's known coding-plan headroom is at or below 20 percent. The advisory never reroutes a run and fails open if usage is unavailable. Disable it with `quota_warn = false` or `--no-quota-warn`.
 
-When you `orchestra dispatch`, Orchestra also runs a single cached snapshot
-to flag targets whose coding-plan headroom is at-or-below 20%. The advisory
-prints to stderr before any run row is inserted, never reroutes, never
-consumes a Codex reset credit, and fails open if the snapshot is stale or
-unavailable (dispatch still proceeds). Configure `quota_warn = false` in
-`~/.config/orchestra/config.toml` or `.orchestra/config.toml` to opt out,
-or pass `--no-quota-warn` per-dispatch.
+## Configuration
 
-## Both-ways orchestration
+Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and relevant plugins.
 
-There is no privileged orchestrator. Claude Code identifies as `--as claude`, Codex as
-`--as codex`; completion notices route to whoever dispatched. Codex can dispatch a `claude`
-worker and vice versa. Inboxes are just names — a human can read any of them.
+Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra reply` resumes the same worker rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+
+## How state is divided
+
+- `.orchestra/` in each project stores its SQLite run state and project configuration.
+- The user-level registry stores project identifiers and roots for the shared UI.
+- `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
+- Optional slash-work data remains the durable task and decision record.
+
+The dashboard is intentionally read-only. Dispatch, reply, interrupt, registry changes, and other mutations stay in the CLI.
+
+## Development
+
+```sh
+python3 -W error::ResourceWarning -m unittest discover -s tests -v
+uv build
+```
+
+The package has no runtime Python dependencies. UI assets are bundled in the wheel.
+
+## Security and license
+
+Read [SECURITY.md](SECURITY.md) for the network boundary and private reporting instructions. Orchestra is available under the [MIT License](LICENSE).
