@@ -21,7 +21,10 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
 1. **Plan in the tracker.** Break the goal into work items:
    `work task "title" --type feature --priority high --goal "..." --requirement "..." --acceptance "..."`
    Record decisions worth surfacing to the human: `work decision "question" --option A --option B --recommend A`.
-2. **Dispatch.** `orchestra dispatch --to glm --work W-0003 --as claude "mission text"`
+2. **Dispatch.** First `orchestra roster` — the roster is LIVE config that may have changed
+   since you last looked (models added/removed/re-tiered); route against what it says NOW.
+   Check `orchestra usage` when planning heavy work (codex plan quota, per-agent token burn).
+   Then `orchestra dispatch --to glm --work W-0003 --as claude "mission text"`
    - Fan out one mission to several agents: repeat `--to` (e.g. `--to glm --to minimax`).
    - Independent missions: separate dispatch calls — they all run concurrently in the background.
    - `--worktree` gives the worker an isolated git worktree (skills folders auto-synced).

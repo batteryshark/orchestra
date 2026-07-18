@@ -494,6 +494,91 @@ def cmd_host(args):
               + f"\nlog: {host.LOG_FILE}")
 
 
+def cmd_usage(args):
+    from datetime import datetime
+    # --- codex plan quota: latest rate_limits event in recent session rollouts
+    print("## codex plan quota")
+    rollouts = sorted(Path("~/.codex/sessions").expanduser().glob("*/*/*/rollout-*.jsonl"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    rl = None
+    for f in rollouts:
+        try:
+            for line in reversed(f.read_text(errors="replace").splitlines()):
+                if '"rate_limits"' not in line:
+                    continue
+                obj = json.loads(line)
+                rl = (obj.get("payload") or {}).get("rate_limits") or obj.get("rate_limits")
+                if rl:
+                    break
+        except (OSError, ValueError):
+            continue
+        if rl:
+            break
+    if rl:
+        plan = rl.get("plan_type", "?")
+        for name in ("primary", "secondary"):
+            w = rl.get(name)
+            if not w:
+                continue
+            days = (w.get("window_minutes") or 0) / 1440
+            resets = w.get("resets_at")
+            resets_s = datetime.fromtimestamp(resets).strftime("%Y-%m-%d %H:%M") if resets else "?"
+            print(f"  {plan} · {days:.0f}-day window: {w.get('used_percent', '?')}% used · resets {resets_s}")
+    else:
+        print("  (no rate_limit events found in recent codex sessions)")
+    print("  note: zhipu/minimax coding plans expose no quota API via opencode — token burn below is the proxy")
+
+    # --- per-agent token burn from this project's run logs
+    root = _maybe_root()
+    if not root:
+        return
+    con = db.connect(root)
+    agg = {}
+    for r in con.execute("SELECT agent, log_path FROM runs WHERE log_path IS NOT NULL"):
+        lp = Path(r["log_path"])
+        if not lp.is_file():
+            continue
+        a = agg.setdefault(r["agent"], {"runs": 0, "in": 0, "out": 0, "reason": 0, "cache": 0, "cost": 0.0})
+        a["runs"] += 1
+        for line in lp.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            part = obj.get("part")
+            if isinstance(part, dict) and part.get("type") == "step-finish":  # opencode
+                tk = part.get("tokens") or {}
+                a["in"] += tk.get("input", 0)
+                a["out"] += tk.get("output", 0)
+                a["reason"] += tk.get("reasoning", 0)
+                a["cache"] += (tk.get("cache") or {}).get("read", 0)
+                a["cost"] += part.get("cost") or 0
+            elif obj.get("type") == "turn.completed":  # codex
+                u = obj.get("usage") or {}
+                a["in"] += u.get("input_tokens", 0)
+                a["out"] += u.get("output_tokens", 0)
+                a["cache"] += u.get("cached_input_tokens", 0)
+            elif obj.get("type") == "result":  # claude
+                u = obj.get("usage") or {}
+                a["in"] += u.get("input_tokens", 0)
+                a["out"] += u.get("output_tokens", 0)
+                a["cache"] += u.get("cache_read_input_tokens", 0)
+                a["cost"] += obj.get("total_cost_usd") or 0
+    print(f"\n## worker token burn ({root.name})")
+    if not agg:
+        print("  (no runs)")
+        return
+    fmt = lambda n: f"{n/1000:.0f}k" if n >= 1000 else str(n)
+    print(f"  {'agent':<12}{'runs':<6}{'input':<9}{'output':<9}{'reasoning':<11}{'cache-read':<12}cost")
+    for name, a in sorted(agg.items()):
+        cost = f"${a['cost']:.2f}" if a["cost"] else "-"
+        print(f"  {name:<12}{a['runs']:<6}{fmt(a['in']):<9}{fmt(a['out']):<9}"
+              f"{fmt(a['reason']):<11}{fmt(a['cache']):<12}{cost}")
+
+
 def cmd_ui(args):
     from orchestra_cli import ui
     ui.serve(paths.find_root(), port=args.port, open_browser=not args.no_open)
@@ -610,6 +695,9 @@ def main():
                    help=f"opencode serve port for the ensemble host (default {host.DEFAULT_PORT}); "
                         "ensemble dispatches attach to whatever host is recorded as running")
     s.set_defaults(fn=cmd_host)
+
+    s = sub.add_parser("usage", help="codex plan quota + per-agent token burn for this project")
+    s.set_defaults(fn=cmd_usage)
 
     s = sub.add_parser("ui", help="live web dashboard for this project (runs, inboxes, feed)")
     s.add_argument("--port", type=int, default=4764)
