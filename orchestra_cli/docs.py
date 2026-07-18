@@ -82,6 +82,14 @@ Good pattern: minimax implements → glm reviews; or glm-max/codex design → mi
   review large changes (e.g. `--to minimax "review the diff on branch orchestra/run-N ..."`).
 - Record every notable finding or decision in `work` — sessions are disposable, the tracker is not.
 
+## Supervisor recovery / upgrade
+
+Supervisors are detached parents of their worker process — they can't be hot-swapped.
+If a run's supervisor is gone (machine reboot, crash) or predates a code upgrade you need:
+`orchestra kill <run>` then `orchestra reply <run> "continue where you left off"` — the
+reply resumes the same worker session under a freshly spawned supervisor; no work is lost.
+Never run `orchestra _supervise` against a live run (it would spawn a duplicate worker).
+
 ## Codex-as-orchestrator sandbox note
 
 `orchestra dispatch` spawns other agent CLIs that need network access and write to their own
