@@ -4,9 +4,11 @@ inboxes, findings feed, and teams. Reads the project SQLite; no writes.
 The HTML page lives in ui.html next to this module and is read from disk on
 every request, so UI edits only need a browser refresh (no server restart).
 """
+import errno
 import hashlib
 import json
 import mimetypes
+import socket
 import sqlite3
 import threading
 import urllib.request
@@ -15,8 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import db, host
+from orchestra_cli import db, host, tailscale
 from orchestra_cli.usage import default_service
+
+DEFAULT_UI_PORT = 4764
 
 UI_FILE = Path(__file__).with_name("ui.html")
 RUNWAY_FILE = Path(__file__).parent / "usage" / "web" / "runway.html"
@@ -386,13 +390,127 @@ def make_handler(root: Path):
     return Handler
 
 
-def serve(root: Path, port: int = 4764, open_browser: bool = True) -> None:
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(root))
-    url = f"http://127.0.0.1:{port}"
+def parse_port(value: int | None, *, fallback: int = DEFAULT_UI_PORT,
+                label: str = "--port") -> int:
+    """Validate a port number coming off argparse. None means "no value
+    supplied" (caller wants the default preference with safe fallback); any
+    other int must be a legal TCP port."""
+    if value is None:
+        return fallback
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{label} must be an integer")
+    if value < 0 or value > 65_535:
+        raise ValueError(f"{label} must be between 0 and 65535")
+    return value
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """Non-connecting probe: ask the OS to bind a fresh socket to
+    ``(host, port)``. ``EADDRINUSE`` is the only signal that matters; we
+    don't open a connection."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return False
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            return True
+        # In case the host isn't bindable (e.g. tailscale down by race),
+        # surface anything else rather than claim the port is free.
+        raise
+    finally:
+        s.close()
+
+
+def _pick_free_port(host: str) -> int:
+    """Ask the OS for a free port on ``host``. Pure helper; never raises
+    for "port taken" — only for OS-level bind failures we cannot recover
+    from (the caller can then decide)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def tailscale_warning(bind_host: str) -> str:
+    """The exact one-line warning orchestra prints when Tailscale is the
+    bind mode. Returned (not printed) so tests can assert on it without
+    spinning up a real server against a non-routable interface. The string
+    explicitly describes the dashboard as read-only and ACL-scoped to
+    avoid the misleading "use and modify" wording."""
+    return (
+        "[orchestra] Tailnet access is enabled. Members permitted by "
+        "your Tailscale ACLs can view this Orchestra dashboard — its "
+        "runs, inboxes, transcript feeds, and project status — from "
+        "your Tailnet."
+    )
+
+
+def serve(root: Path, *, port: int | None = None,
+          open_browser: bool = True,
+          host: str | None = None, tailscale_mode: bool = False) -> int:
+    """Start the dashboard, bind exactly the resolved host.
+
+    ``port`` semantics:
+      * ``None`` (caller passed no ``--port``): we prefer 4764 and, only in
+        that case, fall back to an OS-chosen free port if 4764 is busy.
+      * Any explicit int (including 0) is PINNED: the caller chose it, so a
+        busy port fails clearly with ``EADDRINUSE``.
+
+    Returns the actual port the server is bound to.
+    """
+    plan = tailscale.resolve_bind_host(explicit_host=host, tailscale=tailscale_mode)
+    bind_host = plan.host
+
+    if port is None:
+        # Default preference: 4764, with safe fallback to OS-chosen when 4764
+        # is busy on this host.
+        try:
+            if _port_in_use(bind_host, DEFAULT_UI_PORT):
+                chosen = _pick_free_port(bind_host)
+                fallback_used = True
+            else:
+                chosen = DEFAULT_UI_PORT
+                fallback_used = False
+        except OSError:
+            chosen = _pick_free_port(bind_host)
+            fallback_used = True
+        pin_port = False
+    else:
+        chosen = port
+        pin_port = True
+        fallback_used = False
+
+    try:
+        httpd = ThreadingHTTPServer((bind_host, chosen), make_handler(root))
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise SystemExit(
+                f"orchestra: port {chosen} is already in use on {bind_host}. "
+                "Pick a free port with --port, or omit --port to let orchestra "
+                "fall back to an OS-chosen free port."
+            ) from exc
+        raise
+
+    actual_port = httpd.server_address[1]
+    url = f"http://{bind_host}:{actual_port}"
     print(f"orchestra ui: {url}  (ctrl-c to stop; ui.html edits apply on browser refresh)")
-    if open_browser:
+    if plan.tailscale:
+        print(tailscale_warning(bind_host))
+    if fallback_used:
+        print(f"[orchestra] Preferred port {DEFAULT_UI_PORT} was occupied on "
+              f"{bind_host}; using {actual_port} instead.")
+    elif pin_port and actual_port != port:
+        # Pinned port that wasn't free should have raised already; this
+        # guard exists only for paranoia.
+        print(f"[orchestra] Bound to {actual_port} (pinned to {port}).")
+
+    if open_browser and bind_host == "127.0.0.1":
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    return actual_port

@@ -5,11 +5,22 @@ Verifies:
   * default-on warns before run DB inserts when headroom is critical.
   * exceptions during quota collection are fail-open (dispatch still inserts).
 
-Isolation: every test patches `cli.paths.find_root` to return the temp root,
-saves and restores `_spawn_supervisor`, sets `work=None`, and points the
-service at a stub so no real quota collectors ever fire. The temp project's
-database is dropped during tearDown, so nothing leaks to the real Orchestra
-DB or work tracker.
+Isolation contract — read this before adding cases:
+
+  * ``cli.paths.find_root`` is patched to a temp root for the entire test,
+    so every ``db.connect`` and work-tracker write is sandboxed.
+  * ``cli._spawn_supervisor`` is monkey-patched to a no-op, so the test
+    never spawns a real CLI / worker process. Re-running `orchestra dispatch`
+    (or any consumer) by hand against this project's DB would leak — never
+    do that here.
+  * ``work=None`` is passed on every dispatch, so the real ``work`` CLI is
+    never invoked.
+  * The temp project's database is closed in ``tearDown`` and the tempdir
+    is removed.
+
+When adding new tests, keep ALL four guards in place; an inherited env
+variable (``ORCHESTRA_ROOT``) can otherwise point ``find_root`` at the
+real project root and silently write there.
 """
 from __future__ import annotations
 
@@ -158,14 +169,19 @@ class DispatchQuotaHookTests(unittest.TestCase):
         self.assertEqual(runs_seen_at_snapshot["n"], 0)
         # The warning text reached stderr.
         self.assertIn("quota warning", err.getvalue().lower())
-        # And the warning was printed before the "run N:" line in stdout.
+        # And the warning was printed before the run-start line in stdout.
         warn_idx = err.getvalue().lower().find("quota warning")
         out_text = out.getvalue()
-        run_idx = out_text.find("run 1:")
+        # As of W-0007 the dispatcher prints "run <id> (<slug>): ..." instead
+        # of "run <id>: ...". Match the run-prefix generically so this
+        # guard doesn't depend on the exact wording.
+        import re as _re
+        run_match = _re.search(r"run\s+\d+\b", out_text)
+        run_idx = run_match.start() if run_match else -1
         # Warning must come before the first "run N:" line in chronological
         # output (both streams are buffered; we know stderr was flushed
         # before stdout because cmd_dispatch's `print(line, file=sys.stderr)`
-        # runs in the phase BEFORE the loop emits `print(f"run {run_id}...")`).
+        # runs in the phase BEFORE the loop emits the run line).
         self.assertGreater(warn_idx, -1)
         self.assertGreater(run_idx, -1)
         # And a row was created.
