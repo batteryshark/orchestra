@@ -28,7 +28,10 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
 4. **Harvest.** `orchestra inbox <you> --unread --mark-read` for handoffs and completions;
    `orchestra feed` for findings workers logged; `orchestra logs <run> --pretty` for full output.
 5. **Review & iterate.** Follow up in the SAME worker session: `orchestra reply <run> "feedback" `.
-   Review items workers moved to `review`; only you/the human move them: `work move W-XXXX done`.
+   Workers log `VERIFIED: <criterion> — <evidence>` lines instead of flipping checklist boxes
+   (Work enforces checked boxes before `review`, and boxes are only togglable via the Work UI/API).
+   Verify their evidence, check the boxes in the Work UI (or via `POST /api/tasks/<id>/checklist`
+   when this workspace is being served), then `work move W-XXXX review` / `done`.
 6. **Close the loop.** Log outcomes to the work item (`work log`), merge worktree branches
    (`orchestra run show <run>` shows branch), and keep the tracker current so any future
    session (yours or another orchestrator's) can resume cold.
@@ -54,6 +57,13 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
 - Verify worker output before marking anything done. Prefer dispatching a second agent to
   review large changes (e.g. `--to kimi "review the diff on branch orchestra/run-N ..."`).
 - Record every notable finding or decision in `work` — sessions are disposable, the tracker is not.
+
+## Codex-as-orchestrator sandbox note
+
+`orchestra dispatch` spawns other agent CLIs that need network access and write to their own
+state dirs (outside the workspace). Interactive Codex: approve the escalation when dispatching.
+Headless: `codex exec --sandbox danger-full-access` (or `--dangerously-bypass-approvals-and-sandbox`)
+for orchestration sessions. Claude Code needs no special handling.
 
 ## Cheatsheet
 

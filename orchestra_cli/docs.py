@@ -61,6 +61,13 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
   review large changes (e.g. `--to kimi "review the diff on branch orchestra/run-N ..."`).
 - Record every notable finding or decision in `work` — sessions are disposable, the tracker is not.
 
+## Codex-as-orchestrator sandbox note
+
+`orchestra dispatch` spawns other agent CLIs that need network access and write to their own
+state dirs (outside the workspace). Interactive Codex: approve the escalation when dispatching.
+Headless: `codex exec --sandbox danger-full-access` (or `--dangerously-bypass-approvals-and-sandbox`)
+for orchestration sessions. Claude Code needs no special handling.
+
 ## Cheatsheet
 
 ```

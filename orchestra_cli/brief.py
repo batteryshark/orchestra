@@ -67,5 +67,7 @@ Before starting, check the project's skill folders for relevant guides and follo
 
 You have opencode-ensemble team tools (team_create, team_spawn, team_message, team_broadcast, team_tasks_add, team_tasks_list, team_claim, team_tasks_complete, team_results, team_merge, team_status, team_shutdown, team_cleanup).
 You are the LEAD: split the mission into parallel tasks on the team task board, spawn teammates over this model pool: {', '.join(pool) or '(configured pool)'}, coordinate via team messages, merge results with team_merge, then team_shutdown and team_cleanup. Report the consolidated outcome through the normal handoff protocol above.
+
+IMPORTANT: your session is non-interactive — if your turn ends, teammate completion messages have nobody to wake. Never end your turn to "wait". After spawning, actively poll team_status/team_results until every task is complete, then team_merge, verify the merged files exist in the project, team_shutdown, team_cleanup, and only then hand off.
 """)
     return "\n".join(parts)
