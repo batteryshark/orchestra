@@ -10,6 +10,8 @@ DEFAULT_CONFIG = """\
 [settings]
 timeout = 3600            # per-run seconds before the supervisor kills a worker
 default_requester = "orchestrator"
+# env vars pulled from `launchctl getenv` into worker/host env when not already set
+env_passthrough = ["FIRECRAWL_API_KEY"]
 
 # --- roster ---------------------------------------------------------------
 # backend: opencode | codex | claude
@@ -57,6 +59,22 @@ ensemble = true
 role = "lead of an opencode-ensemble team"
 model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
 """
+
+
+def apply_env_passthrough(cfg: dict, env: dict) -> dict:
+    """Fill missing env vars from launchctl (macOS user-session env), so workers
+    spawned from scrubbed environments still see keys the user set globally."""
+    import subprocess
+    for name in cfg.get("settings", {}).get("env_passthrough", []):
+        if not env.get(name):
+            try:
+                v = subprocess.run(["launchctl", "getenv", name], capture_output=True,
+                                   text=True, timeout=5).stdout.strip()
+                if v:
+                    env[name] = v
+            except Exception:
+                pass
+    return env
 
 
 def codex_defaults() -> tuple[str | None, str | None]:

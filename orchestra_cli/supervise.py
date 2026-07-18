@@ -129,7 +129,8 @@ def supervise(root: Path, run_id: int) -> int:
             last_msg_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
             cmd = cmd[:2] + ["-o", last_msg_file] + cmd[2:]  # `codex exec -o FILE ...`
 
-        env = dict(os.environ, ORCHESTRA_SELF=run["agent"], ORCHESTRA_ROOT=str(root))
+        env = config.apply_env_passthrough(
+            cfg, dict(os.environ, ORCHESTRA_SELF=run["agent"], ORCHESTRA_ROOT=str(root)))
         outcome, exit_code = _run_proc(con, run, cmd, run["workdir"], env,
                                        run["log_path"], run_id, deadline)
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()

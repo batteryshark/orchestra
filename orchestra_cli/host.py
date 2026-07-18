@@ -64,6 +64,11 @@ def ensure(port: int = DEFAULT_PORT) -> str:
         return u
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    try:
+        from orchestra_cli import config as _config
+        _config.apply_env_passthrough(_config.load(None), env)
+    except Exception:
+        pass
     # server-side sessions (teammates, async lead wake-ups) have no client to
     # answer permission asks — a blocked ask hangs the team forever. This server
     # exists only to run orchestra workers, so allow everything on it.
