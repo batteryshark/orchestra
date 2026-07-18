@@ -28,16 +28,24 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    - `--to ensemble` dispatches an opencode-ensemble LEAD that spawns its own model-pool team.
      Ensemble runs ride a persistent opencode host (`orchestra host status`); the mission is
      complete when the lead's HANDOFF arrives, not when the client process exits.
-3. **Monitor without blocking.** `orchestra wait` blocks until runs finish (run it in a
+3. **Messaging semantics — know which tool delivers.**
+   - `orchestra send <agent>` to a RUNNING worker is BEST-EFFORT (workers only check
+     their inbox at start and between steps). If the worker never checks, the run's
+     end bounces an UNDELIVERED notice back to your inbox.
+   - Guaranteed mid-run delivery: `orchestra interrupt <run> "message" --as you` —
+     pauses the worker, injects the message, resumes the same session and mission.
+   - After a run finished: `orchestra reply <run> "message"` resumes the session.
+   - Corrections to in-flight missions should ALWAYS use interrupt, not send.
+4. **Monitor without blocking.** `orchestra wait` blocks until runs finish (run it in a
    background shell and keep working); `orchestra status` for a snapshot; `orchestra runs --active`.
-4. **Harvest.** `orchestra inbox <you> --unread --mark-read` for handoffs and completions;
+5. **Harvest.** `orchestra inbox <you> --unread --mark-read` for handoffs and completions;
    `orchestra feed` for findings workers logged; `orchestra logs <run> --pretty` for full output.
-5. **Review & iterate.** Follow up in the SAME worker session: `orchestra reply <run> "feedback" `.
+6. **Review & iterate.** Follow up in the SAME worker session: `orchestra reply <run> "feedback" `.
    Workers log `VERIFIED: <criterion> — <evidence>` lines instead of flipping checklist boxes
    (Work enforces checked boxes before `review`, and boxes are only togglable via the Work UI/API).
    Verify their evidence, check the boxes in the Work UI (or via `POST /api/tasks/<id>/checklist`
    when this workspace is being served), then `work move W-XXXX review` / `done`.
-6. **Close the loop.** Log outcomes to the work item (`work log`), merge worktree branches
+7. **Close the loop.** Log outcomes to the work item (`work log`), merge worktree branches
    (`orchestra run show <run>` shows branch), and keep the tracker current so any future
    session (yours or another orchestrator's) can resume cold.
 
@@ -87,6 +95,7 @@ orchestra dispatch --to glm --to minimax --as claude "same mission, two takes"
 orchestra wait                        # block until active runs finish
 orchestra inbox claude --unread --mark-read
 orchestra reply 7 "looks good; also add tests"
+orchestra interrupt 7 "stop - the schema changed, read W-0012 first" --as claude
 orchestra send glm "heads up: schema changed" --as claude
 orchestra broadcast "stop touching db.py" --team core --as claude
 orchestra note "auth flow uses PKCE, not implicit" --as claude --tags arch

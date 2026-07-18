@@ -70,13 +70,18 @@ def _dig(obj, keys: set[str]) -> list[str]:
     return out
 
 
-def parse_log(log_path: str) -> tuple[str | None, str | None]:
-    """Return (session_ref, last_text) best-effort from a JSONL worker log."""
+def parse_log(log_path: str, max_bytes: int | None = None) -> tuple[str | None, str | None]:
+    """Return (session_ref, last_text) best-effort from a JSONL worker log.
+    max_bytes limits the scan (cheap early session-ref sniffing)."""
     import json
     session, last_text = None, None
     try:
         with open(log_path, errors="replace") as f:
-            for line in f:
+            if max_bytes:
+                content = f.read(max_bytes).splitlines()
+            else:
+                content = f
+            for line in content:
                 line = line.strip()
                 if not line or not line.startswith("{"):
                     continue

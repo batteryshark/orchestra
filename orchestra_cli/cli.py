@@ -357,6 +357,41 @@ def cmd_wait(args):
     print("all runs finished — check your inbox: `orchestra inbox <you> --unread --mark-read`")
 
 
+def cmd_interrupt(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    con = db.connect(root)
+    r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
+    if not r:
+        raise SystemExit(f"orchestra: no run {args.run_id}")
+    if r["status"] in db.RUN_TERMINAL:
+        raise SystemExit(f"orchestra: run {args.run_id} already {r['status']} — "
+                         f"use `orchestra reply {args.run_id} \"...\"` instead")
+    agent = config.agent_cfg(cfg, r["agent"])
+    if agent.get("ensemble"):
+        raise SystemExit("orchestra: ensemble leads can't be interrupted (their team runs "
+                         "server-side); use `orchestra send` — the lead reads its inbox "
+                         "when teammates wake it")
+    if not r["session_ref"]:
+        raise SystemExit(f"orchestra: run {args.run_id}'s session isn't identified yet "
+                         "(happens ~10s after spawn) — retry in a moment, or `orchestra send` "
+                         "to queue the message")
+    sender = _identity(args, cfg)
+    con.execute("INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+                "VALUES(?,?,?,?,?)",
+                (sender, r["agent"], f"[INTERRUPT] {' '.join(args.message)}",
+                 args.run_id, db.now()))
+    con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (args.run_id,))
+    con.commit()
+    if r["pid"]:
+        try:
+            os.killpg(r["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    print(f"run {args.run_id} interrupted — worker will resume its session, read the "
+          f"message, and continue the mission")
+
+
 def cmd_kill(args):
     root = paths.find_root()
     con = db.connect(root)
@@ -703,6 +738,13 @@ def main():
     s.add_argument("--port", type=int, default=4764)
     s.add_argument("--no-open", action="store_true", help="don't open a browser")
     s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("interrupt", help="guaranteed delivery to a RUNNING worker: "
+                                         "pause it, inject the message, resume the mission")
+    s.add_argument("run_id", type=int)
+    s.add_argument("message", nargs="+")
+    ident(s)
+    s.set_defaults(fn=cmd_interrupt)
 
     s = sub.add_parser("kill", help="terminate a running worker")
     s.add_argument("run_id", type=int)
