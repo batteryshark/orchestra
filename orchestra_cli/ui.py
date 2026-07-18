@@ -3,6 +3,16 @@ inboxes, findings feed, and teams. Reads the project SQLite; no writes.
 
 The HTML page lives in ui.html next to this module and is read from disk on
 every request, so UI edits only need a browser refresh (no server restart).
+
+Multi-project control plane
+---------------------------
+A single ``orchestra ui`` process serves every registered Orchestra project
+root (see :mod:`orchestra_cli.projects`). Each request carries the selected
+project via the ``X-Orchestra-Project`` header *or* the ``?project=<id>``
+query parameter; the header wins when both are present. Unknown ids surface
+as a 404 JSON error — they are never silently rerouted to the default. When
+no selection is sent, requests fall through to the project the UI was
+launched from (so single-project use is unchanged).
 """
 import errno
 import hashlib
@@ -17,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import db, host, tailscale
+from orchestra_cli import db, host, projects, tailscale
 from orchestra_cli.usage import default_service
 
 DEFAULT_UI_PORT = 4764
@@ -29,6 +39,12 @@ ENSEMBLE_DB = Path("~/.config/opencode/ensemble.db").expanduser()
 
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
+
+# Header is canonically lowercase (BaseHTTPRequestHandler lowercases header
+# names). The query param covers browser fetches that cannot easily set a
+# header (e.g. top-level document navigations).
+PROJECT_HEADER = "x-orchestra-project"
+PROJECT_QUERY = "project"
 
 
 def _fmt(v, limit=MAX_OUTPUT) -> str:
@@ -250,7 +266,61 @@ def teammate_transcript(session_id: str) -> tuple[list[dict], str]:
     return items, hashlib.md5(raw).hexdigest()
 
 
-def make_handler(root: Path):
+def make_handler(root: Path, registry: list[dict] | None = None):
+    """Build a request handler.
+
+    ``root`` is the project the UI process was launched from and stays
+    the default selection when a request does not name one. ``registry``
+    is only the *startup* snapshot of the allowlist (purely advisory);
+    every request re-reads the live registry on disk so a root
+    registered from another terminal after the UI started is selectable
+    immediately. The launch root is always merged into the live
+    allowlist so `orchestra ui` works even before `orchestra init` /
+    `orchestra project register` has run.
+
+    The default project id is whatever ``projects.project_id(root)``
+    resolves to (canonical, not whatever ``root`` was passed in as) so
+    requests with no header and requests with the canonical id both
+    land on the same project row in the registry.
+    """
+    default_root = projects._canonical(root)
+    default_id = projects.project_id(default_root)
+    # Snapshot the startup registry ONLY to surface startup problems
+    # (corrupt file, etc.) in the server log. The live view is read on
+    # every request below.
+    if registry is not None:
+        try:
+            # Touch the live registry path so an early error shows up
+            # at startup rather than on the first request.
+            projects.list_registered()
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            import sys
+            print(f"orchestra ui: projects registry unreadable at startup: {exc}",
+                  file=sys.stderr)
+
+    def _live_allowlist() -> list[dict]:
+        """Merge the live registry with the launch root.
+
+        Read fresh on every call (cheap: a tiny JSON file) so the
+        picker and the request routing share ONE source of truth. The
+        launch root is always present, even if the user has not
+        registered it yet — `orchestra ui` should never refuse to
+        serve the project it was started from.
+        """
+        try:
+            live = projects.list_available()
+        except Exception:
+            live = []
+        if not any(e["id"] == default_id for e in live) \
+                and projects.is_orchestra_root(default_root):
+            live = list(live) + [{
+                "id": default_id,
+                "name": default_root.name,
+                "root": str(default_root),
+                "available": True,
+            }]
+        return live
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
             pass
@@ -274,6 +344,59 @@ def make_handler(root: Path):
             self.send_header("Cache-Control", "no-store" if no_store else "max-age=300")
             self.end_headers()
             self.wfile.write(body)
+
+        # --- project selection ------------------------------------------
+        def _requested_project(self, url) -> str | None:
+            """The client's project id, from header or query. Header wins."""
+            header = self.headers.get(PROJECT_HEADER)
+            if header and header.strip():
+                return header.strip()
+            q = parse_qs(url.query).get(PROJECT_QUERY)
+            if q and q[0].strip():
+                return q[0].strip()
+            return None
+
+        def _resolve_project(self, url, *, required: bool = False) -> Path | None:
+            """Return the canonical project root this request is for.
+
+            Reads the allowlist fresh on every request so a root
+            registered after the UI process started routes correctly
+            (the picker already lists it via /api/projects). The launch
+            root is always in the allowlist. Unknown explicit ids
+            surface as a 404 *side effect* (the response is already
+            written) and return ``None`` so the caller bails.
+            """
+            allowed = _live_allowlist()
+            requested = self._requested_project(url)
+            if not requested and not required:
+                # Fast path: default selection. Still validated against
+                # the live allowlist in case the launch root has been
+                # deleted from disk out from under us.
+                by_id = {e["id"]: e for e in allowed}
+                sel = by_id.get(default_id)
+                if sel is None and allowed:
+                    sel = allowed[0]
+                if sel is None:
+                    self._json({"error": "no projects available"}, 503)
+                    return None
+                return Path(sel["root"])
+            try:
+                sel = projects.resolve_selection(allowed, requested, default_id)
+            except projects.UnknownProjectError as exc:
+                self._json({"error": "unknown project",
+                            "project": exc.project_id}, 404)
+                return None
+            except LookupError:
+                self._json({"error": "no projects available"}, 503)
+                return None
+            return Path(sel["root"])
+
+        def _projects_listing(self) -> dict:
+            """Snapshot of the picker: live allowlist + which one is default."""
+            return {
+                "defaultProjectId": default_id,
+                "projects": _live_allowlist(),
+            }
 
         def do_GET(self):
             url = urlparse(self.path)
@@ -311,10 +434,18 @@ def make_handler(root: Path):
                     return self._json({"error": "asset not found"}, 404)
                 ctype = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
                 self._send_static(asset, content_type=ctype, no_store=False)
+            elif path == "/api/projects":
+                # The picker source of truth. Always served off the
+                # global registry; no project header needed.
+                self._json(self._projects_listing())
             elif path == "/api/state":
-                con = db.connect(root)
+                project = self._resolve_project(url)
+                if project is None:
+                    return
+                con = db.connect(project)
                 state = {
-                    "root": str(root),
+                    "root": str(project),
+                    "project_id": projects.project_id(project),
                     "runs": [dict(r) for r in con.execute(
                         "SELECT * FROM runs ORDER BY id DESC LIMIT 100")][::-1],
                     "messages": [dict(r) for r in con.execute(
@@ -325,11 +456,14 @@ def make_handler(root: Path):
                                "members": [m["agent"] for m in con.execute(
                                    "SELECT agent FROM members WHERE team_id=?", (t["id"],))]}
                               for t in con.execute("SELECT * FROM teams")],
-                    "ensemble": ensemble_teams(root),
+                    "ensemble": ensemble_teams(project),
                 }
                 con.close()
                 self._json(state)
             elif path.startswith("/api/teammate/"):
+                project = self._resolve_project(url)
+                if project is None:
+                    return
                 sid = path.rsplit("/", 1)[1]
                 q = parse_qs(url.query)
                 items, etag = teammate_transcript(sid)
@@ -343,7 +477,10 @@ def make_handler(root: Path):
                     run_id = int(path.rsplit("/", 1)[1])
                 except ValueError:
                     return self._json({"error": "bad id"}, 400)
-                con = db.connect(root)
+                project = self._resolve_project(url)
+                if project is None:
+                    return
+                con = db.connect(project)
                 r = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
                 con.close()
                 if not r:
@@ -366,7 +503,10 @@ def make_handler(root: Path):
                     run_id = int(path.rsplit("/", 1)[1])
                 except ValueError:
                     return self._json({"error": "bad id"}, 400)
-                con = db.connect(root)
+                project = self._resolve_project(url)
+                if project is None:
+                    return
+                con = db.connect(project)
                 r = con.execute("SELECT log_path FROM runs WHERE id=?", (run_id,)).fetchone()
                 con.close()
                 text = ""
@@ -461,6 +601,16 @@ def serve(root: Path, *, port: int | None = None,
 
     Returns the actual port the server is bound to.
     """
+    # Keep the launch root in the explicit allowlist so it appears in every
+    # long-running dashboard. Routing still merges the launch root as a safe
+    # fallback if the registry is temporarily unreadable.
+    try:
+        projects.register(root)
+    except projects.NotAnOrchestraRoot:
+        pass
+    except Exception as exc:
+        print(f"orchestra ui: could not register launch project: {exc}")
+
     plan = tailscale.resolve_bind_host(explicit_host=host, tailscale=tailscale_mode)
     bind_host = plan.host
 

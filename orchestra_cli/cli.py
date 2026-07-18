@@ -8,7 +8,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-from orchestra_cli import brief, config, db, docs, host, names, paths, runners, supervise, tailscale, worktree
+from orchestra_cli import (
+    brief,
+    config,
+    db,
+    docs,
+    host,
+    names,
+    paths,
+    projects,
+    runners,
+    supervise,
+    tailscale,
+    worktree,
+)
 from orchestra_cli.usage import (
     assess_targets,
     default_service,
@@ -58,6 +71,14 @@ def cmd_init(args):
             p.write_text(text + docs.POINTER)
     if args.work and _work_available() and not (root / ".work").is_dir():
         subprocess.run(["work", "init", str(root)], cwd=root)
+    # Register the freshly-initialized root in the multi-project
+    # allowlist so `orchestra ui` started anywhere lists it. Idempotent:
+    # re-running `orchestra init` keeps the same canonical id and only
+    # refreshes the on-disk entry.
+    try:
+        projects.register(root)
+    except Exception as exc:  # pragma: no cover - best-effort
+        print(f"  note: could not register project in picker: {exc}")
     print(f"orchestra: initialized {sd}")
     print(f"  global roster config: {gp}")
     print(f"  playbook: {root / 'ORCHESTRA.md'} (pointers added to AGENTS.md / CLAUDE.md)")
@@ -750,6 +771,44 @@ def cmd_ui(args):
         raise SystemExit(f"orchestra: {exc}") from exc
 
 
+def cmd_project(args):
+    """Multi-project picker allowlist (lives in ~/.config/orchestra/projects.json).
+
+    The picker only ever shows entries managed here. ``forget`` is the
+    picker-side remove: it deletes the registry row but never touches
+    the project's files or its ``.orchestra/`` state — that data stays
+    on disk so the user can re-register later or keep working from the
+    project root via the CLI.
+    """
+    if args.project_cmd == "register":
+        target = Path(args.path).expanduser().resolve() if args.path else Path.cwd().resolve()
+        if not projects.is_orchestra_root(target):
+            raise SystemExit(
+                f"orchestra: {target} is not an Orchestra project "
+                f"(no .orchestra/ directory). Run `orchestra init` there first.")
+        entry = projects.register(target, name=args.name)
+        print(f"registered: {entry['id']}  {entry['name']}\n  {entry['root']}")
+    elif args.project_cmd == "forget":
+        if not args.id_or_path:
+            raise SystemExit("orchestra: `orchestra project forget` needs an id or path")
+        removed = projects.unregister(args.id_or_path)
+        if removed:
+            print(f"forgot: {args.id_or_path}  "
+                  "(project files and .orchestra/ left untouched)")
+        else:
+            raise SystemExit(f"orchestra: nothing matched `{args.id_or_path}` in the picker")
+    else:  # list
+        rows = projects.list_registered()
+        if not rows:
+            print("(no projects registered — run `orchestra init`, or "
+                  "`orchestra project register <path>`)")
+            return
+        print(f"{'id':<16} {'name':<22} root")
+        for r in rows:
+            avail = "" if projects.is_orchestra_root(Path(r["root"])) else "  (unavailable)"
+            print(f"{r['id']:<16} {r['name']:<22} {r['root']}{avail}")
+
+
 def cmd_supervise(args):
     sys.exit(supervise.supervise(Path(args.root), args.run_id))
 
@@ -777,13 +836,14 @@ def main():
 
     s = sub.add_parser("team", help="manage teams")
     ts = s.add_subparsers(dest="team_cmd", required=True)
-    t = ts.add_parser("create")
-    t.add_argument("name")
-    t.add_argument("agents", nargs="*")
-    t.add_argument("--about")
-    t = ts.add_parser("add")
-    t.add_argument("name")
-    t.add_argument("agents", nargs="+")
+    # Distinct locals — see the comment on `project` below for why.
+    t_create = ts.add_parser("create")
+    t_create.add_argument("name")
+    t_create.add_argument("agents", nargs="*")
+    t_create.add_argument("--about")
+    t_add = ts.add_parser("add")
+    t_add.add_argument("name")
+    t_add.add_argument("agents", nargs="+")
     ts.add_parser("list")
     s.set_defaults(fn=cmd_team)
 
@@ -840,8 +900,8 @@ def main():
 
     s = sub.add_parser("run", help="run details")
     rs = s.add_subparsers(dest="run_cmd", required=True)
-    r = rs.add_parser("show")
-    r.add_argument("run_id", type=int)
+    r_show = rs.add_parser("show")
+    r_show.add_argument("run_id", type=int)
     s.set_defaults(fn=cmd_run_show)
 
     s = sub.add_parser("logs", help="show a run's worker output")
@@ -880,6 +940,23 @@ def main():
                         "Fails clearly if Tailscale is unavailable.")
     s.add_argument("--no-open", action="store_true", help="don't open a browser")
     s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("project", help="manage the multi-project picker allowlist")
+    ps = s.add_subparsers(dest="project_cmd", required=True)
+    # Do NOT name these locals `p` — `p` is the root ArgumentParser and
+    # the function ends with `args = p.parse_args()`. Shadowing it makes
+    # every CLI invocation dispatch against whichever child parser was
+    # assigned last (silent, ugly, hard to spot). Distinct names below.
+    ps.add_parser("list", help="list registered project roots")
+    p_register = ps.add_parser("register",
+                               help="add a project root to the picker allowlist")
+    p_register.add_argument("path", nargs="?", help="path to register (default: current directory)")
+    p_register.add_argument("--name", help="display name override (default: directory basename)")
+    p_forget = ps.add_parser("forget",
+                             help="remove a project from the picker allowlist "
+                                  "(never deletes project data)")
+    p_forget.add_argument("id_or_path", nargs="?", help="project id or canonical path to remove")
+    s.set_defaults(fn=cmd_project)
 
     s = sub.add_parser("queue", help="queue a follow-up for a running worker; auto-delivered "
                                      "(session resume) when its current run completes")
