@@ -9,7 +9,7 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
     extra = list(agent.get("extra_args", []))
 
     if backend == "opencode":
-        cmd = ["opencode", "run", "--dir", workdir, "--format", "json", "--auto"]
+        cmd = ["opencode", "run", "--dir", workdir, "--format", "json", "--auto", "--thinking"]
         if attach:
             cmd += ["--attach", attach]
         if resume_ref:

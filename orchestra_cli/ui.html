@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>orchestra</title>
+<style>
+:root { color-scheme: light dark;
+  --bg:#f6f7f9; --card:#fff; --ink:#1a202c; --muted:#64748b; --line:#e2e8f0;
+  --blue:#2563eb; --green:#16a34a; --red:#dc2626; --amber:#d97706; --gray:#6b7280;
+  --think:#8b5cf6; --tool:#0891b2; --sel:#eff6ff; }
+@media (prefers-color-scheme: dark) { :root {
+  --bg:#0f1115; --card:#181b21; --ink:#e5e9f0; --muted:#8b95a5; --line:#2a2f3a; --sel:#1e2a44; } }
+* { box-sizing:border-box }
+body { margin:0; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;
+  background:var(--bg); color:var(--ink); }
+header { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+  padding:12px 20px; border-bottom:1px solid var(--line); }
+header h1 { font-size:16px; margin:0 }
+header .root { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px }
+header nav { margin-left:auto; display:flex; gap:12px }
+header a { color:var(--blue); text-decoration:none; font-size:13px }
+main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-direction:column; gap:14px }
+.cols { display:grid; grid-template-columns:330px 1fr; gap:14px; min-height:0 }
+@media (max-width:980px){ .cols { grid-template-columns:1fr } }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden }
+.card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--muted); margin:0; padding:10px 14px; border-bottom:1px solid var(--line) }
+.chip { display:inline-block; padding:0 8px; border-radius:99px; font-size:11px;
+  font-weight:600; color:#fff }
+.s-running { background:var(--blue); animation:pulse 1.6s infinite }
+.s-spawning { background:var(--amber) }
+.s-done { background:var(--green) } .s-failed,.s-timeout { background:var(--red) }
+.s-killed { background:var(--gray) }
+@keyframes pulse { 50% { opacity:.55 } }
+.muted { color:var(--muted) } .mono { font-family:ui-monospace,monospace; font-size:12px }
+
+/* runs sidebar */
+#runlist { max-height:72vh; overflow-y:auto }
+.runitem { padding:9px 14px; border-bottom:1px solid var(--line); cursor:pointer }
+.runitem:hover { background:var(--sel) }
+.runitem.sel { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
+.runitem .top { display:flex; gap:8px; align-items:center }
+.runitem .title { font-size:12px; color:var(--muted); margin-top:2px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+
+/* transcript panel */
+#panel { display:flex; flex-direction:column; min-height:0 }
+#phead { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  padding:10px 14px; border-bottom:1px solid var(--line); font-size:13px }
+#pbody { overflow-y:auto; height:72vh; padding:12px 16px; scroll-behavior:auto }
+.titem { margin:0 0 10px }
+.titem .prose { white-space:pre-wrap; overflow-wrap:anywhere }
+.titem.meta { color:var(--muted); font-size:12px }
+.titem.error { color:var(--red); white-space:pre-wrap; font-size:13px;
+  border-left:3px solid var(--red); padding-left:10px }
+details { border:1px solid var(--line); border-radius:8px; margin:6px 0 }
+details summary { cursor:pointer; padding:5px 10px; font-size:12.5px; user-select:none;
+  display:flex; gap:8px; align-items:center }
+details[open] summary { border-bottom:1px solid var(--line) }
+details .inner { padding:8px 10px; max-height:420px; overflow:auto }
+details pre { margin:4px 0; white-space:pre-wrap; overflow-wrap:anywhere;
+  font-size:12px; font-family:ui-monospace,monospace }
+details.think summary { color:var(--think) }
+details.tool summary { color:var(--tool) }
+details .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted) }
+#follow { margin-left:auto; display:flex; gap:6px; align-items:center; font-size:12px; color:var(--muted) }
+button { font:inherit; font-size:12px; border:1px solid var(--line); background:none;
+  color:var(--blue); border-radius:6px; padding:2px 10px; cursor:pointer }
+
+/* bottom row */
+.row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px }
+@media (max-width:980px){ .row2 { grid-template-columns:1fr } }
+.scrollbox { max-height:46vh; overflow-y:auto; padding:6px 14px 10px }
+.msg { border-left:3px solid var(--line); padding:6px 10px; margin:8px 0 }
+.msg.unread { border-left-color:var(--blue) }
+.msg .meta { font-size:12px; color:var(--muted) }
+.msg .body { white-space:pre-wrap; overflow-wrap:anywhere; margin-top:2px }
+.feeditem { padding:5px 0; border-bottom:1px solid var(--line); overflow-wrap:anywhere }
+.feeditem:last-child { border-bottom:none }
+#beat { width:8px; height:8px; border-radius:50%; background:var(--green);
+  display:inline-block; margin-left:6px }
+</style></head><body>
+<header><h1>orchestra<span id="beat"></span></h1><span class="root" id="root"></span>
+<nav><a href="http://localhost:4747" target="_blank">ensemble dashboard</a>
+<a href="http://localhost:43170" target="_blank">work tracker</a></nav></header>
+<main>
+<div class="cols">
+  <div class="card"><h2>Runs</h2><div id="runlist"></div></div>
+  <div class="card" id="panel">
+    <div id="phead"><span class="muted">select a run</span></div>
+    <div id="pbody"></div>
+  </div>
+</div>
+<div class="row2">
+  <div class="card"><h2>Inboxes</h2><div class="scrollbox" id="inboxes"></div></div>
+  <div class="card"><h2>Findings feed</h2><div class="scrollbox" id="feed"></div>
+    <h2>Teams</h2><div class="scrollbox" id="teams" style="max-height:12vh"></div></div>
+</div>
+</main>
+<script>
+const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let state = null, selected = null, userPicked = false, tEtag = null;
+let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
+
+function elapsed(start, end){
+  const b = end ? new Date(end) : new Date();
+  let s = Math.max(0, Math.floor((b - new Date(start))/1000));
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60); s = s%60;
+  return h ? `${h}h${String(m).padStart(2,'0')}m` : m ? `${m}m${String(s).padStart(2,'0')}s` : `${s}s`;
+}
+function tickElapsed(){
+  document.querySelectorAll('[data-start]').forEach(el => {
+    el.textContent = elapsed(el.dataset.start, el.dataset.end || null);
+  });
+}
+setInterval(tickElapsed, 1000);
+
+function setIfChanged(id, html){
+  if (lastHash[id] === html) return false;
+  lastHash[id] = html;
+  const el = document.getElementById(id);
+  const st = el.scrollTop;               // preserve scroll inside the box
+  el.innerHTML = html;
+  el.scrollTop = st;
+  return true;
+}
+
+function renderRuns(){
+  const html = [...state.runs].reverse().map(r => `
+    <div class="runitem ${r.id===selected?'sel':''}" onclick="pick(${r.id})">
+      <div class="top"><span class="mono">#${r.id}</span><b>${esc(r.agent)}</b>
+        <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
+        <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
+          ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span></div>
+      <div class="title">${r.work_item?`[${esc(r.work_item)}] `:''}${esc(r.title||'')}</div>
+    </div>`).join('') || '<div class="runitem muted">no runs yet</div>';
+  setIfChanged('runlist', html);
+  tickElapsed();
+}
+
+function pick(id){ userPicked = true; select(id); }
+function select(id){
+  if (selected === id) return;
+  selected = id; tEtag = null; lastHash.pbody = null;
+  document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
+  renderRuns(); refreshTranscript(true);
+}
+
+function itemHtml(it, i){
+  if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
+  if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
+  if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
+  if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;
+  return `<div class="titem meta">${esc(it.body)}</div>`;
+}
+
+async function refreshTranscript(force){
+  if (selected == null) return;
+  let res;
+  try { res = await (await fetch(`api/transcript/${selected}${tEtag&&!force?`?etag=${tEtag}`:''}`)).json(); }
+  catch(e){ return; }
+  if (res.unchanged) return;
+  tEtag = res.etag;
+  const r = res.run;
+  const head = `<span class="mono">#${r.id}</span> <b>${esc(r.agent)}</b>
+    <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
+    <span class="mono muted">${esc(r.model||'')}</span>
+    ${r.work_item?`<span class="mono">${esc(r.work_item)}</span>`:''}
+    ${r.branch?`<span class="mono muted">${esc(r.branch)}</span>`:''}
+    <span class="mono muted" data-start="${esc(r.started_at)}" ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span>
+    <label id="follow"><input type="checkbox" id="followcb" checked> follow tail</label>`;
+  setIfChanged('phead', head);
+  const body = document.getElementById('pbody');
+  const open = new Set([...body.querySelectorAll('details[open]')].map(d=>d.dataset.k));
+  const follow = document.getElementById('followcb')?.checked ?? true;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  body.innerHTML = res.items.map(itemHtml).join('')
+    || '<span class="muted">no output yet…</span>';
+  body.querySelectorAll('details').forEach(d => { if (open.has(d.dataset.k)) d.open = true; });
+  if (follow && (nearBottom || force)) body.scrollTop = body.scrollHeight;
+  tickElapsed();
+}
+
+function renderBottom(){
+  const byRcpt = {};
+  for (const m of state.messages) (byRcpt[m.recipient] ??= []).push(m);
+  const inbox = Object.entries(byRcpt).map(([r, ms]) => {
+    const unread = ms.filter(m=>!m.read_at).length;
+    return `<details ${unread?'open':''}><summary><b>${esc(r)}</b>
+      <span class="muted">${ms.length} msgs${unread?`, <b>${unread} unread</b>`:''}</span></summary>
+      <div class="inner">${ms.slice(-12).map(m=>`<div class="msg ${m.read_at?'':'unread'}">
+        <div class="meta">${esc(m.sender)} → ${esc(m.recipient)} · ${esc(m.created_at)}
+          ${m.run_id?` · <a href="#" onclick="pick(${m.run_id});return false">run ${m.run_id}</a>`:''}
+          ${m.work_item?` · ${esc(m.work_item)}`:''}</div>
+        <div class="body">${esc(m.body)}</div></div>`).join('')}</div></details>`;
+  }).join('') || '<span class="muted">no messages yet</span>';
+  setIfChanged('inboxes', inbox);
+  setIfChanged('feed', state.feed.map(f =>
+    `<div class="feeditem"><span class="muted mono">${esc(f.created_at.slice(11,19))}</span>
+     <b>${esc(f.author)}</b>: ${esc(f.body)}
+     ${f.tags?`<span class="muted">[${esc(f.tags)}]</span>`:''}</div>`).join('')
+    || '<span class="muted">feed empty</span>');
+  setIfChanged('teams', state.teams.map(t =>
+    `<div><b>${esc(t.name)}</b>: ${esc(t.members.join(', ')||'(empty)')}</div>`).join('')
+    || '<span class="muted">no teams</span>');
+}
+
+async function refresh(){
+  try { state = await (await fetch('api/state')).json(); }
+  catch(e){ document.getElementById('beat').style.background='var(--red)'; return; }
+  document.getElementById('beat').style.background='var(--green)';
+  document.getElementById('root').textContent = state.root;
+  if (selected == null && !userPicked && state.runs.length){
+    const active = state.runs.filter(r=>['running','spawning'].includes(r.status));
+    select((active.length ? active[active.length-1] : state.runs[state.runs.length-1]).id);
+  }
+  renderRuns(); renderBottom();
+}
+refresh(); setInterval(refresh, 2500); setInterval(()=>refreshTranscript(false), 2000);
+</script></body></html>

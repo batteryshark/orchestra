@@ -477,7 +477,7 @@ def cmd_host(args):
     if args.host_cmd == "stop":
         print("host stopped" if host.stop() else "host was not running")
     elif args.host_cmd == "start":
-        print(f"host: {host.ensure()}")
+        print(f"host: {host.ensure(args.port)}")
     else:  # status
         u = host.url()
         s = host.state() or {}
@@ -599,6 +599,9 @@ def main():
 
     s = sub.add_parser("host", help="manage the persistent opencode host (used by ensemble runs)")
     s.add_argument("host_cmd", nargs="?", default="status", choices=["status", "start", "stop"])
+    s.add_argument("--port", type=int, default=host.DEFAULT_PORT,
+                   help=f"opencode serve port for the ensemble host (default {host.DEFAULT_PORT}); "
+                        "ensemble dispatches attach to whatever host is recorded as running")
     s.set_defaults(fn=cmd_host)
 
     s = sub.add_parser("ui", help="live web dashboard for this project (runs, inboxes, feed)")
