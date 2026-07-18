@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Provider runway</title>
+  <link rel="stylesheet" href="/runway-assets/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Back to orchestra dashboard">
+      <span class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </span>
+      <span>orchestra</span>
+      <span class="brand-divider"></span>
+      <strong>provider runway</strong>
+    </a>
+    <div class="topbar-actions">
+      <span class="live-state" id="live-state"><span class="live-dot"></span> Connecting</span>
+      <button class="refresh-button" id="refresh-button" type="button">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.8 6.2A7 7 0 1 0 17 10M15.8 6.2V2.8m0 3.4h-3.4"/></svg>
+        <span>Refresh</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="overview" aria-labelledby="overview-title">
+      <div class="eyebrow"><span class="eyebrow-line"></span> Routing signal</div>
+      <div class="overview-grid">
+        <div>
+          <h1 id="overview-title">Know where your next run should go.</h1>
+          <p class="overview-copy">Live coding-plan headroom across every provider in the Orchestra roster.</p>
+        </div>
+        <div class="recommendation is-loading" id="recommendation" aria-live="polite">
+          <div class="recommendation-label">Best runway</div>
+          <div class="recommendation-value">Checking providers…</div>
+          <div class="recommendation-detail">One moment</div>
+        </div>
+      </div>
+      <div class="overview-meta">
+        <span id="updated-at">Waiting for first snapshot</span>
+        <span class="meta-separator"></span>
+        <span>Auto-refreshes every 90 seconds</span>
+        <span class="meta-separator"></span>
+        <span>Burn rate appears after 5 minutes</span>
+      </div>
+    </section>
+
+    <section aria-labelledby="provider-heading">
+      <div class="section-heading">
+        <div>
+          <div class="eyebrow"><span class="eyebrow-line"></span> Capacity map</div>
+          <h2 id="provider-heading">Coding plans</h2>
+        </div>
+        <div class="legend" aria-label="Quota status legend">
+          <span><i class="legend-dot healthy"></i> Comfortable</span>
+          <span><i class="legend-dot watch"></i> Watch</span>
+          <span><i class="legend-dot critical"></i> Switch soon</span>
+        </div>
+      </div>
+      <div class="provider-grid" id="provider-grid" aria-live="polite">
+        <article class="provider-card skeleton-card"></article>
+        <article class="provider-card skeleton-card"></article>
+        <article class="provider-card skeleton-card"></article>
+        <article class="provider-card skeleton-card"></article>
+      </div>
+    </section>
+
+    <section class="security-note" aria-labelledby="security-title">
+      <div class="security-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M12 3 5.5 5.8v5.3c0 4.2 2.7 8 6.5 9.9 3.8-1.9 6.5-5.7 6.5-9.9V5.8L12 3Z"/><path d="m9.2 12 1.8 1.8 3.9-4"/></svg>
+      </div>
+      <div>
+        <h2 id="security-title">Credentials stay server-side</h2>
+        <p>OpenCode, Codex, and Claude Code credentials never enter browser responses. This remains true over loopback and the explicit Tailscale listener.</p>
+      </div>
+      <span class="loopback-pill" id="network-scope">server-side only</span>
+    </section>
+  </main>
+
+  <footer>
+    <span>Orchestra · provider runway</span>
+    <span id="footer-status">No snapshot yet</span>
+  </footer>
+
+  <script src="/runway-assets/app.js" defer></script>
+</body>
+</html>

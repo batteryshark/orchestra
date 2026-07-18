@@ -1,0 +1,36 @@
+[project]
+name = "orchestra-cli"
+version = "0.1.0"
+description = "Multi-agent orchestration layer: dispatch and coordinate opencode/codex/claude workers with teams, inboxes, and slash-work integration"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/batteryshark/orchestra"
+Repository = "https://github.com/batteryshark/orchestra"
+Issues = "https://github.com/batteryshark/orchestra/issues"
+
+[project.scripts]
+orchestra = "orchestra_cli.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["orchestra_cli"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/.agents",
+  "/.claude",
+  "/.codex",
+  "/.opencode",
+  "/.orchestra",
+  "/.work",
+  "/AGENTS.md",
+  "/CLAUDE.md",
+  "/ORCHESTRA.md",
+]

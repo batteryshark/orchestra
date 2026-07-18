@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>orchestra</title>
+<style>
+:root { color-scheme: light dark;
+  --bg:#f6f7f9; --card:#fff; --ink:#1a202c; --muted:#64748b; --line:#e2e8f0;
+  --blue:#2563eb; --green:#16a34a; --red:#dc2626; --amber:#d97706; --gray:#6b7280;
+  --think:#8b5cf6; --tool:#0891b2; --sel:#eff6ff; }
+@media (prefers-color-scheme: dark) { :root {
+  --bg:#0f1115; --card:#181b21; --ink:#e5e9f0; --muted:#8b95a5; --line:#2a2f3a; --sel:#1e2a44; } }
+* { box-sizing:border-box }
+body { margin:0; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;
+  background:var(--bg); color:var(--ink); }
+header { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  padding:12px 20px; border-bottom:1px solid var(--line); }
+header .brand { display:inline-flex; align-items:center; gap:10px;
+  color:inherit; text-decoration:none; font-size:13px; font-weight:620; }
+.brand-mark { display:inline-flex; align-items:flex-end; gap:2px;
+  width:18px; height:18px; }
+.brand-mark span { width:4px; border-radius:4px; background:var(--ink); }
+.brand-mark span:nth-child(1) { height:9px; opacity:.45; }
+.brand-mark span:nth-child(2) { height:16px; }
+.brand-mark span:nth-child(3) { height:12px; opacity:.7; }
+header h1 { margin:0; font-size:inherit; font-weight:inherit; letter-spacing:inherit }
+header .root { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px }
+header nav { margin-left:auto; display:flex; gap:12px; align-items:center }
+header a.nav-link { color:var(--blue); text-decoration:none; font-size:13px }
+.proj-sel { position:relative; display:inline-flex }
+.proj-btn { display:inline-flex; align-items:center; gap:7px;
+  font:inherit; font-size:13px; padding:4px 10px; color:var(--ink);
+  background:var(--card); border:1px solid var(--line); border-radius:8px; cursor:pointer;
+  max-width:280px }
+.proj-btn:hover { background:var(--sel) }
+.proj-btn[aria-expanded="true"] { background:var(--sel); box-shadow:inset 0 0 0 1px var(--blue) }
+.proj-dot { width:8px; height:8px; border-radius:50%; background:var(--green); flex:0 0 auto }
+.proj-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.proj-caret { color:var(--muted); font-size:10px }
+.proj-menu { position:absolute; top:calc(100% + 4px); left:0; min-width:280px; max-width:380px;
+  background:var(--card); border:1px solid var(--line); border-radius:10px; padding:6px;
+  box-shadow:0 8px 24px rgba(0,0,0,.14); z-index:50; max-height:60vh; overflow-y:auto }
+.proj-opt { display:block; width:100%; text-align:left; padding:7px 10px; border-radius:7px;
+  cursor:pointer; background:none; color:var(--ink); border:none; font:inherit; font-size:13px }
+.proj-opt:hover { background:var(--sel) }
+.proj-opt[aria-selected="true"] { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
+.proj-opt .po-name { display:block; font-weight:600 }
+.proj-opt .po-root { display:block; color:var(--muted); font-family:ui-monospace,monospace;
+  font-size:11px; margin-top:2px; word-break:break-all }
+.proj-opt.offline .po-name { color:var(--muted) }
+main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-direction:column; gap:14px }
+.cols { display:grid; grid-template-columns:330px 1fr; gap:14px; min-height:0 }
+@media (max-width:980px){ .cols { grid-template-columns:1fr } }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden }
+.card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--muted); margin:0; padding:10px 14px; border-bottom:1px solid var(--line) }
+.chip { display:inline-block; padding:0 8px; border-radius:99px; font-size:11px;
+  font-weight:600; color:#fff }
+.s-running { background:var(--blue); animation:pulse 1.6s infinite }
+.s-spawning { background:var(--amber) }
+.s-done { background:var(--green) } .s-failed,.s-timeout { background:var(--red) }
+.s-killed { background:var(--gray) }
+@keyframes pulse { 50% { opacity:.55 } }
+.muted { color:var(--muted) } .mono { font-family:ui-monospace,monospace; font-size:12px }
+
+/* runs sidebar */
+#runlist { max-height:72vh; overflow-y:auto }
+.runitem { padding:9px 14px; border-bottom:1px solid var(--line); cursor:pointer }
+.runitem:hover { background:var(--sel) }
+.runitem.sel { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
+.runitem .top { display:flex; gap:8px; align-items:center }
+.runitem .title { font-size:12px; color:var(--muted); margin-top:2px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+
+/* transcript panel */
+#panel { display:flex; flex-direction:column; min-height:0 }
+#phead { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  padding:10px 14px; border-bottom:1px solid var(--line); font-size:13px }
+#pbody { overflow-y:auto; height:72vh; padding:12px 16px; scroll-behavior:auto }
+.titem { margin:0 0 10px }
+.titem .prose { white-space:pre-wrap; overflow-wrap:anywhere }
+.titem.meta { color:var(--muted); font-size:12px }
+.titem.error { color:var(--red); white-space:pre-wrap; font-size:13px;
+  border-left:3px solid var(--red); padding-left:10px }
+details { border:1px solid var(--line); border-radius:8px; margin:6px 0 }
+details summary { cursor:pointer; padding:5px 10px; font-size:12.5px; user-select:none;
+  display:flex; gap:8px; align-items:center }
+details[open] summary { border-bottom:1px solid var(--line) }
+details .inner { padding:8px 10px; max-height:420px; overflow:auto }
+details pre { margin:4px 0; white-space:pre-wrap; overflow-wrap:anywhere;
+  font-size:12px; font-family:ui-monospace,monospace }
+details.think summary { color:var(--think) }
+details.tool summary { color:var(--tool) }
+details .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted) }
+table.kv { border-collapse:collapse; font-size:12.5px }
+table.kv th { text-align:left; color:var(--muted); font-weight:600;
+  padding:2px 12px 2px 0; text-transform:lowercase; letter-spacing:.02em }
+table.kv td { padding:2px 0; font-family:ui-monospace,monospace }
+#follow { margin-left:auto; display:flex; gap:6px; align-items:center; font-size:12px; color:var(--muted) }
+button { font:inherit; font-size:12px; border:1px solid var(--line); background:none;
+  color:var(--blue); border-radius:6px; padding:2px 10px; cursor:pointer }
+
+/* bottom row */
+.row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px }
+@media (max-width:980px){ .row2 { grid-template-columns:1fr } }
+.scrollbox { max-height:46vh; overflow-y:auto; padding:6px 14px 10px }
+.msg { border-left:3px solid var(--line); padding:6px 10px; margin:8px 0 }
+.msg.unread { border-left-color:var(--blue) }
+.msg .meta { font-size:12px; color:var(--muted) }
+.msg .body { white-space:pre-wrap; overflow-wrap:anywhere; margin-top:2px }
+.feeditem { padding:5px 0; border-bottom:1px solid var(--line); overflow-wrap:anywhere }
+.feeditem:last-child { border-bottom:none }
+#beat { width:8px; height:8px; border-radius:50%; background:var(--green);
+  display:inline-block; margin-left:6px }
+</style></head><body>
+ <header><a class="brand" href="/" aria-label="orchestra">
+   <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+   <h1>orchestra<span id="beat"></span></h1>
+</a><span class="root" id="root" hidden></span>
+<div class="proj-sel" id="projSel" hidden>
+  <button class="proj-btn" id="projBtn" type="button" aria-haspopup="listbox" aria-expanded="false">
+    <span class="proj-dot" id="projDot" aria-hidden="true"></span>
+    <span class="proj-label" id="projLabel">project</span>
+    <span class="proj-caret" aria-hidden="true">▾</span>
+  </button>
+  <div class="proj-menu" id="projMenu" role="listbox" aria-label="Orchestra projects" hidden></div>
+</div>
+<nav><a class="nav-link" href="/runway">provider runway</a></nav></header>
+<main>
+<div class="cols">
+  <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+    <div class="card"><h2>Runs</h2><div id="runlist"></div></div>
+    <div class="card" id="enscard" style="display:none"><h2>Ensemble teams</h2><div id="ensteams"></div></div>
+  </div>
+  <div class="card" id="panel">
+    <div id="phead"><span class="muted">select a run</span></div>
+    <div id="pbody"></div>
+  </div>
+</div>
+<div class="row2">
+  <div class="card"><h2>Inboxes</h2><div class="scrollbox" id="inboxes"></div></div>
+  <div class="card"><h2>Findings feed</h2><div class="scrollbox" id="feed"></div>
+    <h2>Teams</h2><div class="scrollbox" id="teams" style="max-height:12vh"></div></div>
+</div>
+</main>
+<script>
+const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let state = null, selected = null, selTm = null, userPicked = false, tEtag = null;
+let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
+
+// --- project selection (control-plane) -----------------------------------
+// The browser only ever switches among entries returned by GET /api/projects.
+// No typed path, no filesystem browser — the allowlist lives in the
+// orchestra projects registry on disk and is the sole source of truth.
+const PROJECT_KEY = 'orchestra.project';
+let projectDir = null;     // {defaultProjectId, projects: [...]}
+let activeProjectId = null;
+
+function rememberedProject(){
+  try { return localStorage.getItem(PROJECT_KEY) || null; } catch(e){ return null; }
+}
+function rememberProject(id){
+  try {
+    if (id) localStorage.setItem(PROJECT_KEY, id);
+    else localStorage.removeItem(PROJECT_KEY);
+  } catch(e){ /* private mode etc. — picker still works for this tab */ }
+}
+function projectHeader(){
+  // Every fetch the page makes carries the active project id. The header
+  // wins over any ?project= query, which exists for top-level navigations
+  // and for clients that cannot easily set headers.
+  return activeProjectId ? {'X-Orchestra-Project': activeProjectId} : {};
+}
+async function api(path, opts){
+  opts = opts || {};
+  const headers = Object.assign({}, projectHeader(), opts.headers || {});
+  const res = await fetch(path, Object.assign({}, opts, {headers}));
+  return res;
+}
+
+function renderProjectMenu(){
+  if (!projectDir) return;
+  const projs = projectDir.projects || [];
+  // Active = the id we have in localStorage IF it is still in the live
+  // allowlist; otherwise the launch default. Stale ids fall through to
+  // the default silently here — the API will still 404 any explicit
+  // request for an unknown id, but the picker itself never offers one.
+  const remembered = rememberedProject();
+  if (remembered && projs.some(p => p.id === remembered)){
+    activeProjectId = remembered;
+  } else {
+    activeProjectId = projectDir.defaultProjectId || (projs[0] && projs[0].id) || null;
+    rememberProject(activeProjectId);
+  }
+  const sel = document.getElementById('projSel');
+  sel.hidden = !projs.length;
+  if (!projs.length) return;
+  const cur = projs.find(p => p.id === activeProjectId) || projs[0];
+  document.getElementById('projLabel').textContent = cur.name || cur.root;
+  document.getElementById('projDot').style.background =
+    cur.id === projectDir.defaultProjectId ? 'var(--green)' : 'var(--blue)';
+  const menu = document.getElementById('projMenu');
+  menu.innerHTML = projs.map(p => {
+    const sel = p.id === activeProjectId ? 'true' : 'false';
+    const off = p.available === false ? ' offline' : '';
+    const tag = p.id === projectDir.defaultProjectId ? ' <span class="muted">· default</span>' : '';
+    return `<button class="proj-opt${off}" role="option" aria-selected="${sel}"
+      onclick="pickProject('${esc(p.id)}')">
+      <span class="po-name">${esc(p.name)}${tag}</span>
+      <span class="po-root">${esc(p.root)}</span>
+    </button>`;
+  }).join('');
+}
+function toggleProjectMenu(open){
+  const btn = document.getElementById('projBtn');
+  const menu = document.getElementById('projMenu');
+  const next = open == null ? menu.hidden : open;
+  menu.hidden = !next;
+  btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+}
+document.addEventListener('click', e => {
+  const sel = document.getElementById('projSel');
+  if (!sel || sel.hidden) return;
+  if (!sel.contains(e.target)) toggleProjectMenu(false);
+});
+async function pickProject(id){
+  toggleProjectMenu(false);
+  if (id === activeProjectId) return;
+  rememberProject(id);
+  activeProjectId = id;
+  // Project switch invalidates every cached selection: the new project
+  // has its own runs, teams, inboxes — drop them all and re-fetch.
+  selected = null; selTm = null; tEtag = null; userPicked = false;
+  lastHash = {};
+  document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
+  document.getElementById('phead').innerHTML = '<span class="muted">select a run</span>';
+  renderProjectMenu();
+  await refresh();
+}
+
+function elapsed(start, end){
+  const b = end ? new Date(end) : new Date();
+  let s = Math.max(0, Math.floor((b - new Date(start))/1000));
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60); s = s%60;
+  return h ? `${h}h${String(m).padStart(2,'0')}m` : m ? `${m}m${String(s).padStart(2,'0')}s` : `${s}s`;
+}
+function tickElapsed(){
+  document.querySelectorAll('[data-start]').forEach(el => {
+    el.textContent = elapsed(el.dataset.start, el.dataset.end || null);
+  });
+}
+setInterval(tickElapsed, 1000);
+
+function setIfChanged(id, html){
+  if (lastHash[id] === html) return false;
+  lastHash[id] = html;
+  const el = document.getElementById(id);
+  const st = el.scrollTop;               // preserve scroll inside the box
+  el.innerHTML = html;
+  el.scrollTop = st;
+  return true;
+}
+
+function renderRuns(){
+  const html = [...state.runs].reverse().map(r => `
+    <div class="runitem ${!selTm&&r.id===selected?'sel':''}" onclick="pick(${r.id})">
+      <div class="top"><span class="mono">#${r.id}</span>${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+        <b>${esc(r.agent)}</b>
+        <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
+        <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
+          ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span></div>
+      <div class="title">${r.backend?`<span class="mono muted">${esc(r.backend)}</span> `:''}${r.model?`<span class="mono muted">${esc((r.model||'').split('/').pop())}</span> `:''}${r.work_item?`[${esc(r.work_item)}] `:''}${esc(r.title||'')}</div>
+    </div>`).join('') || '<div class="runitem muted">no runs yet</div>';
+  setIfChanged('runlist', html);
+  tickElapsed();
+}
+
+function pick(id){ userPicked = true; select(id); }
+function select(id){
+  if (selected === id && !selTm) return;
+  selected = id; selTm = null; tEtag = null; lastHash.pbody = null;
+  document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
+  renderRuns(); renderEnsemble(); refreshTranscript(true);
+}
+function pickTm(sid, team, label, model, status){
+  userPicked = true;
+  selTm = {sid, team, label, model, status}; selected = null; tEtag = null; lastHash.pbody = null;
+  document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
+  renderRuns(); renderEnsemble(); refreshTranscript(true);
+}
+function tmChip(m){
+  const cls = m.status === 'busy' ? 's-running' : m.status === 'ready' ? 's-done' : 's-killed';
+  return `<span class="chip ${cls}">${esc(m.status)}${m.execution_status?'/'+esc(m.execution_status):''}</span>`;
+}
+function renderEnsemble(){
+  const card = document.getElementById('enscard');
+  const teams = state.ensemble || [];
+  card.style.display = teams.length ? '' : 'none';
+  if (!teams.length) return;
+  const html = teams.map(t => {
+    const doneN = t.tasks.filter(x=>x.status==='completed').length;
+    return `<div style="padding:8px 14px;border-bottom:1px solid var(--line)">
+      <div><b>${esc(t.name)}</b> <span class="chip ${t.status==='active'?'s-running':'s-killed'}">${esc(t.status)}</span>
+        <span class="muted mono">${doneN}/${t.tasks.length} tasks</span></div>
+      ${t.members.map(m => `<div class="runitem ${selTm&&selTm.sid===m.session_id?'sel':''}" style="border:none;padding:4px 0 4px 8px"
+        onclick="pickTm('${esc(m.session_id)}','${esc(t.id)}','${esc(m.name)}','${esc(m.model||'')}')">
+        <div class="top"><b>${esc(m.name)}</b> ${tmChip(m)}
+          <span class="mono muted" style="margin-left:auto">${esc((m.model||'').split('/').pop())}</span></div>
+      </div>`).join('')}</div>`;
+  }).join('');
+  setIfChanged('ensteams', html);
+}
+
+function itemHtml(it, i){
+  if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
+  if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
+  if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
+  if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;
+  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.parent_run?`<tr><th>parent run</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
+  return `<div class="titem meta">${esc(it.body)}</div>`;
+}
+
+function renderDetails(r){
+  // Pure-data block injected as the first "details" item in the transcript
+  // pane, without removing existing items below. Credentials are NEVER
+  // carried on the run row — only the configured backend + model name.
+  return {
+    kind:'details',
+    backend:r.backend||'',
+    model:r.model||'',
+    team:r.team||'',
+    requested_by:r.requested_by||'',
+    parent_run:r.parent_run||null,
+    session_ref:r.session_ref||'',
+  };
+}
+
+async function refreshTranscript(force){
+  if (selTm) return refreshTmTranscript(force);
+  if (selected == null) return;
+  let res;
+  try { res = await (await api(`api/transcript/${selected}${tEtag&&!force?`?etag=${tEtag}`:''}`)).json(); }
+  catch(e){ return; }
+  if (res.unchanged) return;
+  tEtag = res.etag;
+  const r = res.run;
+  const head = `<span class="mono">#${r.id}</span> ${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+    <b>${esc(r.agent)}</b>
+    <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
+    <span class="mono muted" title="configured backend">${esc(r.backend||'')}</span>
+    ${r.model?`<span class="mono muted" title="configured model">${esc(r.model)}</span>`:''}
+    ${r.work_item?`<span class="mono">${esc(r.work_item)}</span>`:''}
+    ${r.branch?`<span class="mono muted">${esc(r.branch)}</span>`:''}
+    <span class="mono muted" data-start="${esc(r.started_at)}" ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span>
+    <label id="follow"><input type="checkbox" id="followcb" checked> follow tail</label>`;
+  setIfChanged('phead', head);
+  const body = document.getElementById('pbody');
+  const open = new Set([...body.querySelectorAll('details[open]')].map(d=>d.dataset.k));
+  const follow = document.getElementById('followcb')?.checked ?? true;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  body.innerHTML = [renderDetails(r), ...res.items].map(itemHtml).join('')
+    || '<span class="muted">no output yet…</span>';
+  body.querySelectorAll('details').forEach(d => { if (open.has(d.dataset.k)) d.open = true; });
+  if (follow && (nearBottom || force)) body.scrollTop = body.scrollHeight;
+  tickElapsed();
+}
+
+async function refreshTmTranscript(force){
+  const tm = selTm;
+  let res;
+  try { res = await (await api(`api/teammate/${tm.sid}?team=${encodeURIComponent(tm.team)}${tEtag&&!force?`&etag=${tEtag}`:''}`)).json(); }
+  catch(e){ return; }
+  if (res.unchanged || selTm !== tm) return;
+  tEtag = res.etag;
+  const team = (state.ensemble||[]).find(t=>t.id===tm.team);
+  const mem = team?.members.find(m=>m.session_id===tm.sid);
+  setIfChanged('phead', `<b>${esc(tm.label)}</b> ${mem?tmChip(mem):''}
+    <span class="mono muted">${esc(tm.model)}</span>
+    <span class="muted">ensemble teammate · ${esc(team?.name||'')}</span>
+    <label id="follow"><input type="checkbox" id="followcb" checked> follow tail</label>`);
+  const body = document.getElementById('pbody');
+  const open = new Set([...body.querySelectorAll('details[open]')].map(d=>d.dataset.k));
+  const follow = document.getElementById('followcb')?.checked ?? true;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  let html = '';
+  if (team?.tasks.length) html += `<details data-k="board"><summary>&#128203; team board
+    <span class="muted">· ${team.tasks.filter(x=>x.status==='completed').length}/${team.tasks.length} done</span></summary>
+    <div class="inner">${team.tasks.map(x=>`<div>[${esc(x.status)}] ${esc(x.content)}
+      ${x.assignee?`<span class="muted">→ ${esc(x.assignee)}</span>`:''}</div>`).join('')}</div></details>`;
+  if (res.messages?.length) html += `<details data-k="msgs"><summary>&#128172; team messages
+    <span class="muted">· ${res.messages.length}</span></summary>
+    <div class="inner">${res.messages.map(m=>`<div class="msg"><div class="meta">${esc(m.from_name)} → ${esc(m.to_name)}</div>
+      <div class="body">${esc(m.content)}</div></div>`).join('')}</div></details>`;
+  html += res.items.map(itemHtml).join('') || '<span class="muted">no output yet…</span>';
+  body.innerHTML = html;
+  body.querySelectorAll('details').forEach(d => { if (open.has(d.dataset.k)) d.open = true; });
+  if (follow && (nearBottom || force)) body.scrollTop = body.scrollHeight;
+}
+
+function renderBottom(){
+  const byRcpt = {};
+  for (const m of state.messages) (byRcpt[m.recipient] ??= []).push(m);
+  const inbox = Object.entries(byRcpt).map(([r, ms]) => {
+    const unread = ms.filter(m=>!m.read_at).length;
+    return `<details ${unread?'open':''}><summary><b>${esc(r)}</b>
+      <span class="muted">${ms.length} msgs${unread?`, <b>${unread} unread</b>`:''}</span></summary>
+      <div class="inner">${ms.slice(-12).map(m=>`<div class="msg ${m.read_at?'':'unread'}">
+        <div class="meta">${esc(m.sender)} → ${esc(m.recipient)} · ${esc(m.created_at)}
+          ${m.run_id?` · <a href="#" onclick="pick(${m.run_id});return false">run ${m.run_id}</a>`:''}
+          ${m.work_item?` · ${esc(m.work_item)}`:''}</div>
+        <div class="body">${esc(m.body)}</div></div>`).join('')}</div></details>`;
+  }).join('') || '<span class="muted">no messages yet</span>';
+  setIfChanged('inboxes', inbox);
+  setIfChanged('feed', state.feed.map(f =>
+    `<div class="feeditem"><span class="muted mono">${esc(f.created_at.slice(11,19))}</span>
+     <b>${esc(f.author)}</b>: ${esc(f.body)}
+     ${f.tags?`<span class="muted">[${esc(f.tags)}]</span>`:''}</div>`).join('')
+    || '<span class="muted">feed empty</span>');
+  setIfChanged('teams', state.teams.map(t =>
+    `<div><b>${esc(t.name)}</b>: ${esc(t.members.join(', ')||'(empty)')}</div>`).join('')
+    || '<span class="muted">no teams</span>');
+}
+
+async function refreshProjects(){
+  try {
+    const res = await fetch('api/projects');
+    if (!res.ok) return;
+    const dir = await res.json();
+    const prev = projectDir && projectDir.projects ? projectDir.projects.length : 0;
+    projectDir = dir;
+    renderProjectMenu();
+    // If the picker just appeared for the first time, force a state
+    // refresh so /api/state runs with the now-active project header.
+    if (prev === 0 && dir.projects.length > 0) void refresh();
+  } catch(e){ /* picker is best-effort */ }
+}
+
+async function refresh(){
+  try { state = await (await api('api/state')).json(); }
+  catch(e){ document.getElementById('beat').style.background='var(--red)'; return; }
+  document.getElementById('beat').style.background='var(--green)';
+  document.getElementById('root').textContent = state.root;
+  if (selected == null && !selTm && !userPicked && state.runs.length){
+    const active = state.runs.filter(r=>['running','spawning'].includes(r.status));
+    select((active.length ? active[active.length-1] : state.runs[state.runs.length-1]).id);
+  }
+  renderRuns(); renderEnsemble(); renderBottom();
+}
+document.getElementById('projBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  toggleProjectMenu();
+});
+refreshProjects(); setInterval(refreshProjects, 8000);
+refresh(); setInterval(refresh, 2500); setInterval(()=>refreshTranscript(false), 2000);
+</script></body></html>
