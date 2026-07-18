@@ -60,6 +60,39 @@ Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion 
 
 Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
 
+## Hand off a wave to another orchestrator
+
+An orchestration wave is resumable by a fresh session of the same orchestrator, or by a different one entirely, without depending on the leaving orchestrator's conversation state. Two commands do the work:
+
+```sh
+# Planned exit (you're about to stop). --work anchors recovery: the
+# successor's objective is derived from `work show W-XXXX --json`.
+orchestra checkpoint --as codex --work W-0010 \
+  --objective "land W-0010; review diff before merge" \
+  --next "merge the worktree branch after review" \
+  --next "run full test suite"
+
+# Abrupt exit (provider exhausted, session lost — run it once you
+# realise you can't continue). --objective is optional: --work still
+# anchors the objective via `work show --json`, and falls back to the
+# highest-priority active work item if that's also unavailable.
+orchestra checkpoint --as codex --work W-0010
+```
+
+`checkpoint` writes a small bounded JSON file under `.orchestra/checkpoints/`. It records durable intent (objective, next steps, source identity, anchored `--work` item) plus **high-water marks** — the largest run / message / feed IDs observed at write time — not a frozen copy of every active row. Free-text fields (objective, next steps, run titles, work titles, feed tags, bodies) are redacted for credential patterns before they land on disk.
+
+The successor picks it up with:
+
+```sh
+orchestra takeover --as claude
+# or, when multiple sources have checkpoints:
+orchestra takeover --from codex --as claude
+# or, an explicit path:
+orchestra takeover --checkpoint .orchestra/checkpoints/codex-...json --as claude
+```
+
+`takeover` opens the project DB in SQLite URI `mode=ro` (no schema, no migrations, no WAL writes to the source file) and re-queries it for everything that happened **after** the checkpoint's high-water marks, then renders a markdown cold-start brief. The brief is strictly read-only — no source DB row is inserted, updated, or marked read. Bodies are redacted before they enter a checkpoint AND re-sanitized on render as defense in depth.
+
 ## One dashboard, many projects
 
 Start the UI from any initialized project:
@@ -108,7 +141,7 @@ Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and o
 
 ## How state is divided
 
-- `.orchestra/` in each project stores its SQLite run state and project configuration.
+- `.orchestra/` in each project stores its SQLite run state, project configuration, and durable handoff checkpoints.
 - The user-level registry stores project identifiers and roots for the shared UI.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.
