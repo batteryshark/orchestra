@@ -8,6 +8,13 @@ import sys
 from pathlib import Path
 
 from orchestra_cli import brief, config, db, docs, host, paths, runners, supervise, worktree
+from orchestra_cli.usage import (
+    assess_targets,
+    default_service,
+    infer_from_agent,
+    infer_provider,
+    render_warning_lines,
+)
 
 
 def _identity(args, cfg) -> str:
@@ -160,6 +167,50 @@ def cmd_inbox(args):
         con.commit()
 
 
+def _quota_warnings_enabled(cfg: dict) -> bool:
+    """Settings.quota_warn. False opts out; default is on."""
+    return bool(cfg.get("settings", {}).get("quota_warn", True))
+
+
+def _resolve_quota_targets(cfg: dict, targets: list[str]) -> list[tuple[str, str | None]]:
+    """Map each --to target to a provider id. Ensemble leads add every model
+    in their `model_pool` so the warning fires for every provider the team
+    might spin up."""
+    resolved: list[tuple[str, str | None]] = []
+    for name in targets:
+        agent = config.agent_cfg(cfg, name)
+        primary = infer_from_agent(agent)
+        if isinstance(primary, str):
+            resolved.append((name, primary))
+        model_pool = agent.get("model_pool")
+        if isinstance(model_pool, list):
+            for model_id in model_pool:
+                if isinstance(model_id, str):
+                    backend = agent.get("backend") if isinstance(agent.get("backend"), str) else None
+                    inferred = infer_provider(backend, model_id)
+                    if isinstance(inferred, str) and inferred != primary:
+                        resolved.append((f"{name}:{model_id}", inferred))
+    return resolved
+
+
+def _assess_quota_warnings(cfg: dict, targets: list[str]) -> tuple[list[str], list]:
+    """One cached snapshot, then per-target advisories. Never reroutes, never
+    blocks, never consumes a Codex reset credit. Fail-open: quota collection
+    crashes or returns None are caught so they cannot break dispatch.
+    """
+    if not _quota_warnings_enabled(cfg):
+        return [], []
+    try:
+        snapshot = default_service().snapshot()
+    except Exception:
+        return [], []
+    if not isinstance(snapshot, dict):
+        return [], []
+    resolved = _resolve_quota_targets(cfg, targets)
+    warnings = assess_targets(snapshot, resolved)
+    return render_warning_lines(warnings), warnings
+
+
 def cmd_dispatch(args):
     root = paths.find_root()
     cfg = config.load(root)
@@ -173,6 +224,19 @@ def cmd_dispatch(args):
     if args.team:
         if not con.execute("SELECT 1 FROM teams WHERE name=?", (args.team,)).fetchone():
             raise SystemExit(f"orchestra: no team '{args.team}' (create it first)")
+
+    # Warn-only quota assessment — ONE cached snapshot, no DB inserts yet.
+    # The snapshot is read first (bounded and fail-open, never reroutes,
+    # never consumes reset credits), then we emit the warning lines to
+    # stderr so they're visible before the run rows are even created.
+    # --no-quota-warn skips the snapshot entirely (no collectors fire).
+    skip_quota = bool(args.no_quota_warn)
+    warning_lines: list[str] = []
+    if not skip_quota:
+        warning_lines, _ = _assess_quota_warnings(cfg, list(args.to))
+        for line in warning_lines:
+            print(line, file=sys.stderr)
+
     run_ids = []
     for target in args.to:
         agent = config.agent_cfg(cfg, target)
@@ -541,47 +605,59 @@ def cmd_host(args):
               + f"\nlog: {host.LOG_FILE}")
 
 
-def cmd_usage(args):
-    from datetime import datetime
-    # --- codex plan quota: latest rate_limits event in recent session rollouts
-    print("## codex plan quota")
-    rollouts = sorted(Path("~/.codex/sessions").expanduser().glob("*/*/*/rollout-*.jsonl"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)[:5]
-    rl = None
-    for f in rollouts:
-        try:
-            for line in reversed(f.read_text(errors="replace").splitlines()):
-                if '"rate_limits"' not in line:
-                    continue
-                obj = json.loads(line)
-                rl = (obj.get("payload") or {}).get("rate_limits") or obj.get("rate_limits")
-                if rl:
-                    break
-        except (OSError, ValueError):
-            continue
-        if rl:
-            break
-    if rl:
-        plan = rl.get("plan_type", "?")
-        for name in ("primary", "secondary"):
-            w = rl.get(name)
-            if not w:
-                continue
-            days = (w.get("window_minutes") or 0) / 1440
-            resets = w.get("resets_at")
-            resets_s = datetime.fromtimestamp(resets).strftime("%Y-%m-%d %H:%M") if resets else "?"
-            print(f"  {plan} · {days:.0f}-day window: {w.get('used_percent', '?')}% used · resets {resets_s}")
-    else:
-        print("  (no rate_limit events found in recent codex sessions)")
-    print("  note: zhipu/minimax coding plans expose no quota API via opencode — token burn below is the proxy")
+def _format_reset_credits(resets: dict | None) -> str:
+    """Render the Codex rate-limit reset-credit line. Always emit a value
+    when the wire carries ``rate_limit_resets`` (even when the count is 0):
+    operators expect to see "0 reset credits available", not a missing row.
+    """
+    if not isinstance(resets, dict):
+        return ""
+    count = resets.get("available_count")
+    if not isinstance(count, int) or count < 0:
+        return ""
+    credits_label = "reset credit available" if count == 1 else "reset credits available"
+    return f" · {count} {credits_label}"
 
-    # --- per-agent token burn from this project's run logs
+
+def cmd_usage(args):
+    print("## provider runway")
+    snap = default_service().snapshot(force=args.refresh)
+    rec = snap.get("recommendation") or {}
+    if rec:
+        print(f"  best runway: {rec.get('provider_name')} "
+              f"({rec.get('headroom_percent'):.0f}% headroom across coding windows)")
+    else:
+        print("  (no provider returned a usable coding headroom yet)")
+    for row in snap.get("providers") or []:
+        plan = row.get("plan") or "—"
+        headroom = row.get("headroom_percent")
+        headroom_s = f"{headroom:.0f}%" if isinstance(headroom, (int, float)) else "n/a"
+        resets = row.get("rate_limit_resets")
+        # Only the Codex collector populates `rate_limit_resets`; other
+        # providers leave it None and we render the count line only when
+        # the wire carries an actual Codex reset-credit record.
+        reset_note = _format_reset_credits(resets)
+        print(f"  {row.get('name'):<8} [{row.get('status'):<12}] {plan:<22} "
+              f"headroom {headroom_s}{reset_note}")
+
+    print()
+    # --- per-project worker token burn: this is project-local data, the only
+    # piece the shared service doesn't already provide. Keep it. The runs
+    # lookup is read into memory inside a try/finally so the connection
+    # closes even when the project has zero runs (the empty-agg path).
     root = _maybe_root()
     if not root:
         return
+    rows: list = []
     con = db.connect(root)
+    try:
+        rows = list(con.execute(
+            "SELECT agent, log_path FROM runs WHERE log_path IS NOT NULL"
+        ))
+    finally:
+        con.close()
     agg = {}
-    for r in con.execute("SELECT agent, log_path FROM runs WHERE log_path IS NOT NULL"):
+    for r in rows:
         lp = Path(r["log_path"])
         if not lp.is_file():
             continue
@@ -614,7 +690,7 @@ def cmd_usage(args):
                 a["out"] += u.get("output_tokens", 0)
                 a["cache"] += u.get("cache_read_input_tokens", 0)
                 a["cost"] += obj.get("total_cost_usd") or 0
-    print(f"\n## worker token burn ({root.name})")
+    print(f"## worker token burn ({root.name})")
     if not agg:
         print("  (no runs)")
         return
@@ -702,6 +778,8 @@ def main():
     s.add_argument("--brief-file", help="read mission text from a file")
     s.add_argument("--worktree", action="store_true", help="isolate in a git worktree (skills auto-synced)")
     s.add_argument("--sync", action="store_true", help="block until the run finishes")
+    s.add_argument("--no-quota-warn", action="store_true",
+                   help="suppress the warn-only provider-headroom check (default: on)")
     ident(s)
     s.set_defaults(fn=cmd_dispatch)
 
@@ -743,7 +821,8 @@ def main():
                         "ensemble dispatches attach to whatever host is recorded as running")
     s.set_defaults(fn=cmd_host)
 
-    s = sub.add_parser("usage", help="codex plan quota + per-agent token burn for this project")
+    s = sub.add_parser("usage", help="cached provider runway + per-agent token burn for this project")
+    s.add_argument("--refresh", action="store_true", help="force a fresh quota snapshot")
     s.set_defaults(fn=cmd_usage)
 
     s = sub.add_parser("ui", help="live web dashboard for this project (runs, inboxes, feed)")

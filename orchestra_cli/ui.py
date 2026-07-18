@@ -6,6 +6,7 @@ every request, so UI edits only need a browser refresh (no server restart).
 """
 import hashlib
 import json
+import mimetypes
 import sqlite3
 import threading
 import urllib.request
@@ -15,8 +16,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from orchestra_cli import db, host
+from orchestra_cli.usage import default_service
 
 UI_FILE = Path(__file__).with_name("ui.html")
+RUNWAY_FILE = Path(__file__).parent / "usage" / "web" / "runway.html"
+RUNWAY_ASSETS_DIR = Path(__file__).parent / "usage" / "web" / "assets"
 ENSEMBLE_DB = Path("~/.config/opencode/ensemble.db").expanduser()
 
 MAX_INPUT = 4000
@@ -255,6 +259,18 @@ def make_handler(root: Path):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_static(self, path: Path, *, content_type: str, no_store: bool) -> None:
+            try:
+                body = path.read_bytes()
+            except OSError:
+                return self._json({"error": "static asset unavailable"}, 500)
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store" if no_store else "max-age=300")
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             url = urlparse(self.path)
             path = url.path
@@ -269,6 +285,28 @@ def make_handler(root: Path):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/runway":
+                if not RUNWAY_FILE.is_file():
+                    return self._json({"error": "runway page unavailable"}, 500)
+                try:
+                    body = RUNWAY_FILE.read_bytes()
+                except OSError:
+                    return self._json({"error": "runway page read error"}, 500)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path.startswith("/runway-assets/"):
+                asset = (RUNWAY_ASSETS_DIR / path[len("/runway-assets/"):]).resolve()
+                # confine to the assets dir — refuse path traversal
+                if RUNWAY_ASSETS_DIR.resolve() not in asset.parents and asset.parent != RUNWAY_ASSETS_DIR.resolve():
+                    return self._json({"error": "bad asset path"}, 400)
+                if not asset.is_file():
+                    return self._json({"error": "asset not found"}, 404)
+                ctype = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
+                self._send_static(asset, content_type=ctype, no_store=False)
             elif path == "/api/state":
                 con = db.connect(root)
                 state = {
@@ -331,6 +369,17 @@ def make_handler(root: Path):
                 if r and r["log_path"] and Path(r["log_path"]).is_file():
                     text = Path(r["log_path"]).read_text(errors="replace")[-40000:]
                 self._json({"text": text})
+            elif path == "/api/usage":
+                # Honor ?refresh=1 — the runway page's Refresh button sends it.
+                force = (parse_qs(url.query).get("refresh") or ["0"])[0] in {"1", "true", "yes"}
+                snap = default_service().snapshot(force=force)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                body = json.dumps(snap).encode()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self._json({"error": "not found"}, 404)
 

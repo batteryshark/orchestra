@@ -65,7 +65,14 @@ orchestra feed                     # findings/decisions workers logged along the
 orchestra reply 7 "good — now add tests"        # resume the SAME worker session
 orchestra status                   # runs, inboxes, feed, work board snapshot
 orchestra ui                       # live web dashboard at http://localhost:4764
+orchestra usage                    # cached provider runway + per-agent token burn
 ```
+
+The dashboard has a top-level **provider runway** link in the header; clicking
+it opens `/runway`, a dedicated page that visualises cached coding-plan quota
+for MiniMax, Claude, Z.AI, and Codex (multi-bucket, with Codex rate-limit
+reset-credit count + expiry and per-window reset countdowns). The dashboard
+itself does not render quota cards — they live on `/runway`.
 
 Workers are briefed with a standard coordination protocol: check inbox → log progress to the
 work item → post findings to the feed → message peers → end with a `HANDOFF` to the requester.
@@ -112,6 +119,36 @@ status|start|stop`, state in `~/.local/state/orchestra/`) and dispatches leads w
 the supervisor treats the lead's `HANDOFF` message — not process exit — as mission
 completion. Killing an ensemble run's client does not stop the server-side team; use
 `orchestra reply <run> "team_shutdown and team_cleanup"` or `orchestra host stop`.
+
+## Provider runway
+
+`orchestra usage` and `GET /api/usage` (served by `orchestra ui`) both read
+from a single per-process `UsageService` cache. The cache fans out to four
+server-side collectors that never expose credentials to the browser:
+
+| Provider | Quota source | Credential discovery |
+|---|---|---|
+| MiniMax | `GET /v1/token_plan/remains` | `MINIMAX_API_KEY` / OpenCode `minimax-coding-plan` |
+| Z.AI | `GET /api/monitor/usage/quota/limit` | `ZAI_API_KEY` / OpenCode `zhipuai-coding-plan` |
+| Codex | `account/rateLimits/read` via the installed `codex` CLI | existing Codex login |
+| Claude | Claude Code's `/usage` cache (`~/.claude.json`) | existing Claude Code login |
+
+The runway page is served at `/runway` (linked from the dashboard header) and
+reads its dashboard, recommendation, and reset-credit card from the
+self-same `/api/usage` endpoint. Burn rates sample in memory and only show
+after the same reset window has been observed for ≥5 minutes — they vanish
+on process restart so we never write account telemetry to disk. Codex
+multi-bucket limits (e.g. Codex Spark) are preserved as separate rows, and
+when an account has rate-limit reset credits the Codex card shows the count
+and earliest known expiry; credit IDs and descriptions are discarded.
+
+When you `orchestra dispatch`, Orchestra also runs a single cached snapshot
+to flag targets whose coding-plan headroom is at-or-below 20%. The advisory
+prints to stderr before any run row is inserted, never reroutes, never
+consumes a Codex reset credit, and fails open if the snapshot is stale or
+unavailable (dispatch still proceeds). Configure `quota_warn = false` in
+`~/.config/orchestra/config.toml` or `.orchestra/config.toml` to opt out,
+or pass `--no-quota-warn` per-dispatch.
 
 ## Both-ways orchestration
 

@@ -10,12 +10,20 @@
 * { box-sizing:border-box }
 body { margin:0; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;
   background:var(--bg); color:var(--ink); }
-header { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
+header { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
   padding:12px 20px; border-bottom:1px solid var(--line); }
-header h1 { font-size:16px; margin:0 }
+header .brand { display:inline-flex; align-items:center; gap:10px;
+  color:inherit; text-decoration:none; font-size:13px; font-weight:620; }
+.brand-mark { display:inline-flex; align-items:flex-end; gap:2px;
+  width:18px; height:18px; }
+.brand-mark span { width:4px; border-radius:4px; background:var(--ink); }
+.brand-mark span:nth-child(1) { height:9px; opacity:.45; }
+.brand-mark span:nth-child(2) { height:16px; }
+.brand-mark span:nth-child(3) { height:12px; opacity:.7; }
+header h1 { margin:0; font-size:inherit; font-weight:inherit; letter-spacing:inherit }
 header .root { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px }
-header nav { margin-left:auto; display:flex; gap:12px }
-header a { color:var(--blue); text-decoration:none; font-size:13px }
+header nav { margin-left:auto; display:flex; gap:12px; align-items:center }
+header a.nav-link { color:var(--blue); text-decoration:none; font-size:13px }
 main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-direction:column; gap:14px }
 .cols { display:grid; grid-template-columns:330px 1fr; gap:14px; min-height:0 }
 @media (max-width:980px){ .cols { grid-template-columns:1fr } }
@@ -77,8 +85,12 @@ button { font:inherit; font-size:12px; border:1px solid var(--line); background:
 #beat { width:8px; height:8px; border-radius:50%; background:var(--green);
   display:inline-block; margin-left:6px }
 </style></head><body>
-<header><h1>orchestra<span id="beat"></span></h1><span class="root" id="root"></span>
-<nav><a href="http://localhost:43170" target="_blank">work tracker</a></nav></header>
+<header><a class="brand" href="/" aria-label="orchestra">
+  <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+  <h1>orchestra<span id="beat"></span></h1>
+</a><span class="root" id="root"></span>
+<nav><a class="nav-link" href="/runway">provider runway</a>
+<a class="nav-link" href="http://localhost:43170" target="_blank">work tracker</a></nav></header>
 <main>
 <div class="cols">
   <div style="display:flex;flex-direction:column;gap:14px;min-width:0">

@@ -10,8 +10,14 @@ DEFAULT_CONFIG = """\
 [settings]
 timeout = 3600            # per-run seconds before the supervisor kills a worker
 default_requester = "orchestrator"
+# quota_warn = true (default) — print a one-shot cached headroom advisory before
+# each dispatch when the target coding plan is below the runway floor; never
+# blocks dispatch, never reroutes, never consumes a Codex reset credit.
+# Set to false in .orchestra/config.toml to opt out.
+quota_warn = true
 # env vars pulled from `launchctl getenv` into worker/host env when not already set
 env_passthrough = ["FIRECRAWL_API_KEY"]
+
 
 # --- roster ---------------------------------------------------------------
 # backend: opencode | codex | claude
