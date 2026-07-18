@@ -24,6 +24,27 @@ header h1 { margin:0; font-size:inherit; font-weight:inherit; letter-spacing:inh
 header .root { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px }
 header nav { margin-left:auto; display:flex; gap:12px; align-items:center }
 header a.nav-link { color:var(--blue); text-decoration:none; font-size:13px }
+.proj-sel { position:relative; display:inline-flex }
+.proj-btn { display:inline-flex; align-items:center; gap:7px;
+  font:inherit; font-size:13px; padding:4px 10px; color:var(--ink);
+  background:var(--card); border:1px solid var(--line); border-radius:8px; cursor:pointer;
+  max-width:280px }
+.proj-btn:hover { background:var(--sel) }
+.proj-btn[aria-expanded="true"] { background:var(--sel); box-shadow:inset 0 0 0 1px var(--blue) }
+.proj-dot { width:8px; height:8px; border-radius:50%; background:var(--green); flex:0 0 auto }
+.proj-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.proj-caret { color:var(--muted); font-size:10px }
+.proj-menu { position:absolute; top:calc(100% + 4px); left:0; min-width:280px; max-width:380px;
+  background:var(--card); border:1px solid var(--line); border-radius:10px; padding:6px;
+  box-shadow:0 8px 24px rgba(0,0,0,.14); z-index:50; max-height:60vh; overflow-y:auto }
+.proj-opt { display:block; width:100%; text-align:left; padding:7px 10px; border-radius:7px;
+  cursor:pointer; background:none; color:var(--ink); border:none; font:inherit; font-size:13px }
+.proj-opt:hover { background:var(--sel) }
+.proj-opt[aria-selected="true"] { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
+.proj-opt .po-name { display:block; font-weight:600 }
+.proj-opt .po-root { display:block; color:var(--muted); font-family:ui-monospace,monospace;
+  font-size:11px; margin-top:2px; word-break:break-all }
+.proj-opt.offline .po-name { color:var(--muted) }
 main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-direction:column; gap:14px }
 .cols { display:grid; grid-template-columns:330px 1fr; gap:14px; min-height:0 }
 @media (max-width:980px){ .cols { grid-template-columns:1fr } }
@@ -85,10 +106,18 @@ button { font:inherit; font-size:12px; border:1px solid var(--line); background:
 #beat { width:8px; height:8px; border-radius:50%; background:var(--green);
   display:inline-block; margin-left:6px }
 </style></head><body>
-<header><a class="brand" href="/" aria-label="orchestra">
-  <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
-  <h1>orchestra<span id="beat"></span></h1>
+ <header><a class="brand" href="/" aria-label="orchestra">
+   <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+   <h1>orchestra<span id="beat"></span></h1>
 </a><span class="root" id="root"></span>
+<div class="proj-sel" id="projSel" hidden>
+  <button class="proj-btn" id="projBtn" type="button" aria-haspopup="listbox" aria-expanded="false">
+    <span class="proj-dot" id="projDot" aria-hidden="true"></span>
+    <span class="proj-label" id="projLabel">project</span>
+    <span class="proj-caret" aria-hidden="true">▾</span>
+  </button>
+  <div class="proj-menu" id="projMenu" role="listbox" aria-label="Orchestra projects" hidden></div>
+</div>
 <nav><a class="nav-link" href="/runway">provider runway</a>
 <a class="nav-link" href="http://localhost:43170" target="_blank">work tracker</a></nav></header>
 <main>
@@ -112,6 +141,96 @@ button { font:inherit; font-size:12px; border:1px solid var(--line); background:
 const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = null, selected = null, selTm = null, userPicked = false, tEtag = null;
 let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
+
+// --- project selection (control-plane) -----------------------------------
+// The browser only ever switches among entries returned by GET /api/projects.
+// No typed path, no filesystem browser — the allowlist lives in the
+// orchestra projects registry on disk and is the sole source of truth.
+const PROJECT_KEY = 'orchestra.project';
+let projectDir = null;     // {defaultProjectId, projects: [...]}
+let activeProjectId = null;
+
+function rememberedProject(){
+  try { return localStorage.getItem(PROJECT_KEY) || null; } catch(e){ return null; }
+}
+function rememberProject(id){
+  try {
+    if (id) localStorage.setItem(PROJECT_KEY, id);
+    else localStorage.removeItem(PROJECT_KEY);
+  } catch(e){ /* private mode etc. — picker still works for this tab */ }
+}
+function projectHeader(){
+  // Every fetch the page makes carries the active project id. The header
+  // wins over any ?project= query, which exists for top-level navigations
+  // and for clients that cannot easily set headers.
+  return activeProjectId ? {'X-Orchestra-Project': activeProjectId} : {};
+}
+async function api(path, opts){
+  opts = opts || {};
+  const headers = Object.assign({}, projectHeader(), opts.headers || {});
+  const res = await fetch(path, Object.assign({}, opts, {headers}));
+  return res;
+}
+
+function renderProjectMenu(){
+  if (!projectDir) return;
+  const projs = projectDir.projects || [];
+  // Active = the id we have in localStorage IF it is still in the live
+  // allowlist; otherwise the launch default. Stale ids fall through to
+  // the default silently here — the API will still 404 any explicit
+  // request for an unknown id, but the picker itself never offers one.
+  const remembered = rememberedProject();
+  if (remembered && projs.some(p => p.id === remembered)){
+    activeProjectId = remembered;
+  } else {
+    activeProjectId = projectDir.defaultProjectId || (projs[0] && projs[0].id) || null;
+    rememberProject(activeProjectId);
+  }
+  const sel = document.getElementById('projSel');
+  sel.hidden = !projs.length;
+  if (!projs.length) return;
+  const cur = projs.find(p => p.id === activeProjectId) || projs[0];
+  document.getElementById('projLabel').textContent = cur.name || cur.root;
+  document.getElementById('projDot').style.background =
+    cur.id === projectDir.defaultProjectId ? 'var(--green)' : 'var(--blue)';
+  const menu = document.getElementById('projMenu');
+  menu.innerHTML = projs.map(p => {
+    const sel = p.id === activeProjectId ? 'true' : 'false';
+    const off = p.available === false ? ' offline' : '';
+    const tag = p.id === projectDir.defaultProjectId ? ' <span class="muted">· default</span>' : '';
+    return `<button class="proj-opt${off}" role="option" aria-selected="${sel}"
+      onclick="pickProject('${esc(p.id)}')">
+      <span class="po-name">${esc(p.name)}${tag}</span>
+      <span class="po-root">${esc(p.root)}</span>
+    </button>`;
+  }).join('');
+}
+function toggleProjectMenu(open){
+  const btn = document.getElementById('projBtn');
+  const menu = document.getElementById('projMenu');
+  const next = open == null ? menu.hidden : open;
+  menu.hidden = !next;
+  btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+}
+document.addEventListener('click', e => {
+  const sel = document.getElementById('projSel');
+  if (!sel || sel.hidden) return;
+  if (!sel.contains(e.target)) toggleProjectMenu(false);
+});
+async function pickProject(id){
+  toggleProjectMenu(false);
+  if (id === activeProjectId) return;
+  rememberProject(id);
+  activeProjectId = id;
+  // Project switch invalidates every cached selection: the new project
+  // has its own runs, teams, inboxes — drop them all and re-fetch.
+  selected = null; selTm = null; tEtag = null; userPicked = false;
+  lastHash = {};
+  document.getElementById('pbody').innerHTML = '<span class="muted">loading…</span>';
+  document.getElementById('phead').innerHTML = '<span class="muted">select a run</span>';
+  renderProjectMenu();
+  await refresh();
+}
 
 function elapsed(start, end){
   const b = end ? new Date(end) : new Date();
@@ -197,7 +316,7 @@ async function refreshTranscript(force){
   if (selTm) return refreshTmTranscript(force);
   if (selected == null) return;
   let res;
-  try { res = await (await fetch(`api/transcript/${selected}${tEtag&&!force?`?etag=${tEtag}`:''}`)).json(); }
+  try { res = await (await api(`api/transcript/${selected}${tEtag&&!force?`?etag=${tEtag}`:''}`)).json(); }
   catch(e){ return; }
   if (res.unchanged) return;
   tEtag = res.etag;
@@ -224,7 +343,7 @@ async function refreshTranscript(force){
 async function refreshTmTranscript(force){
   const tm = selTm;
   let res;
-  try { res = await (await fetch(`api/teammate/${tm.sid}?team=${encodeURIComponent(tm.team)}${tEtag&&!force?`&etag=${tEtag}`:''}`)).json(); }
+  try { res = await (await api(`api/teammate/${tm.sid}?team=${encodeURIComponent(tm.team)}${tEtag&&!force?`&etag=${tEtag}`:''}`)).json(); }
   catch(e){ return; }
   if (res.unchanged || selTm !== tm) return;
   tEtag = res.etag;
@@ -277,8 +396,22 @@ function renderBottom(){
     || '<span class="muted">no teams</span>');
 }
 
+async function refreshProjects(){
+  try {
+    const res = await fetch('api/projects');
+    if (!res.ok) return;
+    const dir = await res.json();
+    const prev = projectDir && projectDir.projects ? projectDir.projects.length : 0;
+    projectDir = dir;
+    renderProjectMenu();
+    // If the picker just appeared for the first time, force a state
+    // refresh so /api/state runs with the now-active project header.
+    if (prev === 0 && dir.projects.length > 0) void refresh();
+  } catch(e){ /* picker is best-effort */ }
+}
+
 async function refresh(){
-  try { state = await (await fetch('api/state')).json(); }
+  try { state = await (await api('api/state')).json(); }
   catch(e){ document.getElementById('beat').style.background='var(--red)'; return; }
   document.getElementById('beat').style.background='var(--green)';
   document.getElementById('root').textContent = state.root;
@@ -288,5 +421,10 @@ async function refresh(){
   }
   renderRuns(); renderEnsemble(); renderBottom();
 }
+document.getElementById('projBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  toggleProjectMenu();
+});
+refreshProjects(); setInterval(refreshProjects, 8000);
 refresh(); setInterval(refresh, 2500); setInterval(()=>refreshTranscript(false), 2000);
 </script></body></html>
