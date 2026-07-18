@@ -3,11 +3,12 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-from orchestra_cli import brief, config, db, docs, host, paths, runners, supervise, worktree
+from orchestra_cli import brief, config, db, docs, host, names, paths, runners, supervise, tailscale, worktree
 from orchestra_cli.usage import (
     assess_targets,
     default_service,
@@ -247,12 +248,35 @@ def cmd_dispatch(args):
             display_model = (display_model or dm or "codex-default") + (f" ({eff})" if eff else "")
         elif agent.get("variant"):
             display_model = f"{display_model} ({agent['variant']})"
-        cur = con.execute(
-            "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, "
-            "workdir, status, started_at) VALUES(?,?,?,?,?,?,?,?, 'spawning', ?)",
-            (target, agent["backend"], display_model, args.title or mission[:80],
-             args.work, args.team, requester, str(root), db.now()))
-        run_id = cur.lastrowid
+        run_id = None
+        slug = None
+        # Race defence: the in-Python collision check is best-effort; a
+        # parallel dispatcher could mint the same slug between our read and
+        # INSERT. The DB partial UNIQUE index is the real guard — on a
+        # constraint violation we regenerate the slug and retry, never
+        # silently overwrite the original collision.
+        for attempt in range(names.MAX_ATTEMPTS + 4):
+            slug = names.assign_slug(con)
+            try:
+                cur = con.execute(
+                    "INSERT INTO runs(agent, backend, model, title, work_item, team, "
+                    "requested_by, workdir, slug, status, started_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+                    (target, agent["backend"], display_model,
+                     args.title or mission[:80],
+                     args.work, args.team, requester, str(root), slug, db.now()))
+                run_id = cur.lastrowid
+                break
+            except sqlite3.IntegrityError as exc:
+                if not names.is_unique_violation(exc):
+                    raise
+                names.reset_memory_cache()
+                continue
+        if run_id is None:
+            raise SystemExit(
+                f"orchestra: could not mint a unique run slug for {target} "
+                f"after repeated collisions — odd, retry dispatch"
+            )
         workdir, branch = str(root), None
         if args.worktree:
             wt, branch = worktree.create(root, run_id)
@@ -268,10 +292,10 @@ def cmd_dispatch(args):
                     (str(bp), str(lp), workdir, branch, run_id))
         con.commit()
         run_ids.append(run_id)
-        _work_log(root, args.work, f"orchestra: dispatched run {run_id} to {target} "
+        _work_log(root, args.work, f"orchestra: dispatched run {run_id} ({slug}) to {target} "
                                    f"({agent['backend']}/{agent.get('model') or 'default'})"
                                    + (f" in worktree branch {branch}" if branch else ""))
-        print(f"run {run_id}: {target} ({agent['backend']}/{agent.get('model') or 'default'})"
+        print(f"run {run_id} ({slug}): {target} ({agent['backend']}/{agent.get('model') or 'default'})"
               + (f" worktree={workdir}" if branch else ""))
     con.close()
     for rid in run_ids:
@@ -704,7 +728,26 @@ def cmd_usage(args):
 
 def cmd_ui(args):
     from orchestra_cli import ui
-    ui.serve(paths.find_root(), port=args.port, open_browser=not args.no_open)
+    # --tailscale and --host are mutually exclusive: --tailscale DISCOVERS
+    # the right interface; explicit --host would silently override the
+    # discovery and undermine the safety promise, so we reject the
+    # combination up-front.
+    if args.tailscale and args.host:
+        raise SystemExit(
+            "orchestra: --tailscale and --host cannot be combined. "
+            "--tailscale discovers and binds the machine's Tailnet IPv4; "
+            "drop --host or drop --tailscale."
+        )
+    try:
+        ui.serve(
+            paths.find_root(),
+            port=args.port,
+            open_browser=not args.no_open,
+            host=args.host,
+            tailscale_mode=args.tailscale,
+        )
+    except tailscale.TailscaleError as exc:
+        raise SystemExit(f"orchestra: {exc}") from exc
 
 
 def cmd_supervise(args):
@@ -826,7 +869,15 @@ def main():
     s.set_defaults(fn=cmd_usage)
 
     s = sub.add_parser("ui", help="live web dashboard for this project (runs, inboxes, feed)")
-    s.add_argument("--port", type=int, default=4764)
+    s.add_argument("--port", type=int, default=None,
+                   help="UI port; defaults to a 4764 preference (falls back to OS-chosen when 4764 is busy). "
+                        "Any other explicit value is pinned — a busy port fails clearly.")
+    s.add_argument("--host", default=None,
+                   help="bind host. Default: 127.0.0.1. Accepts loopback or a Tailscale IPv4; "
+                        "wildcard and ordinary LAN hosts are rejected. Mutually exclusive with --tailscale.")
+    s.add_argument("--tailscale", action="store_true",
+                   help="discover this machine's Tailscale IPv4 and bind only that interface. "
+                        "Fails clearly if Tailscale is unavailable.")
     s.add_argument("--no-open", action="store_true", help="don't open a browser")
     s.set_defaults(fn=cmd_ui)
 

@@ -68,6 +68,10 @@ details pre { margin:4px 0; white-space:pre-wrap; overflow-wrap:anywhere;
 details.think summary { color:var(--think) }
 details.tool summary { color:var(--tool) }
 details .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted) }
+table.kv { border-collapse:collapse; font-size:12.5px }
+table.kv th { text-align:left; color:var(--muted); font-weight:600;
+  padding:2px 12px 2px 0; text-transform:lowercase; letter-spacing:.02em }
+table.kv td { padding:2px 0; font-family:ui-monospace,monospace }
 #follow { margin-left:auto; display:flex; gap:6px; align-items:center; font-size:12px; color:var(--muted) }
 button { font:inherit; font-size:12px; border:1px solid var(--line); background:none;
   color:var(--blue); border-radius:6px; padding:2px 10px; cursor:pointer }
@@ -139,11 +143,12 @@ function setIfChanged(id, html){
 function renderRuns(){
   const html = [...state.runs].reverse().map(r => `
     <div class="runitem ${!selTm&&r.id===selected?'sel':''}" onclick="pick(${r.id})">
-      <div class="top"><span class="mono">#${r.id}</span><b>${esc(r.agent)}</b>
+      <div class="top"><span class="mono">#${r.id}</span>${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+        <b>${esc(r.agent)}</b>
         <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
         <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
           ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span></div>
-      <div class="title">${r.work_item?`[${esc(r.work_item)}] `:''}${esc(r.title||'')}</div>
+      <div class="title">${r.backend?`<span class="mono muted">${esc(r.backend)}</span> `:''}${r.model?`<span class="mono muted">${esc((r.model||'').split('/').pop())}</span> `:''}${r.work_item?`[${esc(r.work_item)}] `:''}${esc(r.title||'')}</div>
     </div>`).join('') || '<div class="runitem muted">no runs yet</div>';
   setIfChanged('runlist', html);
   tickElapsed();
@@ -190,7 +195,23 @@ function itemHtml(it, i){
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
   if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;
+  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.parent_run?`<tr><th>parent run</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
   return `<div class="titem meta">${esc(it.body)}</div>`;
+}
+
+function renderDetails(r){
+  // Pure-data block injected as the first "details" item in the transcript
+  // pane, without removing existing items below. Credentials are NEVER
+  // carried on the run row — only the configured backend + model name.
+  return {
+    kind:'details',
+    backend:r.backend||'',
+    model:r.model||'',
+    team:r.team||'',
+    requested_by:r.requested_by||'',
+    parent_run:r.parent_run||null,
+    session_ref:r.session_ref||'',
+  };
 }
 
 async function refreshTranscript(force){
@@ -202,9 +223,11 @@ async function refreshTranscript(force){
   if (res.unchanged) return;
   tEtag = res.etag;
   const r = res.run;
-  const head = `<span class="mono">#${r.id}</span> <b>${esc(r.agent)}</b>
+  const head = `<span class="mono">#${r.id}</span> ${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+    <b>${esc(r.agent)}</b>
     <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
-    <span class="mono muted">${esc(r.model||'')}</span>
+    <span class="mono muted" title="configured backend">${esc(r.backend||'')}</span>
+    ${r.model?`<span class="mono muted" title="configured model">${esc(r.model)}</span>`:''}
     ${r.work_item?`<span class="mono">${esc(r.work_item)}</span>`:''}
     ${r.branch?`<span class="mono muted">${esc(r.branch)}</span>`:''}
     <span class="mono muted" data-start="${esc(r.started_at)}" ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span>
@@ -214,7 +237,7 @@ async function refreshTranscript(force){
   const open = new Set([...body.querySelectorAll('details[open]')].map(d=>d.dataset.k));
   const follow = document.getElementById('followcb')?.checked ?? true;
   const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
-  body.innerHTML = res.items.map(itemHtml).join('')
+  body.innerHTML = [renderDetails(r), ...res.items].map(itemHtml).join('')
     || '<span class="muted">no output yet…</span>';
   body.querySelectorAll('details').forEach(d => { if (open.has(d.dataset.k)) d.open = true; });
   if (follow && (nearBottom || force)) body.scrollTop = body.scrollHeight;
