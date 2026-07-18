@@ -38,14 +38,21 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    (`orchestra run show <run>` shows branch), and keep the tracker current so any future
    session (yours or another orchestrator's) can resume cold.
 
-## Roster (see `orchestra roster` for live view)
+## Roster & routing (see `orchestra roster` for live view)
 
-- `glm` — opencode / GLM-5.2 · generalist implementation
-- `minimax` — opencode / MiniMax-M3 · generalist implementation
-- `codex` — codex CLI / gpt-5.6 default · hard problems
-- `codex-55` — codex CLI / gpt-5.5 · medium tasks, faster
-- `claude` — claude CLI worker (useful when Codex orchestrates)
-- `ensemble` — opencode-ensemble lead; spawns a GLM/MiniMax team internally
+Route by difficulty — don't burn the heavy tiers on grunt work:
+
+- `minimax` — MiniMax-M3 · THE DEFAULT. Routine implementation, ports, mechanical
+  refactors, test writing (the "Sonnet" tier).
+- `glm` — GLM-5.2 · standard tier for normal feature work needing more judgment.
+- `codex-55` — gpt-5.5 (high) · fast solid engineer for medium tasks.
+- `glm-max` — GLM-5.2 variant=max · heavy reasoning: hard design, gnarly debugging.
+- `codex` — gpt-5.6 (xhigh) · REALLY tough thinking only; slow and expensive — use sparingly.
+- `claude` — claude CLI worker (useful when Codex orchestrates).
+- `ensemble` — opencode-ensemble lead; spawns a GLM/MiniMax team internally for
+  parallelizable multi-part missions.
+
+Good pattern: minimax implements → glm reviews; or glm-max/codex design → minimax executes.
 
 ## Rules of engagement
 
@@ -69,7 +76,8 @@ for orchestration sessions. Claude Code needs no special handling.
 ## Cheatsheet
 
 ```
-orchestra ui                          # live web dashboard (:4764)
+orchestra ui                          # live web dashboard (:4764; --port N, auto-falls-back if busy; prints the project root)
+orchestra host start --port 4763      # persistent opencode host for ensemble runs (--port configurable)
 orchestra status                      # snapshot: runs, inboxes, feed
 orchestra dispatch --to glm --work W-0001 --as claude "mission"
 orchestra dispatch --to glm --to minimax --as claude "same mission, two takes"

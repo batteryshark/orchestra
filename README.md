@@ -76,10 +76,11 @@ completions land in the requester's inbox (plus the work item log).
 
 | roster entry | backend | model | notes |
 |---|---|---|---|
-| `glm` | opencode | zhipuai-coding-plan/glm-5.2 | `--auto`, JSON event log |
-| `minimax` | opencode | minimax-coding-plan/MiniMax-M3 | |
-| `codex` | codex exec | config default (gpt-5.6) | workspace-write sandbox |
-| `codex-55` | codex exec | gpt-5.5 | |
+| `minimax` | opencode | minimax-coding-plan/MiniMax-M3 | default workhorse ("Sonnet" tier) |
+| `glm` | opencode | zhipuai-coding-plan/glm-5.2 | standard tier |
+| `glm-max` | opencode | glm-5.2 `--variant max` | heavy reasoning tier |
+| `codex-55` | codex exec | gpt-5.5 (effort high) | medium tasks |
+| `codex` | codex exec | gpt-5.6-sol (xhigh) | toughest problems only |
 | `claude` | claude -p | default | for when Codex orchestrates |
 | `ensemble` | opencode | glm-5.2 lead | opencode-ensemble team over a model pool |
 

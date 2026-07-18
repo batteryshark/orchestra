@@ -17,21 +17,27 @@ default_requester = "orchestrator"
 # ensemble = true makes an opencode agent the LEAD of an ensemble team
 # extra_args: appended to the backend CLI invocation
 
-[agents.glm]
-backend = "opencode"
-model = "zhipuai-coding-plan/glm-5.2"
-role = "generalist implementation engineer"
-
 [agents.minimax]
 backend = "opencode"
 model = "minimax-coding-plan/MiniMax-M3"
-role = "generalist implementation engineer"
+role = "workhorse — first choice for routine implementation and grunt work (the 'Sonnet' tier)"
+
+[agents.glm]
+backend = "opencode"
+model = "zhipuai-coding-plan/glm-5.2"
+role = "strong generalist — standard tier for normal feature work"
+
+[agents.glm-max]
+backend = "opencode"
+model = "zhipuai-coding-plan/glm-5.2"
+variant = "max"
+role = "heavy reasoning tier — hard design/debugging (pairs with codex xhigh)"
 
 [agents.codex]
 backend = "codex"
 # model omitted -> uses ~/.codex/config.toml default (gpt-5.6-sol)
 # effort = "high"   # override reasoning effort for workers (codex config default: xhigh)
-role = "senior engineer for hard problems"
+role = "really tough thinking only — heaviest tier, use sparingly"
 
 [agents.codex-55]
 backend = "codex"
