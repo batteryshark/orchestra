@@ -32,10 +32,12 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    - `orchestra send <agent>` to a RUNNING worker is BEST-EFFORT (workers only check
      their inbox at start and between steps). If the worker never checks, the run's
      end bounces an UNDELIVERED notice back to your inbox.
-   - Guaranteed mid-run delivery: `orchestra interrupt <run> "message" --as you` —
-     pauses the worker, injects the message, resumes the same session and mission.
-   - After a run finished: `orchestra reply <run> "message"` resumes the session.
-   - Corrections to in-flight missions should ALWAYS use interrupt, not send.
+   - URGENT (changes what the worker is doing right now): `orchestra interrupt <run> "msg"`
+     — pauses the worker, injects the message, resumes the same session and mission.
+   - NOT urgent (fine to land after current work): `orchestra queue <run> "msg"` — auto-
+     delivered as a session-resume follow-up the moment the run completes.
+   - After a run finished: `orchestra reply <run> "msg"` resumes the session manually.
+   - Corrections to in-flight missions must use interrupt or queue — never bare send.
 4. **Monitor without blocking.** `orchestra wait` blocks until runs finish (run it in a
    background shell and keep working); `orchestra status` for a snapshot; `orchestra runs --active`.
 5. **Harvest.** `orchestra inbox <you> --unread --mark-read` for handoffs and completions;
@@ -96,6 +98,7 @@ orchestra wait                        # block until active runs finish
 orchestra inbox claude --unread --mark-read
 orchestra reply 7 "looks good; also add tests"
 orchestra interrupt 7 "stop - the schema changed, read W-0012 first" --as claude
+orchestra queue 7 "when done: also update the README section" --as claude
 orchestra send glm "heads up: schema changed" --as claude
 orchestra broadcast "stop touching db.py" --team core --as claude
 orchestra note "auth flow uses PKCE, not implicit" --as claude --tags arch

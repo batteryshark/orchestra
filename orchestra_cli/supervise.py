@@ -11,14 +11,45 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra_cli import config, db, host, runners
+from orchestra_cli import config, db, host, paths, runners
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
+
+
+def spawn_supervisor(root: Path, run_id: int) -> None:
+    exe = shutil.which("orchestra")
+    cmd = [exe, "_supervise", str(run_id), "--root", str(root)] if exe else \
+        [sys.executable, "-m", "orchestra_cli", "_supervise", str(run_id), "--root", str(root)]
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def create_followup(con, root: Path, parent: dict, requester: str, text: str,
+                    title: str | None = None) -> int:
+    """New run row that resumes parent's session with `text` as the prompt."""
+    cur = con.execute(
+        "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, "
+        "workdir, branch, parent_run, session_ref, status, started_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+        (parent["agent"], parent["backend"], parent["model"],
+         title or f"follow-up to run {parent['id']}", parent["work_item"], parent["team"],
+         requester, parent["workdir"], parent["branch"], parent["id"],
+         parent["session_ref"], db.now()))
+    run_id = cur.lastrowid
+    bp = paths.briefs_dir(root) / f"run-{run_id}.md"
+    bp.write_text(text)
+    lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
+    lp.touch()
+    con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",
+                (str(bp), str(lp), run_id))
+    con.commit()
+    return run_id
 
 
 def _work_log(root: Path, item: str, text: str) -> None:
@@ -163,18 +194,39 @@ def supervise(root: Path, run_id: int) -> int:
         "UPDATE runs SET status=?, exit_code=?, session_ref=COALESCE(?, session_ref), "
         "summary=?, finished_at=? WHERE id=?",
         (status, exit_code, session_ref, summary, db.now(), run_id))
+    # queued follow-ups: deliver by resuming the session in a fresh run
+    followup_id = None
+    ref_final = session_ref or run["session_ref"]
+    queued = list(con.execute("SELECT * FROM messages WHERE COALESCE(kind,'')='queued' "
+                              "AND run_id=? AND read_at IS NULL", (run_id,)))
+    if queued and ref_final and status in ("done", "failed"):
+        joined = "\n\n".join(f"From {q['sender']}: {q['body']}" for q in queued)
+        text = (f"Your previous run finished ({status}). Follow-up instructions were queued "
+                f"for you while you worked — apply them now:\n\n{joined}\n\n"
+                f"Also check `orchestra inbox {run['agent']} --unread --mark-read` for anything "
+                f"else. Finish with `orchestra send {queued[0]['sender']} \"HANDOFF: ...\" "
+                f"--as {run['agent']}`"
+                + (f", and log progress with `work log {run['work_item']} ...`"
+                   if run["work_item"] else "") + ".")
+        parent = dict(run)
+        parent["session_ref"] = ref_final
+        followup_id = create_followup(con, root, parent, queued[0]["sender"], text)
+        con.execute(f"UPDATE messages SET read_at=? WHERE id IN "
+                    f"({','.join(str(q['id']) for q in queued)})", (db.now(),))
+
     body = (f"[run {run_id}] {run['agent']} finished: {status}"
             f"{f' (exit {exit_code})' if exit_code not in (None, 0) else ''}."
             f"{chr(10) + 'Last output: ' + summary[:800] if summary else ''}\n"
             f"Details: `orchestra run show {run_id}` · logs: `orchestra logs {run_id}`"
-            + (f" · follow up: `orchestra reply {run_id} \"...\"`"
-               if session_ref or run["session_ref"] else ""))
+            + (f" · follow up: `orchestra reply {run_id} \"...\"`" if ref_final else "")
+            + (f"\nQueued follow-up auto-dispatched as run {followup_id}." if followup_id else ""))
     con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
                 "VALUES('orchestra', ?, ?, ?, ?, ?)",
                 (run["requested_by"], body, run["work_item"], run_id, db.now()))
     # bounce unread mail: a finished worker will never read its inbox again
     for m in con.execute("SELECT * FROM messages WHERE recipient=? AND read_at IS NULL "
-                         "AND created_at>=? AND sender != 'orchestra'",
+                         "AND created_at>=? AND sender != 'orchestra' "
+                         "AND COALESCE(kind,'') != 'queued'",
                          (run["agent"], run["started_at"])):
         con.execute("INSERT INTO messages(sender, recipient, body, run_id, created_at) "
                     "VALUES('orchestra', ?, ?, ?, ?)",
@@ -192,5 +244,7 @@ def supervise(root: Path, run_id: int) -> int:
         _work_log(root, run["work_item"],
                   f"orchestra run {run_id} ({run['agent']}) finished: {status}."
                   + (f" {summary[:300]}" if summary else ""))
+    if followup_id:
+        spawn_supervisor(root, followup_id)
     con.close()
     return 0 if status == "done" else 1

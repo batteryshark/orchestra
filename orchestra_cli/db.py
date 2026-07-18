@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS messages (
   body TEXT NOT NULL,
   work_item TEXT,
   run_id INTEGER,
+  kind TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   read_at TEXT
 );
@@ -76,4 +77,8 @@ def connect(root: Path) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=10000")
     con.executescript(SCHEMA)
+    try:  # migration for DBs created before messages.kind existed
+        con.execute("ALTER TABLE messages ADD COLUMN kind TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     return con

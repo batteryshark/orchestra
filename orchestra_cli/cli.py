@@ -15,12 +15,7 @@ def _identity(args, cfg) -> str:
         or cfg["settings"].get("default_requester", "orchestrator")
 
 
-def _spawn_supervisor(root: Path, run_id: int) -> None:
-    exe = shutil.which("orchestra")
-    cmd = [exe, "_supervise", str(run_id), "--root", str(root)] if exe else \
-        [sys.executable, "-m", "orchestra_cli", "_supervise", str(run_id), "--root", str(root)]
-    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+_spawn_supervisor = supervise.spawn_supervisor
 
 
 def _work_available() -> bool:
@@ -239,22 +234,12 @@ def cmd_reply(args):
         raise SystemExit(f"orchestra: run {args.run_id} has no session ref; dispatch a fresh run")
     requester = _identity(args, cfg) or parent["requested_by"]
     msg = " ".join(args.message)
-    followup = (f"{msg}\n\n(Orchestra follow-up on run {args.run_id}. Same coordination protocol: "
-                f"finish with `orchestra send {requester} \"HANDOFF: ...\" --as {parent['agent']}`"
+    followup = (f"{msg}\n\n(Orchestra follow-up on run {args.run_id}. First check "
+                f"`orchestra inbox {parent['agent']} --unread --mark-read`. Same coordination "
+                f"protocol: finish with `orchestra send {requester} \"HANDOFF: ...\" --as {parent['agent']}`"
                 + (f", log progress with `work log {parent['work_item']} ...`" if parent["work_item"] else "") + ".)")
-    cur = con.execute(
-        "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, workdir, "
-        "branch, parent_run, session_ref, status, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
-        (parent["agent"], parent["backend"], parent["model"], f"reply to run {args.run_id}",
-         parent["work_item"], parent["team"], requester, parent["workdir"], parent["branch"],
-         args.run_id, parent["session_ref"], db.now()))
-    run_id = cur.lastrowid
-    bp = paths.briefs_dir(root) / f"run-{run_id}.md"
-    bp.write_text(followup)
-    lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
-    lp.touch()
-    con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?", (str(bp), str(lp), run_id))
-    con.commit()
+    run_id = supervise.create_followup(con, root, dict(parent), requester, followup,
+                                       title=f"reply to run {args.run_id}")
     con.close()
     print(f"run {run_id}: follow-up to {parent['agent']} (session {parent['session_ref'][:20]}...)")
     if args.sync:
@@ -355,6 +340,33 @@ def cmd_wait(args):
         if pending:
             time.sleep(2)
     print("all runs finished — check your inbox: `orchestra inbox <you> --unread --mark-read`")
+
+
+def cmd_queue(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    con = db.connect(root)
+    r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
+    if not r:
+        raise SystemExit(f"orchestra: no run {args.run_id}")
+    sender = _identity(args, cfg)
+    msg = " ".join(args.message)
+    if r["status"] in db.RUN_TERMINAL:
+        if not r["session_ref"]:
+            raise SystemExit(f"orchestra: run {args.run_id} has no session to resume — "
+                             "dispatch a fresh run instead")
+        text = (f"{msg}\n\n(Queued follow-up on run {args.run_id}. Same protocol: finish with "
+                f"`orchestra send {sender} \"HANDOFF: ...\" --as {r['agent']}`.)")
+        rid = supervise.create_followup(con, root, dict(r), sender, text)
+        supervise.spawn_supervisor(root, rid)
+        print(f"run {args.run_id} already finished — follow-up dispatched now as run {rid}")
+    else:
+        con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
+                    "VALUES(?,?,?,?, 'queued', ?)",
+                    (sender, r["agent"], msg, args.run_id, db.now()))
+        con.commit()
+        print(f"queued — will be auto-delivered as a session follow-up when run "
+              f"{args.run_id} completes")
 
 
 def cmd_interrupt(args):
@@ -738,6 +750,13 @@ def main():
     s.add_argument("--port", type=int, default=4764)
     s.add_argument("--no-open", action="store_true", help="don't open a browser")
     s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("queue", help="queue a follow-up for a running worker; auto-delivered "
+                                     "(session resume) when its current run completes")
+    s.add_argument("run_id", type=int)
+    s.add_argument("message", nargs="+")
+    ident(s)
+    s.set_defaults(fn=cmd_queue)
 
     s = sub.add_parser("interrupt", help="guaranteed delivery to a RUNNING worker: "
                                          "pause it, inject the message, resume the mission")
