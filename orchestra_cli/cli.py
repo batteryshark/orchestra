@@ -181,10 +181,17 @@ def cmd_dispatch(args):
     run_ids = []
     for target in args.to:
         agent = config.agent_cfg(cfg, target)
+        display_model = agent.get("model")
+        if agent["backend"] == "codex":
+            dm, de = config.codex_defaults()
+            eff = agent.get("effort") or de
+            display_model = (display_model or dm or "codex-default") + (f" ({eff})" if eff else "")
+        elif agent.get("variant"):
+            display_model = f"{display_model} ({agent['variant']})"
         cur = con.execute(
             "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, "
             "workdir, status, started_at) VALUES(?,?,?,?,?,?,?,?, 'spawning', ?)",
-            (target, agent["backend"], agent.get("model"), args.title or mission[:80],
+            (target, agent["backend"], display_model, args.title or mission[:80],
              args.work, args.team, requester, str(root), db.now()))
         run_id = cur.lastrowid
         workdir, branch = str(root), None

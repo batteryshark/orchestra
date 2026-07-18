@@ -29,6 +29,8 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
             flags += ["--add-dir", d]
         if model:
             flags += ["-m", model]
+        if agent.get("effort"):
+            flags += ["-c", f'model_reasoning_effort="{agent["effort"]}"']
         flags += extra
         if resume_ref:
             return ["codex", "exec", "resume", *flags, resume_ref, prompt]

@@ -30,11 +30,13 @@ role = "generalist implementation engineer"
 [agents.codex]
 backend = "codex"
 # model omitted -> uses ~/.codex/config.toml default (gpt-5.6-sol)
+# effort = "high"   # override reasoning effort for workers (codex config default: xhigh)
 role = "senior engineer for hard problems"
 
 [agents.codex-55]
 backend = "codex"
 model = "gpt-5.5"
+effort = "high"
 role = "fast engineer for medium tasks"
 
 [agents.claude]
@@ -49,6 +51,12 @@ ensemble = true
 role = "lead of an opencode-ensemble team"
 model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
 """
+
+
+def codex_defaults() -> tuple[str | None, str | None]:
+    """(model, reasoning_effort) from ~/.codex/config.toml, for display."""
+    cfg = _load_toml(Path("~/.codex/config.toml").expanduser())
+    return cfg.get("model"), cfg.get("model_reasoning_effort")
 
 
 def _load_toml(p: Path) -> dict:
