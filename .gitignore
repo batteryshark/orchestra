@@ -1,8 +1,8 @@
-.orchestra/logs/
-.orchestra/worktrees/
-.orchestra/briefs/
-.orchestra/*.db*
+.orchestra/
 .work/
+AGENTS.md
+CLAUDE.md
+ORCHESTRA.md
 __pycache__/
 *.egg-info/
 dist/

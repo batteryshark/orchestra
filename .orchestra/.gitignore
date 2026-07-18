@@ -1,6 +1,0 @@
-logs/
-worktrees/
-briefs/
-*.db
-*.db-shm
-*.db-wal

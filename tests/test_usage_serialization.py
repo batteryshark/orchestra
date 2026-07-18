@@ -16,7 +16,7 @@ from orchestra_cli.usage.models import (
 )
 
 
-SAMPLE_KEY = "sk-test-this-must-not-appear-in-any-serialized-output"
+SAMPLE_KEY = "not-a-real-key-test-sentinel"
 SAMPLE_OAUTH = "oauth-fake-account-1234567890"
 SAMPLE_CREDIT_ID = "credit-internal-id-must-be-hidden"
 
