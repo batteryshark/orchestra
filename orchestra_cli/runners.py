@@ -33,7 +33,9 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
             flags += ["-c", f'model_reasoning_effort="{agent["effort"]}"']
         flags += extra
         if resume_ref:
-            return ["codex", "exec", "resume", *flags, resume_ref, prompt]
+            # `--cd`, `--sandbox`, and `--add-dir` belong to `codex exec`, not
+            # its `resume` subcommand, so keep shared flags before the command.
+            return ["codex", "exec", *flags, "resume", resume_ref, prompt]
         return ["codex", "exec", *flags, prompt]
 
     if backend == "claude":

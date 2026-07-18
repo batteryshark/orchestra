@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import os
 import pty
+import re
 import selectors
 import select
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,8 +43,13 @@ MAX_RESPONSE_BYTES = 524_288
 HTTP_TIMEOUT_SECONDS = 8.0
 CODEX_TIMEOUT_SECONDS = 12.0
 CLAUDE_CACHE_MAX_AGE_SECONDS = 300.0
-CLAUDE_REFRESH_TIMEOUT_SECONDS = 15.0
+CLAUDE_REFRESH_TIMEOUT_SECONDS = 20.0
 MAX_CLAUDE_STATE_BYTES = 5_242_880
+
+_CLAUDE_LIVE_LOCK = threading.Lock()
+_CLAUDE_LIVE_USAGE: dict[str, dict[str, float]] | None = None
+_CLAUDE_LIVE_FETCHED_AT = 0.0
+_CLAUDE_REFRESH_IN_FLIGHT = False
 
 JsonFetcher = Callable[[str, dict[str, str], float], dict[str, Any]]
 
@@ -407,26 +414,76 @@ def _claude_refresh_cwd(state: dict[str, Any]) -> Path | None:
     return None
 
 
-def refresh_claude_usage_cache(
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def _clean_terminal_line(line: str) -> str:
+    line = _ANSI_ESCAPE.sub("", line)
+    line = re.sub(r"\x1b(?:[()][0-9A-Z]|.)", "", line)
+    printable = (
+        character for character in line if character >= " " or character == "\t"
+    )
+    return "".join(printable).strip()
+
+
+def parse_claude_usage_screen(output: bytes | bytearray | str) -> dict[str, dict[str, float]]:
+    """Extract live utilization from Claude Code's screen-reader `/usage` view.
+
+    Claude Code can show current values without updating
+    `cachedUsageUtilization` in ``~/.claude.json``. The screen-reader view is
+    flat text, so parse only its named quota rows and ignore the surrounding
+    terminal UI and account diagnostics.
+    """
+    text = (
+        bytes(output).decode("utf-8", errors="replace")
+        if isinstance(output, (bytes, bytearray))
+        else output
+    )
+    lines = [
+        _clean_terminal_line(line)
+        for line in text.replace("\r", "\n").splitlines()
+    ]
+    labels = {
+        "Current session": "five_hour",
+        "Current week (all models)": "seven_day",
+        "Current week (Sonnet only)": "seven_day_sonnet",
+        "Current week (Opus only)": "seven_day_opus",
+    }
+    usage: dict[str, dict[str, float]] = {}
+    for index, line in enumerate(lines):
+        key = next((value for label, value in labels.items() if label in line), None)
+        if not key:
+            continue
+        for candidate in lines[index + 1 : index + 4]:
+            if "used" not in candidate.lower():
+                continue
+            percentages = re.findall(r"(\d+(?:\.\d+)?)%", candidate)
+            if percentages:
+                usage[key] = {"utilization": float(percentages[-1])}
+                break
+    return usage
+
+
+def read_claude_live_usage(
     state: dict[str, Any],
     *,
-    state_path: Path | None = None,
     binary: str | None = None,
     timeout: float = CLAUDE_REFRESH_TIMEOUT_SECONDS,
-) -> bool:
-    """Ask Claude's own /usage command to refresh its non-secret local cache.
+) -> dict[str, dict[str, float]] | None:
+    """Read current plan utilization from Claude Code's own `/usage` view.
 
-    Screen-reader mode keeps the pseudo-terminal output stable. The output is
-    discarded; only `cachedUsageUtilization` is read after Claude writes it.
+    This starts a safe-mode interactive shell in a trusted project, sends the
+    built-in command, parses only named percentages, and terminates before the
+    optional local-session analysis finishes. No prompt is sent to a model.
     """
     executable = binary or os.environ.get("CLAUDE_BIN") or shutil.which("claude")
     cwd = _claude_refresh_cwd(state)
     if not executable or cwd is None:
-        return False
-    previous = _claude_cached_usage(state)
-    previous_fetched_at = previous[1] if previous else 0.0
-    path = state_path or Path.home() / ".claude.json"
-    master_fd, slave_fd = pty.openpty()
+        return None
+    try:
+        master_fd, slave_fd = pty.openpty()
+    except OSError:
+        return None
     environment = os.environ.copy()
     environment["NO_COLOR"] = "1"
     try:
@@ -442,7 +499,7 @@ def refresh_claude_usage_cache(
     except OSError:
         os.close(master_fd)
         os.close(slave_fd)
-        return False
+        return None
     os.close(slave_fd)
     sent_usage = False
     output = bytearray()
@@ -451,7 +508,10 @@ def refresh_claude_usage_cache(
     try:
         while time.monotonic() < deadline:
             elapsed = time.monotonic() - started
-            readable, _, _ = select.select([master_fd], [], [], 0.25)
+            try:
+                readable, _, _ = select.select([master_fd], [], [], 0.25)
+            except OSError:
+                break
             if readable:
                 try:
                     chunk = os.read(master_fd, 65_536)
@@ -459,25 +519,21 @@ def refresh_claude_usage_cache(
                         output.extend(chunk[: 262_144 - len(output)])
                 except OSError:
                     break
-            if not sent_usage and (b"$" in output or elapsed >= 2.5):
+            ready = b"manual mode on" in output or b"Manual mode on" in output
+            if not sent_usage and (ready or elapsed >= 8.0):
                 try:
                     os.write(master_fd, b"/usage\r")
                     sent_usage = True
                 except OSError:
                     break
             if sent_usage:
-                try:
-                    updated_state = _read_claude_state(state_path=path)
-                except ProviderRequestError:
-                    continue
-                updated = _claude_cached_usage(updated_state)
-                if updated and updated[1] > previous_fetched_at:
-                    return True
-                if b"Current session" in output and b"Usage credits" in output:
-                    return True
+                parsed = parse_claude_usage_screen(output)
+                if "five_hour" in parsed and "seven_day" in parsed:
+                    return parsed
             if process.poll() is not None:
                 break
-        return False
+        parsed = parse_claude_usage_screen(output)
+        return parsed or None
     finally:
         if process.poll() is None:
             process.terminate()
@@ -487,6 +543,39 @@ def refresh_claude_usage_cache(
                 process.kill()
                 process.wait(timeout=1)
         os.close(master_fd)
+
+
+def _cached_claude_live_usage() -> dict[str, dict[str, float]] | None:
+    with _CLAUDE_LIVE_LOCK:
+        if (
+            _CLAUDE_LIVE_USAGE is None
+            or time.monotonic() - _CLAUDE_LIVE_FETCHED_AT > CLAUDE_CACHE_MAX_AGE_SECONDS
+        ):
+            return None
+        return {key: dict(value) for key, value in _CLAUDE_LIVE_USAGE.items()}
+
+
+def _request_claude_live_refresh(state: dict[str, Any]) -> None:
+    """Refresh Claude usage off-request so a slow/rate-limited CLI cannot stall the UI."""
+    global _CLAUDE_REFRESH_IN_FLIGHT
+    with _CLAUDE_LIVE_LOCK:
+        if _CLAUDE_REFRESH_IN_FLIGHT:
+            return
+        _CLAUDE_REFRESH_IN_FLIGHT = True
+
+    def refresh() -> None:
+        global _CLAUDE_LIVE_USAGE, _CLAUDE_LIVE_FETCHED_AT, _CLAUDE_REFRESH_IN_FLIGHT
+        try:
+            usage = read_claude_live_usage(state)
+            if usage:
+                with _CLAUDE_LIVE_LOCK:
+                    _CLAUDE_LIVE_USAGE = usage
+                    _CLAUDE_LIVE_FETCHED_AT = time.monotonic()
+        finally:
+            with _CLAUDE_LIVE_LOCK:
+                _CLAUDE_REFRESH_IN_FLIGHT = False
+
+    threading.Thread(target=refresh, name="orchestra-claude-usage", daemon=True).start()
 
 
 def collect_claude(*, state_path: Path | None = None) -> ProviderResult:
@@ -499,43 +588,64 @@ def collect_claude(*, state_path: Path | None = None) -> ProviderResult:
             "auth_required",
             "Open Claude Code and run /usage once to enable plan usage.",
         )
+    oauth_account = state.get("oauthAccount")
+    subscription = (
+        oauth_account.get("subscriptionType")
+        if isinstance(oauth_account, dict)
+        else None
+    )
+    plan = f"Claude {str(subscription).title()}" if subscription else "Claude subscription"
     cached = _claude_cached_usage(state)
     age_seconds = (time.time() * 1000 - cached[1]) / 1000 if cached else float("inf")
+    live_usage = None
     if age_seconds > CLAUDE_CACHE_MAX_AGE_SECONDS:
-        refresh_claude_usage_cache(state, state_path=state_path)
-        try:
-            state = _read_claude_state(state_path=state_path)
-        except ProviderRequestError:
-            pass
-        cached = _claude_cached_usage(state)
-        age_seconds = (time.time() * 1000 - cached[1]) / 1000 if cached else float("inf")
+        live_usage = _cached_claude_live_usage()
+        if live_usage is None:
+            _request_claude_live_refresh(state)
+        if live_usage:
+            old_usage = cached[0] if cached else {}
+            base: dict[str, Any] = {}
+            for key, item in live_usage.items():
+                previous = old_usage.get(key)
+                base[key] = {**previous, **item} if isinstance(previous, dict) else item
+            cached = (base, time.time() * 1000)
+            age_seconds = 0.0
     if cached is None:
-        return error_result(
-            "claude",
-            "Claude",
-            "auth_required",
-            "Open Claude Code and run /usage once to enable plan usage.",
+        return ProviderResult(
+            id="claude",
+            name="Claude",
+            status="stale",
+            plan=plan,
+            windows=[],
+            message="Refreshing live /usage; no cached snapshot is available yet.",
+            source="Claude Code /usage",
+        )
+    stale = age_seconds > CLAUDE_CACHE_MAX_AGE_SECONDS
+    if stale:
+        return ProviderResult(
+            id="claude",
+            name="Claude",
+            status="stale",
+            plan=plan,
+            windows=[],
+            message=(
+                "Refreshing live /usage; cached percentages are hidden because they may be "
+                "outdated."
+            ),
+            source="Claude Code /usage cache",
         )
     try:
         windows = parse_claude(cached[0])
     except ProviderRequestError as exc:
         return error_result("claude", "Claude", "unavailable", str(exc))
-    oauth_account = state.get("oauthAccount")
-    subscription = oauth_account.get("subscriptionType") if isinstance(oauth_account, dict) else None
-    plan = f"Claude {str(subscription).title()}" if subscription else "Claude subscription"
-    stale = age_seconds > CLAUDE_CACHE_MAX_AGE_SECONDS
     return ProviderResult(
         id="claude",
         name="Claude",
-        status="stale" if stale else "ok",
+        status="ok",
         plan=plan,
         windows=windows,
-        message=(
-            "Automatic refresh was unavailable; showing Claude Code's latest cached /usage snapshot."
-            if stale
-            else None
-        ),
-        source="Claude Code /usage cache",
+        message=None,
+        source="Claude Code /usage" if live_usage else "Claude Code /usage cache",
     )
 
 

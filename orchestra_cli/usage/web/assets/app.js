@@ -95,6 +95,7 @@ function resetCreditsTemplate(resetCredits) {
 }
 
 function commandFor(provider) {
+  if (provider.status === 'stale') return 'retry shortly';
   if (provider.id === 'claude') return 'claude → /login';
   if (provider.id === 'minimax' || provider.id === 'zai') return 'opencode auth login';
   return 'codex login';
@@ -106,6 +107,9 @@ function providerTemplate(provider) {
   const cardTone = headroom == null ? '' : `status-${severity(Number(headroom))}`;
   const status = statusLabels[provider.status] || provider.status;
   const source = provider.source ? `via ${provider.source}` : 'credential source unavailable';
+  const emptyTitle = provider.status === 'auth_required'
+    ? 'Login needed'
+    : provider.status === 'stale' ? 'Usage refreshing' : 'Usage unavailable';
   const body = hasQuota ? `
     <div class="headroom">
       <div class="headroom-number">${escapeHtml(percent(headroom))}<small>%</small></div>
@@ -118,7 +122,7 @@ function providerTemplate(provider) {
       <div class="empty-state-icon" aria-hidden="true">
         <svg viewBox="0 0 20 20"><path d="M10 3v8m0 3.3v.2"/><circle cx="10" cy="10" r="7.2"/></svg>
       </div>
-      <h3>${provider.status === 'auth_required' ? 'Login needed' : 'Usage unavailable'}</h3>
+      <h3>${emptyTitle}</h3>
       <p>${escapeHtml(provider.message || 'This provider did not return a quota snapshot.')}</p>
       <code class="empty-command">${escapeHtml(commandFor(provider))}</code>
     </div>`;

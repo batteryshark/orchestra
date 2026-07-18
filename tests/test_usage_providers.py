@@ -5,12 +5,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestra_cli.usage.credentials import opencode_api_key
 from orchestra_cli.usage.providers import (
     ProviderRequestError,
     collect_claude,
     parse_claude,
+    parse_claude_usage_screen,
     parse_codex,
     parse_codex_reset_credits,
     parse_minimax,
@@ -102,6 +104,25 @@ class ClaudeParserTests(unittest.TestCase):
         self.assertEqual(windows[2].scope, "Fable")
         self.assertTrue(windows[0].resets_at and windows[0].resets_at.endswith("+00:00"))
 
+    def test_parses_live_screen_reader_usage(self) -> None:
+        usage = parse_claude_usage_screen(
+            "\x1b[2KCurrent session\n92% 92% used\nResets 7pm\n"
+            "Current week (all models)\n20% 20% used\nResets Jul 21 at 7pm\n"
+        )
+
+        self.assertEqual(usage["five_hour"]["utilization"], 92.0)
+        self.assertEqual(usage["seven_day"]["utilization"], 20.0)
+
+    def test_live_screen_parser_ignores_unrelated_percentages(self) -> None:
+        usage = parse_claude_usage_screen(
+            bytearray(
+                b"86% of your usage was at >150k context\n"
+                b"Current session\n8% used\nCurrent week (Sonnet only)\n44% used\n"
+            )
+        )
+
+        self.assertEqual(set(usage), {"five_hour", "seven_day_sonnet"})
+
     def test_collects_from_fresh_non_secret_claude_usage_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".claude.json"
@@ -131,6 +152,70 @@ class ClaudeParserTests(unittest.TestCase):
         self.assertEqual(result.plan, "Claude Max")
         self.assertEqual(result.windows[0].remaining_percent, 16.0)
         self.assertEqual(result.source, "Claude Code /usage cache")
+
+    def test_hides_stale_percentages_when_live_refresh_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".claude.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "oauthAccount": {"subscriptionType": "max"},
+                        "cachedUsageUtilization": {
+                            "fetchedAtMs": 1,
+                            "utilization": {
+                                "five_hour": {"utilization": 84},
+                                "seven_day": {"utilization": 20},
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "orchestra_cli.usage.providers._cached_claude_live_usage",
+                return_value=None,
+            ), patch("orchestra_cli.usage.providers._request_claude_live_refresh"):
+                result = collect_claude(state_path=path)
+
+        self.assertEqual(result.status, "stale")
+        self.assertEqual(result.windows, [])
+        self.assertIn("hidden", result.message or "")
+
+    def test_live_refresh_replaces_stale_values_without_old_scoped_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".claude.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "cachedUsageUtilization": {
+                            "fetchedAtMs": 1,
+                            "utilization": {
+                                "five_hour": {"utilization": 84},
+                                "seven_day": {"utilization": 20},
+                                "limits": [
+                                    {"kind": "weekly_scoped", "percent": 99}
+                                ],
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "orchestra_cli.usage.providers._cached_claude_live_usage",
+                return_value={
+                    "five_hour": {"utilization": 92.0},
+                    "seven_day": {"utilization": 20.0},
+                },
+            ):
+                result = collect_claude(state_path=path)
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.source, "Claude Code /usage")
+        self.assertEqual(
+            [(window.id, window.remaining_percent) for window in result.windows],
+            [("five_hour", 8.0), ("seven_day", 80.0)],
+        )
 
 
 class CodexParserTests(unittest.TestCase):

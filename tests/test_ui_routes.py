@@ -106,6 +106,8 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("javascript", headers.get("content-type", ""))
         self.assertIn("/api/usage", body)
+        self.assertIn("Usage refreshing", body)
+        self.assertIn("retry shortly", body)
 
     def test_runway_assets_missing_returns_404(self) -> None:
         status, headers, body = self.get("/runway-assets/does-not-exist.css")
