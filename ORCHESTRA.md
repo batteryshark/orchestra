@@ -23,6 +23,8 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    - Independent missions: separate dispatch calls — they all run concurrently in the background.
    - `--worktree` gives the worker an isolated git worktree (skills folders auto-synced).
    - `--to ensemble` dispatches an opencode-ensemble LEAD that spawns its own model-pool team.
+     Ensemble runs ride a persistent opencode host (`orchestra host status`); the mission is
+     complete when the lead's HANDOFF arrives, not when the client process exits.
 3. **Monitor without blocking.** `orchestra wait` blocks until runs finish (run it in a
    background shell and keep working); `orchestra status` for a snapshot; `orchestra runs --active`.
 4. **Harvest.** `orchestra inbox <you> --unread --mark-read` for handoffs and completions;
@@ -40,11 +42,10 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
 
 - `glm` — opencode / GLM-5.2 · generalist implementation
 - `minimax` — opencode / MiniMax-M3 · generalist implementation
-- `kimi` — opencode / Kimi K3 · research, second opinions
 - `codex` — codex CLI / gpt-5.6 default · hard problems
 - `codex-55` — codex CLI / gpt-5.5 · medium tasks, faster
 - `claude` — claude CLI worker (useful when Codex orchestrates)
-- `ensemble` — opencode-ensemble lead; spawns a GLM/MiniMax/Kimi team internally
+- `ensemble` — opencode-ensemble lead; spawns a GLM/MiniMax team internally
 
 ## Rules of engagement
 
@@ -55,7 +56,7 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
   if a run completes without one, read `orchestra logs <run> --pretty` and treat the
   result as unverified.
 - Verify worker output before marking anything done. Prefer dispatching a second agent to
-  review large changes (e.g. `--to kimi "review the diff on branch orchestra/run-N ..."`).
+  review large changes (e.g. `--to minimax "review the diff on branch orchestra/run-N ..."`).
 - Record every notable finding or decision in `work` — sessions are disposable, the tracker is not.
 
 ## Codex-as-orchestrator sandbox note

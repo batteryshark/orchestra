@@ -13,8 +13,8 @@ teams, and per-agent inboxes.
                             │  orchestra CLI  +  work CLI
         ┌───────────┬───────┴──────┬─────────────┬──────────────┐
         ▼           ▼              ▼             ▼              ▼
-   glm (opencode) minimax     kimi (opencode)  codex CLI    claude -p
-   GLM-5.2       MiniMax-M3   Kimi K3          gpt-5.6/5.5  worker
+   glm (opencode) minimax        codex CLI       claude -p
+   GLM-5.2        MiniMax-M3     gpt-5.6/5.5     worker
         │
         ▼
    ensemble lead (opencode + opencode-ensemble plugin)
@@ -77,7 +77,6 @@ completions land in the requester's inbox (plus the work item log).
 |---|---|---|---|
 | `glm` | opencode | zhipuai-coding-plan/glm-5.2 | `--auto`, JSON event log |
 | `minimax` | opencode | minimax-coding-plan/MiniMax-M3 | |
-| `kimi` | opencode | kimi-for-coding/k3 | reviewer/second opinion |
 | `codex` | codex exec | config default (gpt-5.6) | workspace-write sandbox |
 | `codex-55` | codex exec | gpt-5.5 | |
 | `claude` | claude -p | default | for when Codex orchestrates |
@@ -99,7 +98,16 @@ everywhere (including ensemble's own worktrees).
 Installed globally in `~/.config/opencode/opencode.json` (`@hueyexe/opencode-ensemble`),
 model pool configured in `~/.config/opencode/ensemble.json`. Dispatching `--to ensemble`
 sends an opencode lead that uses `team_*` tools to spawn teammates across the pool
-(GLM-5.2 / MiniMax-M3 / Kimi K3), with its own dashboard at `http://localhost:4747`.
+(GLM-5.2 / MiniMax-M3), with its own dashboard at `http://localhost:4747`.
+
+**Ensemble runs go through a persistent host.** Teammates live inside the lead's opencode
+process, so a one-shot `opencode run` would kill the team the moment the lead's turn ends.
+Orchestra therefore keeps a long-lived `opencode serve` (managed via `orchestra host
+status|start|stop`, state in `~/.local/state/orchestra/`) and dispatches leads with
+`--attach`: the team survives client exits, teammate reports wake the lead server-side, and
+the supervisor treats the lead's `HANDOFF` message — not process exit — as mission
+completion. Killing an ensemble run's client does not stop the server-side team; use
+`orchestra reply <run> "team_shutdown and team_cleanup"` or `orchestra host stop`.
 
 ## Both-ways orchestration
 

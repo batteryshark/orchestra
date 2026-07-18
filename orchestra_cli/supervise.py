@@ -4,9 +4,11 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra_cli import config, db, runners
+from orchestra_cli import config, db, host, runners
 
 
 def _work_log(root: Path, item: str, text: str) -> None:
@@ -32,9 +34,12 @@ def supervise(root: Path, run_id: int) -> int:
     if run["workdir"] != str(root):
         add_dirs.append(str(root))  # isolated runs still write .orchestra/.work at root
     last_msg_file = None
+    # ensemble leads attach to the persistent host so their teammate sessions
+    # survive the client process exiting mid-mission
+    attach = host.ensure() if agent.get("ensemble") else None
     cmd = runners.build_cmd(agent, workdir=run["workdir"], title=f"orchestra-run-{run_id}",
                             prompt=prompt, resume_ref=run["session_ref"] if run["parent_run"] else None,
-                            add_dirs=add_dirs)
+                            add_dirs=add_dirs, attach=attach)
     if agent["backend"] == "codex" and not run["parent_run"]:
         last_msg_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
         cmd = cmd[:2] + ["-o", last_msg_file] + cmd[2:]  # `codex exec -o FILE ...` (fresh runs only)
@@ -65,7 +70,34 @@ def supervise(root: Path, run_id: int) -> int:
                 except Exception:
                     pass
 
+    handoff_body = None
+
+    def _handoff():
+        return con.execute(
+            "SELECT body FROM messages WHERE sender=? AND created_at>=? "
+            "AND (run_id=? OR body LIKE ?) ORDER BY id DESC LIMIT 1",
+            (run["agent"], run["started_at"], run_id, f"HANDOFF run {run_id}:%")).fetchone()
+
+    if agent.get("ensemble") and status != "killed":
+        # attach mode: the mission may continue server-side after the client
+        # exits (teammate wake-ups re-prompt the lead). Completion = HANDOFF.
+        started = datetime.strptime(run["started_at"], "%Y-%m-%dT%H:%M:%SZ") \
+            .replace(tzinfo=timezone.utc).timestamp()
+        deadline = max(started + timeout, time.time() + 120)
+        while not _handoff() and time.time() < deadline:
+            cur = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if cur["status"] == "killed":
+                break
+            time.sleep(5)
+        ho = _handoff()
+        if ho:
+            status, exit_code, handoff_body = "done", 0, ho["body"]
+        elif status == "done":
+            status = "timeout" if time.time() >= deadline else status
+
     session_ref, last_text = runners.parse_log(log_path)
+    if handoff_body:
+        last_text = handoff_body
     if last_msg_file and Path(last_msg_file).is_file():
         txt = Path(last_msg_file).read_text(errors="replace").strip()
         if txt:

@@ -27,11 +27,6 @@ backend = "opencode"
 model = "minimax-coding-plan/MiniMax-M3"
 role = "generalist implementation engineer"
 
-[agents.kimi]
-backend = "opencode"
-model = "kimi-for-coding/k3"
-role = "researcher / second-opinion reviewer"
-
 [agents.codex]
 backend = "codex"
 # model omitted -> uses ~/.codex/config.toml default (gpt-5.6-sol)
@@ -52,7 +47,7 @@ backend = "opencode"
 model = "zhipuai-coding-plan/glm-5.2"
 ensemble = true
 role = "lead of an opencode-ensemble team"
-model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3", "kimi-for-coding/k3"]
+model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
 """
 
 

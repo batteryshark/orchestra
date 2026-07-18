@@ -2,13 +2,16 @@
 
 
 def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
-              resume_ref: str | None = None, add_dirs: list[str] | None = None) -> list[str]:
+              resume_ref: str | None = None, add_dirs: list[str] | None = None,
+              attach: str | None = None) -> list[str]:
     backend = agent["backend"]
     model = agent.get("model")
     extra = list(agent.get("extra_args", []))
 
     if backend == "opencode":
         cmd = ["opencode", "run", "--dir", workdir, "--format", "json", "--auto"]
+        if attach:
+            cmd += ["--attach", attach]
         if resume_ref:
             cmd += ["--session", resume_ref]
         else:

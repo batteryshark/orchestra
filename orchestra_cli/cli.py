@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from orchestra_cli import brief, config, db, docs, paths, runners, supervise, worktree
+from orchestra_cli import brief, config, db, docs, host, paths, runners, supervise, worktree
 
 
 def _identity(args, cfg) -> str:
@@ -473,6 +473,20 @@ def cmd_doctor(args):
         print(f"  work tracker: {'present' if (root / '.work').is_dir() else 'absent (run `work init .`)'}")
 
 
+def cmd_host(args):
+    if args.host_cmd == "stop":
+        print("host stopped" if host.stop() else "host was not running")
+    elif args.host_cmd == "start":
+        print(f"host: {host.ensure()}")
+    else:  # status
+        u = host.url()
+        s = host.state() or {}
+        print(f"host: {u or 'not running'}"
+              + (f" (pid {s.get('pid')})" if u else "")
+              + f"\nensemble dashboard: http://localhost:4747 (when a team is active)"
+              + f"\nlog: {host.LOG_FILE}")
+
+
 def cmd_supervise(args):
     sys.exit(supervise.supervise(Path(args.root), args.run_id))
 
@@ -575,7 +589,12 @@ def main():
     s.add_argument("run_ids", nargs="*", type=int)
     s.add_argument("--any", action="store_true", help="return after the first completion")
     s.add_argument("--timeout", type=int, default=0)
+    ident(s)  # accepted for consistency; wait is identity-agnostic
     s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("host", help="manage the persistent opencode host (used by ensemble runs)")
+    s.add_argument("host_cmd", nargs="?", default="status", choices=["status", "start", "stop"])
+    s.set_defaults(fn=cmd_host)
 
     s = sub.add_parser("kill", help="terminate a running worker")
     s.add_argument("run_id", type=int)
