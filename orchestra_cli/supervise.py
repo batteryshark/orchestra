@@ -44,7 +44,10 @@ def supervise(root: Path, run_id: int) -> int:
     status, exit_code = "done", None
     with open(log_path, "ab") as log:
         log.write((" ".join(cmd[:6]) + " ...\n").encode())
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+        # stdin MUST be closed: codex exec (and possibly others) block reading a
+        # piped stdin to EOF, which never comes from a detached/background parent
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT,
                                 cwd=run["workdir"], env=env, start_new_session=True)
         con.execute("UPDATE runs SET pid=?, status='running' WHERE id=?", (proc.pid, run_id))
         con.commit()

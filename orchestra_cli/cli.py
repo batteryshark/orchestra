@@ -19,8 +19,8 @@ def _spawn_supervisor(root: Path, run_id: int) -> None:
     exe = shutil.which("orchestra")
     cmd = [exe, "_supervise", str(run_id), "--root", str(root)] if exe else \
         [sys.executable, "-m", "orchestra_cli", "_supervise", str(run_id), "--root", str(root)]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def _work_available() -> bool:
