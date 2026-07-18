@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestra mark</title>
+  <desc id="desc">Three ascending and descending vertical bars.</desc>
+  <rect width="128" height="128" rx="24" fill="#0b0d10"/>
+  <g fill="#f3f4f2">
+    <rect x="25" y="55" width="20" height="42" rx="10" opacity=".45"/>
+    <rect x="54" y="30" width="20" height="67" rx="10"/>
+    <rect x="83" y="46" width="20" height="51" rx="10" opacity=".7"/>
+  </g>
+</svg>

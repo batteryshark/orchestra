@@ -2,5 +2,7 @@
 .orchestra/worktrees/
 .orchestra/briefs/
 .orchestra/*.db*
+.work/
 __pycache__/
 *.egg-info/
+dist/

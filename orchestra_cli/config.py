@@ -15,8 +15,9 @@ default_requester = "orchestrator"
 # blocks dispatch, never reroutes, never consumes a Codex reset credit.
 # Set to false in .orchestra/config.toml to opt out.
 quota_warn = true
-# env vars pulled from `launchctl getenv` into worker/host env when not already set
-env_passthrough = ["FIRECRAWL_API_KEY"]
+# Optional env vars to recover from `launchctl getenv` on macOS when a worker
+# starts outside the user's interactive shell. Add only names, never values.
+env_passthrough = []
 
 
 # --- roster ---------------------------------------------------------------
