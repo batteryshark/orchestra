@@ -165,6 +165,12 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
 ## How state is divided
 
 - `.orchestra/` in each project stores its SQLite run state, project configuration, and durable handoff checkpoints.
+- Supervised workers can create native child runs with `orchestra spawn --to AGENT "mission"`.
+  Child ownership is distinct from backend session follow-ups, works across OpenCode, Codex,
+  and Claude runners, and is shown hierarchically in the dashboard. Children use isolated git
+  worktrees by default; Orchestra reports their branches and never auto-merges them. Defaults
+  are deliberately bounded by `settings.child_max_depth`, `child_max_per_run`, and
+  `child_max_active` (1, 3, and 3). Stopping a lead cascades to its active descendants.
 - The user-level registry stores project identifiers and roots for the shared UI.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.

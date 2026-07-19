@@ -28,6 +28,10 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    - Fan out one mission to several agents: repeat `--to` (e.g. `--to glm --to minimax`).
    - Independent missions: separate dispatch calls — they all run concurrently in the background.
    - `--worktree` gives the worker an isolated git worktree (skills folders auto-synced).
+   - A supervised worker can delegate a bounded child batch with
+     `orchestra spawn --to <agent> "mission"`. Children are backend-neutral and use isolated
+     worktrees by default. The lead should commit any work children need before spawning;
+     child branches are reported but never auto-merged.
 3. **Messaging semantics — know which tool delivers.**
    - `orchestra send <agent>` to a RUNNING worker is BEST-EFFORT (workers only check
      their inbox at start and between steps). If the worker never checks, the run's
@@ -159,6 +163,7 @@ orchestra project register /path      # add a root while the dashboard is runnin
 orchestra status                      # snapshot: runs, inboxes, feed
 orchestra dispatch --to glm --work W-0001 --as claude "mission"
 orchestra dispatch --to glm --to minimax --as claude "same mission, two takes"
+orchestra spawn --to minimax "focused child mission"  # inside a supervised worker
 orchestra wait                        # block until active runs finish
 orchestra inbox claude --unread --mark-read
 orchestra reply 7 "looks good; also add tests"

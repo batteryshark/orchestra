@@ -65,6 +65,7 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .runitem { padding:9px 14px; border-bottom:1px solid var(--line); cursor:pointer }
 .runitem:hover { background:var(--sel) }
 .runitem.sel { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
+.runitem.child { border-left:2px solid color-mix(in srgb, var(--blue) 35%, var(--line)) }
 .runitem .top { display:flex; gap:8px; align-items:center }
 .runitem .title { font-size:12px; color:var(--muted); margin-top:2px;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
@@ -272,9 +273,17 @@ function setIfChanged(id, html){
 }
 
 function renderRuns(){
-  const html = [...state.runs].reverse().map(r => `
-    <div class="runitem ${!selTm&&r.id===selected?'sel':''}" onclick="pick(${r.id})">
+  const byLead = new Map();
+  state.runs.forEach(r => { if(r.lead_run){ const a=byLead.get(r.lead_run)||[]; a.push(r); byLead.set(r.lead_run,a); } });
+  const visibleIds = new Set(state.runs.map(r=>r.id));
+  const owned = new Set(state.runs.filter(r=>r.lead_run&&visibleIds.has(r.lead_run)).map(r=>r.id));
+  const ordered = [];
+  function add(r){ ordered.push(r); [...(byLead.get(r.id)||[])].reverse().forEach(add); }
+  [...state.runs].reverse().filter(r=>!owned.has(r.id)).forEach(add);
+  const html = ordered.map(r => `
+    <div class="runitem ${r.lead_run?'child':''} ${!selTm&&r.id===selected?'sel':''}" style="padding-left:${14+Math.min(Number(r.child_depth||0),4)*14}px" onclick="pick(${r.id})">
       <div class="top"><span class="mono">#${r.id}</span>${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+        ${r.lead_run?`<span class="mono muted" title="child of run #${r.lead_run}">↳ #${r.lead_run}</span>`:''}
         <b>${esc(r.agent)}</b>
         ${statusChip(r.status)}
         <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
@@ -352,7 +361,7 @@ function itemHtml(it, i){
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
   if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;
-  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.parent_run?`<tr><th>parent run</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
+  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.lead_run?`<tr><th>lead run</th><td>#${esc(it.lead_run)}</td></tr>`:''}${it.parent_run?`<tr><th>session follow-up</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
   return `<div class="titem meta">${esc(it.body)}</div>`;
 }
 
@@ -366,6 +375,7 @@ function renderDetails(r){
     model:r.model||'',
     team:r.team||'',
     requested_by:r.requested_by||'',
+    lead_run:r.lead_run||null,
     parent_run:r.parent_run||null,
     session_ref:r.session_ref||'',
   };

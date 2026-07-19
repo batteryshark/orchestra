@@ -18,6 +18,7 @@ class StopResult:
     signal_sent: bool
     reason: str
     pid: int | None = None
+    descendant_ids: tuple[int, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -28,6 +29,7 @@ class StopResult:
             "signal_sent": self.signal_sent,
             "reason": self.reason,
             "pid": self.pid,
+            "descendant_ids": list(self.descendant_ids),
         }
 
 
@@ -86,18 +88,35 @@ def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
                 reason="already_terminal",
                 pid=_safe_pid(row["pid"]),
             )
+        descendants = list(con.execute(
+            "WITH RECURSIVE tree(id) AS ("
+            " SELECT id FROM runs WHERE lead_run=?"
+            " UNION SELECT r.id FROM runs r JOIN tree t ON r.lead_run=t.id"
+            ") SELECT r.id, r.pid FROM runs r JOIN tree t ON r.id=t.id "
+            "WHERE r.status NOT IN ('done','failed','timeout','killed')",
+            (run_id,),
+        ))
         pid = _safe_pid(row["pid"])
         con.execute(
             "UPDATE runs SET status='killed', finished_at=COALESCE(finished_at, ?) "
             "WHERE id=? AND status NOT IN ('done','failed','timeout','killed')",
             (db.now(), run_id),
         )
+        if descendants:
+            ids = [int(r["id"]) for r in descendants]
+            con.execute(
+                f"UPDATE runs SET status='killed', finished_at=COALESCE(finished_at, ?) "
+                f"WHERE id IN ({','.join('?' for _ in ids)})",
+                (db.now(), *ids),
+            )
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
 
     signal_sent, reason = _signal_process_group(pid)
+    for child in descendants:
+        _signal_process_group(_safe_pid(child["pid"]))
     return StopResult(
         run_id=run_id,
         status="killed",
@@ -106,4 +125,5 @@ def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
         signal_sent=signal_sent,
         reason=reason,
         pid=pid,
+        descendant_ids=tuple(int(r["id"]) for r in descendants),
     )

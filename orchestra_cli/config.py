@@ -9,12 +9,18 @@ DEFAULT_CONFIG = """\
 
 [settings]
 timeout = 3600            # per-run seconds before the supervisor kills a worker
+supervisor_checkin_interval = 600  # seconds between safe progress check-ins for long runs
 default_requester = "orchestrator"
 # quota_warn = true (default) — print a one-shot cached headroom advisory before
 # each dispatch when the target coding plan is below the runway floor; never
 # blocks dispatch, never reroutes, never consumes a Codex reset credit.
 # Set to false in .orchestra/config.toml to opt out.
 quota_warn = true
+# Native worker delegation limits. Children use isolated git worktrees by
+# default and never merge their branches automatically.
+child_max_depth = 1
+child_max_per_run = 3
+child_max_active = 3
 # Optional env vars to recover from `launchctl getenv` on macOS when a worker
 # starts outside the user's interactive shell. Add only names, never values.
 env_passthrough = []

@@ -11,6 +11,7 @@ from pathlib import Path
 from orchestra_cli import (
     brief,
     cancel,
+    child_runs,
     checkpoint,
     config,
     db,
@@ -337,6 +338,44 @@ def cmd_dispatch(args):
               f"completions land in inbox '{requester}'.")
 
 
+def cmd_spawn(args):
+    """Spawn a bounded child batch from the currently supervised worker."""
+    root = paths.find_root()
+    cfg = config.load(root)
+    raw_parent = os.environ.get("ORCHESTRA_RUN_ID")
+    identity = os.environ.get("ORCHESTRA_SELF")
+    try:
+        parent_id = int(raw_parent or "")
+    except ValueError:
+        raise SystemExit(
+            "orchestra: spawn is worker-only and requires ORCHESTRA_RUN_ID from a supervisor"
+        )
+    mission = " ".join(args.mission)
+    if args.brief_file:
+        mission = Path(args.brief_file).read_text()
+    if not mission.strip():
+        raise SystemExit("orchestra: empty child mission (pass text, or --brief-file)")
+    targets = [(target, config.agent_cfg(cfg, target)) for target in args.to]
+    ensemble_targets = [name for name, agent in targets if agent.get("ensemble")]
+    if ensemble_targets:
+        ensemble.require_plugin(ensemble_targets)
+    con = db.connect(root)
+    try:
+        parent = child_runs.validate_parent(con, cfg, parent_id, identity)
+        run_ids = child_runs.create(
+            con, root, cfg, parent, list(args.to), mission,
+            title=args.title, context=args.context,
+            shared_workdir=args.shared_workdir,
+        )
+    finally:
+        con.close()
+    for run_id in run_ids:
+        _spawn_supervisor(root, run_id)
+        print(f"child run {run_id}: spawned for lead run {parent_id}")
+    print("Child completions will notify this lead; if it exits first, Orchestra will "
+          "resume it exactly once after the batch settles.")
+
+
 def cmd_reply(args):
     root = paths.find_root()
     cfg = config.load(root)
@@ -534,6 +573,9 @@ def cmd_kill(args):
         print(f"sent SIGTERM to run {args.run_id} (pgid {result.pid})")
     else:
         print(f"run {args.run_id} marked killed ({result.reason})")
+    if result.descendant_ids:
+        print(f"also stopped {len(result.descendant_ids)} active child run(s): "
+              + ", ".join(map(str, result.descendant_ids)))
 
 
 def cmd_note(args):
@@ -996,6 +1038,17 @@ def main():
                    help="suppress the warn-only provider-headroom check (default: on)")
     ident(s)
     s.set_defaults(fn=cmd_dispatch)
+
+    s = sub.add_parser("spawn", help="spawn bounded child runs from the active worker")
+    s.add_argument("mission", nargs="*")
+    s.add_argument("--to", action="append", required=True,
+                   help="roster agent (repeatable for a child batch)")
+    s.add_argument("--title")
+    s.add_argument("--context", help="extra context appended to each child brief")
+    s.add_argument("--brief-file", help="read child mission text from a file")
+    s.add_argument("--shared-workdir", action="store_true",
+                   help="opt out of the default isolated child worktree")
+    s.set_defaults(fn=cmd_spawn)
 
     s = sub.add_parser("reply", help="continue a finished run's session with a follow-up")
     s.add_argument("run_id", type=int)
