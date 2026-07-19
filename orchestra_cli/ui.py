@@ -21,7 +21,6 @@ launched from (so single-project use is unchanged).
 import errno
 import hashlib
 import json
-import mimetypes
 import re
 import socket
 import threading
@@ -37,8 +36,6 @@ from orchestra_cli.usage import default_service
 DEFAULT_UI_PORT = 4764
 
 UI_FILE = Path(__file__).with_name("ui.html")
-RUNWAY_FILE = Path(__file__).parent / "usage" / "web" / "runway.html"
-RUNWAY_ASSETS_DIR = Path(__file__).parent / "usage" / "web" / "assets"
 
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
@@ -141,7 +138,7 @@ def parse_transcript(text: str) -> list[dict]:
         if t == "orchestra.delivery":
             delivery = obj.get("delivery")
             if delivery in ("interrupt", "checkin"):
-                add(None, {
+                add(("delivery", obj.get("message_id")), {
                     "kind": "delivery",
                     "message_id": obj.get("message_id"),
                     "delivery": delivery,
@@ -149,6 +146,7 @@ def parse_transcript(text: str) -> list[dict]:
                     "recipient": _fmt(obj.get("recipient"), 120),
                     "body": _fmt(obj.get("body"), MAX_INPUT),
                     "created_at": _fmt(obj.get("created_at"), 80),
+                    "phase": _fmt(obj.get("phase") or "delivered", 40),
                 })
             continue
 
@@ -459,27 +457,12 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/runway":
-                if not RUNWAY_FILE.is_file():
-                    return self._json({"error": "runway page unavailable"}, 500)
-                try:
-                    body = RUNWAY_FILE.read_bytes()
-                except OSError:
-                    return self._json({"error": "runway page read error"}, 500)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                # Preserve old bookmarks while keeping usage in the dashboard.
+                self.send_response(302)
+                self.send_header("Location", "/?runway=open")
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", "0")
                 self.end_headers()
-                self.wfile.write(body)
-            elif path.startswith("/runway-assets/"):
-                asset = (RUNWAY_ASSETS_DIR / path[len("/runway-assets/"):]).resolve()
-                # confine to the assets dir — refuse path traversal
-                if RUNWAY_ASSETS_DIR.resolve() not in asset.parents and asset.parent != RUNWAY_ASSETS_DIR.resolve():
-                    return self._json({"error": "bad asset path"}, 400)
-                if not asset.is_file():
-                    return self._json({"error": "asset not found"}, 404)
-                ctype = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
-                self._send_static(asset, content_type=ctype, no_store=True)
             elif path == "/api/projects":
                 # The picker source of truth. Always served off the
                 # global registry; no project header needed.
@@ -497,7 +480,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     "messages": [dict(r) for r in con.execute(
                         "SELECT * FROM messages ORDER BY id DESC LIMIT 150")][::-1],
                     "feed": [dict(r) for r in con.execute(
-                        "SELECT * FROM feed ORDER BY id DESC LIMIT 50")][::-1],
+                        "SELECT * FROM feed ORDER BY id DESC LIMIT 50")],
                     "teams": [{"name": t["name"],
                                "members": [m["agent"] for m in con.execute(
                                    "SELECT agent FROM members WHERE team_id=?", (t["id"],))]}
@@ -529,7 +512,8 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 con = db.connect(project)
                 r = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
                 deliveries = list(con.execute(
-                    "SELECT id, sender, recipient, body, kind, created_at FROM messages "
+                    "SELECT id, sender, recipient, body, kind, created_at, delivery_offset, "
+                    "delivered_at FROM messages "
                     "WHERE run_id=? AND (kind IN ('queued','interrupt','checkin') "
                     "OR body LIKE '[INTERRUPT]%') ORDER BY id",
                     (run_id,),
@@ -584,6 +568,8 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                         "recipient": _fmt(message["recipient"], 120),
                         "body": _fmt(body, MAX_INPUT),
                         "created_at": _fmt(message["created_at"], 80),
+                        "phase": ("pending" if message["delivery_offset"] is not None
+                                  and message["delivered_at"] is None else "delivered"),
                     })
                 serialized_questions = {item.get("question_id") for item in items
                                         if item.get("kind") == "question"}

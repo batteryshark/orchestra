@@ -79,6 +79,12 @@ class MigrationTests(unittest.TestCase):
             self.assertIsNone(row["slug"])
             self.assertEqual(row["allow_question"], 0)
             self.assertEqual(row["question_wait_seconds"], 1800)
+            self.assertEqual(row["supervisor_protocol"], 0)
+            message_cols = {
+                r["name"] for r in con.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            self.assertIn("delivery_offset", message_cols)
+            self.assertIn("delivered_at", message_cols)
             question_cols = {
                 r["name"] for r in con.execute("PRAGMA table_info(questions)").fetchall()
             }
