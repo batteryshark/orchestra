@@ -164,6 +164,70 @@ class SupervisorUsageLimitTests(unittest.TestCase):
         zai_collector.assert_called_once_with()
 
 
+class SupervisorStallTimeoutTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        if hasattr(self, "tmp"):
+            self.tmp.cleanup()
+
+    def test_productive_worker_can_outlive_stall_window(self) -> None:
+        self.tmp, root = _project(checkin_interval=0, timeout=10)
+        run_id = _insert_run(root)
+        con = db.connect(root)
+        try:
+            run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            code = (
+                "import time;"
+                "[(print(i,flush=True),time.sleep(.08)) for i in range(6)]"
+            )
+            outcome, exit_code = supervise._run_proc(
+                con,
+                run,
+                [sys.executable, "-c", code],
+                str(root),
+                {},
+                run["log_path"],
+                run_id,
+                time.time() + 3,
+                stall_timeout=0.15,
+                poll_interval=0.02,
+            )
+        finally:
+            con.close()
+
+        self.assertEqual((outcome, exit_code), ("exit", 0))
+
+    def test_silent_worker_times_out_with_durable_reason(self) -> None:
+        self.tmp, root = _project(checkin_interval=0, timeout=10)
+        config_path = root / ".orchestra" / "config.toml"
+        config_path.write_text(config_path.read_text() + "stall_timeout = 1\n")
+        run_id = _insert_run(root)
+
+        started = time.monotonic()
+        with mock.patch.object(supervise, "PROC_POLL_INTERVAL", 0.05), \
+                mock.patch.object(supervise.runners, "build_cmd",
+                                  return_value=_sleeping_worker(seconds=10)):
+            rc = supervise.supervise(root, run_id)
+        elapsed = time.monotonic() - started
+
+        con = db.connect(root)
+        try:
+            row = con.execute(
+                "SELECT status, summary FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(rc, 1)
+        self.assertEqual(row["status"], "timeout")
+        self.assertIn("Stalled: no worker output", row["summary"])
+        self.assertLess(elapsed, 3)
+
+    def test_stall_timeout_validation(self) -> None:
+        self.assertIsNone(supervise._stall_timeout_seconds(0))
+        self.assertEqual(supervise._stall_timeout_seconds("30"), 30)
+        with self.assertRaisesRegex(SystemExit, "zero or a positive"):
+            supervise._stall_timeout_seconds(-1)
+
+
 class SupervisorCheckinTests(unittest.TestCase):
     def tearDown(self) -> None:
         if hasattr(self, "tmp"):

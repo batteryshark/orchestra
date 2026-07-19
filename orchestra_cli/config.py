@@ -6,13 +6,16 @@ from orchestra_cli import paths
 DEFAULT_QUESTION_WAIT_SECONDS = 1800
 MIN_QUESTION_WAIT_SECONDS = 10
 MAX_QUESTION_WAIT_SECONDS = 86400
+DEFAULT_RUN_TIMEOUT_SECONDS = 36000
+DEFAULT_STALL_TIMEOUT_SECONDS = 1800
 
-DEFAULT_CONFIG = """\
+DEFAULT_CONFIG = f"""\
 # Orchestra roster + settings. Global file: ~/.config/orchestra/config.toml
 # Project overrides: .orchestra/config.toml (same shape, merged over global).
 
 [settings]
-timeout = 3600            # per-run seconds before the supervisor kills a worker
+timeout = {DEFAULT_RUN_TIMEOUT_SECONDS}           # hard cap for runaway workers (10 hours)
+stall_timeout = {DEFAULT_STALL_TIMEOUT_SECONDS}   # kill after no worker output (30 minutes); 0 disables
 supervisor_checkin_interval = 600  # seconds between safe progress check-ins for long runs
 question_wait_timeout = 1800  # opted-in blocking question fallback (30 minutes)
 default_requester = "orchestrator"

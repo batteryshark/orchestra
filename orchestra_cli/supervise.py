@@ -139,6 +139,18 @@ def _checkin_interval_seconds(raw) -> int | None:
     return min(max(seconds, MIN_CHECKIN_INTERVAL), MAX_CHECKIN_INTERVAL)
 
 
+def _stall_timeout_seconds(raw) -> int | None:
+    if raw is False or raw is None:
+        return None
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit("orchestra: stall timeout must be an integer number of seconds")
+    if seconds < 0:
+        raise SystemExit("orchestra: stall timeout must be zero or a positive number of seconds")
+    return seconds or None
+
+
 def _terminate_process_group(pid: int) -> None:
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -447,6 +459,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
               checkin_interval: int | None = None,
               checkin_state: dict | None = None,
               delivery_events: list[dict] | None = None,
+              stall_timeout: float | None = None,
               poll_interval: float = PROC_POLL_INTERVAL) -> tuple[str, int | None]:
     """Start one worker process; wait with timeout + early session-ref capture.
     Returns (outcome, exit_code) where outcome is
@@ -478,6 +491,14 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
         have_ref = bool(run["session_ref"])
         pending_after: int | None = None
         boundary_scan_offset = 0
+        # A growing log is the backend-neutral progress signal. Productive work
+        # may continue until the hard deadline; a silent worker gets the shorter
+        # stall timeout.
+        try:
+            last_log_size = os.path.getsize(log_path)
+        except OSError:
+            last_log_size = 0
+        last_progress_at = started
         while True:
             try:
                 exit_code = proc.wait(timeout=max(0.01, min(CONTROL_POLL_INTERVAL,
@@ -566,6 +587,23 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                         )
                         con.commit()
                         checkin_state["last_sent_at"] = now
+            try:
+                sz = os.path.getsize(log_path)
+            except OSError:
+                sz = last_log_size
+            if sz > last_log_size:
+                last_log_size = sz
+                last_progress_at = now
+            if stall_timeout and (now - last_progress_at) >= stall_timeout:
+                con.execute(
+                    "UPDATE runs SET summary=? WHERE id=?",
+                    (f"Stalled: no worker output for "
+                     f"{int(now - last_progress_at)}s (stall_timeout)", run_id),
+                )
+                con.commit()
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
+                return "timeout", None
             if now > deadline:
                 _terminate_process_group(proc.pid)
                 _wait_after_term(proc)
@@ -592,7 +630,13 @@ def supervise(root: Path, run_id: int) -> int:
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cfg = config.load(root)
     agent = config.agent_cfg(cfg, run["agent"])
-    timeout = int(agent.get("timeout") or cfg["settings"].get("timeout", 3600))
+    timeout = int(agent.get("timeout") or cfg["settings"].get(
+        "timeout", config.DEFAULT_RUN_TIMEOUT_SECONDS
+    ))
+    stall_timeout = _stall_timeout_seconds(agent.get(
+        "stall_timeout",
+        cfg["settings"].get("stall_timeout", config.DEFAULT_STALL_TIMEOUT_SECONDS),
+    ))
     checkin_interval = _checkin_interval_seconds(
         agent.get("supervisor_checkin_interval",
                   cfg["settings"].get("supervisor_checkin_interval", DEFAULT_CHECKIN_INTERVAL))
@@ -628,6 +672,7 @@ def supervise(root: Path, run_id: int) -> int:
                                        checkin_interval=checkin_interval,
                                        checkin_state=checkin_state,
                                        delivery_events=delivery_events,
+                                       stall_timeout=stall_timeout,
                                        poll_interval=PROC_POLL_INTERVAL)
         delivery_events = []
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -763,6 +808,8 @@ def supervise(root: Path, run_id: int) -> int:
         exit_code = None
 
     session_ref, last_text = runners.parse_log(run["log_path"])
+    if status == "timeout" and run["summary"] and run["summary"].startswith("Stalled:"):
+        last_text = run["summary"]
     if status == "failed" and run["summary"] and "usage limit" in run["summary"].lower():
         last_text = (
             f"{run['summary']}\n\n"
