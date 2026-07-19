@@ -178,6 +178,7 @@ class SupervisorCheckinTests(unittest.TestCase):
             if resume_ref is None:
                 code = (
                     "import json,time;"
+                    "print(json.dumps('tools'),flush=True);"
                     "print(json.dumps({'sessionID':'ses-checkin'}),flush=True);"
                     "time.sleep(1.2);"
                     "print(json.dumps({'type':'step_finish','part':"
@@ -229,6 +230,51 @@ class SupervisorCheckinTests(unittest.TestCase):
         self.assertEqual(delivery_events[0]["delivery"], "checkin")
         self.assertEqual(delivery_events[0]["sender"], "orchestra")
         self.assertEqual(delivery_events[0]["recipient"], "glm")
+
+
+class ReplyRecoveryTests(unittest.TestCase):
+    def test_reply_recovers_orphaned_interrupt_as_session_followup(self) -> None:
+        tmp, root = _project(checkin_interval=0)
+        self.addCleanup(tmp.cleanup)
+        run_id = _insert_run(root)
+        con = db.connect(root)
+        try:
+            con.execute(
+                "UPDATE runs SET status='interrupt', session_ref='ses-orphan', pid=4321 "
+                "WHERE id=?",
+                (run_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        cfg = {"settings": {"default_requester": "orchestrator"}}
+        args = Namespace(
+            run_id=run_id,
+            message=["Continue", "after", "the", "check-in"],
+            as_="claude",
+            sync=False,
+        )
+        with mock.patch.object(cli.paths, "find_root", return_value=root), \
+                mock.patch.object(cli.config, "load", return_value=cfg), \
+                mock.patch.object(cli, "_spawn_supervisor") as spawn, \
+                mock.patch("builtins.print"):
+            cli.cmd_reply(args)
+
+        con = db.connect(root)
+        try:
+            original = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            followup = con.execute(
+                "SELECT * FROM runs WHERE parent_run=? ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(original["status"], "killed")
+        self.assertIsNotNone(original["finished_at"])
+        self.assertEqual(followup["session_ref"], "ses-orphan")
+        self.assertEqual(followup["status"], "spawning")
+        spawn.assert_called_once_with(root, followup["id"])
 
 
 class InterruptMessageTests(unittest.TestCase):

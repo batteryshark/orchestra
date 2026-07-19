@@ -397,11 +397,32 @@ def cmd_reply(args):
     parent = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
     if not parent:
         raise SystemExit(f"orchestra: no run {args.run_id}")
-    if parent["status"] not in db.RUN_TERMINAL:
+    if parent["status"] not in db.RUN_TERMINAL + ("interrupt",):
         raise SystemExit(f"orchestra: run {args.run_id} is still {parent['status']} — "
                          "use `orchestra send` to leave it a message instead")
     if not parent["session_ref"]:
         raise SystemExit(f"orchestra: run {args.run_id} has no session ref; dispatch a fresh run")
+    if parent["status"] == "interrupt":
+        # A detached supervisor may have died after stopping its worker but
+        # before launching the session resume. Make `reply` an explicit,
+        # recoverable handoff: terminalize the orphan before creating its child.
+        con.execute("BEGIN IMMEDIATE")
+        fresh = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
+        if fresh["status"] == "interrupt":
+            con.execute(
+                "UPDATE runs SET status='killed', finished_at=COALESCE(finished_at, ?) "
+                "WHERE id=? AND status='interrupt'",
+                (db.now(), args.run_id),
+            )
+            con.execute("COMMIT")
+        else:
+            con.execute("ROLLBACK")
+            if fresh["status"] not in db.RUN_TERMINAL:
+                raise SystemExit(
+                    f"orchestra: run {args.run_id} resumed while reply was starting — "
+                    "use `orchestra send` to leave it a message instead"
+                )
+        parent = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
     requester = _identity(args, cfg) or parent["requested_by"]
     msg = " ".join(args.message)
     followup = (f"{msg}\n\n(Orchestra follow-up on run {args.run_id}. First check "
