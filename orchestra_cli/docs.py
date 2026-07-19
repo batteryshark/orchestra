@@ -205,7 +205,8 @@ PROJECT_CONFIG_STUB = """\
 # role = "..."
 
 [settings]
-# timeout = 3600
+# timeout = 36000        # hard cap for runaway workers (10 hours)
+# stall_timeout = 1800   # no worker output before termination; 0 disables
 """
 
 STATE_GITIGNORE = """\
