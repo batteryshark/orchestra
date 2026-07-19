@@ -312,6 +312,8 @@ def _recent_logged_delivery_ids(log_path: str | None, max_bytes: int = 1_000_000
             event = json.loads(raw)
         except (UnicodeDecodeError, ValueError):
             continue
+        if not isinstance(event, dict):
+            continue
         if event.get("type") != "orchestra.delivery":
             continue
         try:
@@ -692,6 +694,16 @@ def supervise(root: Path, run_id: int) -> int:
                 status = "failed"  # can't resume; cli guards against this
                 break
             resume_ref = run["session_ref"]
+            claimed = con.execute(
+                "UPDATE runs SET status='running' WHERE id=? AND status=?",
+                (run_id, run["status"]),
+            )
+            con.commit()
+            if claimed.rowcount != 1:
+                latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+                status = latest["status"] if latest and latest["status"] in db.RUN_TERMINAL \
+                    else "failed"
+                break
             newly_delivered = _mark_pending_delivered(con, run_id)
             con.commit()
             for event in newly_delivered:
@@ -718,8 +730,6 @@ def supervise(root: Path, run_id: int) -> int:
                       f"normal HANDOFF to {run['requested_by']} "
                       f"(`orchestra send {run['requested_by']} \"HANDOFF run {run_id}: ...\" "
                       f"--as {run['agent']} --run {run_id}`).")
-            con.execute("UPDATE runs SET status='running' WHERE id=?", (run_id,))
-            con.commit()
             continue
         status = "done" if exit_code == 0 else "failed"
         break
