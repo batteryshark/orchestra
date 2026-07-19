@@ -826,7 +826,11 @@ def cmd_usage(args):
               f"({rec.get('headroom_percent'):.0f}% headroom across coding windows)")
     else:
         print("  (no provider returned a usable coding headroom yet)")
-    for row in snap.get("providers") or []:
+    provider_rows = snap.get("providers") or []
+    provider_name_width = max(
+        8, *(len(str(row.get("name") or "")) for row in provider_rows)
+    )
+    for row in provider_rows:
         plan = row.get("plan") or "—"
         headroom = row.get("headroom_percent")
         headroom_s = f"{headroom:.0f}%" if isinstance(headroom, (int, float)) else "n/a"
@@ -835,7 +839,7 @@ def cmd_usage(args):
         # providers leave it None and we render the count line only when
         # the wire carries an actual Codex reset-credit record.
         reset_note = _format_reset_credits(resets)
-        print(f"  {row.get('name'):<8} [{row.get('status'):<12}] {plan:<22} "
+        print(f"  {row.get('name'):<{provider_name_width}} [{row.get('status'):<12}] {plan:<22} "
               f"headroom {headroom_s}{reset_note}")
 
     print()

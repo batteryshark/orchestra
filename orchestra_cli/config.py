@@ -49,6 +49,17 @@ model = "zhipuai-coding-plan/glm-5.2"
 variant = "max"
 role = "heavy reasoning tier — hard design/debugging (pairs with codex xhigh)"
 
+[agents.kimi]
+backend = "opencode"
+model = "kimi-for-coding/k3"
+role = "flagship Kimi generalist — complex coding, long context, and visual work"
+
+[agents.kimi-max]
+backend = "opencode"
+model = "kimi-for-coding/k3"
+variant = "max"
+role = "Kimi K3 max-thinking tier — hard design, debugging, and integration work"
+
 [agents.codex]
 backend = "codex"
 # model omitted -> uses ~/.codex/config.toml default (gpt-5.6-sol)

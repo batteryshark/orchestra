@@ -62,6 +62,8 @@ Route by difficulty — don't burn the heavy tiers on grunt work:
 - `minimax` — MiniMax-M3 · THE DEFAULT. Routine implementation, ports, mechanical
   refactors, test writing (the "Sonnet" tier).
 - `glm` — GLM-5.2 · standard tier for normal feature work needing more judgment.
+- `kimi` — Kimi K3 · flagship generalist for complex coding, long-context, and visual work.
+- `kimi-max` — Kimi K3 variant=max · heavy reasoning for hard design and integration work.
 - `codex-55` — gpt-5.5 (high) · fast solid engineer for medium tasks.
 - `glm-max` — GLM-5.2 variant=max · heavy reasoning: hard design, gnarly debugging.
 - `codex` — gpt-5.6 (xhigh) · REALLY tough thinking only; slow and expensive — use sparingly.
@@ -71,7 +73,7 @@ Optional integrations such as OpenCode Ensemble are not in the default roster. A
 explicitly in Orchestra configuration after installing their external runtime;
 `orchestra doctor` checks integrations that are actually configured.
 
-Good pattern: minimax implements → glm reviews; or glm-max/codex design → minimax executes.
+Good pattern: minimax implements → glm or kimi reviews; or glm-max/kimi-max/codex designs → minimax executes.
 
 ## Rules of engagement
 

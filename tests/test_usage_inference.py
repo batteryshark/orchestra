@@ -49,6 +49,13 @@ class InferProviderTests(unittest.TestCase):
         self.assertEqual(infer_provider("opencode", "zhipuai-coding-plan/glm-5.2"), "zai")
         self.assertEqual(infer_provider("opencode", "zai-coding-plan/glm-5.2"), "zai")
 
+    def test_maps_kimi_for_coding_to_kimi(self) -> None:
+        self.assertEqual(infer_provider("opencode", "kimi-for-coding/k3"), "kimi")
+        self.assertEqual(
+            infer_provider("opencode", "kimi-for-coding/kimi-for-coding-highspeed"),
+            "kimi",
+        )
+
     def test_claude_backend_maps_to_claude(self) -> None:
         # Coding-plan quota only follows the dedicated Claude backend; bare
         # Anthropic claude-* models over opencode are NOT coding-plan quota.

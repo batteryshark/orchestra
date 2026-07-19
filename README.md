@@ -125,7 +125,7 @@ Port `4764` is preferred. An implicit port may safely fall back when busy; an ex
 
 ## Provider runway
 
-The dashboard links to `/runway`, which combines cached coding-plan quota from configured MiniMax, Claude, Z.AI, and Codex accounts. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
+The dashboard links to `/runway`, which combines cached coding-plan quota from configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
 
 ![Provider runway with fictional balances](docs/screenshots/provider-runway.jpg)
 
@@ -138,6 +138,8 @@ Claude usage refreshes from Claude Code's live `/usage` view in the background. 
 Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and configured optional integrations.
 
 Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra reply` resumes the same worker rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+
+The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables the max-thinking variant for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
 
 ### Optional OpenCode Ensemble integration
 

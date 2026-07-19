@@ -39,6 +39,12 @@ class DefaultRosterTests(unittest.TestCase):
     def test_default_roster_does_not_include_ensemble(self) -> None:
         self.assertNotIn("ensemble", default_config()["agents"])
 
+    def test_default_roster_includes_kimi_k3_tiers(self) -> None:
+        agents = default_config()["agents"]
+        self.assertEqual(agents["kimi"]["model"], "kimi-for-coding/k3")
+        self.assertEqual(agents["kimi-max"]["model"], "kimi-for-coding/k3")
+        self.assertEqual(agents["kimi-max"]["variant"], "max")
+
 
 class PluginDetectionTests(unittest.TestCase):
     def setUp(self) -> None:

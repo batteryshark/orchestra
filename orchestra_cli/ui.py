@@ -61,6 +61,10 @@ def _fmt(v, limit=MAX_OUTPUT) -> str:
     return v if len(v) <= limit else v[:limit] + f"\n… [+{len(v) - limit} chars]"
 
 
+def _visible_text(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def parse_transcript(text: str) -> list[dict]:
     """Best-effort JSONL -> ordered transcript items across the three backend
     event formats (opencode --format json, codex --json, claude stream-json).
@@ -70,6 +74,8 @@ def parse_transcript(text: str) -> list[dict]:
     index: dict = {}
 
     def add(key, item):
+        if item.get("kind") in ("text", "thinking") and not _visible_text(item.get("body")):
+            return
         if key is not None and key in index:
             index[key].update({k: v for k, v in item.items() if v not in (None, "")})
         else:
@@ -206,9 +212,13 @@ def teammate_transcript(session_id: str) -> tuple[list[dict], str]:
                                   + (" …" if len(body) > 400 else "")})
                 continue
             if pt == "text":
-                items.append({"kind": "text", "body": p.get("text", "")})
+                body = p.get("text", "")
+                if _visible_text(body):
+                    items.append({"kind": "text", "body": body})
             elif pt == "reasoning":
-                items.append({"kind": "thinking", "body": p.get("text", "")})
+                body = p.get("text", "")
+                if _visible_text(body):
+                    items.append({"kind": "thinking", "body": body})
             elif pt == "tool":
                 st = p.get("state") or {}
                 items.append({"kind": "tool", "name": p.get("tool", "tool"),

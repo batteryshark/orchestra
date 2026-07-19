@@ -15,6 +15,7 @@ from orchestra_cli.usage.models import ProviderResult, error_result, utc_now_iso
 from orchestra_cli.usage.providers import (
     collect_claude,
     collect_codex,
+    collect_kimi,
     collect_minimax,
     collect_zai,
 )
@@ -32,6 +33,7 @@ class HistorySample:
 
 DEFAULT_COLLECTORS: tuple[tuple[str, str, Collector], ...] = (
     ("minimax", "MiniMax", collect_minimax),
+    ("kimi", "Moonshot AI", collect_kimi),
     ("claude", "Claude", collect_claude),
     ("zai", "Z.AI", collect_zai),
     ("codex", "Codex", collect_codex),
@@ -88,7 +90,7 @@ class UsageService:
 
     def _collect(self) -> dict[str, Any]:
         results: dict[str, ProviderResult] = {}
-        max_workers = max(1, min(4, len(self._collectors)))
+        max_workers = max(1, min(8, len(self._collectors)))
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="quota") as pool:
             futures = {
                 pool.submit(collector): (provider_id, name)

@@ -18,8 +18,47 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from orchestra_cli import db, ui
+
+
+class TranscriptNormalizationTests(unittest.TestCase):
+    def test_suppresses_kimi_placeholder_reasoning_without_losing_real_thinking(self) -> None:
+        events = [
+            {"part": {"type": "reasoning", "id": "empty", "text": ""}},
+            {"part": {"type": "reasoning", "id": "spaces", "text": "  \n"}},
+            {"part": {"type": "reasoning", "id": "real", "text": "Inspect the loader."}},
+            # A streaming placeholder must not reserve the key and prevent a
+            # later populated update from appearing.
+            {"part": {"type": "reasoning", "id": "streamed", "text": ""}},
+            {"part": {"type": "reasoning", "id": "streamed", "text": "Now patch it."}},
+        ]
+        transcript = ui.parse_transcript("\n".join(json.dumps(event) for event in events))
+
+        thinking = [item["body"] for item in transcript if item["kind"] == "thinking"]
+        self.assertEqual(thinking, ["Inspect the loader.", "Now patch it."])
+
+    def test_teammate_transcript_suppresses_empty_reasoning_parts(self) -> None:
+        payload = json.dumps(
+            [
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [
+                        {"type": "reasoning", "text": ""},
+                        {"type": "reasoning", "text": "Useful thought"},
+                    ],
+                }
+            ]
+        ).encode()
+        response = mock.Mock()
+        response.read.return_value = payload
+        with mock.patch.object(ui.host, "url", return_value="http://host"), mock.patch.object(
+            ui.urllib.request, "urlopen", return_value=response
+        ):
+            items, _ = ui.teammate_transcript("session")
+
+        self.assertEqual(items, [{"kind": "thinking", "body": "Useful thought"}])
 
 
 class DetailSerializationTests(unittest.TestCase):
