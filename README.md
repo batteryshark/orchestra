@@ -176,7 +176,7 @@ The dashboard's right-side runway rail keeps the current headroom for configured
 
 `orchestra usage` prints the same state in the terminal. Before dispatch, Orchestra can warn when a target's known coding-plan headroom is at or below 20 percent. The advisory never reroutes a run and fails open if usage is unavailable. Disable it with `quota_warn = false` or `--no-quota-warn`.
 
-Claude usage refreshes from Claude Code's live `/usage` view in the background. If that endpoint is unavailable or rate-limited, Orchestra labels the card cached and hides the old percentages instead of presenting them as current.
+Claude usage refreshes from Claude Code's live `/usage` view in the background. While a refresh is pending or unavailable, Orchestra keeps the last known percentages visible, labels them cached, and reports their age instead of presenting them as current.
 
 ## Configuration
 
