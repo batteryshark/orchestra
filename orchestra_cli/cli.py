@@ -687,20 +687,53 @@ def cmd_interrupt(args):
                          "(happens ~10s after spawn) — retry in a moment, or `orchestra send` "
                          "to queue the message")
     sender = _identity(args, cfg)
-    con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
-                "VALUES(?,?,?,?, 'interrupt', ?)",
-                (sender, r["agent"], f"[INTERRUPT] {' '.join(args.message)}",
-                 args.run_id, db.now()))
-    con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (args.run_id,))
+    body = " ".join(args.message)
+    created_at = db.now()
+    immediate = bool(getattr(args, "now", False))
+    if not immediate and int(r["supervisor_protocol"] or 0) < 1:
+        con.close()
+        raise SystemExit(
+            f"orchestra: run {args.run_id}'s detached supervisor predates safe interrupts; "
+            f"use `orchestra interrupt {args.run_id} \"...\" --now`, or stop and reply "
+            "to resume it under the current supervisor"
+        )
+    cur = con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, "
+                      "created_at, delivered_at) VALUES(?,?,?,?, 'interrupt', ?, ?)",
+                      (sender, r["agent"], f"[INTERRUPT] {body}",
+                       args.run_id, created_at, created_at if immediate else None))
+    message_id = int(cur.lastrowid)
+    if immediate:
+        con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (args.run_id,))
+    con.commit()
+    delivery_offset = supervise.append_delivery_event(r["log_path"], {
+        "message_id": message_id,
+        "delivery": "interrupt",
+        "sender": sender,
+        "recipient": r["agent"],
+        "body": body,
+        "created_at": created_at,
+        "phase": "delivered" if immediate else "pending",
+    })
+    if delivery_offset is None:
+        try:
+            delivery_offset = Path(r["log_path"]).stat().st_size
+        except (OSError, TypeError):
+            delivery_offset = 0
+    con.execute("UPDATE messages SET delivery_offset=? WHERE id=?",
+                (delivery_offset, message_id))
     con.commit()
     con.close()
-    if r["pid"]:
+    if immediate and r["pid"]:
         try:
             os.killpg(r["pid"], signal.SIGTERM)
         except ProcessLookupError:
             pass
-    print(f"run {args.run_id} interrupted — worker will resume its session, read the "
-          f"message, and continue the mission")
+    if immediate:
+        print(f"run {args.run_id} interrupted now — worker will resume its session, read "
+              "the message, and continue the mission")
+    else:
+        print(f"interrupt scheduled for run {args.run_id}'s next safe action boundary; "
+              f"use `orchestra interrupt {args.run_id} \"...\" --now` for an emergency stop")
 
 
 def cmd_kill(args):
@@ -743,7 +776,7 @@ def cmd_feed(args):
         params.append(f"%{args.tag}%")
     q += " ORDER BY id DESC LIMIT ?"
     params.append(args.limit)
-    rows = list(con.execute(q, params))[::-1]
+    rows = list(con.execute(q, params))
     if not rows:
         print("(feed empty)")
     for r in rows:
@@ -1296,9 +1329,11 @@ def main():
     s.set_defaults(fn=cmd_answer)
 
     s = sub.add_parser("interrupt", help="guaranteed delivery to a RUNNING worker: "
-                                         "pause it, inject the message, resume the mission")
+                                         "deliver at the next safe action boundary")
     s.add_argument("run_id", type=int)
     s.add_argument("message", nargs="+")
+    s.add_argument("--now", action="store_true",
+                   help="stop immediately instead of waiting for a safe boundary")
     ident(s)
     s.set_defaults(fn=cmd_interrupt)
 

@@ -16,11 +16,11 @@ Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocki
 
 - Dispatches independent or parallel runs to Codex, Claude Code, and OpenCode backends.
 - Gives every run a memorable name such as `brisk_otter`; numeric run IDs remain the authoritative reference.
-- Resumes the same agent session with `reply`, or redirects it immediately with `interrupt`.
+- Resumes the same agent session with `reply`, or redirects it safely between actions with `interrupt`.
 - Coordinates workers through inboxes, teams, and a shared findings feed.
 - Keeps backend and model configuration visible in the run details pane.
 - Registers many project roots behind one long-running dashboard and project picker.
-- Shows normalized coding-plan headroom on a separate provider runway without sending credentials to the browser.
+- Keeps normalized coding-plan headroom in a compact dashboard rail with an expandable provider drawer, without sending credentials to the browser.
 - Serves on loopback by default or on the machine's Tailscale address when explicitly requested.
 
 ## Install from source
@@ -54,6 +54,7 @@ orchestra wait
 orchestra inbox codex --unread --mark-read
 orchestra reply 7 "good; now cover malformed input"
 orchestra interrupt 8 "stop—the schema changed" --as codex
+orchestra interrupt 8 "stop immediately" --now --as codex
 orchestra logs 7 --pretty
 ```
 
@@ -62,6 +63,8 @@ Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion 
 Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
 
 Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
+
+`orchestra interrupt` waits for the next completed action boundary reported by the active backend before stopping and resuming the worker, so routine redirection does not terminate a tool during a file write. OpenCode step finishes, Codex completed tool items, and Claude tool results are recognized. Use `--now` only when stopping immediately is more important than preserving the current tool operation. If the worker exits before another boundary, Orchestra resumes the same session immediately with the pending message. Periodic supervisor check-ins use the same safe path.
 
 ## Hand off a wave to another orchestrator
 
@@ -128,9 +131,7 @@ Port `4764` is preferred. An implicit port may safely fall back when busy; an ex
 
 ## Provider runway
 
-The dashboard links to `/runway`, which combines cached coding-plan quota from configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
-
-![Provider runway with fictional balances](docs/screenshots/provider-runway.jpg)
+The dashboard's right-side runway rail keeps the current headroom for configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts visible while you work. Select a provider—or the Usage button on narrower screens—to open quota windows and refresh controls without leaving the dashboard. Existing `/runway` bookmarks open this drawer. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
 
 `orchestra usage` prints the same state in the terminal. Before dispatch, Orchestra can warn when a target's known coding-plan headroom is at or below 20 percent. The advisory never reroutes a run and fails open if usage is unavailable. Disable it with `quota_warn = false` or `--no-quota-warn`.
 

@@ -23,7 +23,6 @@ header .brand { display:inline-flex; align-items:center; gap:10px;
 header h1 { margin:0; font-size:inherit; font-weight:inherit; letter-spacing:inherit }
 header .root { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px }
 header nav { margin-left:auto; display:flex; gap:12px; align-items:center }
-header a.nav-link { color:var(--blue); text-decoration:none; font-size:13px }
 .proj-sel { position:relative; display:inline-flex }
 .proj-btn { display:inline-flex; align-items:center; gap:7px;
   font:inherit; font-size:13px; padding:4px 10px; color:var(--ink);
@@ -86,6 +85,7 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .titem.delivery.interrupt { border-left-color:var(--red);
   background:color-mix(in srgb, var(--red) 6%, transparent) }
 .titem.delivery.checkin { border-left-color:var(--think) }
+.titem.delivery.pending { border-left-color:var(--amber); border-style:dashed }
 .titem.delivery .event-title { font-size:12px; font-weight:700; letter-spacing:.035em;
   text-transform:uppercase }
 .titem.delivery .event-route { color:var(--muted); font-size:11.5px; margin-left:7px }
@@ -136,6 +136,97 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
 .feeditem:last-child { border-bottom:none }
 #beat { width:8px; height:8px; border-radius:50%; background:var(--green);
   display:inline-block; margin-left:6px }
+
+/* provider runway dock */
+.runway-dock { position:fixed; inset:0 0 0 auto; z-index:80; pointer-events:none }
+.runway-rail { position:absolute; top:74px; right:10px; width:62px; max-height:calc(100vh - 88px);
+  display:flex; flex-direction:column; gap:7px; padding:7px; overflow-y:auto; pointer-events:auto;
+  background:color-mix(in srgb, var(--card) 94%, transparent); border:1px solid var(--line);
+  border-radius:12px; box-shadow:0 10px 28px rgba(0,0,0,.16); backdrop-filter:blur(14px) }
+.runway-toggle { display:flex; align-items:center; justify-content:center; width:46px; min-height:36px;
+  padding:5px; color:var(--ink); background:var(--card); border-radius:8px }
+.runway-toggle:hover { background:var(--sel) }
+.runway-toggle svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8 }
+.runway-rail-provider { display:flex; flex-direction:column; align-items:center; gap:2px; width:46px;
+  min-height:48px; padding:5px 2px; color:var(--ink); border:0; border-radius:8px; background:transparent }
+.runway-rail-provider:hover { background:var(--sel) }
+.runway-monogram { display:grid; place-items:center; width:24px; height:24px; border-radius:7px;
+  color:var(--muted); background:color-mix(in srgb, var(--muted) 11%, transparent);
+  font-size:9px; font-weight:750; letter-spacing:.02em }
+.runway-rail-value { font-size:10px; font-weight:700; line-height:1.1 }
+.runway-rail-provider.healthy .runway-rail-value { color:var(--green) }
+.runway-rail-provider.watch .runway-rail-value { color:var(--amber) }
+.runway-rail-provider.critical .runway-rail-value { color:var(--red) }
+.runway-rail-provider.unavailable { opacity:.55 }
+.runway-backdrop { position:fixed; inset:0; pointer-events:auto; background:rgba(5,8,12,.24);
+  opacity:0; transition:opacity .18s; backdrop-filter:blur(1px) }
+.runway-drawer { position:fixed; inset:0 0 0 auto; width:min(390px, calc(100vw - 32px));
+  display:flex; flex-direction:column; pointer-events:auto; background:var(--bg);
+  border-left:1px solid var(--line); box-shadow:-18px 0 48px rgba(0,0,0,.2);
+  transform:translateX(102%); transition:transform .22s ease }
+.runway-dock.open .runway-backdrop { opacity:1 }
+.runway-dock.open .runway-drawer { transform:translateX(0) }
+.runway-drawer-head { display:flex; align-items:flex-start; gap:10px; padding:17px 16px 13px;
+  border-bottom:1px solid var(--line) }
+.runway-drawer-head h2 { margin:0; font-size:15px; letter-spacing:-.01em }
+.runway-drawer-head p { margin:2px 0 0; color:var(--muted); font-size:11px }
+.runway-drawer-actions { display:flex; gap:6px; margin-left:auto }
+.runway-icon-button { display:grid; place-items:center; width:30px; height:30px; padding:0;
+  color:var(--muted); background:var(--card) }
+.runway-icon-button:hover { color:var(--ink); background:var(--sel) }
+.runway-icon-button svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8;
+  stroke-linecap:round; stroke-linejoin:round }
+.runway-icon-button.loading svg { animation:runway-spin .8s linear infinite }
+@keyframes runway-spin { to { transform:rotate(360deg) } }
+.runway-summary { display:flex; align-items:center; gap:9px; padding:10px 16px;
+  color:var(--muted); border-bottom:1px solid var(--line); font-size:11px }
+.runway-live-dot { width:7px; height:7px; flex:0 0 auto; border-radius:50%; background:var(--amber) }
+.runway-summary.online .runway-live-dot { background:var(--green) }
+.runway-summary.offline .runway-live-dot { background:var(--red) }
+.runway-updated { margin-left:auto }
+.runway-providers { flex:1; min-height:0; overflow-y:auto; padding:10px }
+.runway-provider { margin-bottom:8px; overflow:hidden; background:var(--card);
+  border:1px solid var(--line); border-radius:10px }
+.runway-provider summary { min-height:58px; padding:9px 10px; border:0 }
+.runway-provider[open] summary { border-bottom:1px solid var(--line) }
+.runway-provider-title { min-width:0; flex:1 }
+.runway-provider-title strong,.runway-provider-title span { display:block; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap }
+.runway-provider-title span { color:var(--muted); font-size:10px }
+.runway-headroom { font-size:15px; font-weight:720 }
+.runway-headroom.healthy { color:var(--green) }
+.runway-headroom.watch { color:var(--amber) }
+.runway-headroom.critical { color:var(--red) }
+.runway-provider-body { padding:9px 10px 10px }
+.runway-quota { margin:7px 0 11px }
+.runway-quota-head { display:flex; justify-content:space-between; gap:8px; font-size:11px }
+.runway-quota-head span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.runway-track { height:5px; margin-top:5px; overflow:hidden; border-radius:99px;
+  background:color-mix(in srgb, var(--muted) 15%, transparent) }
+.runway-fill { height:100%; border-radius:inherit; background:var(--green) }
+.runway-quota.watch .runway-fill { background:var(--amber) }
+.runway-quota.critical .runway-fill { background:var(--red) }
+.runway-quota-meta,.runway-provider-message { margin-top:4px; color:var(--muted); font-size:10px }
+.runway-credits { margin:2px 0 10px; padding:7px 8px; color:var(--muted);
+  background:color-mix(in srgb, var(--blue) 5%, transparent); border:1px solid var(--line);
+  border-radius:7px; font-size:10px }
+.runway-credits strong { color:var(--ink) }
+.runway-empty { padding:5px 0; color:var(--muted); font-size:11px }
+.runway-error { padding:20px 12px; color:var(--muted); text-align:center; font-size:12px }
+@media (min-width:1200px) {
+  body { padding-right:80px }
+  .runway-backdrop { display:none }
+}
+@media (max-width:1199px) {
+  .runway-rail { top:auto; right:14px; bottom:14px; width:auto; padding:0; overflow:visible;
+    border:0; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.22) }
+  .runway-rail-provider { display:none }
+  .runway-toggle { width:auto; min-width:48px; padding:7px 10px; gap:7px }
+  .runway-toggle::after { content:"Usage"; font-size:12px; font-weight:650 }
+}
+@media (max-width:520px) {
+  .runway-drawer { inset:0; width:auto }
+}
 </style></head><body>
  <header><a class="brand" href="/" aria-label="orchestra">
    <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
@@ -149,7 +240,7 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
   </button>
   <div class="proj-menu" id="projMenu" role="listbox" aria-label="Orchestra projects" hidden></div>
 </div>
-<nav><a class="nav-link" href="/runway">provider runway</a></nav></header>
+<nav></nav></header>
 <main>
 <div class="cols">
   <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
@@ -167,12 +258,172 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
     <h2>Teams</h2><div class="scrollbox" id="teams" style="max-height:12vh"></div></div>
 </div>
 </main>
+<aside class="runway-dock" id="runwayDock" aria-label="Provider runway">
+  <div class="runway-backdrop" id="runwayBackdrop" hidden></div>
+  <div class="runway-rail" id="runwayRail">
+    <button class="runway-toggle" id="runwayToggle" type="button" aria-label="Open provider runway" aria-controls="runwayDrawer" aria-expanded="false">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 15.5V11m5.5 4.5v-11m5.5 11V8"/></svg>
+    </button>
+  </div>
+  <section class="runway-drawer" id="runwayDrawer" aria-labelledby="runwayTitle" aria-hidden="true" inert>
+    <div class="runway-drawer-head">
+      <div><h2 id="runwayTitle">Provider runway</h2><p>Live coding-plan headroom</p></div>
+      <div class="runway-drawer-actions">
+        <button class="runway-icon-button" id="runwayRefresh" type="button" aria-label="Refresh provider usage">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.8 6.2A7 7 0 1 0 17 10M15.8 6.2V2.8m0 3.4h-3.4"/></svg>
+        </button>
+        <button class="runway-icon-button" id="runwayClose" type="button" aria-label="Close provider runway">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="runway-summary" id="runwaySummary"><span class="runway-live-dot"></span><span id="runwaySignal">Connecting</span><span class="runway-updated" id="runwayUpdated"></span></div>
+    <div class="runway-providers" id="runwayProviders" aria-live="polite"><div class="runway-error">Checking providers…</div></div>
+  </section>
+</aside>
 <script>
 const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = null, selected = null, selTm = null, userPicked = false, tEtag = null;
 let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
 const TERMINAL = new Set(['done','failed','timeout','killed']);
 const stopping = new Set();
+
+// --- provider runway (global control-plane signal) ----------------------
+// Usage is account-wide rather than project-specific, so this request does
+// not carry the selected-project header. The compact rail remains visible
+// while the drawer is closed; opening a provider reveals its quota windows.
+const runwayDock = document.getElementById('runwayDock');
+const runwayRail = document.getElementById('runwayRail');
+const runwayDrawer = document.getElementById('runwayDrawer');
+const runwayToggle = document.getElementById('runwayToggle');
+const runwayBackdrop = document.getElementById('runwayBackdrop');
+const runwayProviders = document.getElementById('runwayProviders');
+const runwaySummary = document.getElementById('runwaySummary');
+const runwaySignal = document.getElementById('runwaySignal');
+const runwayUpdated = document.getElementById('runwayUpdated');
+const runwayRefresh = document.getElementById('runwayRefresh');
+const RUNWAY_OPEN_KEY = 'orchestra.runway.open';
+const RUNWAY_MONOGRAMS = {minimax:'MM', kimi:'K', claude:'CL', zai:'Z', codex:'CX'};
+let runwayLoading = false;
+
+function runwayTone(value){
+  if (value == null || !Number.isFinite(Number(value))) return 'unavailable';
+  if (Number(value) <= 15) return 'critical';
+  if (Number(value) <= 35) return 'watch';
+  return 'healthy';
+}
+function runwayPercent(value){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${Number.isInteger(n) ? n : n.toFixed(1)}%`;
+}
+function runwayReset(value){
+  const target = new Date(value).getTime();
+  if (!Number.isFinite(target)) return 'reset unknown';
+  let minutes = Math.max(0, Math.floor((target - Date.now()) / 60000));
+  const days = Math.floor(minutes / 1440); minutes %= 1440;
+  const hours = Math.floor(minutes / 60); minutes %= 60;
+  if (days) return `resets in ${days}d ${hours}h`;
+  if (hours) return `resets in ${hours}h ${minutes}m`;
+  return minutes ? `resets in ${minutes}m` : 'resetting now';
+}
+function runwaySetOpen(open, {remember=true}={}){
+  runwayDock.classList.toggle('open', open);
+  runwayToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  runwayToggle.setAttribute('aria-label', open ? 'Close provider runway' : 'Open provider runway');
+  runwayDrawer.setAttribute('aria-hidden', open ? 'false' : 'true');
+  runwayDrawer.toggleAttribute('inert', !open);
+  runwayBackdrop.hidden = !open;
+  if (remember) {
+    try { localStorage.setItem(RUNWAY_OPEN_KEY, open ? '1' : '0'); } catch(e){}
+  }
+}
+function runwayOpenProvider(id){
+  runwaySetOpen(true);
+  requestAnimationFrame(() => {
+    const card = runwayProviders.querySelector(`[data-runway-provider="${CSS.escape(id)}"]`);
+    if (!card) return;
+    card.open = true;
+    card.scrollIntoView({block:'nearest'});
+  });
+}
+function runwayWindowHtml(quota){
+  const remaining = Number(quota.remaining_percent);
+  const bounded = Number.isFinite(remaining) ? Math.max(0, Math.min(100, remaining)) : 0;
+  const tone = runwayTone(remaining);
+  const burn = Number.isFinite(Number(quota.burn_rate_percent_per_hour))
+    ? ` · −${runwayPercent(quota.burn_rate_percent_per_hour)}/hr` : '';
+  return `<div class="runway-quota ${tone}">
+    <div class="runway-quota-head"><span><b>${esc(quota.label)}</b> · ${esc(quota.scope)}</span><b>${esc(runwayPercent(remaining))}</b></div>
+    <div class="runway-track" role="progressbar" aria-label="${esc(quota.label)} remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${bounded}"><div class="runway-fill" style="width:${bounded}%"></div></div>
+    <div class="runway-quota-meta">${esc(quota.resets_at ? runwayReset(quota.resets_at) : 'reset unknown')}${esc(burn)}</div>
+  </div>`;
+}
+function runwayCreditsHtml(credits){
+  if (!credits) return '';
+  const count = Number(credits.available_count);
+  if (!Number.isInteger(count) || count < 0) return '';
+  const label = count === 1 ? 'reset credit' : 'reset credits';
+  const expiry = credits.expires_at ? ` · ${runwayReset(credits.expires_at).replace('resets', 'expires')}` : '';
+  return `<div class="runway-credits"><strong>${esc(count)} ${label}</strong> available${esc(expiry)}</div>`;
+}
+function runwayProviderHtml(provider, wasOpen){
+  const windows = Array.isArray(provider.windows) ? provider.windows : [];
+  const tone = runwayTone(provider.headroom_percent);
+  const status = provider.status === 'ok' ? 'live' : provider.status === 'stale' ? 'cached' : provider.status === 'auth_required' ? 'login needed' : provider.status === 'not_configured' ? 'setup needed' : 'offline';
+  const body = windows.length ? windows.map(runwayWindowHtml).join('') :
+    `<div class="runway-empty">${esc(provider.message || 'No usage snapshot is available.')}</div>`;
+  return `<details class="runway-provider" data-runway-provider="${esc(provider.id)}" ${wasOpen ? 'open' : ''}>
+    <summary><span class="runway-monogram" aria-hidden="true">${esc(RUNWAY_MONOGRAMS[provider.id] || provider.name.slice(0,2))}</span>
+      <span class="runway-provider-title"><strong>${esc(provider.name)}</strong><span>${esc(provider.plan || 'Coding plan')} · ${esc(status)}</span></span>
+      <span class="runway-headroom ${tone}">${esc(runwayPercent(provider.headroom_percent))}</span></summary>
+    <div class="runway-provider-body">${runwayCreditsHtml(provider.rate_limit_resets)}${body}${provider.source ? `<div class="runway-provider-message">via ${esc(provider.source)}</div>` : ''}</div>
+  </details>`;
+}
+function renderRunway(data){
+  const providers = Array.isArray(data.providers) ? data.providers : [];
+  const openProviders = new Set([...runwayProviders.querySelectorAll('details[open]')].map(el => el.dataset.runwayProvider));
+  runwayProviders.innerHTML = providers.map(provider => runwayProviderHtml(provider, openProviders.has(provider.id))).join('') ||
+    '<div class="runway-error">No providers are configured.</div>';
+  runwayRail.querySelectorAll('.runway-rail-provider').forEach(el => el.remove());
+  providers.forEach(provider => {
+    const tone = runwayTone(provider.headroom_percent);
+    const button = document.createElement('button');
+    button.className = `runway-rail-provider ${tone}`;
+    button.type = 'button';
+    button.title = `${provider.name}: ${runwayPercent(provider.headroom_percent)} headroom`;
+    button.setAttribute('aria-label', button.title);
+    button.innerHTML = `<span class="runway-monogram" aria-hidden="true">${esc(RUNWAY_MONOGRAMS[provider.id] || provider.name.slice(0,2))}</span><span class="runway-rail-value">${esc(runwayPercent(provider.headroom_percent))}</span>`;
+    button.addEventListener('click', () => runwayOpenProvider(provider.id));
+    runwayRail.appendChild(button);
+  });
+  const generated = new Date(data.generated_at);
+  runwayUpdated.textContent = Number.isFinite(generated.getTime())
+    ? generated.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '';
+}
+async function refreshRunway({force=false}={}){
+  if (runwayLoading) return;
+  runwayLoading = true;
+  runwayRefresh.disabled = true;
+  runwayRefresh.classList.add('loading');
+  try {
+    const response = await fetch(`/api/usage${force ? '?refresh=1' : ''}`, {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    renderRunway(await response.json());
+    runwaySummary.className = 'runway-summary online';
+    runwaySignal.textContent = 'Live';
+  } catch(e) {
+    runwaySummary.className = 'runway-summary offline';
+    runwaySignal.textContent = 'Usage unavailable';
+    if (!runwayProviders.querySelector('.runway-provider')) {
+      runwayProviders.innerHTML = '<div class="runway-error">Could not reach the local usage service.</div>';
+    }
+  } finally {
+    runwayLoading = false;
+    runwayRefresh.disabled = false;
+    runwayRefresh.classList.remove('loading');
+  }
+}
 
 // --- project selection (control-plane) -----------------------------------
 // The browser only ever switches among entries returned by GET /api/projects.
@@ -384,9 +635,11 @@ function itemHtml(it, i){
   if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
   if (it.kind === 'delivery') {
     const mode = ['interrupt','checkin','queued'].includes(it.delivery) ? it.delivery : 'queued';
+    const pending = it.phase === 'pending';
     const icon = mode === 'interrupt' ? '&#128680;' : mode === 'checkin' ? '&#9200;' : '&#128236;';
-    const label = mode === 'interrupt' ? 'interrupt delivered to inbox' : mode === 'checkin' ? 'supervisor check-in' : 'queued for runner';
-    return `<div class="titem delivery ${mode}"><div><span class="event-title">${icon} ${label}</span><span class="event-route">${esc(it.sender||'orchestra')} → ${esc(it.recipient||'runner')}</span></div>${it.body?`<div class="event-body">${esc(it.body)}</div>`:''}</div>`;
+    const label = pending ? (mode === 'checkin' ? 'check-in awaiting safe boundary' : 'interrupt awaiting safe boundary') : mode === 'interrupt' ? 'interrupt delivered to inbox' : mode === 'checkin' ? 'supervisor check-in delivered' : 'queued for runner';
+    const at = it.created_at ? ` · ${esc(it.created_at)}` : '';
+    return `<div class="titem delivery ${mode} ${pending?'pending':'delivered'}"><div><span class="event-title">${icon} ${label}</span><span class="event-route">${esc(it.sender||'orchestra')} → ${esc(it.recipient||'runner')}${at}</span></div>${it.body?`<div class="event-body">${esc(it.body)}</div>`:''}</div>`;
   }
   if (it.kind === 'question') {
     const waiting = it.status === 'waiting';
@@ -535,6 +788,17 @@ document.getElementById('projBtn').addEventListener('click', e => {
   e.stopPropagation();
   toggleProjectMenu();
 });
+runwayToggle.addEventListener('click', () => runwaySetOpen(!runwayDock.classList.contains('open')));
+document.getElementById('runwayClose').addEventListener('click', () => runwaySetOpen(false));
+runwayBackdrop.addEventListener('click', () => runwaySetOpen(false));
+runwayRefresh.addEventListener('click', () => refreshRunway({force:true}));
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && runwayDock.classList.contains('open')) runwaySetOpen(false);
+});
+let runwayInitiallyOpen = new URLSearchParams(location.search).get('runway') === 'open';
+try { runwayInitiallyOpen ||= localStorage.getItem(RUNWAY_OPEN_KEY) === '1'; } catch(e){}
+runwaySetOpen(runwayInitiallyOpen, {remember:false});
+refreshRunway(); setInterval(refreshRunway, 90000);
 refreshProjects(); setInterval(refreshProjects, 8000);
 refresh(); setInterval(refresh, 2500); setInterval(()=>refreshTranscript(false), 2000);
 </script></body></html>

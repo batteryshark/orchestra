@@ -54,6 +54,7 @@ class TranscriptNormalizationTests(unittest.TestCase):
                 "recipient": "kimi",
                 "body": "Check your inbox, then fix the flaky test.",
                 "created_at": "2026-07-19T02:00:00Z",
+                "phase": "delivered",
             }),
             '{"part":{"type":"text","id":"a","text":"On it."}}',
         ]))
@@ -67,9 +68,30 @@ class TranscriptNormalizationTests(unittest.TestCase):
                 "recipient": "kimi",
                 "body": "Check your inbox, then fix the flaky test.",
                 "created_at": "2026-07-19T02:00:00Z",
+                "phase": "delivered",
             },
             {"kind": "text", "body": "On it."},
         ])
+
+    def test_repeated_delivery_marker_keeps_its_first_timeline_position(self) -> None:
+        event = {
+            "type": "orchestra.delivery",
+            "message_id": 42,
+            "delivery": "interrupt",
+            "sender": "codex",
+            "recipient": "kimi",
+            "body": "Change direction.",
+            "created_at": "2026-07-19T02:00:00Z",
+        }
+        transcript = ui.parse_transcript("\n".join([
+            '{"type":"item.completed","item":{"id":"before","type":"agent_message","text":"Before"}}',
+            json.dumps(event),
+            '{"type":"item.completed","item":{"id":"after","type":"agent_message","text":"After"}}',
+            json.dumps(event),
+        ]))
+
+        self.assertEqual([item["kind"] for item in transcript], ["text", "delivery", "text"])
+        self.assertEqual(transcript[1]["message_id"], 42)
 
     def test_resolved_question_event_is_normalized(self) -> None:
         transcript = ui.parse_transcript(json.dumps({
@@ -155,6 +177,14 @@ class DetailSerializationTests(unittest.TestCase):
              str(cls.root), "feral_otter", "done",
              "2026-07-18T22:00:00Z"),
         )
+        con.executemany(
+            "INSERT INTO feed(author, body, tags, created_at) VALUES(?,?,?,?)",
+            [
+                ("minimax", "oldest finding", "test", "2026-07-18T22:00:00Z"),
+                ("codex", "middle finding", "test", "2026-07-18T22:01:00Z"),
+                ("orchestra", "newest event", "run", "2026-07-18T22:02:00Z"),
+            ],
+        )
         con.commit()
         con.close()
 
@@ -225,6 +255,7 @@ class DetailSerializationTests(unittest.TestCase):
                     "recipient": "minimax",
                     "body": "After this, update the release note.",
                     "created_at": "2026-07-18T22:01:00Z",
+                    "phase": "delivered",
                 },
                 {
                     "kind": "question",
@@ -248,6 +279,13 @@ class DetailSerializationTests(unittest.TestCase):
         state = self.get("/api/state")
         slugs = sorted(r["slug"] for r in state["runs"] if r.get("slug"))
         self.assertEqual(slugs, ["feral_otter", "silly_panda"])
+
+    def test_state_payload_orders_feed_newest_first(self) -> None:
+        state = self.get("/api/state")
+        self.assertEqual(
+            [entry["body"] for entry in state["feed"]],
+            ["newest event", "middle finding", "oldest finding"],
+        )
 
 
 class LiveRefreshCacheHeaderTests(unittest.TestCase):

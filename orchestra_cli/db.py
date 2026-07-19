@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS messages (
   run_id INTEGER,
   kind TEXT DEFAULT '',
   created_at TEXT NOT NULL,
-  read_at TEXT
+  read_at TEXT,
+  delivery_offset INTEGER,
+  delivered_at TEXT
 );
 CREATE TABLE IF NOT EXISTS questions (
   id INTEGER PRIMARY KEY,
@@ -69,6 +71,7 @@ CREATE TABLE IF NOT EXISTS runs (
   child_wakeup_run INTEGER,
   allow_question INTEGER NOT NULL DEFAULT 0,
   question_wait_seconds INTEGER NOT NULL DEFAULT 1800,
+  supervisor_protocol INTEGER NOT NULL DEFAULT 0,
   pid INTEGER,
   session_ref TEXT,
   status TEXT NOT NULL DEFAULT 'spawning',
@@ -120,6 +123,10 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE messages ADD COLUMN kind TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    if not _has_column(con, "messages", "delivery_offset"):
+        con.execute("ALTER TABLE messages ADD COLUMN delivery_offset INTEGER")
+    if not _has_column(con, "messages", "delivered_at"):
+        con.execute("ALTER TABLE messages ADD COLUMN delivered_at TEXT")
 
     # W-0007: memorable run identities. The column is added without a UNIQUE
     # constraint so existing pre-W-0007 rows (all slug = NULL) are valid;
@@ -149,6 +156,8 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         con.execute(
             "ALTER TABLE runs ADD COLUMN question_wait_seconds INTEGER NOT NULL DEFAULT 1800"
         )
+    if not _has_column(con, "runs", "supervisor_protocol"):
+        con.execute("ALTER TABLE runs ADD COLUMN supervisor_protocol INTEGER NOT NULL DEFAULT 0")
     con.execute(
         "CREATE TABLE IF NOT EXISTS questions ("
         "id INTEGER PRIMARY KEY, run_id INTEGER UNIQUE NOT NULL REFERENCES runs(id), "

@@ -1,8 +1,9 @@
 """Detached supervisor: runs one worker process, tracks it, reports back.
 
 Messaging semantics it enforces:
-- `orchestra interrupt` sets run.status='interrupt' and kills the worker; the
-  supervisor then RESUMES the same session with an instruction to read the
+- `orchestra interrupt` records a pending delivery and waits for a completed
+  backend action before stopping the worker. `--now` retains the immediate
+  stop path. Both RESUME the same session with an instruction to read the
   inbox, so delivery to a running worker is guaranteed (not best-effort).
 - A run that finishes with unread inbox messages bounces a notice back to each
   sender — a message to a worker can never rot silently.
@@ -24,6 +25,7 @@ from orchestra_cli.usage import DEFAULT_COLLECTORS, infer_from_agent
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 PROC_POLL_INTERVAL = 2
+CONTROL_POLL_INTERVAL = 0.1
 DEFAULT_CHECKIN_INTERVAL = 600
 MIN_CHECKIN_INTERVAL = 1
 MAX_CHECKIN_INTERVAL = 3600
@@ -239,7 +241,8 @@ def _usage_limit_text(log_path: str, *, max_bytes: int = 262144) -> str | None:
     return None
 
 
-def _insert_checkin_message(con, run, run_id: int) -> None:
+def _insert_checkin_message(con, run, run_id: int) -> dict:
+    created_at = db.now()
     body = (
         f"PROGRESS CHECK-IN run {run_id}: send {run['requested_by']} a short progress "
         f"update with `orchestra send {run['requested_by']} \"PROGRESS run {run_id}: ...\" "
@@ -247,11 +250,164 @@ def _insert_checkin_message(con, run, run_id: int) -> None:
     )
     if run["work_item"]:
         body += f" Also record durable progress with `work log {run['work_item']} ...`."
-    con.execute(
+    cur = con.execute(
         "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, created_at) "
         "VALUES('orchestra', ?, ?, ?, ?, 'checkin', ?)",
-        (run["agent"], body, run["work_item"], run_id, db.now()),
+        (run["agent"], body, run["work_item"], run_id, created_at),
     )
+    return {
+        "message_id": int(cur.lastrowid),
+        "delivery": "checkin",
+        "sender": "orchestra",
+        "recipient": run["agent"],
+        "body": body,
+        "created_at": created_at,
+        "phase": "pending",
+    }
+
+
+def _write_json_event(log, event: dict) -> int:
+    payload = dict(event)
+    event_type = payload.pop("type", "orchestra.delivery")
+    log.write((json.dumps({"type": event_type, **payload},
+                          ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+    log.flush()
+    return os.fstat(log.fileno()).st_size
+
+
+def append_delivery_event(log_path: str | None, event: dict) -> int | None:
+    """Place a delivery marker at its actual point in the runner timeline.
+
+    The SQLite row remains authoritative. A failed append therefore does not
+    lose the message; the UI falls back to the row, albeit without exact
+    transcript placement.
+    """
+    if not log_path:
+        return None
+    try:
+        with open(log_path, "ab") as log:
+            return _write_json_event(log, event)
+    except OSError:
+        return None
+
+
+def _recent_logged_delivery_ids(log_path: str | None, max_bytes: int = 1_000_000) -> set[int]:
+    """Return delivery IDs from a bounded tail scan of a worker log."""
+    if not log_path:
+        return set()
+    try:
+        with open(log_path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            start = max(0, size - max_bytes)
+            log.seek(start)
+            if start:
+                log.readline()  # discard a possibly partial first line
+            lines = log.readlines()
+    except OSError:
+        return set()
+    ids = set()
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if event.get("type") != "orchestra.delivery":
+            continue
+        try:
+            ids.add(int(event["message_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return ids
+
+
+def _pending_delivery_offset(con, run_id: int) -> int | None:
+    row = con.execute(
+        "SELECT MAX(delivery_offset) AS offset FROM messages "
+        "WHERE run_id=? AND kind IN ('interrupt','checkin') "
+        "AND delivery_offset IS NOT NULL AND delivered_at IS NULL",
+        (run_id,),
+    ).fetchone()
+    return int(row["offset"]) if row and row["offset"] is not None else None
+
+
+def _read_log_events(log_path: str, offset: int,
+                     max_bytes: int = 4_000_000) -> tuple[list[dict], int]:
+    """Read complete JSONL events after ``offset`` without consuming a partial line."""
+    try:
+        with open(log_path, "rb") as source:
+            source.seek(offset)
+            data = source.read(max_bytes)
+    except OSError:
+        return [], offset
+    end = data.rfind(b"\n")
+    if end < 0:
+        # Do not let one unusually large JSON event stall boundary watching
+        # forever. Skipping its first bounded chunk may delay delivery until
+        # the following boundary, but it never makes an unsafe interruption.
+        return [], offset + len(data) if len(data) == max_bytes else offset
+    events = []
+    for raw in data[:end].splitlines():
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events, offset + end + 1
+
+
+def _is_safe_boundary(backend: str, event: dict) -> bool:
+    """Recognize a completed action boundary in each runner's JSONL protocol."""
+    event_type = event.get("type")
+    part = event.get("part") or {}
+    if backend == "opencode":
+        return event_type == "step_finish" or part.get("type") == "step-finish"
+    if backend == "codex":
+        item = event.get("item") or {}
+        return event_type == "item.completed" and item.get("type") in {
+            "command_execution", "file_change", "patch", "mcp_tool_call", "web_search",
+        }
+    if backend == "claude" and event_type == "user":
+        content = (event.get("message") or {}).get("content") or []
+        return any(isinstance(item, dict) and item.get("type") == "tool_result"
+                   for item in content)
+    return False
+
+
+def _delivery_event_from_message(message, *, phase: str) -> dict:
+    kind = "checkin" if message["kind"] == "checkin" else "interrupt"
+    body = message["body"]
+    if kind == "interrupt" and body.startswith("[INTERRUPT]"):
+        body = body.removeprefix("[INTERRUPT]").lstrip()
+    return {
+        "message_id": int(message["id"]),
+        "delivery": kind,
+        "sender": message["sender"],
+        "recipient": message["recipient"],
+        "body": body,
+        "created_at": message["created_at"],
+        "phase": phase,
+    }
+
+
+def _mark_pending_delivered(con, run_id: int) -> list[dict]:
+    rows = list(con.execute(
+        "SELECT id, sender, recipient, body, kind, created_at FROM messages "
+        "WHERE run_id=? AND kind IN ('interrupt','checkin') "
+        "AND delivery_offset IS NOT NULL AND delivered_at IS NULL ORDER BY id",
+        (run_id,),
+    ))
+    if not rows:
+        return []
+    delivered_at = db.now()
+    con.execute(
+        "UPDATE messages SET delivered_at=? WHERE run_id=? "
+        "AND kind IN ('interrupt','checkin') "
+        "AND delivery_offset IS NOT NULL AND delivered_at IS NULL",
+        (delivered_at, run_id),
+    )
+    return [_delivery_event_from_message(row, phase="delivered") for row in rows]
 
 
 def _quota_exhausted_text(agent: dict) -> str | None:
@@ -290,10 +446,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
         if latest and latest["status"] in db.RUN_TERMINAL:
             return "exit", None
         for event in delivery_events or []:
-            payload = dict(event)
-            event_type = payload.pop("type", "orchestra.delivery")
-            log.write((json.dumps({"type": event_type, **payload},
-                                  ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+            _write_json_event(log, event)
         log.write((" ".join(cmd[:6]) + " ...\n").encode())
         log.flush()
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
@@ -311,43 +464,77 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                 _wait_after_term(proc)
             return "exit", proc.poll()
         started = time.time()
+        next_health_check = started
         have_ref = bool(run["session_ref"])
+        pending_after: int | None = None
+        boundary_scan_offset = 0
         while True:
             try:
-                exit_code = proc.wait(timeout=max(0.01, poll_interval))
+                exit_code = proc.wait(timeout=max(0.01, min(CONTROL_POLL_INTERVAL,
+                                                            poll_interval)))
                 break
             except subprocess.TimeoutExpired:
                 pass
-            if not have_ref and time.time() - started < EARLY_REF_WINDOW:
-                ref, _ = runners.parse_log(log_path, max_bytes=65536)
-                if ref:
-                    con.execute("UPDATE runs SET session_ref=? WHERE id=?", (ref, run_id))
-                    con.commit()
-                    have_ref = True
-            usage_text = _usage_limit_text(log_path)
-            if usage_text:
-                con.execute(
-                    "UPDATE runs SET summary=? WHERE id=?",
-                    (f"Provider usage limit exhausted: {usage_text}", run_id),
-                )
-                con.commit()
-                _terminate_process_group(proc.pid)
-                _wait_after_term(proc)
-                return "usage_limit", None
+            now = time.time()
             latest = con.execute("SELECT status, session_ref FROM runs WHERE id=?", (run_id,)).fetchone()
             if latest and latest["status"] == "waiting_input":
                 _terminate_process_group(proc.pid)
                 _wait_after_term(proc)
                 return "waiting_input", None
+            if latest and latest["status"] == "interrupt":
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
+                return "exit", proc.poll()
             if latest and latest["status"] in db.RUN_TERMINAL:
                 _terminate_process_group(proc.pid)
                 _wait_after_term(proc)
                 return "exit", proc.poll()
             if latest and latest["session_ref"]:
                 have_ref = True
+
+            pending_offset = _pending_delivery_offset(con, run_id)
+            if pending_offset is not None:
+                if pending_after != pending_offset:
+                    pending_after = pending_offset
+                    boundary_scan_offset = pending_offset
+                events, boundary_scan_offset = _read_log_events(
+                    log_path, boundary_scan_offset
+                )
+                if any(_is_safe_boundary(run["backend"], event) for event in events):
+                    delivered = _mark_pending_delivered(con, run_id)
+                    con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (run_id,))
+                    con.commit()
+                    for event in delivered:
+                        _write_json_event(log, event)
+                    if checkin_state is not None:
+                        checkin_state["last_sent_at"] = now
+                    _terminate_process_group(proc.pid)
+                    _wait_after_term(proc)
+                    return "exit", proc.poll()
+            else:
+                pending_after = None
+
+            if now >= next_health_check:
+                next_health_check = now + max(0.05, poll_interval)
+                if not have_ref and now - started < EARLY_REF_WINDOW:
+                    ref, _ = runners.parse_log(log_path, max_bytes=65536)
+                    if ref:
+                        con.execute("UPDATE runs SET session_ref=? WHERE id=?", (ref, run_id))
+                        con.commit()
+                        have_ref = True
+                usage_text = _usage_limit_text(log_path)
+                if usage_text:
+                    con.execute(
+                        "UPDATE runs SET summary=? WHERE id=?",
+                        (f"Provider usage limit exhausted: {usage_text}", run_id),
+                    )
+                    con.commit()
+                    _terminate_process_group(proc.pid)
+                    _wait_after_term(proc)
+                    return "usage_limit", None
             if checkin_interval and have_ref and checkin_state is not None:
                 last_sent_at = float(checkin_state.get("last_sent_at") or started)
-                if time.time() - last_sent_at >= checkin_interval:
+                if now - last_sent_at >= checkin_interval and pending_offset is None:
                     latest_run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
                     if latest_run and latest_run["status"] == "running":
                         quota_text = _quota_exhausted_text(agent or {})
@@ -361,14 +548,15 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                             _terminate_process_group(proc.pid)
                             _wait_after_term(proc)
                             return "usage_limit", None
-                        _insert_checkin_message(con, latest_run, run_id)
-                        con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (run_id,))
+                        checkin_event = _insert_checkin_message(con, latest_run, run_id)
+                        delivery_offset = _write_json_event(log, checkin_event)
+                        con.execute(
+                            "UPDATE messages SET delivery_offset=? WHERE id=?",
+                            (delivery_offset, checkin_event["message_id"]),
+                        )
                         con.commit()
-                        checkin_state["last_sent_at"] = time.time()
-                        _terminate_process_group(proc.pid)
-                        _wait_after_term(proc)
-                        return "exit", proc.poll()
-            if time.time() > deadline:
+                        checkin_state["last_sent_at"] = now
+            if now > deadline:
                 _terminate_process_group(proc.pid)
                 _wait_after_term(proc)
                 return "timeout", None
@@ -389,6 +577,9 @@ def supervise(root: Path, run_id: int) -> int:
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not run:
         raise SystemExit(f"orchestra: run {run_id} not found")
+    con.execute("UPDATE runs SET supervisor_protocol=1 WHERE id=?", (run_id,))
+    con.commit()
+    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cfg = config.load(root)
     agent = config.agent_cfg(cfg, run["agent"])
     timeout = int(agent.get("timeout") or cfg["settings"].get("timeout", 3600))
@@ -426,7 +617,8 @@ def supervise(root: Path, run_id: int) -> int:
                                        agent=agent,
                                        checkin_interval=checkin_interval,
                                        checkin_state=checkin_state,
-                                       delivery_events=delivery_events)
+                                       delivery_events=delivery_events,
+                                       poll_interval=PROC_POLL_INTERVAL)
         delivery_events = []
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
 
@@ -484,12 +676,19 @@ def supervise(root: Path, run_id: int) -> int:
         if run["status"] == "killed":
             status = "killed"
             break
-        if run["status"] == "interrupt":
-            # orchestra interrupt: resume the same session and force an inbox read
+        pending_delivery = _pending_delivery_offset(con, run_id) is not None
+        if run["status"] == "interrupt" or pending_delivery:
+            # Resume the same session after an immediate stop, a safe boundary,
+            # or a natural process exit that beat the next boundary.
             if not run["session_ref"]:
                 status = "failed"  # can't resume; cli guards against this
                 break
             resume_ref = run["session_ref"]
+            newly_delivered = _mark_pending_delivered(con, run_id)
+            con.commit()
+            for event in newly_delivered:
+                append_delivery_event(run["log_path"], event)
+            announced_message_ids.update(_recent_logged_delivery_ids(run["log_path"]))
             messages = con.execute(
                 "SELECT id, sender, recipient, body, kind, created_at FROM messages "
                 "WHERE run_id=? AND recipient=? "
@@ -501,20 +700,11 @@ def supervise(root: Path, run_id: int) -> int:
                 message_id = int(message["id"])
                 if message_id in announced_message_ids:
                     continue
-                kind = "checkin" if message["kind"] == "checkin" else "interrupt"
-                body = message["body"]
-                if kind == "interrupt" and body.startswith("[INTERRUPT]"):
-                    body = body.removeprefix("[INTERRUPT]").lstrip()
-                delivery_events.append({
-                    "message_id": message_id,
-                    "delivery": kind,
-                    "sender": message["sender"],
-                    "recipient": message["recipient"],
-                    "body": body,
-                    "created_at": message["created_at"],
-                })
+                delivery_events.append(
+                    _delivery_event_from_message(message, phase="delivered")
+                )
                 announced_message_ids.add(message_id)
-            prompt = (f"You were interrupted by the orchestrator with an urgent message. "
+            prompt = (f"The orchestrator delivered an in-flight message. "
                       f"IMMEDIATELY run `orchestra inbox {run['agent']} --unread --mark-read`, "
                       f"apply what it says, then continue your original mission. Finish with the "
                       f"normal HANDOFF to {run['requested_by']} "
