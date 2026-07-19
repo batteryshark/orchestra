@@ -747,23 +747,30 @@ def collect_claude(*, state_path: Path | None = None) -> ProviderResult:
             source="Claude Code /usage",
         )
     stale = age_seconds > CLAUDE_CACHE_MAX_AGE_SECONDS
+    try:
+        windows = parse_claude(cached[0])
+    except ProviderRequestError as exc:
+        return error_result("claude", "Claude", "unavailable", str(exc))
     if stale:
+        # Live refresh via the Claude Code screen-reader is best-effort and runs
+        # off-request. Show the cached plan percentages while it is pending or
+        # unavailable, marked stale with an age hint and the real reset times.
+        age_hint = (
+            f"~{age_seconds / 3600:.1f}h" if age_seconds >= 3600
+            else f"~{age_seconds / 60:.0f}m"
+        )
         return ProviderResult(
             id="claude",
             name="Claude",
             status="stale",
             plan=plan,
-            windows=[],
+            windows=windows,
             message=(
-                "Refreshing live /usage; cached percentages are hidden because they may be "
-                "outdated."
+                f"Cached /usage snapshot is {age_hint} old; refreshing live usage in "
+                "the background. Run /usage in Claude Code if it remains stale."
             ),
             source="Claude Code /usage cache",
         )
-    try:
-        windows = parse_claude(cached[0])
-    except ProviderRequestError as exc:
-        return error_result("claude", "Claude", "unavailable", str(exc))
     return ProviderResult(
         id="claude",
         name="Claude",

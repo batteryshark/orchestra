@@ -210,7 +210,7 @@ class ClaudeParserTests(unittest.TestCase):
         self.assertEqual(result.windows[0].remaining_percent, 16.0)
         self.assertEqual(result.source, "Claude Code /usage cache")
 
-    def test_hides_stale_percentages_when_live_refresh_is_unavailable(self) -> None:
+    def test_shows_stale_percentages_when_live_refresh_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".claude.json"
             path.write_text(
@@ -234,9 +234,14 @@ class ClaudeParserTests(unittest.TestCase):
             ), patch("orchestra_cli.usage.providers._request_claude_live_refresh"):
                 result = collect_claude(state_path=path)
 
+        # A stale-but-real cached snapshot is now SHOWN (marked stale + age hint),
+        # not hidden as n/a — the live refresh being unavailable no longer blanks it.
         self.assertEqual(result.status, "stale")
-        self.assertEqual(result.windows, [])
-        self.assertIn("hidden", result.message or "")
+        self.assertEqual(len(result.windows), 2)
+        self.assertEqual(result.windows[0].remaining_percent, 16.0)
+        self.assertEqual(result.windows[1].remaining_percent, 80.0)
+        self.assertIn("old", (result.message or "").lower())
+        self.assertIn("background", (result.message or "").lower())
 
     def test_live_refresh_replaces_stale_values_without_old_scoped_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
