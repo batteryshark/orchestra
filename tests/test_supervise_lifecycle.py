@@ -5,10 +5,11 @@ import sys
 import tempfile
 import time
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from orchestra_cli import db, supervise
+from orchestra_cli import cli, db, supervise
 from orchestra_cli.usage.models import ProviderResult, QuotaWindow
 
 
@@ -204,6 +205,57 @@ class SupervisorCheckinTests(unittest.TestCase):
         self.assertEqual(row["session_ref"], "ses-checkin")
         self.assertEqual(len(checkins), 1)
         self.assertIn("PROGRESS CHECK-IN", checkins[0]["body"])
+        delivery_events = [
+            json.loads(line)
+            for line in (root / "run.jsonl").read_text().splitlines()
+            if line.startswith('{"type":"orchestra.delivery"')
+        ]
+        self.assertEqual(len(delivery_events), 1)
+        self.assertEqual(delivery_events[0]["delivery"], "checkin")
+        self.assertIsInstance(delivery_events[0]["message_id"], int)
+        self.assertEqual(delivery_events[0]["sender"], "orchestra")
+        self.assertEqual(delivery_events[0]["recipient"], "glm")
+
+
+class InterruptMessageTests(unittest.TestCase):
+    def test_cli_records_interrupt_as_typed_inbox_delivery(self) -> None:
+        tmp, root = _project(checkin_interval=0)
+        self.addCleanup(tmp.cleanup)
+        run_id = _insert_run(root)
+        con = db.connect(root)
+        try:
+            con.execute("UPDATE runs SET status='running', session_ref='ses-123' WHERE id=?",
+                        (run_id,))
+            con.commit()
+        finally:
+            con.close()
+
+        cfg = {
+            "settings": {"default_requester": "orchestrator"},
+            "agents": {"glm": {"backend": "opencode"}},
+        }
+        args = Namespace(run_id=run_id, message=["Check", "your", "inbox"], as_="claude")
+        with mock.patch.object(cli.paths, "find_root", return_value=root), \
+                mock.patch.object(cli.config, "load", return_value=cfg), \
+                mock.patch("builtins.print"):
+            cli.cmd_interrupt(args)
+
+        con = db.connect(root)
+        try:
+            message = con.execute(
+                "SELECT sender, recipient, body, kind FROM messages WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            status = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(dict(message), {
+            "sender": "claude",
+            "recipient": "glm",
+            "body": "[INTERRUPT] Check your inbox",
+            "kind": "interrupt",
+        })
+        self.assertEqual(status, "interrupt")
 
 
 if __name__ == "__main__":

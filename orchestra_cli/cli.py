@@ -545,12 +545,13 @@ def cmd_interrupt(args):
                          "(happens ~10s after spawn) — retry in a moment, or `orchestra send` "
                          "to queue the message")
     sender = _identity(args, cfg)
-    con.execute("INSERT INTO messages(sender, recipient, body, run_id, created_at) "
-                "VALUES(?,?,?,?,?)",
+    con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
+                "VALUES(?,?,?,?, 'interrupt', ?)",
                 (sender, r["agent"], f"[INTERRUPT] {' '.join(args.message)}",
                  args.run_id, db.now()))
     con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (args.run_id,))
     con.commit()
+    con.close()
     if r["pid"]:
         try:
             os.killpg(r["pid"], signal.SIGTERM)

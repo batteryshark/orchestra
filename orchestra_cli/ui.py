@@ -22,6 +22,7 @@ import errno
 import hashlib
 import json
 import mimetypes
+import re
 import socket
 import threading
 import urllib.request
@@ -42,6 +43,8 @@ RUNWAY_ASSETS_DIR = Path(__file__).parent / "usage" / "web" / "assets"
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
 MAX_PROMPT = 1_000_000
+
+_RUNNER_COMMAND_RE = re.compile(r"^(?:opencode run|codex exec|claude -p)\b.* \.\.\.$")
 
 # Header is canonically lowercase (BaseHTTPRequestHandler lowercases header
 # names). The query param covers browser fetches that cannot easily set a
@@ -106,6 +109,8 @@ def parse_transcript(text: str) -> list[dict]:
         if not line:
             continue
         if not line.startswith("{"):
+            if _RUNNER_COMMAND_RE.match(line):
+                continue
             add(None, {"kind": "meta", "body": line[:300]})
             continue
         try:
@@ -132,6 +137,20 @@ def parse_transcript(text: str) -> list[dict]:
             continue
 
         t = obj.get("type", "")
+
+        if t == "orchestra.delivery":
+            delivery = obj.get("delivery")
+            if delivery in ("interrupt", "checkin"):
+                add(None, {
+                    "kind": "delivery",
+                    "message_id": obj.get("message_id"),
+                    "delivery": delivery,
+                    "sender": _fmt(obj.get("sender"), 120),
+                    "recipient": _fmt(obj.get("recipient"), 120),
+                    "body": _fmt(obj.get("body"), MAX_INPUT),
+                    "created_at": _fmt(obj.get("created_at"), 80),
+                })
+            continue
 
         # --- codex --json: item.* events ---
         if t.startswith("item."):
@@ -492,6 +511,12 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     return
                 con = db.connect(project)
                 r = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+                deliveries = list(con.execute(
+                    "SELECT id, sender, recipient, body, kind, created_at FROM messages "
+                    "WHERE run_id=? AND (kind IN ('queued','interrupt','checkin') "
+                    "OR body LIKE '[INTERRUPT]%') ORDER BY id",
+                    (run_id,),
+                )) if r else []
                 con.close()
                 if not r:
                     return self._json({"error": "no such run"}, 404)
@@ -508,6 +533,8 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     brief_st = None
                 if brief_st:
                     etag += f"-{brief_st.st_size}-{int(brief_st.st_mtime)}"
+                if deliveries:
+                    etag += f"-m{deliveries[-1]['id']}-{len(deliveries)}"
                 client_etag = (parse_qs(url.query).get("etag") or [None])[0]
                 if client_etag == etag:
                     return self._json({"etag": etag, "unchanged": True})
@@ -517,6 +544,25 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     items.append({"kind": "prompt", "body": prompt})
                 if st:
                     items.extend(parse_transcript(lp.read_text(errors="replace")))
+                serialized_ids = {item.get("message_id") for item in items
+                                  if item.get("kind") == "delivery"}
+                for message in deliveries:
+                    if message["id"] in serialized_ids:
+                        continue
+                    delivery = message["kind"] if message["kind"] in ("queued", "checkin") \
+                        else "interrupt"
+                    body = message["body"]
+                    if delivery == "interrupt" and body.startswith("[INTERRUPT]"):
+                        body = body.removeprefix("[INTERRUPT]").lstrip()
+                    items.append({
+                        "kind": "delivery",
+                        "message_id": message["id"],
+                        "delivery": delivery,
+                        "sender": _fmt(message["sender"], 120),
+                        "recipient": _fmt(message["recipient"], 120),
+                        "body": _fmt(body, MAX_INPUT),
+                        "created_at": _fmt(message["created_at"], 80),
+                    })
                 self._json({"etag": etag, "run": dict(r), "items": items})
             elif path.startswith("/api/log/"):
                 try:

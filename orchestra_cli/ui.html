@@ -80,6 +80,15 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .titem.meta { color:var(--muted); font-size:12px }
 .titem.error { color:var(--red); white-space:pre-wrap; font-size:13px;
   border-left:3px solid var(--red); padding-left:10px }
+.titem.delivery { border:1px solid var(--line); border-left:4px solid var(--blue);
+  border-radius:8px; margin:10px 0; padding:9px 11px; background:color-mix(in srgb, var(--blue) 5%, transparent) }
+.titem.delivery.interrupt { border-left-color:var(--red);
+  background:color-mix(in srgb, var(--red) 6%, transparent) }
+.titem.delivery.checkin { border-left-color:var(--think) }
+.titem.delivery .event-title { font-size:12px; font-weight:700; letter-spacing:.035em;
+  text-transform:uppercase }
+.titem.delivery .event-route { color:var(--muted); font-size:11.5px; margin-left:7px }
+.titem.delivery .event-body { margin-top:6px; white-space:pre-wrap; overflow-wrap:anywhere }
 details { border:1px solid var(--line); border-radius:8px; margin:6px 0 }
 details summary { cursor:pointer; padding:5px 10px; font-size:12.5px; user-select:none;
   display:flex; gap:8px; align-items:center }
@@ -360,6 +369,12 @@ async function stopRun(id){
 
 function itemHtml(it, i){
   if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
+  if (it.kind === 'delivery') {
+    const mode = ['interrupt','checkin','queued'].includes(it.delivery) ? it.delivery : 'queued';
+    const icon = mode === 'interrupt' ? '&#128680;' : mode === 'checkin' ? '&#9200;' : '&#128236;';
+    const label = mode === 'interrupt' ? 'interrupt delivered to inbox' : mode === 'checkin' ? 'supervisor check-in' : 'queued for runner';
+    return `<div class="titem delivery ${mode}"><div><span class="event-title">${icon} ${label}</span><span class="event-route">${esc(it.sender||'orchestra')} → ${esc(it.recipient||'runner')}</span></div>${it.body?`<div class="event-body">${esc(it.body)}</div>`:''}</div>`;
+  }
   if (it.kind === 'prompt')  return `<details class="prompt" data-k="${i}"><summary>&#128221; initial runner prompt <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;

@@ -43,6 +43,34 @@ class TranscriptNormalizationTests(unittest.TestCase):
         thinking = [item["body"] for item in transcript if item["kind"] == "thinking"]
         self.assertEqual(thinking, ["Inspect the loader.", "Now patch it."])
 
+    def test_interrupt_delivery_replaces_runner_command_noise(self) -> None:
+        transcript = ui.parse_transcript("\n".join([
+            "opencode run --dir /tmp/worktree --format json ...",
+            json.dumps({
+                "type": "orchestra.delivery",
+                "message_id": 42,
+                "delivery": "interrupt",
+                "sender": "codex",
+                "recipient": "kimi",
+                "body": "Check your inbox, then fix the flaky test.",
+                "created_at": "2026-07-19T02:00:00Z",
+            }),
+            '{"part":{"type":"text","id":"a","text":"On it."}}',
+        ]))
+
+        self.assertEqual(transcript, [
+            {
+                "kind": "delivery",
+                "message_id": 42,
+                "delivery": "interrupt",
+                "sender": "codex",
+                "recipient": "kimi",
+                "body": "Check your inbox, then fix the flaky test.",
+                "created_at": "2026-07-19T02:00:00Z",
+            },
+            {"kind": "text", "body": "On it."},
+        ])
+
     def test_teammate_transcript_suppresses_empty_reasoning_parts(self) -> None:
         payload = json.dumps(
             [
@@ -84,6 +112,12 @@ class DetailSerializationTests(unittest.TestCase):
              "naming work", "W-0007", None, "codex",
              str(cls.root), str(brief_path), str(log_path), "silly_panda", "running",
              "2026-07-18T22:00:00Z"),
+        )
+        con.execute(
+            "INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
+            "VALUES(?,?,?,?, 'queued', ?)",
+            ("codex", "minimax", "After this, update the release note.", 1,
+             "2026-07-18T22:01:00Z"),
         )
         con.execute(
             "INSERT INTO runs(agent, backend, model, title, work_item, "
@@ -156,6 +190,15 @@ class DetailSerializationTests(unittest.TestCase):
             [
                 {"kind": "prompt", "body": "Exact runner prompt\nwith mission"},
                 {"kind": "text", "body": "model reply"},
+                {
+                    "kind": "delivery",
+                    "message_id": 1,
+                    "delivery": "queued",
+                    "sender": "codex",
+                    "recipient": "minimax",
+                    "body": "After this, update the release note.",
+                    "created_at": "2026-07-18T22:01:00Z",
+                },
             ],
         )
 

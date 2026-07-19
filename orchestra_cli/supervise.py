@@ -239,6 +239,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
               agent: dict | None = None,
               checkin_interval: int | None = None,
               checkin_state: dict | None = None,
+              delivery_events: list[dict] | None = None,
               poll_interval: float = PROC_POLL_INTERVAL) -> tuple[str, int | None]:
     """Start one worker process; wait with timeout + early session-ref capture.
     Returns (outcome, exit_code) where outcome is 'exit'|'timeout'|'usage_limit'."""
@@ -246,7 +247,11 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
         latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
         if latest and latest["status"] in db.RUN_TERMINAL:
             return "exit", None
+        for event in delivery_events or []:
+            log.write((json.dumps({"type": "orchestra.delivery", **event},
+                                  ensure_ascii=False, separators=(",", ":")) + "\n").encode())
         log.write((" ".join(cmd[:6]) + " ...\n").encode())
+        log.flush()
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT,
                                 cwd=workdir, env=env, start_new_session=True)
@@ -354,6 +359,8 @@ def supervise(root: Path, run_id: int) -> int:
 
     status, exit_code = "done", None
     resume_ref = run["session_ref"] if run["parent_run"] else None
+    delivery_events: list[dict] = []
+    announced_message_ids: set[int] = set()
     while True:
         last_msg_file = None
         cmd = runners.build_cmd(agent, workdir=run["workdir"], title=f"orchestra-run-{run_id}",
@@ -370,7 +377,9 @@ def supervise(root: Path, run_id: int) -> int:
                                        run["log_path"], run_id, deadline,
                                        agent=agent,
                                        checkin_interval=checkin_interval,
-                                       checkin_state=checkin_state)
+                                       checkin_state=checkin_state,
+                                       delivery_events=delivery_events)
+        delivery_events = []
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
 
         if outcome == "timeout":
@@ -388,6 +397,30 @@ def supervise(root: Path, run_id: int) -> int:
                 status = "failed"  # can't resume; cli guards against this
                 break
             resume_ref = run["session_ref"]
+            messages = con.execute(
+                "SELECT id, sender, recipient, body, kind, created_at FROM messages "
+                "WHERE run_id=? AND recipient=? "
+                "AND (kind IN ('interrupt','checkin') OR body LIKE '[INTERRUPT]%') "
+                "ORDER BY id",
+                (run_id, run["agent"]),
+            ).fetchall()
+            for message in messages:
+                message_id = int(message["id"])
+                if message_id in announced_message_ids:
+                    continue
+                kind = "checkin" if message["kind"] == "checkin" else "interrupt"
+                body = message["body"]
+                if kind == "interrupt" and body.startswith("[INTERRUPT]"):
+                    body = body.removeprefix("[INTERRUPT]").lstrip()
+                delivery_events.append({
+                    "message_id": message_id,
+                    "delivery": kind,
+                    "sender": message["sender"],
+                    "recipient": message["recipient"],
+                    "body": body,
+                    "created_at": message["created_at"],
+                })
+                announced_message_ids.add(message_id)
             prompt = (f"You were interrupted by the orchestrator with an urgent message. "
                       f"IMMEDIATELY run `orchestra inbox {run['agent']} --unread --mark-read`, "
                       f"apply what it says, then continue your original mission. Finish with the "
