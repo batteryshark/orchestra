@@ -89,6 +89,8 @@ details pre { margin:4px 0; white-space:pre-wrap; overflow-wrap:anywhere;
   font-size:12px; font-family:ui-monospace,monospace }
 details.think summary { color:var(--think) }
 details.tool summary { color:var(--tool) }
+details.prompt { border-color:color-mix(in srgb, var(--blue) 35%, var(--line)) }
+details.prompt summary { color:var(--blue) }
 details .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted) }
 table.kv { border-collapse:collapse; font-size:12.5px }
 table.kv th { text-align:left; color:var(--muted); font-weight:600;
@@ -358,6 +360,7 @@ async function stopRun(id){
 
 function itemHtml(it, i){
   if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
+  if (it.kind === 'prompt')  return `<details class="prompt" data-k="${i}"><summary>&#128221; initial runner prompt <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
   if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;

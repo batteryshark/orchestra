@@ -24,6 +24,10 @@ from orchestra_cli import db, ui
 
 
 class TranscriptNormalizationTests(unittest.TestCase):
+    def test_unreadable_saved_prompt_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(ui._read_prompt(Path(tmp)))
+
     def test_suppresses_kimi_placeholder_reasoning_without_losing_real_thinking(self) -> None:
         events = [
             {"part": {"type": "reasoning", "id": "empty", "text": ""}},
@@ -67,14 +71,18 @@ class DetailSerializationTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.tmp.name)
         (cls.root / ".orchestra").mkdir(parents=True, exist_ok=True)
+        brief_path = cls.root / "run-1-brief.md"
+        brief_path.write_text("Exact runner prompt\nwith mission")
+        log_path = cls.root / "run-1.jsonl"
+        log_path.write_text('{"part":{"type":"text","id":"a","text":"model reply"}}\n')
         con = db.connect(cls.root)
         con.execute(
             "INSERT INTO runs(agent, backend, model, title, work_item, "
-            "team, requested_by, workdir, slug, status, started_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "team, requested_by, workdir, brief_path, log_path, slug, status, started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             ("minimax", "opencode", "minimax-coding-plan/MiniMax-M3",
              "naming work", "W-0007", None, "codex",
-             str(cls.root), "silly_panda", "running",
+             str(cls.root), str(brief_path), str(log_path), "silly_panda", "running",
              "2026-07-18T22:00:00Z"),
         )
         con.execute(
@@ -139,6 +147,17 @@ class DetailSerializationTests(unittest.TestCase):
         # model carries the ("xhigh")-suffix the dispatcher applies.
         self.assertIn("xhigh", r["model"])
         self.assertEqual(r["slug"], "feral_otter")
+        self.assertEqual(payload["items"], [])
+
+    def test_saved_runner_prompt_precedes_model_output(self) -> None:
+        payload = self.get("/api/transcript/1")
+        self.assertEqual(
+            payload["items"],
+            [
+                {"kind": "prompt", "body": "Exact runner prompt\nwith mission"},
+                {"kind": "text", "body": "model reply"},
+            ],
+        )
 
     def test_state_payload_includes_slug_for_dashboard_render(self) -> None:
         # The sidebar shows slugs; check both rows are exposed.

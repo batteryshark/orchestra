@@ -41,6 +41,7 @@ RUNWAY_ASSETS_DIR = Path(__file__).parent / "usage" / "web" / "assets"
 
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
+MAX_PROMPT = 1_000_000
 
 # Header is canonically lowercase (BaseHTTPRequestHandler lowercases header
 # names). The query param covers browser fetches that cannot easily set a
@@ -63,6 +64,23 @@ def _fmt(v, limit=MAX_OUTPUT) -> str:
 
 def _visible_text(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _read_prompt(path: Path | None) -> str | None:
+    """Read a saved runner brief without letting an unexpected file size
+    make the live dashboard unresponsive."""
+    if path is None:
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as brief:
+            text = brief.read(MAX_PROMPT + 1)
+    except OSError:
+        return None
+    if not text:
+        return None
+    if len(text) > MAX_PROMPT:
+        return text[:MAX_PROMPT] + f"\n… [prompt truncated at {MAX_PROMPT} chars]"
+    return text
 
 
 def parse_transcript(text: str) -> list[dict]:
@@ -478,17 +496,27 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 if not r:
                     return self._json({"error": "no such run"}, 404)
                 lp = Path(r["log_path"]) if r["log_path"] else None
+                bp = Path(r["brief_path"]) if r["brief_path"] else None
                 try:
                     st = lp.stat() if lp else None
                     etag = f"{r['status']}-{st.st_size}-{int(st.st_mtime)}" if st else r["status"]
                 except OSError:
                     etag, st = r["status"], None
+                try:
+                    brief_st = bp.stat() if bp else None
+                except OSError:
+                    brief_st = None
+                if brief_st:
+                    etag += f"-{brief_st.st_size}-{int(brief_st.st_mtime)}"
                 client_etag = (parse_qs(url.query).get("etag") or [None])[0]
                 if client_etag == etag:
                     return self._json({"etag": etag, "unchanged": True})
                 items = []
+                prompt = _read_prompt(bp)
+                if prompt is not None:
+                    items.append({"kind": "prompt", "body": prompt})
                 if st:
-                    items = parse_transcript(lp.read_text(errors="replace"))
+                    items.extend(parse_transcript(lp.read_text(errors="replace")))
                 self._json({"etag": etag, "run": dict(r), "items": items})
             elif path.startswith("/api/log/"):
                 try:
