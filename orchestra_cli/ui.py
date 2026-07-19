@@ -1,5 +1,9 @@
 """`orchestra ui` — zero-dependency live web dashboard for a project's runs,
-inboxes, findings feed, and teams. Reads the project SQLite; no writes.
+inboxes, findings feed, and teams.
+
+The UI is read-mostly: normal refresh routes read project SQLite state, while
+the details pane exposes a POST-only stop action that uses the same run
+cancellation semantics as the CLI.
 
 The HTML page lives in ui.html next to this module and is read from disk on
 every request, so UI edits only need a browser refresh (no server restart).
@@ -19,7 +23,6 @@ import hashlib
 import json
 import mimetypes
 import socket
-import sqlite3
 import threading
 import urllib.request
 import webbrowser
@@ -27,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import db, host, projects, tailscale
+from orchestra_cli import cancel, db, ensemble, host, projects, tailscale
 from orchestra_cli.usage import default_service
 
 DEFAULT_UI_PORT = 4764
@@ -35,7 +38,6 @@ DEFAULT_UI_PORT = 4764
 UI_FILE = Path(__file__).with_name("ui.html")
 RUNWAY_FILE = Path(__file__).parent / "usage" / "web" / "runway.html"
 RUNWAY_ASSETS_DIR = Path(__file__).parent / "usage" / "web" / "assets"
-ENSEMBLE_DB = Path("~/.config/opencode/ensemble.db").expanduser()
 
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
@@ -59,6 +61,10 @@ def _fmt(v, limit=MAX_OUTPUT) -> str:
     return v if len(v) <= limit else v[:limit] + f"\n… [+{len(v) - limit} chars]"
 
 
+def _visible_text(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def parse_transcript(text: str) -> list[dict]:
     """Best-effort JSONL -> ordered transcript items across the three backend
     event formats (opencode --format json, codex --json, claude stream-json).
@@ -68,6 +74,8 @@ def parse_transcript(text: str) -> list[dict]:
     index: dict = {}
 
     def add(key, item):
+        if item.get("kind") in ("text", "thinking") and not _visible_text(item.get("body")):
+            return
         if key is not None and key in index:
             index[key].update({k: v for k, v in item.items() if v not in (None, "")})
         else:
@@ -181,56 +189,6 @@ def parse_transcript(text: str) -> list[dict]:
     return items
 
 
-def _ensemble_con():
-    if not ENSEMBLE_DB.exists():
-        return None
-    try:
-        con = sqlite3.connect(f"file:{ENSEMBLE_DB}?mode=ro", uri=True)
-        con.row_factory = sqlite3.Row
-        return con
-    except sqlite3.Error:
-        return None
-
-
-def ensemble_teams(root: Path) -> list[dict]:
-    """Teams for this project, straight from ensemble's own SQLite (read-only)."""
-    con = _ensemble_con()
-    if not con:
-        return []
-    try:
-        teams = []
-        for t in con.execute("SELECT * FROM team WHERE project_id=? "
-                             "ORDER BY time_created DESC LIMIT 8", (str(root),)):
-            members = [dict(m) for m in con.execute(
-                "SELECT name, model, status, execution_status, session_id "
-                "FROM team_member WHERE team_id=?", (t["id"],))]
-            tasks = [dict(x) for x in con.execute(
-                "SELECT content, status, priority, assignee FROM team_task "
-                "WHERE team_id=? ORDER BY time_created", (t["id"],))]
-            teams.append({"id": t["id"], "name": t["name"], "status": t["status"],
-                          "lead_session": t["lead_session_id"],
-                          "members": members, "tasks": tasks})
-        return teams
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-
-
-def team_messages(team_id: str) -> list[dict]:
-    con = _ensemble_con()
-    if not con:
-        return []
-    try:
-        return [dict(m) for m in con.execute(
-            "SELECT from_name, to_name, content, time_created FROM team_message "
-            "WHERE team_id=? ORDER BY time_created LIMIT 200", (team_id,))]
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-
-
 def teammate_transcript(session_id: str) -> tuple[list[dict], str]:
     """Teammate session parts via the orchestra host API -> transcript items."""
     u = host.url()
@@ -254,9 +212,13 @@ def teammate_transcript(session_id: str) -> tuple[list[dict], str]:
                                   + (" …" if len(body) > 400 else "")})
                 continue
             if pt == "text":
-                items.append({"kind": "text", "body": p.get("text", "")})
+                body = p.get("text", "")
+                if _visible_text(body):
+                    items.append({"kind": "text", "body": body})
             elif pt == "reasoning":
-                items.append({"kind": "thinking", "body": p.get("text", "")})
+                body = p.get("text", "")
+                if _visible_text(body):
+                    items.append({"kind": "thinking", "body": body})
             elif pt == "tool":
                 st = p.get("state") or {}
                 items.append({"kind": "tool", "name": p.get("tool", "tool"),
@@ -329,6 +291,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -344,6 +307,35 @@ def make_handler(root: Path, registry: list[dict] | None = None):
             self.send_header("Cache-Control", "no-store" if no_store else "max-age=300")
             self.end_headers()
             self.wfile.write(body)
+
+        def _read_json_post(self) -> tuple[bool, dict | None]:
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                self._json({"error": "Content-Type must be application/json"}, 415)
+                return False, None
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return False, None
+            if length < 0:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return False, None
+            if length > 2048:
+                self._json({"error": "request body too large"}, 413)
+                return False, None
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                return True, {}
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self._json({"error": "invalid JSON body"}, 400)
+                return False, None
+            if not isinstance(payload, dict):
+                self._json({"error": "JSON body must be an object"}, 400)
+                return False, None
+            return True, payload
 
         # --- project selection ------------------------------------------
         def _requested_project(self, url) -> str | None:
@@ -456,7 +448,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                                "members": [m["agent"] for m in con.execute(
                                    "SELECT agent FROM members WHERE team_id=?", (t["id"],))]}
                               for t in con.execute("SELECT * FROM teams")],
-                    "ensemble": ensemble_teams(project),
+                    "ensemble": ensemble.store.teams(project),
                 }
                 con.close()
                 self._json(state)
@@ -471,7 +463,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     return self._json({"etag": etag, "unchanged": True})
                 team_id = (q.get("team") or [None])[0]
                 self._json({"etag": etag, "items": items,
-                            "messages": team_messages(team_id) if team_id else []})
+                            "messages": ensemble.store.messages(team_id) if team_id else []})
             elif path.startswith("/api/transcript/"):
                 try:
                     run_id = int(path.rsplit("/", 1)[1])
@@ -527,6 +519,36 @@ def make_handler(root: Path, registry: list[dict] | None = None):
             else:
                 self._json({"error": "not found"}, 404)
 
+        def do_POST(self):
+            url = urlparse(self.path)
+            path = url.path
+            if path.startswith("/api/runs/") and path.endswith("/stop"):
+                ok, _payload = self._read_json_post()
+                if not ok:
+                    return
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    return self._json({"error": "not found"}, 404)
+                try:
+                    run_id = int(parts[2])
+                except ValueError:
+                    return self._json({"error": "bad id"}, 400)
+                project = self._resolve_project(url)
+                if project is None:
+                    return
+                con = db.connect(project)
+                try:
+                    result = cancel.stop_run(con, run_id)
+                finally:
+                    con.close()
+                if not result:
+                    return self._json({"error": "no such run"}, 404)
+                return self._json({
+                    **result.as_dict(),
+                    "label": "stopped by user" if result.status == "killed" else result.status,
+                })
+            self.send_error(501, "Unsupported method ('POST')")
+
     return Handler
 
 
@@ -577,14 +599,13 @@ def _pick_free_port(host: str) -> int:
 def tailscale_warning(bind_host: str) -> str:
     """The exact one-line warning orchestra prints when Tailscale is the
     bind mode. Returned (not printed) so tests can assert on it without
-    spinning up a real server against a non-routable interface. The string
-    explicitly describes the dashboard as read-only and ACL-scoped to
-    avoid the misleading "use and modify" wording."""
+    spinning up a real server against a non-routable interface. The string is
+    explicit that Tailnet viewers can read dashboard data and stop active runs,
+    so operators do not mistake the POST stop action for a passive view."""
     return (
         "[orchestra] Tailnet access is enabled. Members permitted by "
-        "your Tailscale ACLs can view this Orchestra dashboard — its "
-        "runs, inboxes, transcript feeds, and project status — from "
-        "your Tailnet."
+        "your Tailscale ACLs can view this Orchestra dashboard and stop "
+        "active runs from your Tailnet."
     )
 
 

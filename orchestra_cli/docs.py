@@ -28,9 +28,10 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    - Fan out one mission to several agents: repeat `--to` (e.g. `--to glm --to minimax`).
    - Independent missions: separate dispatch calls — they all run concurrently in the background.
    - `--worktree` gives the worker an isolated git worktree (skills folders auto-synced).
-   - `--to ensemble` dispatches an opencode-ensemble LEAD that spawns its own model-pool team.
-     Ensemble runs ride a persistent opencode host (`orchestra host status`); the mission is
-     complete when the lead's HANDOFF arrives, not when the client process exits.
+   - A supervised worker can delegate a bounded child batch with
+     `orchestra spawn --to <agent> "mission"`. Children are backend-neutral and use isolated
+     worktrees by default. The lead should commit any work children need before spawning;
+     child branches are reported but never auto-merged.
 3. **Messaging semantics — know which tool delivers.**
    - `orchestra send <agent>` to a RUNNING worker is BEST-EFFORT (workers only check
      their inbox at start and between steps). If the worker never checks, the run's
@@ -61,14 +62,18 @@ Route by difficulty — don't burn the heavy tiers on grunt work:
 - `minimax` — MiniMax-M3 · THE DEFAULT. Routine implementation, ports, mechanical
   refactors, test writing (the "Sonnet" tier).
 - `glm` — GLM-5.2 · standard tier for normal feature work needing more judgment.
+- `kimi` — Kimi K3 · flagship generalist for complex coding, long-context, and visual work.
+- `kimi-max` — Kimi K3 variant=max · heavy reasoning for hard design and integration work.
 - `codex-55` — gpt-5.5 (high) · fast solid engineer for medium tasks.
 - `glm-max` — GLM-5.2 variant=max · heavy reasoning: hard design, gnarly debugging.
 - `codex` — gpt-5.6 (xhigh) · REALLY tough thinking only; slow and expensive — use sparingly.
 - `claude` — claude CLI worker (useful when Codex orchestrates).
-- `ensemble` — opencode-ensemble lead; spawns a GLM/MiniMax team internally for
-  parallelizable multi-part missions.
 
-Good pattern: minimax implements → glm reviews; or glm-max/codex design → minimax executes.
+Optional integrations such as OpenCode Ensemble are not in the default roster. Add them
+explicitly in Orchestra configuration after installing their external runtime;
+`orchestra doctor` checks integrations that are actually configured.
+
+Good pattern: minimax implements → glm or kimi reviews; or glm-max/kimi-max/codex designs → minimax executes.
 
 ## Rules of engagement
 
@@ -153,14 +158,14 @@ for orchestration sessions. Claude Code needs no special handling.
 ## Cheatsheet
 
 ```
-orchestra ui                          # shared read-only dashboard (:4764; project picker)
+orchestra ui                          # shared dashboard (:4764; project picker)
 orchestra ui --tailscale              # bind only to this machine's Tailnet IPv4
 orchestra project list                # roots registered with the shared dashboard
 orchestra project register /path      # add a root while the dashboard is running
-orchestra host start --port 4763      # persistent opencode host for ensemble runs (--port configurable)
 orchestra status                      # snapshot: runs, inboxes, feed
 orchestra dispatch --to glm --work W-0001 --as claude "mission"
 orchestra dispatch --to glm --to minimax --as claude "same mission, two takes"
+orchestra spawn --to minimax "focused child mission"  # inside a supervised worker
 orchestra wait                        # block until active runs finish
 orchestra inbox claude --unread --mark-read
 orchestra reply 7 "looks good; also add tests"

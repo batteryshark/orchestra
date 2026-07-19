@@ -6,7 +6,7 @@
   A local control plane for people who delegate software work across Codex, Claude Code, and OpenCode agents.
 </p>
 
-Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocking your terminal, keep each worker's session available for follow-ups, and watch every project from one read-only dashboard. Runs survive the orchestrator session that created them, while inboxes, findings, and optional [slash-work](https://github.com/batteryshark/slash-work) items keep the handoff durable.
+Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocking your terminal, keep each worker's session available for follow-ups, and watch every project from one dashboard. Runs survive the orchestrator session that created them, while inboxes, findings, and optional [slash-work](https://github.com/batteryshark/slash-work) items keep the handoff durable.
 
 ![Orchestra dashboard showing fictional projects and runs](docs/screenshots/dashboard.jpg)
 
@@ -119,13 +119,13 @@ Use the project picker in the header to switch roots. The UI only accepts projec
 orchestra ui --tailscale
 ```
 
-This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, and logs. Review [SECURITY.md](SECURITY.md) before enabling it.
+This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, logs, and stop active runs. Review [SECURITY.md](SECURITY.md) before enabling it.
 
 Port `4764` is preferred. An implicit port may safely fall back when busy; an explicit `--port` is pinned and fails instead. `--tailscale` cannot be combined with an explicit `--host`.
 
 ## Provider runway
 
-The dashboard links to `/runway`, which combines cached coding-plan quota from configured MiniMax, Claude, Z.AI, and Codex accounts. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
+The dashboard links to `/runway`, which combines cached coding-plan quota from configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
 
 ![Provider runway with fictional balances](docs/screenshots/provider-runway.jpg)
 
@@ -135,18 +135,49 @@ Claude usage refreshes from Claude Code's live `/usage` view in the background. 
 
 ## Configuration
 
-Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and relevant plugins.
+Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and configured optional integrations.
 
 Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra reply` resumes the same worker rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+
+The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables the max-thinking variant for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
+
+### Optional OpenCode Ensemble integration
+
+Ordinary OpenCode workers do not require OpenCode Ensemble, and Orchestra does not include an Ensemble agent in the default roster. To opt into nested OpenCode teams, first add the separately maintained plugin to the `plugin` list in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["@hueyexe/opencode-ensemble@0.16.0"]
+}
+```
+
+Then add an explicit roster entry to `~/.config/orchestra/config.toml` or `.orchestra/config.toml`:
+
+```toml
+[agents.ensemble]
+backend = "opencode"
+model = "zhipuai-coding-plan/glm-5.2"
+ensemble = true
+role = "lead of an OpenCode Ensemble team"
+model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
+```
+
+After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra dispatch --to ensemble ...`. Orchestra starts its persistent OpenCode host automatically for an Ensemble run. If the configured plugin is absent, dispatch fails before creating a run. The dashboard reads Ensemble's SQLite state through a read-only optional adapter and remains functional when that database is absent or incompatible.
 
 ## How state is divided
 
 - `.orchestra/` in each project stores its SQLite run state, project configuration, and durable handoff checkpoints.
+- Supervised workers can create native child runs with `orchestra spawn --to AGENT "mission"`.
+  Child ownership is distinct from backend session follow-ups, works across OpenCode, Codex,
+  and Claude runners, and is shown hierarchically in the dashboard. Children use isolated git
+  worktrees by default; Orchestra reports their branches and never auto-merges them. Defaults
+  are deliberately bounded by `settings.child_max_depth`, `child_max_per_run`, and
+  `child_max_active` (1, 3, and 3). Stopping a lead cascades to its active descendants.
 - The user-level registry stores project identifiers and roots for the shared UI.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.
 
-The dashboard is intentionally read-only. Dispatch, reply, interrupt, registry changes, and other mutations stay in the CLI.
+The dashboard is read-mostly. Dispatch, reply, interrupt, registry changes, and most mutations stay in the CLI; the run details pane can stop an active run using the same cancellation path as `orchestra kill`.
 
 ## Development
 

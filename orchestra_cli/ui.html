@@ -65,6 +65,7 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .runitem { padding:9px 14px; border-bottom:1px solid var(--line); cursor:pointer }
 .runitem:hover { background:var(--sel) }
 .runitem.sel { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
+.runitem.child { border-left:2px solid color-mix(in srgb, var(--blue) 35%, var(--line)) }
 .runitem .top { display:flex; gap:8px; align-items:center }
 .runitem .title { font-size:12px; color:var(--muted); margin-top:2px;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
@@ -96,6 +97,8 @@ table.kv td { padding:2px 0; font-family:ui-monospace,monospace }
 #follow { margin-left:auto; display:flex; gap:6px; align-items:center; font-size:12px; color:var(--muted) }
 button { font:inherit; font-size:12px; border:1px solid var(--line); background:none;
   color:var(--blue); border-radius:6px; padding:2px 10px; cursor:pointer }
+button.danger { color:var(--red); border-color:color-mix(in srgb, var(--red) 35%, var(--line)) }
+button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
 
 /* bottom row */
 .row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px }
@@ -144,6 +147,8 @@ button { font:inherit; font-size:12px; border:1px solid var(--line); background:
 const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = null, selected = null, selTm = null, userPicked = false, tEtag = null;
 let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
+const TERMINAL = new Set(['done','failed','timeout','killed']);
+const stopping = new Set();
 
 // --- project selection (control-plane) -----------------------------------
 // The browser only ever switches among entries returned by GET /api/projects.
@@ -241,6 +246,15 @@ function elapsed(start, end){
   const h = Math.floor(s/3600), m = Math.floor(s%3600/60); s = s%60;
   return h ? `${h}h${String(m).padStart(2,'0')}m` : m ? `${m}m${String(s).padStart(2,'0')}s` : `${s}s`;
 }
+function statusLabel(status){
+  return status === 'killed' ? 'stopped by user' : status;
+}
+function statusChip(status){
+  return `<span class="chip s-${esc(status)}">${esc(statusLabel(status))}</span>`;
+}
+function canStopRun(r){
+  return r && !TERMINAL.has(r.status);
+}
 function tickElapsed(){
   document.querySelectorAll('[data-start]').forEach(el => {
     el.textContent = elapsed(el.dataset.start, el.dataset.end || null);
@@ -259,11 +273,19 @@ function setIfChanged(id, html){
 }
 
 function renderRuns(){
-  const html = [...state.runs].reverse().map(r => `
-    <div class="runitem ${!selTm&&r.id===selected?'sel':''}" onclick="pick(${r.id})">
+  const byLead = new Map();
+  state.runs.forEach(r => { if(r.lead_run){ const a=byLead.get(r.lead_run)||[]; a.push(r); byLead.set(r.lead_run,a); } });
+  const visibleIds = new Set(state.runs.map(r=>r.id));
+  const owned = new Set(state.runs.filter(r=>r.lead_run&&visibleIds.has(r.lead_run)).map(r=>r.id));
+  const ordered = [];
+  function add(r){ ordered.push(r); [...(byLead.get(r.id)||[])].reverse().forEach(add); }
+  [...state.runs].reverse().filter(r=>!owned.has(r.id)).forEach(add);
+  const html = ordered.map(r => `
+    <div class="runitem ${r.lead_run?'child':''} ${!selTm&&r.id===selected?'sel':''}" style="padding-left:${14+Math.min(Number(r.child_depth||0),4)*14}px" onclick="pick(${r.id})">
       <div class="top"><span class="mono">#${r.id}</span>${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+        ${r.lead_run?`<span class="mono muted" title="child of run #${r.lead_run}">↳ #${r.lead_run}</span>`:''}
         <b>${esc(r.agent)}</b>
-        <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
+        ${statusChip(r.status)}
         <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
           ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span></div>
       <div class="title">${r.backend?`<span class="mono muted">${esc(r.backend)}</span> `:''}${r.model?`<span class="mono muted">${esc((r.model||'').split('/').pop())}</span> `:''}${r.work_item?`[${esc(r.work_item)}] `:''}${esc(r.title||'')}</div>
@@ -308,12 +330,38 @@ function renderEnsemble(){
   setIfChanged('ensteams', html);
 }
 
+async function stopRun(id){
+  const r = state?.runs?.find(x => x.id === id);
+  if (!canStopRun(r) || stopping.has(id)) return;
+  if (!confirm(`Stop run #${id}?`)) return;
+  stopping.add(id);
+  lastHash.phead = null;
+  renderRuns();
+  try {
+    const res = await api(`api/runs/${id}/stop`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:'{}',
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    await refresh();
+    await refreshTranscript(true);
+  } catch(e) {
+    alert(`Could not stop run #${id}: ${e.message || e}`);
+  } finally {
+    stopping.delete(id);
+    lastHash.phead = null;
+    renderRuns();
+    if (selected === id) refreshTranscript(true);
+  }
+}
+
 function itemHtml(it, i){
   if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
   if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;
-  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.parent_run?`<tr><th>parent run</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
+  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.lead_run?`<tr><th>lead run</th><td>#${esc(it.lead_run)}</td></tr>`:''}${it.parent_run?`<tr><th>session follow-up</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
   return `<div class="titem meta">${esc(it.body)}</div>`;
 }
 
@@ -327,6 +375,7 @@ function renderDetails(r){
     model:r.model||'',
     team:r.team||'',
     requested_by:r.requested_by||'',
+    lead_run:r.lead_run||null,
     parent_run:r.parent_run||null,
     session_ref:r.session_ref||'',
   };
@@ -343,12 +392,13 @@ async function refreshTranscript(force){
   const r = res.run;
   const head = `<span class="mono">#${r.id}</span> ${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
     <b>${esc(r.agent)}</b>
-    <span class="chip s-${esc(r.status)}">${esc(r.status)}</span>
+    ${statusChip(r.status)}
     <span class="mono muted" title="configured backend">${esc(r.backend||'')}</span>
     ${r.model?`<span class="mono muted" title="configured model">${esc(r.model)}</span>`:''}
     ${r.work_item?`<span class="mono">${esc(r.work_item)}</span>`:''}
     ${r.branch?`<span class="mono muted">${esc(r.branch)}</span>`:''}
     <span class="mono muted" data-start="${esc(r.started_at)}" ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span>
+    ${canStopRun(r)?`<button class="danger" type="button" onclick="stopRun(${r.id})" ${stopping.has(r.id)?'disabled':''}>${stopping.has(r.id)?'stopping...':'Stop'}</button>`:''}
     <label id="follow"><input type="checkbox" id="followcb" checked> follow tail</label>`;
   setIfChanged('phead', head);
   const body = document.getElementById('pbody');
@@ -438,7 +488,7 @@ async function refresh(){
   document.getElementById('beat').style.background='var(--green)';
   document.getElementById('root').textContent = state.root;
   if (selected == null && !selTm && !userPicked && state.runs.length){
-    const active = state.runs.filter(r=>['running','spawning'].includes(r.status));
+    const active = state.runs.filter(r=>canStopRun(r));
     select((active.length ? active[active.length-1] : state.runs[state.runs.length-1]).id);
   }
   renderRuns(); renderEnsemble(); renderBottom();

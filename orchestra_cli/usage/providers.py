@@ -1,4 +1,4 @@
-"""Native quota collectors for MiniMax, Z.AI, Claude, and Codex.
+"""Native quota collectors for MiniMax, Kimi, Z.AI, Claude, and Codex.
 
 Each `parse_*` function takes the raw provider JSON and returns normalized
 `QuotaWindow` rows. Each `collect_*` function handles credential discovery,
@@ -9,6 +9,7 @@ can show actionable guidance instead of a hard error.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pty
 import re
@@ -38,6 +39,7 @@ from orchestra_cli.usage.models import (
 
 
 MINIMAX_USAGE_URL = "https://www.minimax.io/v1/token_plan/remains"
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 MAX_RESPONSE_BYTES = 524_288
 HTTP_TIMEOUT_SECONDS = 8.0
@@ -196,6 +198,130 @@ def collect_minimax(*, json_fetcher: JsonFetcher = fetch_json) -> ProviderResult
         name="MiniMax",
         status="ok",
         plan="Token Plan",
+        windows=windows,
+        source=credential.source,
+    )
+
+
+def _quota_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    number: float
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _kimi_window(
+    detail: Any,
+    *,
+    window_id: str,
+    label: str,
+) -> QuotaWindow | None:
+    if not isinstance(detail, dict):
+        return None
+    limit = _quota_number(detail.get("limit"))
+    remaining = _quota_number(detail.get("remaining"))
+    if limit is None or remaining is None or limit <= 0 or remaining < 0:
+        return None
+    return QuotaWindow.from_remaining(
+        id=window_id,
+        label=label,
+        scope="Kimi coding models",
+        remaining_percent=remaining / limit * 100,
+        resets_at=_normalize_reset_time(detail.get("resetTime")),
+    )
+
+
+def _kimi_duration_label(window: Any) -> str:
+    if not isinstance(window, dict):
+        return "Rolling window"
+    duration = _quota_number(window.get("duration"))
+    unit = window.get("timeUnit")
+    if duration is None or duration <= 0 or not isinstance(unit, str):
+        return "Rolling window"
+    unit_minutes = {
+        "TIME_UNIT_MINUTE": 1,
+        "TIME_UNIT_HOUR": 60,
+        "TIME_UNIT_DAY": 1_440,
+    }.get(unit)
+    if unit_minutes is None:
+        return "Rolling window"
+    minutes = duration * unit_minutes
+    if not minutes.is_integer():
+        return "Rolling window"
+    return _duration_label(0, int(minutes) * 60_000, "Rolling window")
+
+
+def parse_kimi(payload: dict[str, Any]) -> list[QuotaWindow]:
+    windows: list[QuotaWindow] = []
+    weekly = _kimi_window(payload.get("usage"), window_id="weekly", label="Weekly")
+    if weekly:
+        windows.append(weekly)
+
+    limits = payload.get("limits")
+    if isinstance(limits, list):
+        for index, item in enumerate(limits):
+            if not isinstance(item, dict):
+                continue
+            window = _kimi_window(
+                item.get("detail"),
+                window_id=f"rolling-{index}",
+                label=_kimi_duration_label(item.get("window")),
+            )
+            if window:
+                windows.append(window)
+    if not windows:
+        raise ProviderRequestError("Kimi returned no usable quota windows")
+    return windows
+
+
+def collect_kimi(*, json_fetcher: JsonFetcher = fetch_json) -> ProviderResult:
+    try:
+        credential = opencode_api_key(
+            ("kimi-for-coding",),
+            ("KIMI_API_KEY", "KIMI_CODE_API_KEY"),
+        )
+    except CredentialMissing:
+        return error_result(
+            "kimi",
+            "Moonshot AI",
+            "not_configured",
+            "Connect Kimi for Coding in OpenCode or set KIMI_API_KEY.",
+        )
+    except CredentialError:
+        return error_result(
+            "kimi", "Moonshot AI", "unavailable", "Kimi credentials could not be read."
+        )
+    try:
+        payload = json_fetcher(
+            KIMI_USAGE_URL,
+            {
+                "Authorization": f"Bearer {credential.value}",
+                "Content-Type": "application/json",
+                "User-Agent": "orchestra-cli/0.1",
+            },
+            HTTP_TIMEOUT_SECONDS,
+        )
+        windows = parse_kimi(payload)
+    except ProviderRequestError as exc:
+        if exc.status_code in (401, 403):
+            return error_result(
+                "kimi", "Moonshot AI", "auth_required", "Kimi rejected the saved API key."
+            )
+        return error_result("kimi", "Moonshot AI", "unavailable", str(exc))
+    return ProviderResult(
+        id="kimi",
+        name="Moonshot AI",
+        status="ok",
+        plan="Kimi Code",
         windows=windows,
         source=credential.source,
     )

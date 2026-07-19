@@ -7,7 +7,7 @@ Coverage targets (matches docs/LOCAL-WORKSPACE.md and Work's tailscale-network.m
   * Host validation: wildcard and ordinary LAN hosts are refused; loopback
     and Tailscale IPv4 hosts are accepted.
   * ``--tailscale`` binds ONLY the discovered Tailscale IPv4 and surfaces a
-    clear message that peers may VIEW dashboard data (it is read-only).
+    clear message that peers may view dashboard data and stop active runs.
   * Default vs explicit port semantics: default 4764 falls back to a free
     port when busy; any explicit ``--port`` is pinned and fails clearly
     with ``EADDRINUSE`` (using the canonical errno, not a list of
@@ -250,16 +250,15 @@ class CliArgumentMutualExclusionTests(unittest.TestCase):
 
 
 class TailscaleWarningWordingTests(unittest.TestCase):
-    """The Tailnet warning must not claim UI mutability — the dashboard
-    only exposes read-only views."""
+    """The Tailnet warning must describe the mutating stop action."""
 
-    def test_warning_text_describes_read_only_scope(self) -> None:
+    def test_warning_text_describes_view_and_stop_scope(self) -> None:
         text = ui.tailscale_warning("100.99.99.99")
         # The warning must be one canonical string the serve() function
         # prints verbatim, so any wording change is forced to update both.
         self.assertIn("Tailscale ACLs", text)
-        # Read-only scope — no "use and modify" claim.
         self.assertIn("view", text.lower())
+        self.assertIn("stop active runs", text.lower())
         self.assertNotIn("modify", text.lower())
 
 

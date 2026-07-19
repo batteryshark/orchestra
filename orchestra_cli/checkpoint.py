@@ -63,7 +63,7 @@ BODY_PREVIEW_CHARS = 400
 SAFE_RUN_FIELDS = (
     "id", "slug", "agent", "backend", "model", "title",
     "work_item", "team", "requested_by", "status",
-    "started_at", "finished_at",
+    "lead_run", "child_depth", "started_at", "finished_at",
 )
 SAFE_MESSAGE_FIELDS = (
     "id", "sender", "recipient", "work_item", "run_id",

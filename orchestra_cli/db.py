@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS runs (
   workdir TEXT NOT NULL,
   branch TEXT,
   parent_run INTEGER,
+  lead_run INTEGER,
+  child_depth INTEGER NOT NULL DEFAULT 0,
+  child_wakeup_run INTEGER,
   pid INTEGER,
   session_ref TEXT,
   status TEXT NOT NULL DEFAULT 'spawning',
@@ -109,6 +112,16 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_slug_unique "
         "ON runs(slug) WHERE slug IS NOT NULL"
     )
+
+    # W-0015: native child runs. ``parent_run`` already means a backend
+    # session continuation, so child ownership must remain a separate edge.
+    if not _has_column(con, "runs", "lead_run"):
+        con.execute("ALTER TABLE runs ADD COLUMN lead_run INTEGER")
+    if not _has_column(con, "runs", "child_depth"):
+        con.execute("ALTER TABLE runs ADD COLUMN child_depth INTEGER NOT NULL DEFAULT 0")
+    if not _has_column(con, "runs", "child_wakeup_run"):
+        con.execute("ALTER TABLE runs ADD COLUMN child_wakeup_run INTEGER")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_runs_lead_run ON runs(lead_run)")
 
 
 def connect(root: Path) -> sqlite3.Connection:

@@ -10,11 +10,13 @@ from unittest.mock import patch
 from orchestra_cli.usage.credentials import opencode_api_key
 from orchestra_cli.usage.providers import (
     ProviderRequestError,
+    collect_kimi,
     collect_claude,
     parse_claude,
     parse_claude_usage_screen,
     parse_codex,
     parse_codex_reset_credits,
+    parse_kimi,
     parse_minimax,
     parse_zai,
     read_recent_codex_snapshot,
@@ -81,6 +83,61 @@ class ZaiParserTests(unittest.TestCase):
         self.assertEqual([window.label for window in windows], ["5-hour", "Weekly", "Monthly"])
         self.assertEqual([window.scope for window in windows], ["Coding tokens", "Coding tokens", "MCP tools"])
         self.assertEqual([window.remaining_percent for window in windows], [40.0, 70.0, 100.0])
+
+
+class KimiParserTests(unittest.TestCase):
+    def test_parses_weekly_and_rolling_string_quotas(self) -> None:
+        windows = parse_kimi(
+            {
+                "usage": {
+                    "limit": "100",
+                    "remaining": "75",
+                    "resetTime": "2026-07-26T00:31:11.688326Z",
+                },
+                "limits": [
+                    {
+                        "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {
+                            "limit": "80",
+                            "remaining": "20",
+                            "resetTime": "2026-07-19T05:31:11.688326Z",
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertEqual([window.label for window in windows], ["Weekly", "5-hour"])
+        self.assertEqual([window.remaining_percent for window in windows], [75.0, 25.0])
+        self.assertTrue(windows[0].resets_at and windows[0].resets_at.endswith("+00:00"))
+
+    def test_rejects_zero_limits_and_malformed_rows(self) -> None:
+        with self.assertRaises(ProviderRequestError):
+            parse_kimi(
+                {
+                    "usage": {"limit": "0", "remaining": "0"},
+                    "limits": [{"detail": {"limit": "wat", "remaining": "10"}}],
+                }
+            )
+
+        with self.assertRaises(ProviderRequestError):
+            parse_kimi({"usage": {"limit": "nan", "remaining": "10"}})
+
+    def test_collector_uses_opencode_kimi_credential_without_serializing_it(self) -> None:
+        payload = {
+            "usage": {"limit": "100", "remaining": "90", "resetTime": None},
+            "limits": [],
+        }
+        with patch("orchestra_cli.usage.providers.opencode_api_key") as credential_reader:
+            credential_reader.return_value.value = "fixture-secret"
+            credential_reader.return_value.source = "OpenCode (kimi-for-coding)"
+            result = collect_kimi(json_fetcher=lambda *_: payload)
+
+        credential_reader.assert_called_once_with(
+            ("kimi-for-coding",), ("KIMI_API_KEY", "KIMI_CODE_API_KEY")
+        )
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.source, "OpenCode (kimi-for-coding)")
+        self.assertNotIn("fixture-secret", json.dumps(result.to_dict()))
 
 
 class ClaudeParserTests(unittest.TestCase):

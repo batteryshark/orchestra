@@ -17,7 +17,8 @@ def work_snapshot(root: Path, item: str) -> str:
 
 def compose(*, root: Path, run_id: int, agent: dict, mission: str,
             work_item: str | None, team: str | None, requester: str,
-            workdir: str, extra_context: str | None = None) -> str:
+            workdir: str, extra_context: str | None = None,
+            lead_run: int | None = None) -> str:
     name = agent["name"]
     parts = [f"""# Orchestra worker brief — run {run_id}
 
@@ -39,9 +40,16 @@ Run `work show {work_item}` for full context and `work agent operations` if you 
 """ + (f"Snapshot at dispatch time:\n\n```\n{snap}\n```\n" if snap else ""))
     if extra_context:
         parts.append(f"## Additional context\n\n{extra_context}\n")
+    if lead_run is not None:
+        parts.append(f"""## Child-run contract
+
+This is an isolated child of lead run **{lead_run}**. Return a focused result; do not
+merge your branch automatically. Your completion and branch are reported to the lead.
+You may use `orchestra spawn` only if project policy permits another depth level.
+""")
     parts.append(f"""## Coordination protocol (required)
 
-Coordination runs through the `orchestra` CLI and the `work` CLI, both on PATH. Identify yourself with `--as {name}` on orchestra commands (ORCHESTRA_SELF is also exported for you).
+Coordination runs through the `orchestra` CLI and the `work` CLI, both on PATH. Identify yourself with `--as {name}` on orchestra commands (ORCHESTRA_SELF and ORCHESTRA_RUN_ID are also exported for you).
 
 1. **Start** — read pending messages: `orchestra inbox {name} --unread --mark-read`
 2. **Progress** — {'append to the work item log after each meaningful step: `work log ' + work_item + ' "<what happened>"`' if work_item else 'record meaningful progress with `orchestra note "<progress>" --as ' + name + '`'}

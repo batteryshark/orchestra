@@ -10,10 +10,13 @@ from pathlib import Path
 
 from orchestra_cli import (
     brief,
+    cancel,
+    child_runs,
     checkpoint,
     config,
     db,
     docs,
+    ensemble,
     host,
     names,
     paths,
@@ -237,13 +240,19 @@ def _assess_quota_warnings(cfg: dict, targets: list[str]) -> tuple[list[str], li
 def cmd_dispatch(args):
     root = paths.find_root()
     cfg = config.load(root)
-    con = db.connect(root)
     requester = _identity(args, cfg)
     mission = " ".join(args.mission)
     if args.brief_file:
         mission = Path(args.brief_file).read_text()
     if not mission.strip():
         raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
+
+    target_agents = [(target, config.agent_cfg(cfg, target)) for target in args.to]
+    ensemble_targets = [name for name, agent in target_agents if agent.get("ensemble")]
+    if ensemble_targets:
+        ensemble.require_plugin(ensemble_targets)
+
+    con = db.connect(root)
     if args.team:
         if not con.execute("SELECT 1 FROM teams WHERE name=?", (args.team,)).fetchone():
             raise SystemExit(f"orchestra: no team '{args.team}' (create it first)")
@@ -261,8 +270,7 @@ def cmd_dispatch(args):
             print(line, file=sys.stderr)
 
     run_ids = []
-    for target in args.to:
-        agent = config.agent_cfg(cfg, target)
+    for target, agent in target_agents:
         display_model = agent.get("model")
         if agent["backend"] == "codex":
             dm, de = config.codex_defaults()
@@ -328,6 +336,44 @@ def cmd_dispatch(args):
     if not args.sync:
         print(f"dispatched async. `orchestra wait {' '.join(map(str, run_ids))}` blocks until done; "
               f"completions land in inbox '{requester}'.")
+
+
+def cmd_spawn(args):
+    """Spawn a bounded child batch from the currently supervised worker."""
+    root = paths.find_root()
+    cfg = config.load(root)
+    raw_parent = os.environ.get("ORCHESTRA_RUN_ID")
+    identity = os.environ.get("ORCHESTRA_SELF")
+    try:
+        parent_id = int(raw_parent or "")
+    except ValueError:
+        raise SystemExit(
+            "orchestra: spawn is worker-only and requires ORCHESTRA_RUN_ID from a supervisor"
+        )
+    mission = " ".join(args.mission)
+    if args.brief_file:
+        mission = Path(args.brief_file).read_text()
+    if not mission.strip():
+        raise SystemExit("orchestra: empty child mission (pass text, or --brief-file)")
+    targets = [(target, config.agent_cfg(cfg, target)) for target in args.to]
+    ensemble_targets = [name for name, agent in targets if agent.get("ensemble")]
+    if ensemble_targets:
+        ensemble.require_plugin(ensemble_targets)
+    con = db.connect(root)
+    try:
+        parent = child_runs.validate_parent(con, cfg, parent_id, identity)
+        run_ids = child_runs.create(
+            con, root, cfg, parent, list(args.to), mission,
+            title=args.title, context=args.context,
+            shared_workdir=args.shared_workdir,
+        )
+    finally:
+        con.close()
+    for run_id in run_ids:
+        _spawn_supervisor(root, run_id)
+        print(f"child run {run_id}: spawned for lead run {parent_id}")
+    print("Child completions will notify this lead; if it exits first, Orchestra will "
+          "resume it exactly once after the batch settles.")
 
 
 def cmd_reply(args):
@@ -517,20 +563,19 @@ def cmd_interrupt(args):
 def cmd_kill(args):
     root = paths.find_root()
     con = db.connect(root)
-    r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
-    if not r:
+    result = cancel.stop_run(con, args.run_id)
+    if not result:
         raise SystemExit(f"orchestra: no run {args.run_id}")
-    if r["status"] in db.RUN_TERMINAL:
-        print(f"run {args.run_id} already {r['status']}")
+    if not result.stopped:
+        print(f"run {args.run_id} already {result.status}")
         return
-    con.execute("UPDATE runs SET status='killed' WHERE id=?", (args.run_id,))
-    con.commit()
-    if r["pid"]:
-        try:
-            os.killpg(r["pid"], signal.SIGTERM)
-            print(f"sent SIGTERM to run {args.run_id} (pgid {r['pid']})")
-        except ProcessLookupError:
-            print(f"run {args.run_id} process already gone; marked killed")
+    if result.signal_sent:
+        print(f"sent SIGTERM to run {args.run_id} (pgid {result.pid})")
+    else:
+        print(f"run {args.run_id} marked killed ({result.reason})")
+    if result.descendant_ids:
+        print(f"also stopped {len(result.descendant_ids)} active child run(s): "
+              + ", ".join(map(str, result.descendant_ids)))
 
 
 def cmd_note(args):
@@ -733,10 +778,11 @@ def cmd_doctor(args):
         if a.get("backend") == "opencode" and m and models and m not in models:
             status = f"MODEL NOT FOUND in `opencode models`"
         print(f"    {name:<12} {a.get('backend'):<9} {m or '(default)':<42} {status}")
-    oc_cfg = Path("~/.config/opencode/opencode.json").expanduser()
-    if oc_cfg.is_file():
-        ensemble = "ensemble" in oc_cfg.read_text()
-        print(f"\n  opencode-ensemble plugin: {'installed' if ensemble else 'NOT in ' + str(oc_cfg)}")
+    ensemble_agents = ensemble.configured_agents(cfg)
+    if ensemble_agents:
+        status = ensemble.plugin_status()
+        state = f"configured ({status.detail})" if status.configured else f"MISSING — {status.detail}"
+        print(f"\n  optional opencode-ensemble plugin: {state}")
     if root:
         print(f"\n  project root: {root}")
         print(f"  work tracker: {'present' if (root / '.work').is_dir() else 'absent (run `work init .`)'}")
@@ -746,6 +792,7 @@ def cmd_host(args):
     if args.host_cmd == "stop":
         print("host stopped" if host.stop() else "host was not running")
     elif args.host_cmd == "start":
+        ensemble.require_plugin(["host"])
         print(f"host: {host.ensure(args.port)}")
     else:  # status
         u = host.url()
@@ -779,7 +826,11 @@ def cmd_usage(args):
               f"({rec.get('headroom_percent'):.0f}% headroom across coding windows)")
     else:
         print("  (no provider returned a usable coding headroom yet)")
-    for row in snap.get("providers") or []:
+    provider_rows = snap.get("providers") or []
+    provider_name_width = max(
+        8, *(len(str(row.get("name") or "")) for row in provider_rows)
+    )
+    for row in provider_rows:
         plan = row.get("plan") or "—"
         headroom = row.get("headroom_percent")
         headroom_s = f"{headroom:.0f}%" if isinstance(headroom, (int, float)) else "n/a"
@@ -788,7 +839,7 @@ def cmd_usage(args):
         # providers leave it None and we render the count line only when
         # the wire carries an actual Codex reset-credit record.
         reset_note = _format_reset_credits(resets)
-        print(f"  {row.get('name'):<8} [{row.get('status'):<12}] {plan:<22} "
+        print(f"  {row.get('name'):<{provider_name_width}} [{row.get('status'):<12}] {plan:<22} "
               f"headroom {headroom_s}{reset_note}")
 
     print()
@@ -992,6 +1043,17 @@ def main():
     ident(s)
     s.set_defaults(fn=cmd_dispatch)
 
+    s = sub.add_parser("spawn", help="spawn bounded child runs from the active worker")
+    s.add_argument("mission", nargs="*")
+    s.add_argument("--to", action="append", required=True,
+                   help="roster agent (repeatable for a child batch)")
+    s.add_argument("--title")
+    s.add_argument("--context", help="extra context appended to each child brief")
+    s.add_argument("--brief-file", help="read child mission text from a file")
+    s.add_argument("--shared-workdir", action="store_true",
+                   help="opt out of the default isolated child worktree")
+    s.set_defaults(fn=cmd_spawn)
+
     s = sub.add_parser("reply", help="continue a finished run's session with a follow-up")
     s.add_argument("run_id", type=int)
     s.add_argument("message", nargs="+")
@@ -1034,7 +1096,7 @@ def main():
     s.add_argument("--refresh", action="store_true", help="force a fresh quota snapshot")
     s.set_defaults(fn=cmd_usage)
 
-    s = sub.add_parser("ui", help="shared read-only dashboard for registered projects")
+    s = sub.add_parser("ui", help="shared dashboard for registered projects")
     s.add_argument("--port", type=int, default=None,
                    help="UI port; defaults to a 4764 preference (falls back to OS-chosen when 4764 is busy). "
                         "Any other explicit value is pinned — a busy port fails clearly.")

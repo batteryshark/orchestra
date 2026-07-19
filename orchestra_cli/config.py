@@ -9,12 +9,18 @@ DEFAULT_CONFIG = """\
 
 [settings]
 timeout = 3600            # per-run seconds before the supervisor kills a worker
+supervisor_checkin_interval = 600  # seconds between safe progress check-ins for long runs
 default_requester = "orchestrator"
 # quota_warn = true (default) — print a one-shot cached headroom advisory before
 # each dispatch when the target coding plan is below the runway floor; never
 # blocks dispatch, never reroutes, never consumes a Codex reset credit.
 # Set to false in .orchestra/config.toml to opt out.
 quota_warn = true
+# Native worker delegation limits. Children use isolated git worktrees by
+# default and never merge their branches automatically.
+child_max_depth = 1
+child_max_per_run = 3
+child_max_active = 3
 # Optional env vars to recover from `launchctl getenv` on macOS when a worker
 # starts outside the user's interactive shell. Add only names, never values.
 env_passthrough = []
@@ -23,7 +29,8 @@ env_passthrough = []
 # --- roster ---------------------------------------------------------------
 # backend: opencode | codex | claude
 # model:   backend-specific model id (opencode: provider/model, codex: model name)
-# ensemble = true makes an opencode agent the LEAD of an ensemble team
+# ensemble = true opts an opencode agent into the optional OpenCode Ensemble
+# integration. See the README for the plugin and roster configuration.
 # extra_args: appended to the backend CLI invocation
 
 [agents.minimax]
@@ -42,6 +49,17 @@ model = "zhipuai-coding-plan/glm-5.2"
 variant = "max"
 role = "heavy reasoning tier — hard design/debugging (pairs with codex xhigh)"
 
+[agents.kimi]
+backend = "opencode"
+model = "kimi-for-coding/k3"
+role = "flagship Kimi generalist — complex coding, long context, and visual work"
+
+[agents.kimi-max]
+backend = "opencode"
+model = "kimi-for-coding/k3"
+variant = "max"
+role = "Kimi K3 max-thinking tier — hard design, debugging, and integration work"
+
 [agents.codex]
 backend = "codex"
 # model omitted -> uses ~/.codex/config.toml default (gpt-5.6-sol)
@@ -59,12 +77,6 @@ backend = "claude"
 role = "worker claude for when another orchestrator is driving"
 extra_args = ["--permission-mode", "acceptEdits", "--allowedTools", "Bash Edit Write Read Glob Grep WebFetch"]
 
-[agents.ensemble]
-backend = "opencode"
-model = "zhipuai-coding-plan/glm-5.2"
-ensemble = true
-role = "lead of an opencode-ensemble team"
-model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
 """
 
 

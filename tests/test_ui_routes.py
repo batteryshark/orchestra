@@ -132,6 +132,15 @@ class RouteTests(unittest.TestCase):
         self.assertIn("provider runway</a>", body.lower()
                       or "provider runway</A>".lower())
 
+    def test_main_dashboard_has_json_stop_control_wiring(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("async function stopRun", body)
+        self.assertIn("canStopRun(r)?", body)
+        self.assertIn("api/runs/${id}/stop", body)
+        self.assertIn("'Content-Type':'application/json'", body)
+        self.assertIn("status === 'killed' ? 'stopped by user' : status", body)
+
     def test_api_usage_still_served(self) -> None:
         status, headers, body = self.get("/api/usage")
         self.assertEqual(status, 200)

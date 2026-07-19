@@ -11,7 +11,7 @@ if (networkScope) {
   networkScope.textContent = host.startsWith('100.') ? 'tailnet' : 'loopback';
 }
 
-const monograms = { minimax: 'MM', claude: 'CL', zai: 'Z', codex: 'CX' };
+const monograms = { minimax: 'MM', kimi: 'K', claude: 'CL', zai: 'Z', codex: 'CX' };
 const statusLabels = {
   ok: 'Live', stale: 'Cached', auth_required: 'Login', not_configured: 'Setup', unavailable: 'Offline'
 };
@@ -97,7 +97,7 @@ function resetCreditsTemplate(resetCredits) {
 function commandFor(provider) {
   if (provider.status === 'stale') return 'retry shortly';
   if (provider.id === 'claude') return 'claude → /login';
-  if (provider.id === 'minimax' || provider.id === 'zai') return 'opencode auth login';
+  if (provider.id === 'minimax' || provider.id === 'kimi' || provider.id === 'zai') return 'opencode auth login';
   return 'codex login';
 }
 

@@ -30,13 +30,16 @@ def sync_skills(root: Path, workdir: Path) -> list[str]:
     return synced
 
 
-def create(root: Path, run_id: int) -> tuple[Path, str]:
+def create(root: Path, run_id: int, start_point: str | None = None) -> tuple[Path, str]:
     """Create a git worktree for an isolated run; returns (workdir, branch)."""
     if not (root / ".git").exists():
         raise SystemExit("orchestra: --worktree needs the project to be a git repository")
     branch = f"orchestra/run-{run_id}"
     wt = paths.worktrees_dir(root) / f"run-{run_id}"
-    res = subprocess.run(["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt)],
+    cmd = ["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt)]
+    if start_point:
+        cmd.append(start_point)
+    res = subprocess.run(cmd,
                          capture_output=True, text=True)
     if res.returncode != 0:
         raise SystemExit(f"orchestra: git worktree failed: {res.stderr.strip()}")

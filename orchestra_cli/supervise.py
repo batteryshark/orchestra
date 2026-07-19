@@ -8,6 +8,8 @@ Messaging semantics it enforces:
   sender — a message to a worker can never rot silently.
 """
 import os
+import json
+import re
 import shutil
 import signal
 import subprocess
@@ -18,8 +20,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from orchestra_cli import config, db, host, paths, runners
+from orchestra_cli.usage import DEFAULT_COLLECTORS, infer_from_agent
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
+PROC_POLL_INTERVAL = 2
+DEFAULT_CHECKIN_INTERVAL = 600
+MIN_CHECKIN_INTERVAL = 1
+MAX_CHECKIN_INTERVAL = 3600
+
+_USAGE_LIMIT_RE = re.compile(
+    r"(?i)("
+    r"(usage|quota|credit|token|rate)[\w\s-]{0,40}(exhausted|exceeded|reached|depleted)|"
+    r"(exhausted|exceeded|reached|depleted|insufficient|out of)[\w\s-]{0,40}"
+    r"(usage|quota|credit|token|rate limit)|"
+    r"(monthly|daily|weekly)[\w\s-]{0,20}(limit|quota)[\w\s-]{0,30}"
+    r"(exhausted|exceeded|reached)"
+    r")"
+)
+_RAW_ERROR_LINE_RE = re.compile(r"(?i)^\s*(error|fatal|provider error|api error)\b")
 
 
 def spawn_supervisor(root: Path, run_id: int) -> None:
@@ -31,16 +49,16 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
 
 
 def create_followup(con, root: Path, parent: dict, requester: str, text: str,
-                    title: str | None = None) -> int:
+                    title: str | None = None, *, commit: bool = True) -> int:
     """New run row that resumes parent's session with `text` as the prompt."""
     cur = con.execute(
         "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, "
-        "workdir, branch, parent_run, session_ref, status, started_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+        "workdir, branch, parent_run, lead_run, child_depth, session_ref, status, started_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
         (parent["agent"], parent["backend"], parent["model"],
          title or f"follow-up to run {parent['id']}", parent["work_item"], parent["team"],
          requester, parent["workdir"], parent["branch"], parent["id"],
-         parent["session_ref"], db.now()))
+         parent.get("lead_run"), parent.get("child_depth", 0), parent["session_ref"], db.now()))
     run_id = cur.lastrowid
     bp = paths.briefs_dir(root) / f"run-{run_id}.md"
     bp.write_text(text)
@@ -48,7 +66,8 @@ def create_followup(con, root: Path, parent: dict, requester: str, text: str,
     lp.touch()
     con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",
                 (str(bp), str(lp), run_id))
-    con.commit()
+    if commit:
+        con.commit()
     return run_id
 
 
@@ -65,21 +84,188 @@ def _ts_to_epoch(ts: str) -> float:
     return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
 
 
-def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline) -> tuple[str, int | None]:
+def _checkin_interval_seconds(raw) -> int | None:
+    if raw is False or raw is None:
+        return None
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        seconds = DEFAULT_CHECKIN_INTERVAL
+    if seconds <= 0:
+        return None
+    return min(max(seconds, MIN_CHECKIN_INTERVAL), MAX_CHECKIN_INTERVAL)
+
+
+def _terminate_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        return
+    except ProcessLookupError:
+        return
+    except Exception:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def _wait_after_term(proc: subprocess.Popen, timeout: float = 15) -> None:
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _json_strings(obj, *, keys: set[str] | None = None) -> list[str]:
+    if isinstance(obj, dict):
+        out = []
+        for k, v in obj.items():
+            if keys is None or k in keys:
+                out.extend(_json_strings(v))
+            elif isinstance(v, (dict, list)):
+                out.extend(_json_strings(v, keys=keys))
+        return out
+    if isinstance(obj, list):
+        out = []
+        for v in obj:
+            out.extend(_json_strings(v, keys=keys))
+        return out
+    if isinstance(obj, str):
+        return [obj]
+    return []
+
+
+def _is_error_event(obj: dict) -> bool:
+    marker_keys = {"type", "event", "level", "status", "kind", "subtype"}
+    for key in marker_keys:
+        value = obj.get(key)
+        if isinstance(value, str) and value.lower() in {
+            "error", "fatal", "failed", "failure", "exception"
+        }:
+            return True
+    if "error" in obj:
+        return True
+    nested = obj.get("data") or obj.get("payload")
+    return isinstance(nested, dict) and _is_error_event(nested)
+
+
+def _error_event_strings(obj) -> list[str]:
+    if not isinstance(obj, dict) or not _is_error_event(obj):
+        return []
+    return _json_strings(
+        obj,
+        keys={"error", "message", "detail", "details", "reason", "description", "result"},
+    )
+
+
+def _usage_limit_text(log_path: str, *, max_bytes: int = 262144) -> str | None:
+    try:
+        with open(log_path, "rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes))
+            except OSError:
+                pass
+            lines = f.read(max_bytes).decode(errors="replace").splitlines()
+    except OSError:
+        return None
+
+    for line in reversed(lines):
+        text = line.strip()
+        if not text:
+            continue
+        candidates = [text] if _RAW_ERROR_LINE_RE.search(text) else []
+        if text.startswith("{"):
+            try:
+                obj = json.loads(text)
+            except ValueError:
+                obj = None
+            if obj is not None:
+                candidates = _error_event_strings(obj)
+        for candidate in candidates:
+            compact = " ".join(candidate.split())
+            if compact and _USAGE_LIMIT_RE.search(compact):
+                return compact[:800]
+    return None
+
+
+def _insert_checkin_message(con, run, run_id: int) -> None:
+    body = (
+        f"PROGRESS CHECK-IN run {run_id}: send {run['requested_by']} a short progress "
+        f"update with `orchestra send {run['requested_by']} \"PROGRESS run {run_id}: ...\" "
+        f"--as {run['agent']} --run {run_id}`, then continue the original mission."
+    )
+    if run["work_item"]:
+        body += f" Also record durable progress with `work log {run['work_item']} ...`."
+    con.execute(
+        "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, created_at) "
+        "VALUES('orchestra', ?, ?, ?, ?, 'checkin', ?)",
+        (run["agent"], body, run["work_item"], run_id, db.now()),
+    )
+
+
+def _quota_exhausted_text(agent: dict) -> str | None:
+    provider_id = infer_from_agent(agent)
+    if not provider_id:
+        return None
+    for candidate_id, provider_name, collector in DEFAULT_COLLECTORS:
+        if candidate_id != provider_id:
+            continue
+        try:
+            result = collector()
+        except Exception:
+            return None
+        provider = result.to_dict() if hasattr(result, "to_dict") else result
+        if not isinstance(provider, dict) or provider.get("status") != "ok":
+            return None
+        headroom = provider.get("headroom_percent")
+        if not isinstance(headroom, (int, float)) or float(headroom) > 0:
+            return None
+        name = provider.get("name") or provider_name or provider_id
+        return f"{name} coding headroom is {float(headroom):.0f}%"
+    return None
+
+
+def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
+              agent: dict | None = None,
+              checkin_interval: int | None = None,
+              checkin_state: dict | None = None,
+              poll_interval: float = PROC_POLL_INTERVAL) -> tuple[str, int | None]:
     """Start one worker process; wait with timeout + early session-ref capture.
-    Returns (outcome, exit_code) where outcome is 'exit'|'timeout'."""
+    Returns (outcome, exit_code) where outcome is 'exit'|'timeout'|'usage_limit'."""
     with open(log_path, "ab") as log:
+        latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+        if latest and latest["status"] in db.RUN_TERMINAL:
+            return "exit", None
         log.write((" ".join(cmd[:6]) + " ...\n").encode())
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT,
                                 cwd=workdir, env=env, start_new_session=True)
-        con.execute("UPDATE runs SET pid=?, status='running' WHERE id=?", (proc.pid, run_id))
+        cur = con.execute(
+            "UPDATE runs SET pid=?, status='running' "
+            "WHERE id=? AND status NOT IN ('done','failed','timeout','killed')",
+            (proc.pid, run_id))
         con.commit()
+        if cur.rowcount == 0:
+            latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if latest and latest["status"] in db.RUN_TERMINAL:
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
+            return "exit", proc.poll()
         started = time.time()
         have_ref = bool(run["session_ref"])
         while True:
             try:
-                exit_code = proc.wait(timeout=2)
+                exit_code = proc.wait(timeout=max(0.01, poll_interval))
                 break
             except subprocess.TimeoutExpired:
                 pass
@@ -89,16 +275,59 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline) -> tuple[
                     con.execute("UPDATE runs SET session_ref=? WHERE id=?", (ref, run_id))
                     con.commit()
                     have_ref = True
+            usage_text = _usage_limit_text(log_path)
+            if usage_text:
+                con.execute(
+                    "UPDATE runs SET summary=? WHERE id=?",
+                    (f"Provider usage limit exhausted: {usage_text}", run_id),
+                )
+                con.commit()
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
+                return "usage_limit", None
+            latest = con.execute("SELECT status, session_ref FROM runs WHERE id=?", (run_id,)).fetchone()
+            if latest and latest["status"] in db.RUN_TERMINAL:
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
+                return "exit", proc.poll()
+            if latest and latest["session_ref"]:
+                have_ref = True
+            if checkin_interval and have_ref and checkin_state is not None:
+                last_sent_at = float(checkin_state.get("last_sent_at") or started)
+                if time.time() - last_sent_at >= checkin_interval:
+                    latest_run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+                    if latest_run and latest_run["status"] == "running":
+                        quota_text = _quota_exhausted_text(agent or {})
+                        if quota_text:
+                            con.execute(
+                                "UPDATE runs SET summary=? WHERE id=?",
+                                (f"Provider usage limit exhausted: {quota_text}", run_id),
+                            )
+                            con.commit()
+                            checkin_state["last_sent_at"] = time.time()
+                            _terminate_process_group(proc.pid)
+                            _wait_after_term(proc)
+                            return "usage_limit", None
+                        _insert_checkin_message(con, latest_run, run_id)
+                        con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (run_id,))
+                        con.commit()
+                        checkin_state["last_sent_at"] = time.time()
+                        _terminate_process_group(proc.pid)
+                        _wait_after_term(proc)
+                        return "exit", proc.poll()
             if time.time() > deadline:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=15)
-                except Exception:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except Exception:
-                        pass
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
                 return "timeout", None
+        if exit_code not in (None, 0):
+            usage_text = _usage_limit_text(log_path)
+            if usage_text:
+                con.execute(
+                    "UPDATE runs SET summary=? WHERE id=?",
+                    (f"Provider usage limit exhausted: {usage_text}", run_id),
+                )
+                con.commit()
+                return "usage_limit", exit_code
         return "exit", exit_code
 
 
@@ -110,6 +339,11 @@ def supervise(root: Path, run_id: int) -> int:
     cfg = config.load(root)
     agent = config.agent_cfg(cfg, run["agent"])
     timeout = int(agent.get("timeout") or cfg["settings"].get("timeout", 3600))
+    checkin_interval = _checkin_interval_seconds(
+        agent.get("supervisor_checkin_interval",
+                  cfg["settings"].get("supervisor_checkin_interval", DEFAULT_CHECKIN_INTERVAL))
+    )
+    checkin_state = {"last_sent_at": _ts_to_epoch(run["started_at"])}
     deadline = _ts_to_epoch(run["started_at"]) + timeout
 
     prompt = Path(run["brief_path"]).read_text() if run["brief_path"] else run["title"]
@@ -130,13 +364,20 @@ def supervise(root: Path, run_id: int) -> int:
             cmd = cmd[:2] + ["-o", last_msg_file] + cmd[2:]  # `codex exec -o FILE ...`
 
         env = config.apply_env_passthrough(
-            cfg, dict(os.environ, ORCHESTRA_SELF=run["agent"], ORCHESTRA_ROOT=str(root)))
+            cfg, dict(os.environ, ORCHESTRA_SELF=run["agent"], ORCHESTRA_ROOT=str(root),
+                      ORCHESTRA_RUN_ID=str(run_id)))
         outcome, exit_code = _run_proc(con, run, cmd, run["workdir"], env,
-                                       run["log_path"], run_id, deadline)
+                                       run["log_path"], run_id, deadline,
+                                       agent=agent,
+                                       checkin_interval=checkin_interval,
+                                       checkin_state=checkin_state)
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
 
         if outcome == "timeout":
             status = "timeout"
+            break
+        if outcome == "usage_limit":
+            status = "failed"
             break
         if run["status"] == "killed":
             status = "killed"
@@ -182,7 +423,18 @@ def supervise(root: Path, run_id: int) -> int:
         elif status == "done":
             status = "timeout"
 
+    latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+    if latest and latest["status"] == "killed":
+        status = "killed"
+        exit_code = None
+
     session_ref, last_text = runners.parse_log(run["log_path"])
+    if status == "failed" and run["summary"] and "usage limit" in run["summary"].lower():
+        last_text = (
+            f"{run['summary']}\n\n"
+            "The worker stopped because its provider quota appears exhausted. "
+            "Resume this run after capacity resets or reroute the work to another agent."
+        )
     if last_msg_file and Path(last_msg_file).is_file():
         txt = Path(last_msg_file).read_text(errors="replace").strip()
         if txt:
@@ -241,11 +493,18 @@ def supervise(root: Path, run_id: int) -> int:
                 "VALUES('orchestra', ?, ?, ?, ?, 'run')",
                 (f"run {run_id} ({run['agent']}) -> {status}", run["work_item"], run_id, db.now()))
     con.commit()
+    # A child finishing may settle its lead's batch; a lead finishing after
+    # already-settled children also needs the same check. The DB claim makes
+    # concurrent child supervisors produce at most one continuation.
+    from orchestra_cli import child_runs
+    child_wakeup_id = child_runs.maybe_wake_lead(con, root, run_id)
     if run["work_item"]:
         _work_log(root, run["work_item"],
                   f"orchestra run {run_id} ({run['agent']}) finished: {status}."
                   + (f" {summary[:300]}" if summary else ""))
     if followup_id:
         spawn_supervisor(root, followup_id)
+    if child_wakeup_id:
+        spawn_supervisor(root, child_wakeup_id)
     con.close()
     return 0 if status == "done" else 1
