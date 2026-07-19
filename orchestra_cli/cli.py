@@ -15,6 +15,7 @@ from orchestra_cli import (
     config,
     db,
     docs,
+    ensemble,
     host,
     names,
     paths,
@@ -238,13 +239,19 @@ def _assess_quota_warnings(cfg: dict, targets: list[str]) -> tuple[list[str], li
 def cmd_dispatch(args):
     root = paths.find_root()
     cfg = config.load(root)
-    con = db.connect(root)
     requester = _identity(args, cfg)
     mission = " ".join(args.mission)
     if args.brief_file:
         mission = Path(args.brief_file).read_text()
     if not mission.strip():
         raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
+
+    target_agents = [(target, config.agent_cfg(cfg, target)) for target in args.to]
+    ensemble_targets = [name for name, agent in target_agents if agent.get("ensemble")]
+    if ensemble_targets:
+        ensemble.require_plugin(ensemble_targets)
+
+    con = db.connect(root)
     if args.team:
         if not con.execute("SELECT 1 FROM teams WHERE name=?", (args.team,)).fetchone():
             raise SystemExit(f"orchestra: no team '{args.team}' (create it first)")
@@ -262,8 +269,7 @@ def cmd_dispatch(args):
             print(line, file=sys.stderr)
 
     run_ids = []
-    for target in args.to:
-        agent = config.agent_cfg(cfg, target)
+    for target, agent in target_agents:
         display_model = agent.get("model")
         if agent["backend"] == "codex":
             dm, de = config.codex_defaults()
@@ -730,10 +736,11 @@ def cmd_doctor(args):
         if a.get("backend") == "opencode" and m and models and m not in models:
             status = f"MODEL NOT FOUND in `opencode models`"
         print(f"    {name:<12} {a.get('backend'):<9} {m or '(default)':<42} {status}")
-    oc_cfg = Path("~/.config/opencode/opencode.json").expanduser()
-    if oc_cfg.is_file():
-        ensemble = "ensemble" in oc_cfg.read_text()
-        print(f"\n  opencode-ensemble plugin: {'installed' if ensemble else 'NOT in ' + str(oc_cfg)}")
+    ensemble_agents = ensemble.configured_agents(cfg)
+    if ensemble_agents:
+        status = ensemble.plugin_status()
+        state = f"configured ({status.detail})" if status.configured else f"MISSING — {status.detail}"
+        print(f"\n  optional opencode-ensemble plugin: {state}")
     if root:
         print(f"\n  project root: {root}")
         print(f"  work tracker: {'present' if (root / '.work').is_dir() else 'absent (run `work init .`)'}")
@@ -743,6 +750,7 @@ def cmd_host(args):
     if args.host_cmd == "stop":
         print("host stopped" if host.stop() else "host was not running")
     elif args.host_cmd == "start":
+        ensemble.require_plugin(["host"])
         print(f"host: {host.ensure(args.port)}")
     else:  # status
         u = host.url()

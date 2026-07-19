@@ -135,9 +135,32 @@ Claude usage refreshes from Claude Code's live `/usage` view in the background. 
 
 ## Configuration
 
-Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and relevant plugins.
+Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and configured optional integrations.
 
 Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra reply` resumes the same worker rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+
+### Optional OpenCode Ensemble integration
+
+Ordinary OpenCode workers do not require OpenCode Ensemble, and Orchestra does not include an Ensemble agent in the default roster. To opt into nested OpenCode teams, first add the separately maintained plugin to the `plugin` list in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["@hueyexe/opencode-ensemble@0.16.0"]
+}
+```
+
+Then add an explicit roster entry to `~/.config/orchestra/config.toml` or `.orchestra/config.toml`:
+
+```toml
+[agents.ensemble]
+backend = "opencode"
+model = "zhipuai-coding-plan/glm-5.2"
+ensemble = true
+role = "lead of an OpenCode Ensemble team"
+model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
+```
+
+After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra dispatch --to ensemble ...`. Orchestra starts its persistent OpenCode host automatically for an Ensemble run. If the configured plugin is absent, dispatch fails before creating a run. The dashboard reads Ensemble's SQLite state through a read-only optional adapter and remains functional when that database is absent or incompatible.
 
 ## How state is divided
 

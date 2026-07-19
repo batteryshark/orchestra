@@ -23,7 +23,6 @@ import hashlib
 import json
 import mimetypes
 import socket
-import sqlite3
 import threading
 import urllib.request
 import webbrowser
@@ -31,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import cancel, db, host, projects, tailscale
+from orchestra_cli import cancel, db, ensemble, host, projects, tailscale
 from orchestra_cli.usage import default_service
 
 DEFAULT_UI_PORT = 4764
@@ -39,7 +38,6 @@ DEFAULT_UI_PORT = 4764
 UI_FILE = Path(__file__).with_name("ui.html")
 RUNWAY_FILE = Path(__file__).parent / "usage" / "web" / "runway.html"
 RUNWAY_ASSETS_DIR = Path(__file__).parent / "usage" / "web" / "assets"
-ENSEMBLE_DB = Path("~/.config/opencode/ensemble.db").expanduser()
 
 MAX_INPUT = 4000
 MAX_OUTPUT = 12000
@@ -183,56 +181,6 @@ def parse_transcript(text: str) -> list[dict]:
             continue
         # unknown event: ignore quietly
     return items
-
-
-def _ensemble_con():
-    if not ENSEMBLE_DB.exists():
-        return None
-    try:
-        con = sqlite3.connect(f"file:{ENSEMBLE_DB}?mode=ro", uri=True)
-        con.row_factory = sqlite3.Row
-        return con
-    except sqlite3.Error:
-        return None
-
-
-def ensemble_teams(root: Path) -> list[dict]:
-    """Teams for this project, straight from ensemble's own SQLite (read-only)."""
-    con = _ensemble_con()
-    if not con:
-        return []
-    try:
-        teams = []
-        for t in con.execute("SELECT * FROM team WHERE project_id=? "
-                             "ORDER BY time_created DESC LIMIT 8", (str(root),)):
-            members = [dict(m) for m in con.execute(
-                "SELECT name, model, status, execution_status, session_id "
-                "FROM team_member WHERE team_id=?", (t["id"],))]
-            tasks = [dict(x) for x in con.execute(
-                "SELECT content, status, priority, assignee FROM team_task "
-                "WHERE team_id=? ORDER BY time_created", (t["id"],))]
-            teams.append({"id": t["id"], "name": t["name"], "status": t["status"],
-                          "lead_session": t["lead_session_id"],
-                          "members": members, "tasks": tasks})
-        return teams
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-
-
-def team_messages(team_id: str) -> list[dict]:
-    con = _ensemble_con()
-    if not con:
-        return []
-    try:
-        return [dict(m) for m in con.execute(
-            "SELECT from_name, to_name, content, time_created FROM team_message "
-            "WHERE team_id=? ORDER BY time_created LIMIT 200", (team_id,))]
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
 
 
 def teammate_transcript(session_id: str) -> tuple[list[dict], str]:
@@ -489,7 +437,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                                "members": [m["agent"] for m in con.execute(
                                    "SELECT agent FROM members WHERE team_id=?", (t["id"],))]}
                               for t in con.execute("SELECT * FROM teams")],
-                    "ensemble": ensemble_teams(project),
+                    "ensemble": ensemble.store.teams(project),
                 }
                 con.close()
                 self._json(state)
@@ -504,7 +452,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     return self._json({"etag": etag, "unchanged": True})
                 team_id = (q.get("team") or [None])[0]
                 self._json({"etag": etag, "items": items,
-                            "messages": team_messages(team_id) if team_id else []})
+                            "messages": ensemble.store.messages(team_id) if team_id else []})
             elif path.startswith("/api/transcript/"):
                 try:
                     run_id = int(path.rsplit("/", 1)[1])

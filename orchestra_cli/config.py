@@ -23,7 +23,8 @@ env_passthrough = []
 # --- roster ---------------------------------------------------------------
 # backend: opencode | codex | claude
 # model:   backend-specific model id (opencode: provider/model, codex: model name)
-# ensemble = true makes an opencode agent the LEAD of an ensemble team
+# ensemble = true opts an opencode agent into the optional OpenCode Ensemble
+# integration. See the README for the plugin and roster configuration.
 # extra_args: appended to the backend CLI invocation
 
 [agents.minimax]
@@ -59,12 +60,6 @@ backend = "claude"
 role = "worker claude for when another orchestrator is driving"
 extra_args = ["--permission-mode", "acceptEdits", "--allowedTools", "Bash Edit Write Read Glob Grep WebFetch"]
 
-[agents.ensemble]
-backend = "opencode"
-model = "zhipuai-coding-plan/glm-5.2"
-ensemble = true
-role = "lead of an opencode-ensemble team"
-model_pool = ["zhipuai-coding-plan/glm-5.2", "minimax-coding-plan/MiniMax-M3"]
 """
 
 
