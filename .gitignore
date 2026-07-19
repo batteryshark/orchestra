@@ -2,7 +2,7 @@
 .work/
 AGENTS.md
 CLAUDE.md
-ORCHESTRA.md
+/ORCHESTRA.md
 __pycache__/
 *.egg-info/
 dist/

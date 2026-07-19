@@ -43,6 +43,24 @@ orchestra init
 
 Add `--work` if the optional `work` CLI is installed and you want Orchestra to initialize its tracker too. `init` creates local `.orchestra/` state and an orchestrator playbook; it also registers the root with the shared dashboard registry.
 
+The canonical playbook is a readable, packaged template at
+[`orchestra_cli/templates/ORCHESTRA.md`](orchestra_cli/templates/ORCHESTRA.md). It defines
+generic coordination doctrine—ownership boundaries, task sizing, worker briefs, handoffs,
+verification gates, messaging, and recovery—followed by a project-owned section for domain
+methodology and completion rules. `AGENTS.md` and `CLAUDE.md` receive concise pointers to that
+single source instead of duplicate instructions.
+
+Newer playbooks mark Orchestra's generic section explicitly. Refresh that section without
+overwriting project doctrine with:
+
+```sh
+orchestra init --refresh-playbook
+```
+
+Ordinary `orchestra init` always preserves an existing `ORCHESTRA.md`. A legacy playbook that
+predates the managed markers is also never guessed at or overwritten: refresh exits with an
+instruction to migrate its custom doctrine manually into a newly generated template.
+
 ## Dispatch and coordinate
 
 ```sh
