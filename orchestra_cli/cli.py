@@ -59,6 +59,25 @@ def _work_log(root: Path, item: str | None, text: str) -> None:
 
 def cmd_init(args):
     root = Path.cwd().resolve()
+    playbook = root / "ORCHESTRA.md"
+    refresh_playbook = bool(getattr(args, "refresh_playbook", False))
+    if not playbook.exists():
+        playbook.write_text(docs.playbook_template(), encoding="utf-8")
+        playbook_status = "created"
+    elif refresh_playbook:
+        try:
+            existing = playbook.read_text(encoding="utf-8")
+            refreshed = docs.refresh_playbook(existing)
+        except (OSError, UnicodeError, docs.PlaybookRefreshError) as exc:
+            raise SystemExit(f"orchestra: cannot refresh {playbook}: {exc}") from exc
+        if refreshed == existing:
+            playbook_status = "already current"
+        else:
+            playbook.write_text(refreshed, encoding="utf-8")
+            playbook_status = "refreshed managed section"
+    else:
+        playbook_status = "preserved existing file"
+
     sd = root / paths.STATE_DIR
     sd.mkdir(exist_ok=True)
     (sd / ".gitignore").write_text(docs.STATE_GITIGNORE)
@@ -66,13 +85,11 @@ def cmd_init(args):
         (sd / "config.toml").write_text(docs.PROJECT_CONFIG_STUB)
     gp = config.ensure_global_config()
     db.connect(root).close()
-    if not (root / "ORCHESTRA.md").exists():
-        (root / "ORCHESTRA.md").write_text(docs.ORCHESTRA_MD)
     for doc in ["AGENTS.md", "CLAUDE.md"]:
         p = root / doc
-        text = p.read_text() if p.exists() else ""
+        text = p.read_text(encoding="utf-8") if p.exists() else ""
         if "<!-- orchestra -->" not in text:
-            p.write_text(text + docs.POINTER)
+            p.write_text(text + docs.POINTER, encoding="utf-8")
     if args.work and _work_available() and not (root / ".work").is_dir():
         subprocess.run(["work", "init", str(root)], cwd=root)
     # Register the freshly-initialized root in the multi-project
@@ -85,7 +102,8 @@ def cmd_init(args):
         print(f"  note: could not register project in picker: {exc}")
     print(f"orchestra: initialized {sd}")
     print(f"  global roster config: {gp}")
-    print(f"  playbook: {root / 'ORCHESTRA.md'} (pointers added to AGENTS.md / CLAUDE.md)")
+    print(f"  playbook: {playbook} ({playbook_status}; "
+          "pointers present in AGENTS.md / CLAUDE.md)")
     if not (root / ".work").is_dir():
         print("  note: no .work workspace here — run `work init .` (or `orchestra init --work`) "
               "so missions can be tracked durably")
@@ -1192,6 +1210,8 @@ def main():
 
     s = sub.add_parser("init", help="initialize .orchestra in the current directory")
     s.add_argument("--work", action="store_true", help="also `work init` a tracker workspace here")
+    s.add_argument("--refresh-playbook", action="store_true",
+                   help="update only Orchestra's managed ORCHESTRA.md section")
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("roster", help="list configured worker agents")
