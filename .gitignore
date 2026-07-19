@@ -6,3 +6,8 @@ ORCHESTRA.md
 __pycache__/
 *.egg-info/
 dist/
+
+# macOS / Xcode per-user state
+.DS_Store
+**/xcuserdata/
+*.xcuserstate

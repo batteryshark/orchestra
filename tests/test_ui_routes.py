@@ -12,6 +12,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -109,6 +110,17 @@ class RouteTests(unittest.TestCase):
         self.assertIn("brand-mark", body)
         self.assertNotIn('href="/runway"', body)
 
+    def test_main_dashboard_has_runtime_stats_drawer(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn('id="runtimeToggle"', body)
+        self.assertIn('id="runtimeView"', body)
+        self.assertIn('id="runtimeStats"', body)
+        self.assertIn("api('api/stats'", body)
+        self.assertIn('By roster agent', body)
+        self.assertIn('By model', body)
+        self.assertIn('Concurrent workers count separately.', body)
+
     def test_main_dashboard_has_json_stop_control_wiring(self) -> None:
         status, _headers, body = self.get("/")
         self.assertEqual(status, 200)
@@ -124,6 +136,15 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(headers.get("cache-control"), "no-store")
         payload = json.loads(body)
         self.assertEqual(payload["providers"][0]["id"], "minimax")
+
+    def test_api_runtime_stats_still_served_for_empty_project(self) -> None:
+        status, headers, body = self.get("/api/stats")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("cache-control"), "no-store")
+        payload = json.loads(body)
+        self.assertEqual(payload["total_seconds"], 0)
+        self.assertEqual(payload["by_agent"], [])
+        self.assertEqual(payload["by_model"], [])
 
     def test_runway_keeps_compact_provider_values_while_closed(self) -> None:
         status, _, body = self.get("/")
@@ -174,6 +195,43 @@ class RouteTests(unittest.TestCase):
         # (Either no `font-size:16px` on h1, or all of: `font-size:inherit`,
         # `font-weight:inherit` on the h1 selector.)
         self.assertNotIn("header h1 { font-size:16px", body)
+
+
+class RuntimeSummaryTests(unittest.TestCase):
+    def test_combines_concurrent_runtime_and_groups_by_agent_and_model(self) -> None:
+        rows = [
+            {"agent": "kimi-max", "backend": "opencode", "model": "kimi/k3",
+             "status": "done", "started_at": "2026-07-19T00:00:00Z",
+             "finished_at": "2026-07-19T01:00:00Z"},
+            {"agent": "kimi-max", "backend": "opencode", "model": "kimi/k3-fast",
+             "status": "done", "started_at": "2026-07-19T00:00:00Z",
+             "finished_at": "2026-07-19T00:30:00Z"},
+            {"agent": "opus", "backend": "claude", "model": "opus",
+             "status": "running", "started_at": "2026-07-19T00:30:00Z",
+             "finished_at": None},
+            {"agent": "legacy", "backend": "opencode", "model": None,
+             "status": "done", "started_at": "not-a-time", "finished_at": None},
+        ]
+        result = ui.summarize_runtime(
+            rows,
+            now=datetime(2026, 7, 19, 1, 0, tzinfo=timezone.utc),
+            roles={"kimi-max": "heavy reasoning"},
+        )
+
+        self.assertEqual(result["total_seconds"], 7200)
+        self.assertEqual(result["timed_runs"], 3)
+        self.assertEqual(result["active_runs"], 1)
+        self.assertEqual(result["ignored_runs"], 1)
+        self.assertEqual(result["by_agent"][0]["agent"], "kimi-max")
+        self.assertEqual(result["by_agent"][0]["seconds"], 5400)
+        self.assertEqual(result["by_agent"][0]["models"], ["kimi/k3", "kimi/k3-fast"])
+        self.assertEqual(result["by_agent"][0]["role"], "heavy reasoning")
+        self.assertEqual(result["by_agent"][1]["active_runs"], 1)
+        self.assertEqual(
+            {(item["backend"], item["model"]) for item in result["by_model"]},
+            {("opencode", "kimi/k3"), ("opencode", "kimi/k3-fast"),
+             ("claude", "opus")},
+        )
 
 if __name__ == "__main__":
     unittest.main()

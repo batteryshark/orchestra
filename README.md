@@ -129,6 +129,29 @@ This binds only to the machine's Tailscale IPv4 address and prints the resulting
 
 Port `4764` is preferred. An implicit port may safely fall back when busy; an explicit `--port` is pinned and fails instead. `--tailscale` cannot be combined with an explicit `--host`.
 
+## iOS companion app
+
+The native SwiftUI app in [`ios/`](ios/) is a remote console for one Orchestra
+dashboard. Orchestra continues to run on your Mac or another machine; the app
+uses that instance's project registry and JSON APIs to switch projects, watch
+workers, inspect transcripts, read inboxes and findings, check provider usage,
+view runtime stats, and stop active runs.
+
+To run it:
+
+1. Start the dashboard with `orchestra ui --tailscale`.
+2. Open `ios/Orchestra.xcodeproj` in Xcode, choose your development team, and
+   run the `Orchestra` scheme on an iPhone or iPad.
+3. Enter the full URL printed by the dashboard, including `http://` or
+   `https://`. The app stores this non-secret URL locally and restores the last
+   selected project.
+
+The app targets iOS 17 and pauses its three-second dashboard polling loop while
+backgrounded. Provider usage refreshes on demand; run and Ensemble transcript
+screens follow their selected worker every two seconds while visible. Because
+the dashboard has no application-level authentication, keep using tailnet ACLs
+to control access, as described in [SECURITY.md](SECURITY.md).
+
 ## Provider runway
 
 The dashboard's right-side runway rail keeps the current headroom for configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts visible while you work. Select a provider—or the Usage button on narrower screens—to open quota windows and refresh controls without leaving the dashboard. Existing `/runway` bookmarks open this drawer. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
