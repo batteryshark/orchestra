@@ -177,6 +177,7 @@ orchestra interrupt 7 "stop - the schema changed, read W-0012 first" --as claude
 orchestra interrupt 7 "stop immediately" --now --as claude
 orchestra queue 7 "when done: also update the README section" --as claude
 orchestra send glm "heads up: schema changed" --as claude
+orchestra send glm --file investigation.md --as claude
 orchestra broadcast "stop touching db.py" --team core --as claude
 orchestra note "auth flow uses PKCE, not implicit" --as claude --tags arch
 orchestra feed                        # what everyone has been finding

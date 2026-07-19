@@ -136,12 +136,24 @@ def cmd_team(args):
 def cmd_send(args):
     root = paths.find_root()
     cfg = config.load(root)
-    con = db.connect(root)
     sender = _identity(args, cfg)
-    con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (sender, args.to, args.body, args.work, args.run, db.now()))
-    con.commit()
+    body = args.body
+    if args.body_file:
+        message_path = Path(args.body_file)
+        try:
+            body = message_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise SystemExit(
+                f"orchestra: cannot read message file '{message_path}': {exc}"
+            ) from exc
+    con = db.connect(root)
+    try:
+        con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (sender, args.to, body, args.work, args.run, db.now()))
+        con.commit()
+    finally:
+        con.close()
     print(f"sent {sender} -> {args.to}")
 
 
@@ -1203,7 +1215,10 @@ def main():
 
     s = sub.add_parser("send", help="send a message to an agent/orchestrator inbox")
     s.add_argument("to")
-    s.add_argument("body")
+    send_source = s.add_mutually_exclusive_group(required=True)
+    send_source.add_argument("body", nargs="?", help="message text")
+    send_source.add_argument("--file", dest="body_file", metavar="PATH",
+                             help="read the complete message from a UTF-8 file")
     s.add_argument("--work", help="related work item (W-XXXX)")
     s.add_argument("--run", type=int, help="related run id")
     ident(s)
