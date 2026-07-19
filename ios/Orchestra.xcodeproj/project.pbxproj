@@ -1,0 +1,378 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B00000000000000000000001 /* OrchestraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000001 /* OrchestraApp.swift */; };
+		B00000000000000000000002 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000002 /* AppModel.swift */; };
+		B00000000000000000000003 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000003 /* APIClient.swift */; };
+		B00000000000000000000004 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000004 /* Models.swift */; };
+		B00000000000000000000005 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000005 /* Components.swift */; };
+		B00000000000000000000006 /* ProjectsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000006 /* ProjectsView.swift */; };
+		B00000000000000000000007 /* WorkersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000007 /* WorkersView.swift */; };
+		B00000000000000000000008 /* RunDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000008 /* RunDetailView.swift */; };
+		B00000000000000000000009 /* UpdatesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000009 /* UpdatesView.swift */; };
+		B0000000000000000000000A /* UsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000A /* UsageView.swift */; };
+		B0000000000000000000000B /* StatsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000B /* StatsView.swift */; };
+		B0000000000000000000000C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000C /* Assets.xcassets */; };
+		B0000000000000000000000D /* OrchestraTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000E /* OrchestraTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C00000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D00000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E00000000000000000000001;
+			remoteInfo = Orchestra;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A00000000000000000000001 /* OrchestraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrchestraApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000002 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		A00000000000000000000003 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		A00000000000000000000004 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		A00000000000000000000005 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		A00000000000000000000006 /* ProjectsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectsView.swift; sourceTree = "<group>"; };
+		A00000000000000000000007 /* WorkersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkersView.swift; sourceTree = "<group>"; };
+		A00000000000000000000008 /* RunDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunDetailView.swift; sourceTree = "<group>"; };
+		A00000000000000000000009 /* UpdatesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdatesView.swift; sourceTree = "<group>"; };
+		A0000000000000000000000A /* UsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageView.swift; sourceTree = "<group>"; };
+		A0000000000000000000000B /* StatsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatsView.swift; sourceTree = "<group>"; };
+		A0000000000000000000000C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A0000000000000000000000D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A0000000000000000000000E /* OrchestraTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrchestraTests.swift; sourceTree = "<group>"; };
+		A0000000000000000000000F /* Orchestra.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Orchestra.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000010 /* OrchestraTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OrchestraTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F00000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F00000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		D00000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				D00000000000000000000003 /* Orchestra */,
+				D00000000000000000000004 /* OrchestraTests */,
+				D00000000000000000000005 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D00000000000000000000003 /* Orchestra */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000001 /* OrchestraApp.swift */,
+				A00000000000000000000002 /* AppModel.swift */,
+				A00000000000000000000003 /* APIClient.swift */,
+				A00000000000000000000004 /* Models.swift */,
+				A00000000000000000000005 /* Components.swift */,
+				A00000000000000000000006 /* ProjectsView.swift */,
+				A00000000000000000000007 /* WorkersView.swift */,
+				A00000000000000000000008 /* RunDetailView.swift */,
+				A00000000000000000000009 /* UpdatesView.swift */,
+				A0000000000000000000000A /* UsageView.swift */,
+				A0000000000000000000000B /* StatsView.swift */,
+				A0000000000000000000000C /* Assets.xcassets */,
+				A0000000000000000000000D /* Info.plist */,
+			);
+			path = Orchestra;
+			sourceTree = "<group>";
+		};
+		D00000000000000000000004 /* OrchestraTests */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000000E /* OrchestraTests.swift */,
+			);
+			path = OrchestraTests;
+			sourceTree = "<group>";
+		};
+		D00000000000000000000005 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000000F /* Orchestra.app */,
+				A00000000000000000000010 /* OrchestraTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E00000000000000000000001 /* Orchestra */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D00000000000000000000007 /* Build configuration list for PBXNativeTarget "Orchestra" */;
+			buildPhases = (
+				F00000000000000000000003 /* Sources */,
+				F00000000000000000000001 /* Frameworks */,
+				F00000000000000000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Orchestra;
+			productName = Orchestra;
+			productReference = A0000000000000000000000F /* Orchestra.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E00000000000000000000002 /* OrchestraTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D00000000000000000000008 /* Build configuration list for PBXNativeTarget "OrchestraTests" */;
+			buildPhases = (
+				F00000000000000000000004 /* Sources */,
+				F00000000000000000000002 /* Frameworks */,
+				F00000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				C00000000000000000000002 /* PBXTargetDependency */,
+			);
+			name = OrchestraTests;
+			productName = OrchestraTests;
+			productReference = A00000000000000000000010 /* OrchestraTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2660;
+				LastUpgradeCheck = 2660;
+				TargetAttributes = {
+					E00000000000000000000001 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					E00000000000000000000002 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = E00000000000000000000001;
+					};
+				};
+			};
+			buildConfigurationList = D00000000000000000000006 /* Build configuration list for PBXProject "Orchestra" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = D00000000000000000000002;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = D00000000000000000000005 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				E00000000000000000000001 /* Orchestra */,
+				E00000000000000000000002 /* OrchestraTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F00000000000000000000005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000000C /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F00000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F00000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B00000000000000000000001 /* OrchestraApp.swift in Sources */,
+				B00000000000000000000002 /* AppModel.swift in Sources */,
+				B00000000000000000000003 /* APIClient.swift in Sources */,
+				B00000000000000000000004 /* Models.swift in Sources */,
+				B00000000000000000000005 /* Components.swift in Sources */,
+				B00000000000000000000006 /* ProjectsView.swift in Sources */,
+				B00000000000000000000007 /* WorkersView.swift in Sources */,
+				B00000000000000000000008 /* RunDetailView.swift in Sources */,
+				B00000000000000000000009 /* UpdatesView.swift in Sources */,
+				B0000000000000000000000A /* UsageView.swift in Sources */,
+				B0000000000000000000000B /* StatsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F00000000000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000000D /* OrchestraTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C00000000000000000000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E00000000000000000000001 /* Orchestra */;
+			targetProxy = C00000000000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		D00000000000000000000011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		D00000000000000000000012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		D00000000000000000000013 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Y734633UDM;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Orchestra/Info.plist;
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		D00000000000000000000014 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Y734633UDM;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Orchestra/Info.plist;
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		D00000000000000000000015 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Orchestra.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Orchestra";
+			};
+			name = Debug;
+		};
+		D00000000000000000000016 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Orchestra.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Orchestra";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		D00000000000000000000006 /* Build configuration list for PBXProject "Orchestra" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D00000000000000000000011 /* Debug */,
+				D00000000000000000000012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D00000000000000000000007 /* Build configuration list for PBXNativeTarget "Orchestra" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D00000000000000000000013 /* Debug */,
+				D00000000000000000000014 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D00000000000000000000008 /* Build configuration list for PBXNativeTarget "OrchestraTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D00000000000000000000015 /* Debug */,
+				D00000000000000000000016 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = D00000000000000000000001 /* Project object */;
+}
