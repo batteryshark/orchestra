@@ -100,11 +100,13 @@ class RouteTests(unittest.TestCase):
         status, headers, body = self.get("/runway-assets/styles.css")
         self.assertEqual(status, 200)
         self.assertIn("text/css", headers.get("content-type", ""))
+        self.assertEqual(headers.get("cache-control"), "no-store")
         self.assertIn(".brand-mark", body)
 
         status, headers, body = self.get("/runway-assets/app.js")
         self.assertEqual(status, 200)
         self.assertIn("javascript", headers.get("content-type", ""))
+        self.assertEqual(headers.get("cache-control"), "no-store")
         self.assertIn("/api/usage", body)
         self.assertIn("Usage refreshing", body)
         self.assertIn("retry shortly", body)
@@ -147,6 +149,15 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(headers.get("cache-control"), "no-store")
         payload = json.loads(body)
         self.assertEqual(payload["providers"][0]["id"], "minimax")
+
+    def test_runway_percent_sign_uses_stable_symbol_font(self) -> None:
+        status, _, app = self.get("/runway-assets/app.js")
+        self.assertEqual(status, 200)
+        self.assertIn('class="percent-sign"', app)
+        status, _, styles = self.get("/runway-assets/styles.css")
+        self.assertEqual(status, 200)
+        self.assertIn(".percent-sign", styles)
+        self.assertIn('font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial', styles)
 
     def test_api_usage_honors_refresh_query_param(self) -> None:
         """The runway page Refresh button sends ?refresh=1 - the endpoint

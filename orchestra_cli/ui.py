@@ -425,7 +425,7 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 if not asset.is_file():
                     return self._json({"error": "asset not found"}, 404)
                 ctype = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
-                self._send_static(asset, content_type=ctype, no_store=False)
+                self._send_static(asset, content_type=ctype, no_store=True)
             elif path == "/api/projects":
                 # The picker source of truth. Always served off the
                 # global registry; no project header needed.

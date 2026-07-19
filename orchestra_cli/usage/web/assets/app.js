@@ -40,7 +40,7 @@ function burnLabel(rate) {
   }
   const value = Number(rate);
   const tone = value >= 10 ? 'hot' : value >= 3 ? 'warm' : '';
-  return `<span class="burn-rate ${tone}">−${escapeHtml(percent(value))}% / hr</span>`;
+  return `<span class="burn-rate ${tone}">−${escapeHtml(percent(value))}<span class="percent-sign">%</span> / hr</span>`;
 }
 
 function durationUntil(value, action = 'resets') {
@@ -66,7 +66,7 @@ function windowTemplate(window) {
     <div class="quota-row ${tone}">
       <div class="quota-header">
         <span class="quota-label"><strong>${escapeHtml(window.label)}</strong> · ${escapeHtml(window.scope)}</span>
-        <span class="quota-percent">${escapeHtml(percent(remaining))}% left</span>
+        <span class="quota-percent">${escapeHtml(percent(remaining))}<span class="percent-sign">%</span> left</span>
       </div>
       <div class="quota-track" role="progressbar" aria-label="${escapeHtml(window.label)} remaining"
         aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(remaining)}">
@@ -112,7 +112,7 @@ function providerTemplate(provider) {
     : provider.status === 'stale' ? 'Usage refreshing' : 'Usage unavailable';
   const body = hasQuota ? `
     <div class="headroom">
-      <div class="headroom-number">${escapeHtml(percent(headroom))}<small>%</small></div>
+      <div class="headroom-number">${escapeHtml(percent(headroom))}<small class="percent-sign">%</small></div>
       <div class="headroom-label">minimum coding headroom</div>
     </div>
     ${resetCreditsTemplate(provider.rate_limit_resets)}
@@ -165,7 +165,7 @@ function render(data) {
     recommendation.innerHTML = `
       <div class="recommendation-label">Best runway</div>
       <div class="recommendation-value">${escapeHtml(data.recommendation.provider_name)}</div>
-      <div class="recommendation-detail">${escapeHtml(percent(data.recommendation.headroom_percent))}% minimum headroom · route the next flexible run here</div>`;
+      <div class="recommendation-detail">${escapeHtml(percent(data.recommendation.headroom_percent))}<span class="percent-sign">%</span> minimum headroom · route the next flexible run here</div>`;
   } else {
     recommendation.innerHTML = `
       <div class="recommendation-label">Best runway</div>
