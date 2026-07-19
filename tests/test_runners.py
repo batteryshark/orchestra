@@ -43,5 +43,39 @@ class CodexCommandTests(unittest.TestCase):
             self.assertLess(cmd.index(flag), resume_index)
 
 
+class ClaudeCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.agent = {
+            "name": "claude",
+            "backend": "claude",
+            "model": "opus",
+        }
+
+    def test_prompt_immediately_follows_print_flag(self):
+        cmd = build_cmd(
+            self.agent,
+            workdir="/workspace/project",
+            title="run-1",
+            prompt="do the work",
+        )
+
+        self.assertEqual(cmd[:3], ["claude", "-p", "do the work"])
+        self.assertEqual(cmd.count("do the work"), 1)
+        self.assertIn("stream-json", cmd)
+
+    def test_resume_keeps_prompt_as_print_value(self):
+        cmd = build_cmd(
+            self.agent,
+            workdir="/workspace/project",
+            title="follow-up",
+            prompt="continue",
+            resume_ref="session-123",
+        )
+
+        self.assertEqual(cmd[:3], ["claude", "-p", "continue"])
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "session-123")
+        self.assertEqual(cmd.count("continue"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

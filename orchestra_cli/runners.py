@@ -39,7 +39,11 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
         return ["codex", "exec", *flags, prompt]
 
     if backend == "claude":
-        cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+        # Pass the prompt as the VALUE of -p, not as a trailing positional:
+        # claude CLI >= 2.1.x rejects a trailing positional prompt when
+        # --print/--output-format stream-json are set ("Input must be provided
+        # either through stdin or as a prompt argument"). `-p <prompt>` works.
+        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
         if resume_ref:
             cmd += ["--resume", resume_ref]
         if model:
@@ -47,7 +51,7 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
         if not extra:
             extra = ["--permission-mode", "acceptEdits",
                      "--allowedTools", "Bash Edit Write Read Glob Grep WebFetch"]
-        return cmd + extra + [prompt]
+        return cmd + extra
 
     raise SystemExit(f"orchestra: unknown backend '{backend}' for agent {agent['name']}")
 
