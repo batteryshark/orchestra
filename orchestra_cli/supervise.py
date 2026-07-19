@@ -432,6 +432,14 @@ def _quota_exhausted_text(agent: dict) -> str | None:
     return None
 
 
+def _command_preview(cmd: list[str]) -> str:
+    """Return a short log-safe runner command without embedding Claude's prompt."""
+    preview = list(cmd[:6])
+    if preview[:2] == ["claude", "-p"] and len(preview) > 2:
+        preview[2] = "<prompt>"
+    return " ".join(preview) + " ..."
+
+
 def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
               agent: dict | None = None,
               checkin_interval: int | None = None,
@@ -447,7 +455,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
             return "exit", None
         for event in delivery_events or []:
             _write_json_event(log, event)
-        log.write((" ".join(cmd[:6]) + " ...\n").encode())
+        log.write((_command_preview(cmd) + "\n").encode())
         log.flush()
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT,

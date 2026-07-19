@@ -14,6 +14,20 @@ from orchestra_cli import cli, db, supervise
 from orchestra_cli.usage.models import ProviderResult, QuotaWindow
 
 
+class CommandPreviewTests(unittest.TestCase):
+    def test_redacts_claude_prompt_from_log_preview(self) -> None:
+        preview = supervise._command_preview([
+            "claude", "-p", "secret\nmultiline brief",
+            "--output-format", "stream-json", "--verbose",
+        ])
+
+        self.assertEqual(
+            preview,
+            "claude -p <prompt> --output-format stream-json --verbose ...",
+        )
+        self.assertNotIn("secret", preview)
+
+
 def _project(*, checkin_interval: int = 0, timeout: int = 30) -> tuple[tempfile.TemporaryDirectory, Path]:
     tmp = tempfile.TemporaryDirectory()
     root = Path(tmp.name)
