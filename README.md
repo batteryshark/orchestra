@@ -25,7 +25,12 @@ Orchestra turns agent CLIs into a coordinated team. Dispatch work without blocki
 
 ## Install from source
 
-Orchestra requires Python 3.11 or newer, [uv](https://docs.astral.sh/uv/), and at least one authenticated agent CLI.
+Orchestra supports macOS and Linux and requires Python 3.11 or newer,
+[uv](https://docs.astral.sh/uv/), and at least one authenticated agent CLI.
+Windows is supported through WSL by running Orchestra and its worker harnesses
+inside the same Linux distribution; native Windows execution is out of scope.
+See [Linux and Windows through WSL](docs/linux-wsl.md) for the supported
+boundary, filesystem guidance, and operational notes.
 
 ```sh
 git clone https://github.com/batteryshark/orchestra.git
@@ -191,6 +196,7 @@ uv build
 ```
 
 The package has no runtime Python dependencies. UI assets are bundled in the wheel.
+Pull requests and `main` are verified on Ubuntu with Python 3.11 and 3.13.
 
 ## Security and license
 
