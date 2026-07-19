@@ -146,6 +146,8 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
 .runway-toggle { display:flex; align-items:center; justify-content:center; width:46px; min-height:36px;
   padding:5px; color:var(--ink); background:var(--card); border-radius:8px }
 .runway-toggle:hover { background:var(--sel) }
+.runway-toggle.active { color:var(--blue); background:var(--sel);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--blue) 45%, var(--line)) }
 .runway-toggle svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8 }
 .runway-rail-provider { display:flex; flex-direction:column; align-items:center; gap:2px; width:46px;
   min-height:48px; padding:5px 2px; color:var(--ink); border:0; border-radius:8px; background:transparent }
@@ -213,6 +215,29 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
 .runway-credits strong { color:var(--ink) }
 .runway-empty { padding:5px 0; color:var(--muted); font-size:11px }
 .runway-error { padding:20px 12px; color:var(--muted); text-align:center; font-size:12px }
+.runway-view { flex:1; min-height:0; display:flex; flex-direction:column }
+.runway-view[hidden] { display:none }
+.runtime-stats { flex:1; min-height:0; overflow-y:auto; padding:12px }
+.runtime-hero { padding:14px; margin-bottom:10px; background:var(--card); border:1px solid var(--line);
+  border-radius:10px }
+.runtime-total { font-size:30px; font-weight:760; line-height:1.05; letter-spacing:-.035em }
+.runtime-caption { margin-top:5px; color:var(--muted); font-size:11px }
+.runtime-facts { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:15px }
+.runtime-fact { padding:9px; text-align:center; background:var(--card); border:1px solid var(--line);
+  border-radius:9px }
+.runtime-fact strong,.runtime-fact span { display:block }
+.runtime-fact strong { font-size:16px }
+.runtime-fact span { color:var(--muted); font-size:10px }
+.runtime-section { margin-top:14px }
+.runtime-section h3 { margin:0 0 7px; color:var(--muted); font-size:10px; font-weight:700;
+  letter-spacing:.065em; text-transform:uppercase }
+.runtime-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; padding:9px 10px;
+  margin-bottom:6px; background:var(--card); border:1px solid var(--line); border-radius:9px }
+.runtime-row-title,.runtime-row-meta { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.runtime-row-title { font-weight:650 }
+.runtime-row-meta { color:var(--muted); font-size:10px }
+.runtime-row-value { align-self:center; font-family:ui-monospace,monospace; font-weight:700 }
+.runtime-empty { padding:24px 12px; color:var(--muted); text-align:center }
 @media (min-width:1200px) {
   body { padding-right:80px }
   .runway-backdrop { display:none }
@@ -222,7 +247,8 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
     border:0; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.22) }
   .runway-rail-provider { display:none }
   .runway-toggle { width:auto; min-width:48px; padding:7px 10px; gap:7px }
-  .runway-toggle::after { content:"Usage"; font-size:12px; font-weight:650 }
+  #runwayToggle::after { content:"Usage"; font-size:12px; font-weight:650 }
+  #runtimeToggle::after { content:"Runtime"; font-size:12px; font-weight:650 }
 }
 @media (max-width:520px) {
   .runway-drawer { inset:0; width:auto }
@@ -258,16 +284,19 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
     <h2>Teams</h2><div class="scrollbox" id="teams" style="max-height:12vh"></div></div>
 </div>
 </main>
-<aside class="runway-dock" id="runwayDock" aria-label="Provider runway">
+<aside class="runway-dock" id="runwayDock" aria-label="Orchestra insights">
   <div class="runway-backdrop" id="runwayBackdrop" hidden></div>
   <div class="runway-rail" id="runwayRail">
     <button class="runway-toggle" id="runwayToggle" type="button" aria-label="Open provider runway" aria-controls="runwayDrawer" aria-expanded="false">
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 15.5V11m5.5 4.5v-11m5.5 11V8"/></svg>
     </button>
+    <button class="runway-toggle" id="runtimeToggle" type="button" aria-label="Open runtime statistics" aria-controls="runwayDrawer" aria-expanded="false">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/></svg>
+    </button>
   </div>
   <section class="runway-drawer" id="runwayDrawer" aria-labelledby="runwayTitle" aria-hidden="true" inert>
     <div class="runway-drawer-head">
-      <div><h2 id="runwayTitle">Provider runway</h2><p>Live coding-plan headroom</p></div>
+      <div><h2 id="runwayTitle">Provider runway</h2><p id="runwaySubtitle">Live coding-plan headroom</p></div>
       <div class="runway-drawer-actions">
         <button class="runway-icon-button" id="runwayRefresh" type="button" aria-label="Refresh provider usage">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.8 6.2A7 7 0 1 0 17 10M15.8 6.2V2.8m0 3.4h-3.4"/></svg>
@@ -277,8 +306,14 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
         </button>
       </div>
     </div>
-    <div class="runway-summary" id="runwaySummary"><span class="runway-live-dot"></span><span id="runwaySignal">Connecting</span><span class="runway-updated" id="runwayUpdated"></span></div>
-    <div class="runway-providers" id="runwayProviders" aria-live="polite"><div class="runway-error">Checking providers…</div></div>
+    <div class="runway-view" id="usageView">
+      <div class="runway-summary" id="runwaySummary"><span class="runway-live-dot"></span><span id="runwaySignal">Connecting</span><span class="runway-updated" id="runwayUpdated"></span></div>
+      <div class="runway-providers" id="runwayProviders" aria-live="polite"><div class="runway-error">Checking providers…</div></div>
+    </div>
+    <div class="runway-view" id="runtimeView" hidden>
+      <div class="runway-summary online"><span class="runway-live-dot"></span><span>Combined worker time</span><span class="runway-updated" id="runtimeUpdated"></span></div>
+      <div class="runtime-stats" id="runtimeStats" aria-live="polite"><div class="runway-error">Calculating runtime…</div></div>
+    </div>
   </section>
 </aside>
 <script>
@@ -296,15 +331,22 @@ const runwayDock = document.getElementById('runwayDock');
 const runwayRail = document.getElementById('runwayRail');
 const runwayDrawer = document.getElementById('runwayDrawer');
 const runwayToggle = document.getElementById('runwayToggle');
+const runtimeToggle = document.getElementById('runtimeToggle');
 const runwayBackdrop = document.getElementById('runwayBackdrop');
 const runwayProviders = document.getElementById('runwayProviders');
 const runwaySummary = document.getElementById('runwaySummary');
 const runwaySignal = document.getElementById('runwaySignal');
 const runwayUpdated = document.getElementById('runwayUpdated');
 const runwayRefresh = document.getElementById('runwayRefresh');
+const runwayClose = document.getElementById('runwayClose');
+const usageView = document.getElementById('usageView');
+const runtimeView = document.getElementById('runtimeView');
+const runtimeStats = document.getElementById('runtimeStats');
+const runtimeUpdated = document.getElementById('runtimeUpdated');
 const RUNWAY_OPEN_KEY = 'orchestra.runway.open';
+const INSIGHTS_VIEW_KEY = 'orchestra.insights.view';
 const RUNWAY_MONOGRAMS = {minimax:'MM', kimi:'K', claude:'CL', zai:'Z', codex:'CX'};
-let runwayLoading = false;
+let runwayLoading = false, runtimeLoading = false, insightsView = 'usage';
 
 function runwayTone(value){
   if (value == null || !Number.isFinite(Number(value))) return 'unavailable';
@@ -327,10 +369,30 @@ function runwayReset(value){
   if (hours) return `resets in ${hours}h ${minutes}m`;
   return minutes ? `resets in ${minutes}m` : 'resetting now';
 }
-function runwaySetOpen(open, {remember=true}={}){
+function insightsSetView(view, {remember=true}={}){
+  insightsView = view === 'runtime' ? 'runtime' : 'usage';
+  const runtime = insightsView === 'runtime';
+  usageView.hidden = runtime;
+  runtimeView.hidden = !runtime;
+  runwayToggle.classList.toggle('active', !runtime);
+  runtimeToggle.classList.toggle('active', runtime);
+  document.getElementById('runwayTitle').textContent = runtime ? 'Runtime statistics' : 'Provider runway';
+  document.getElementById('runwaySubtitle').textContent = runtime
+    ? 'Combined execution time across every run' : 'Live coding-plan headroom';
+  runwayClose.setAttribute('aria-label', runtime ? 'Close runtime statistics' : 'Close provider runway');
+  runwayRefresh.setAttribute('aria-label', runtime ? 'Refresh runtime statistics' : 'Refresh provider usage');
+  if (remember) {
+    try { localStorage.setItem(INSIGHTS_VIEW_KEY, insightsView); } catch(e){}
+  }
+  if (runtime) refreshRuntimeStats();
+}
+function runwaySetOpen(open, {remember=true, view=null}={}){
+  if (view) insightsSetView(view, {remember});
   runwayDock.classList.toggle('open', open);
-  runwayToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-  runwayToggle.setAttribute('aria-label', open ? 'Close provider runway' : 'Open provider runway');
+  runwayToggle.setAttribute('aria-expanded', open && insightsView === 'usage' ? 'true' : 'false');
+  runtimeToggle.setAttribute('aria-expanded', open && insightsView === 'runtime' ? 'true' : 'false');
+  runwayToggle.setAttribute('aria-label', open && insightsView === 'usage' ? 'Close provider runway' : 'Open provider runway');
+  runtimeToggle.setAttribute('aria-label', open && insightsView === 'runtime' ? 'Close runtime statistics' : 'Open runtime statistics');
   runwayDrawer.setAttribute('aria-hidden', open ? 'false' : 'true');
   runwayDrawer.toggleAttribute('inert', !open);
   runwayBackdrop.hidden = !open;
@@ -339,7 +401,7 @@ function runwaySetOpen(open, {remember=true}={}){
   }
 }
 function runwayOpenProvider(id){
-  runwaySetOpen(true);
+  runwaySetOpen(true, {view:'usage'});
   requestAnimationFrame(() => {
     const card = runwayProviders.querySelector(`[data-runway-provider="${CSS.escape(id)}"]`);
     if (!card) return;
@@ -420,6 +482,84 @@ async function refreshRunway({force=false}={}){
     }
   } finally {
     runwayLoading = false;
+    runwayRefresh.disabled = false;
+    runwayRefresh.classList.remove('loading');
+  }
+}
+
+function runtimeDuration(seconds){
+  let value = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(value / 3600); value %= 3600;
+  const minutes = Math.floor(value / 60); const secs = value % 60;
+  return `${hours}h ${String(minutes).padStart(2,'0')}m ${String(secs).padStart(2,'0')}s`;
+}
+function runtimeClock(base, active, generated){
+  const at = new Date(generated).getTime();
+  const extra = Number.isFinite(at) ? Math.max(0, Math.floor((Date.now() - at) / 1000)) : 0;
+  return Number(base || 0) + Number(active || 0) * extra;
+}
+function runtimeValue(seconds, active, generated){
+  return `<span data-runtime-base="${Number(seconds)||0}" data-runtime-active="${Number(active)||0}" data-runtime-at="${esc(generated)}">${esc(runtimeDuration(runtimeClock(seconds, active, generated)))}</span>`;
+}
+function runtimeModelLabel(model){
+  return (model || 'default').split('/').pop();
+}
+function runtimeRow(item, kind, generated){
+  const isAgent = kind === 'agent';
+  const title = isAgent ? item.agent : runtimeModelLabel(item.model);
+  const models = isAgent ? (item.models || []).map(runtimeModelLabel).join(', ') : (item.agents || []).join(', ');
+  const route = isAgent ? (item.backends || []).join(', ') : item.backend;
+  const live = item.active_runs ? ` · ${item.active_runs} active` : '';
+  const role = isAgent && item.role ? ` · ${item.role}` : '';
+  return `<div class="runtime-row">
+    <div><div class="runtime-row-title" title="${esc(item.role||title)}">${esc(title)}</div>
+      <div class="runtime-row-meta" title="${esc(models+role)}">${esc(route)} · ${esc(models||'default')} · ${item.runs} run${item.runs===1?'':'s'}${esc(live)}${esc(role)}</div></div>
+    <div class="runtime-row-value">${runtimeValue(item.seconds, item.active_runs, generated)}</div>
+  </div>`;
+}
+function tickRuntimeStats(){
+  document.querySelectorAll('[data-runtime-base]').forEach(el => {
+    el.textContent = runtimeDuration(runtimeClock(
+      el.dataset.runtimeBase, el.dataset.runtimeActive, el.dataset.runtimeAt
+    ));
+  });
+}
+function renderRuntimeStats(data){
+  const agents = Array.isArray(data.by_agent) ? data.by_agent : [];
+  const models = Array.isArray(data.by_model) ? data.by_model : [];
+  const ignored = Number(data.ignored_runs) || 0;
+  runtimeStats.innerHTML = `<div class="runtime-hero">
+      <div class="runtime-total">${runtimeValue(data.total_seconds, data.active_runs, data.generated_at)}</div>
+      <div class="runtime-caption">Combined execution time. Concurrent workers count separately.</div>
+    </div>
+    <div class="runtime-facts">
+      <div class="runtime-fact"><strong>${Number(data.timed_runs)||0}</strong><span>timed runs</span></div>
+      <div class="runtime-fact"><strong>${Number(data.active_runs)||0}</strong><span>active now</span></div>
+      <div class="runtime-fact"><strong>${agents.length}</strong><span>roster agents</span></div>
+    </div>
+    <div class="runtime-section"><h3>By roster agent</h3>${agents.map(x=>runtimeRow(x,'agent',data.generated_at)).join('') || '<div class="runtime-empty">No timed runs yet.</div>'}</div>
+    <div class="runtime-section"><h3>By model</h3>${models.map(x=>runtimeRow(x,'model',data.generated_at)).join('') || '<div class="runtime-empty">No model history yet.</div>'}</div>
+    ${ignored?`<div class="runtime-caption">${ignored} historical run${ignored===1?' was':'s were'} omitted because its timestamps were incomplete.</div>`:''}`;
+  const generated = new Date(data.generated_at);
+  runtimeUpdated.textContent = Number.isFinite(generated.getTime())
+    ? generated.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '';
+  tickRuntimeStats();
+}
+async function refreshRuntimeStats(){
+  if (runtimeLoading) return;
+  runtimeLoading = true;
+  runwayRefresh.disabled = true;
+  runwayRefresh.classList.add('loading');
+  try {
+    const response = await api('api/stats', {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    renderRuntimeStats(await response.json());
+  } catch(e) {
+    if (!runtimeStats.querySelector('.runtime-row')) {
+      runtimeStats.innerHTML = '<div class="runtime-empty">Runtime statistics are unavailable.</div>';
+    }
+  } finally {
+    runtimeLoading = false;
     runwayRefresh.disabled = false;
     runwayRefresh.classList.remove('loading');
   }
@@ -534,6 +674,7 @@ function tickElapsed(){
   document.querySelectorAll('[data-start]').forEach(el => {
     el.textContent = elapsed(el.dataset.start, el.dataset.end || null);
   });
+  tickRuntimeStats();
 }
 setInterval(tickElapsed, 1000);
 
@@ -783,19 +924,30 @@ async function refresh(){
     select((active.length ? active[active.length-1] : state.runs[state.runs.length-1]).id);
   }
   renderRuns(); renderEnsemble(); renderBottom();
+  if (runwayDock.classList.contains('open') && insightsView === 'runtime') refreshRuntimeStats();
 }
 document.getElementById('projBtn').addEventListener('click', e => {
   e.stopPropagation();
   toggleProjectMenu();
 });
-runwayToggle.addEventListener('click', () => runwaySetOpen(!runwayDock.classList.contains('open')));
-document.getElementById('runwayClose').addEventListener('click', () => runwaySetOpen(false));
+runwayToggle.addEventListener('click', () => runwaySetOpen(
+  !(runwayDock.classList.contains('open') && insightsView === 'usage'), {view:'usage'}
+));
+runtimeToggle.addEventListener('click', () => runwaySetOpen(
+  !(runwayDock.classList.contains('open') && insightsView === 'runtime'), {view:'runtime'}
+));
+runwayClose.addEventListener('click', () => runwaySetOpen(false));
 runwayBackdrop.addEventListener('click', () => runwaySetOpen(false));
-runwayRefresh.addEventListener('click', () => refreshRunway({force:true}));
+runwayRefresh.addEventListener('click', () => insightsView === 'runtime'
+  ? refreshRuntimeStats() : refreshRunway({force:true}));
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && runwayDock.classList.contains('open')) runwaySetOpen(false);
 });
-let runwayInitiallyOpen = new URLSearchParams(location.search).get('runway') === 'open';
+const insightParams = new URLSearchParams(location.search);
+let initialInsightsView = insightParams.get('stats') === 'open' ? 'runtime' : 'usage';
+try { initialInsightsView = localStorage.getItem(INSIGHTS_VIEW_KEY) || initialInsightsView; } catch(e){}
+insightsSetView(initialInsightsView, {remember:false});
+let runwayInitiallyOpen = insightParams.get('runway') === 'open' || insightParams.get('stats') === 'open';
 try { runwayInitiallyOpen ||= localStorage.getItem(RUNWAY_OPEN_KEY) === '1'; } catch(e){}
 runwaySetOpen(runwayInitiallyOpen, {remember:false});
 refreshRunway(); setInterval(refreshRunway, 90000);

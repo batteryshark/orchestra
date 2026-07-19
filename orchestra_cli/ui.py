@@ -26,11 +26,12 @@ import socket
 import threading
 import urllib.request
 import webbrowser
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import cancel, db, ensemble, host, projects, tailscale
+from orchestra_cli import cancel, config, db, ensemble, host, projects, tailscale
 from orchestra_cli.usage import default_service
 
 DEFAULT_UI_PORT = 4764
@@ -48,6 +49,83 @@ _RUNNER_COMMAND_RE = re.compile(r"^(?:opencode run|codex exec|claude -p)\b.* \.\
 # header (e.g. top-level document navigations).
 PROJECT_HEADER = "x-orchestra-project"
 PROJECT_QUERY = "project"
+
+
+def _runtime_timestamp(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def summarize_runtime(rows, *, now: datetime | None = None,
+                      roles: dict[str, str] | None = None) -> dict:
+    """Sum worker execution time, intentionally counting concurrent runs separately."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    roles = roles or {}
+    by_agent: dict[str, dict] = {}
+    by_model: dict[tuple[str, str], dict] = {}
+    total_seconds = 0
+    timed_runs = active_runs = 0
+    rows = list(rows)
+
+    for row in rows:
+        started = _runtime_timestamp(row["started_at"])
+        terminal = row["status"] in db.RUN_TERMINAL
+        finished = _runtime_timestamp(row["finished_at"])
+        active = not terminal and finished is None
+        ended = finished or (now if active else None)
+        if started is None or ended is None or ended < started:
+            continue
+        seconds = int((ended - started).total_seconds())
+        total_seconds += seconds
+        timed_runs += 1
+        active_runs += int(active)
+
+        agent = str(row["agent"] or "unknown")
+        backend = str(row["backend"] or "unknown")
+        model = str(row["model"] or "default")
+        agent_item = by_agent.setdefault(agent, {
+            "agent": agent, "seconds": 0, "runs": 0, "active_runs": 0,
+            "models": set(), "backends": set(), "role": roles.get(agent, ""),
+        })
+        agent_item["seconds"] += seconds
+        agent_item["runs"] += 1
+        agent_item["active_runs"] += int(active)
+        agent_item["models"].add(model)
+        agent_item["backends"].add(backend)
+
+        model_item = by_model.setdefault((backend, model), {
+            "backend": backend, "model": model, "seconds": 0, "runs": 0,
+            "active_runs": 0, "agents": set(),
+        })
+        model_item["seconds"] += seconds
+        model_item["runs"] += 1
+        model_item["active_runs"] += int(active)
+        model_item["agents"].add(agent)
+
+    def serialize(items: list[dict], set_fields: tuple[str, ...]) -> list[dict]:
+        for item in items:
+            for field in set_fields:
+                item[field] = sorted(item[field])
+        return sorted(items, key=lambda item: (-item["seconds"], item.get("agent", ""),
+                                                item.get("model", "")))
+
+    return {
+        "generated_at": now.isoformat().replace("+00:00", "Z"),
+        "total_seconds": total_seconds,
+        "total_runs": len(rows),
+        "timed_runs": timed_runs,
+        "active_runs": active_runs,
+        "ignored_runs": len(rows) - timed_runs,
+        "by_agent": serialize(list(by_agent.values()), ("models", "backends")),
+        "by_model": serialize(list(by_model.values()), ("agents",)),
+    }
 
 
 def _fmt(v, limit=MAX_OUTPUT) -> str:
@@ -604,6 +682,24 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 if r and r["log_path"] and Path(r["log_path"]).is_file():
                     text = Path(r["log_path"]).read_text(errors="replace")[-40000:]
                 self._json({"text": text})
+            elif path == "/api/stats":
+                project = self._resolve_project(url)
+                if project is None:
+                    return
+                con = db.connect(project)
+                try:
+                    rows = list(con.execute(
+                        "SELECT agent, backend, model, status, started_at, finished_at "
+                        "FROM runs ORDER BY id"
+                    ))
+                finally:
+                    con.close()
+                cfg = config.load(project)
+                roles = {
+                    name: str(agent.get("role") or "")
+                    for name, agent in cfg.get("agents", {}).items()
+                }
+                self._json(summarize_runtime(rows, roles=roles))
             elif path == "/api/usage":
                 # Honor ?refresh=1 — the runway page's Refresh button sends it.
                 force = (parse_qs(url.query).get("refresh") or ["0"])[0] in {"1", "true", "yes"}
