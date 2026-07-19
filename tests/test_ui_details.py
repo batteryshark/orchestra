@@ -71,6 +71,26 @@ class TranscriptNormalizationTests(unittest.TestCase):
             {"kind": "text", "body": "On it."},
         ])
 
+    def test_resolved_question_event_is_normalized(self) -> None:
+        transcript = ui.parse_transcript(json.dumps({
+            "type": "orchestra.question",
+            "question_id": 7,
+            "sender": "kimi",
+            "recipient": "codex",
+            "question": "Which mode?",
+            "recommended_default": "Use safe mode",
+            "status": "answered",
+            "answer": "Use strict mode",
+            "answered_by": "codex",
+            "asked_at": "2026-07-19T02:00:00Z",
+            "deadline_at": "2026-07-19T02:30:00Z",
+            "answered_at": "2026-07-19T02:01:00Z",
+        }))
+        self.assertEqual(len(transcript), 1)
+        self.assertEqual(transcript[0]["kind"], "question")
+        self.assertEqual(transcript[0]["question_id"], 7)
+        self.assertEqual(transcript[0]["answer"], "Use strict mode")
+
     def test_teammate_transcript_suppresses_empty_reasoning_parts(self) -> None:
         payload = json.dumps(
             [
@@ -118,6 +138,13 @@ class DetailSerializationTests(unittest.TestCase):
             "VALUES(?,?,?,?, 'queued', ?)",
             ("codex", "minimax", "After this, update the release note.", 1,
              "2026-07-18T22:01:00Z"),
+        )
+        con.execute(
+            "INSERT INTO questions(run_id,sender,recipient,question,recommended_default,"
+            "asked_at,deadline_at) VALUES(?,?,?,?,?,?,?)",
+            (1, "minimax", "codex", "Which output format should I preserve?",
+             "Preserve the current JSON format", "2026-07-18T22:02:00Z",
+             "2026-07-18T22:32:00Z"),
         )
         con.execute(
             "INSERT INTO runs(agent, backend, model, title, work_item, "
@@ -198,6 +225,20 @@ class DetailSerializationTests(unittest.TestCase):
                     "recipient": "minimax",
                     "body": "After this, update the release note.",
                     "created_at": "2026-07-18T22:01:00Z",
+                },
+                {
+                    "kind": "question",
+                    "question_id": 1,
+                    "sender": "minimax",
+                    "recipient": "codex",
+                    "question": "Which output format should I preserve?",
+                    "recommended_default": "Preserve the current JSON format",
+                    "status": "waiting",
+                    "answer": "",
+                    "answered_by": "",
+                    "asked_at": "2026-07-18T22:02:00Z",
+                    "deadline_at": "2026-07-18T22:32:00Z",
+                    "answered_at": "",
                 },
             ],
         )

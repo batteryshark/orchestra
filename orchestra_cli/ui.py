@@ -152,6 +152,23 @@ def parse_transcript(text: str) -> list[dict]:
                 })
             continue
 
+        if t == "orchestra.question":
+            add(None, {
+                "kind": "question",
+                "question_id": obj.get("question_id"),
+                "sender": _fmt(obj.get("sender"), 120),
+                "recipient": _fmt(obj.get("recipient"), 120),
+                "question": _fmt(obj.get("question"), MAX_INPUT),
+                "recommended_default": _fmt(obj.get("recommended_default"), MAX_INPUT),
+                "status": _fmt(obj.get("status"), 40),
+                "answer": _fmt(obj.get("answer"), MAX_INPUT),
+                "answered_by": _fmt(obj.get("answered_by"), 120),
+                "asked_at": _fmt(obj.get("asked_at"), 80),
+                "deadline_at": _fmt(obj.get("deadline_at"), 80),
+                "answered_at": _fmt(obj.get("answered_at"), 80),
+            })
+            continue
+
         # --- codex --json: item.* events ---
         if t.startswith("item."):
             it = obj.get("item") or {}
@@ -517,6 +534,9 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     "OR body LIKE '[INTERRUPT]%') ORDER BY id",
                     (run_id,),
                 )) if r else []
+                question = con.execute(
+                    "SELECT * FROM questions WHERE run_id=?", (run_id,)
+                ).fetchone() if r else None
                 con.close()
                 if not r:
                     return self._json({"error": "no such run"}, 404)
@@ -535,6 +555,8 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     etag += f"-{brief_st.st_size}-{int(brief_st.st_mtime)}"
                 if deliveries:
                     etag += f"-m{deliveries[-1]['id']}-{len(deliveries)}"
+                if question:
+                    etag += f"-q{question['id']}-{question['status']}-{question['answered_at'] or ''}"
                 client_etag = (parse_qs(url.query).get("etag") or [None])[0]
                 if client_etag == etag:
                     return self._json({"etag": etag, "unchanged": True})
@@ -562,6 +584,23 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                         "recipient": _fmt(message["recipient"], 120),
                         "body": _fmt(body, MAX_INPUT),
                         "created_at": _fmt(message["created_at"], 80),
+                    })
+                serialized_questions = {item.get("question_id") for item in items
+                                        if item.get("kind") == "question"}
+                if question and question["id"] not in serialized_questions:
+                    items.append({
+                        "kind": "question",
+                        "question_id": question["id"],
+                        "sender": _fmt(question["sender"], 120),
+                        "recipient": _fmt(question["recipient"], 120),
+                        "question": _fmt(question["question"], MAX_INPUT),
+                        "recommended_default": _fmt(question["recommended_default"], MAX_INPUT),
+                        "status": _fmt(question["status"], 40),
+                        "answer": _fmt(question["answer"], MAX_INPUT),
+                        "answered_by": _fmt(question["answered_by"], 120),
+                        "asked_at": _fmt(question["asked_at"], 80),
+                        "deadline_at": _fmt(question["deadline_at"], 80),
+                        "answered_at": _fmt(question["answered_at"], 80),
                     })
                 self._json({"etag": etag, "run": dict(r), "items": items})
             elif path.startswith("/api/log/"):

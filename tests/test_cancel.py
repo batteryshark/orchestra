@@ -83,6 +83,17 @@ class StopRunSemanticsTests(unittest.TestCase):
         self.assertEqual(result.status, "killed")
         self.assertEqual(result.reason, "already_terminal")
 
+    def test_waiting_for_input_run_remains_stoppable(self) -> None:
+        run_id = _insert_run(self.root, status="waiting_input")
+        con = db.connect(self.root)
+        try:
+            result = cancel.stop_run(con, run_id)
+        finally:
+            con.close()
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.previous_status, "waiting_input")
+        self.assertEqual(result.status, "killed")
+
     def test_stale_pid_that_is_not_group_leader_is_not_signalled(self) -> None:
         run_id = _insert_run(self.root, pid=4321)
         con = db.connect(self.root)

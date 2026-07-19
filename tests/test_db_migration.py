@@ -77,6 +77,13 @@ class MigrationTests(unittest.TestCase):
             # The newly-migrated column must be present and NULL.
             self.assertIn("slug", row.keys())
             self.assertIsNone(row["slug"])
+            self.assertEqual(row["allow_question"], 0)
+            self.assertEqual(row["question_wait_seconds"], 1800)
+            question_cols = {
+                r["name"] for r in con.execute("PRAGMA table_info(questions)").fetchall()
+            }
+            self.assertIn("recommended_default", question_cols)
+            self.assertIn("deadline_at", question_cols)
         finally:
             con.close()
 

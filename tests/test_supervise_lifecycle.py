@@ -258,5 +258,148 @@ class InterruptMessageTests(unittest.TestCase):
         self.assertEqual(status, "interrupt")
 
 
+class BlockingQuestionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp, self.root = _project(checkin_interval=0)
+        self.run_id = _insert_run(self.root)
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "UPDATE runs SET status='running', session_ref='ses-question', "
+                "allow_question=1, question_wait_seconds=60 WHERE id=?",
+                (self.run_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+        self.cfg = {
+            "settings": {"default_requester": "orchestrator"},
+            "agents": {"glm": {"backend": "opencode"}},
+        }
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_ask_pauses_and_answer_resolves_the_one_question(self) -> None:
+        ask = Namespace(
+            run_id=self.run_id,
+            question=["Preserve", "malformed", "frames?"],
+            default="Preserve them with a warning",
+            as_="glm",
+        )
+        answer = Namespace(
+            run_id=self.run_id,
+            answer=["Reject", "malformed", "frames"],
+            as_="codex",
+        )
+        with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
+                mock.patch.object(cli.config, "load", return_value=self.cfg), \
+                mock.patch("builtins.print"):
+            cli.cmd_ask(ask)
+            cli.cmd_answer(answer)
+
+        con = db.connect(self.root)
+        try:
+            run = con.execute("SELECT status FROM runs WHERE id=?", (self.run_id,)).fetchone()
+            question = con.execute(
+                "SELECT * FROM questions WHERE run_id=?", (self.run_id,)
+            ).fetchone()
+            message = con.execute(
+                "SELECT kind, read_at FROM messages WHERE run_id=? AND kind='question'",
+                (self.run_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(run["status"], "waiting_input")
+        self.assertEqual(question["status"], "answered")
+        self.assertEqual(question["answer"], "Reject malformed frames")
+        self.assertEqual(question["answered_by"], "codex")
+        self.assertEqual(message["kind"], "question")
+        self.assertIsNotNone(message["read_at"])
+
+    def test_default_run_cannot_block(self) -> None:
+        con = db.connect(self.root)
+        try:
+            con.execute("UPDATE runs SET allow_question=0 WHERE id=?", (self.run_id,))
+            con.commit()
+        finally:
+            con.close()
+        ask = Namespace(
+            run_id=self.run_id,
+            question=["Can", "I", "wait?"],
+            default="Continue",
+            as_="glm",
+        )
+        with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
+                mock.patch.object(cli.config, "load", return_value=self.cfg), \
+                self.assertRaisesRegex(SystemExit, "not dispatched with --allow-question"):
+            cli.cmd_ask(ask)
+
+    def test_unanswered_question_uses_declared_fallback(self) -> None:
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "INSERT INTO questions(run_id,sender,recipient,question,recommended_default,"
+                "asked_at,deadline_at) VALUES(?,?,?,?,?,?,?)",
+                (self.run_id, "glm", "codex", "Which mode?", "Use safe mode",
+                 db.now(), db.now()),
+            )
+            con.execute("UPDATE runs SET status='waiting_input' WHERE id=?", (self.run_id,))
+            con.commit()
+            run = con.execute("SELECT * FROM runs WHERE id=?", (self.run_id,)).fetchone()
+            question, _waited = supervise._wait_for_question(con, run, poll_interval=0.01)
+        finally:
+            con.close()
+        self.assertEqual(question["status"], "defaulted")
+        self.assertEqual(question["answer"], "Use safe mode")
+        self.assertEqual(question["answered_by"], "orchestra")
+
+    def test_supervisor_resumes_answered_question_in_same_session(self) -> None:
+        calls: list[tuple[str | None, str]] = []
+        outcomes = iter(["waiting_input", "exit"])
+
+        def build_cmd(agent, *, workdir, title, prompt, resume_ref=None, add_dirs=None, attach=None):
+            calls.append((resume_ref, prompt))
+            return [sys.executable, "-c", "pass"]
+
+        def run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, **kwargs):
+            outcome = next(outcomes)
+            if outcome == "waiting_input":
+                con.execute(
+                    "INSERT INTO questions(run_id,sender,recipient,question,recommended_default,"
+                    "status,asked_at,deadline_at,answered_at,answered_by,answer) "
+                    "VALUES(?,?,?,?,?,'answered',?,?,?,?,?)",
+                    (run_id, "glm", "codex", "Which mode?", "Use safe mode",
+                     db.now(), db.after(60), db.now(), "codex", "Use strict mode"),
+                )
+                con.execute(
+                    "UPDATE runs SET status='waiting_input', session_ref='ses-question' WHERE id=?",
+                    (run_id,),
+                )
+                con.commit()
+                return outcome, None
+            return outcome, 0
+
+        con = db.connect(self.root)
+        try:
+            con.execute("DELETE FROM questions WHERE run_id=?", (self.run_id,))
+            con.execute("UPDATE runs SET status='spawning', session_ref=NULL WHERE id=?",
+                        (self.run_id,))
+            con.commit()
+        finally:
+            con.close()
+
+        with mock.patch.object(supervise.runners, "build_cmd", side_effect=build_cmd), \
+                mock.patch.object(supervise, "_run_proc", side_effect=run_proc), \
+                mock.patch.object(supervise.runners, "parse_log",
+                                  return_value=("ses-question", "finished")):
+            rc = supervise.supervise(self.root, self.run_id)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0][0], None)
+        self.assertEqual(calls[1][0], "ses-question")
+        self.assertIn("Answer to apply: Use strict mode", calls[1][1])
+
+
 if __name__ == "__main__":
     unittest.main()

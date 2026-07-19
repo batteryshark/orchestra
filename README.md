@@ -48,6 +48,7 @@ Add `--work` if the optional `work` CLI is installed and you want Orchestra to i
 ```sh
 orchestra dispatch --to glm --as codex "implement the parser and add tests"
 orchestra dispatch --to glm --to minimax --as codex "review this independently"
+orchestra dispatch --to kimi --allow-question --as codex "implement the risky migration"
 orchestra status
 orchestra wait
 orchestra inbox codex --unread --mark-read
@@ -59,6 +60,8 @@ orchestra logs 7 --pretty
 Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion events are then logged to that item, and the worker brief asks the agent to record progress and verification evidence there.
 
 Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
+
+Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
 
 ## Hand off a wave to another orchestrator
 

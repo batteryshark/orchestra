@@ -252,9 +252,20 @@ def cmd_dispatch(args):
     if ensemble_targets:
         ensemble.require_plugin(ensemble_targets)
 
+    allow_question = bool(getattr(args, "allow_question", False))
+    configured_question_wait = getattr(args, "question_wait", None)
+    if configured_question_wait is not None and not allow_question:
+        raise SystemExit("orchestra: --question-wait requires --allow-question")
+    if configured_question_wait is None:
+        configured_question_wait = cfg["settings"].get(
+            "question_wait_timeout", config.DEFAULT_QUESTION_WAIT_SECONDS
+        )
+    question_wait = config.question_wait_seconds(configured_question_wait)
+
     con = db.connect(root)
     if args.team:
         if not con.execute("SELECT 1 FROM teams WHERE name=?", (args.team,)).fetchone():
+            con.close()
             raise SystemExit(f"orchestra: no team '{args.team}' (create it first)")
 
     # Warn-only quota assessment — ONE cached snapshot, no DB inserts yet.
@@ -290,11 +301,12 @@ def cmd_dispatch(args):
             try:
                 cur = con.execute(
                     "INSERT INTO runs(agent, backend, model, title, work_item, team, "
-                    "requested_by, workdir, slug, status, started_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+                    "requested_by, workdir, slug, allow_question, question_wait_seconds, "
+                    "status, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
                     (target, agent["backend"], display_model,
                      args.title or mission[:80],
-                     args.work, args.team, requester, str(root), slug, db.now()))
+                     args.work, args.team, requester, str(root), slug,
+                     int(allow_question), question_wait, db.now()))
                 run_id = cur.lastrowid
                 break
             except sqlite3.IntegrityError as exc:
@@ -313,7 +325,9 @@ def cmd_dispatch(args):
             workdir = str(wt)
         text = brief.compose(root=root, run_id=run_id, agent=agent, mission=mission,
                              work_item=args.work, team=args.team, requester=requester,
-                             workdir=workdir, extra_context=args.context)
+                             workdir=workdir, extra_context=args.context,
+                             allow_question=allow_question,
+                             question_wait_seconds=question_wait)
         bp = paths.briefs_dir(root) / f"run-{run_id}.md"
         bp.write_text(text)
         lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
@@ -496,6 +510,134 @@ def cmd_wait(args):
         if pending:
             time.sleep(2)
     print("all runs finished — check your inbox: `orchestra inbox <you> --unread --mark-read`")
+
+
+def _question_run_id(args) -> int:
+    raw = getattr(args, "run_id", None) or os.environ.get("ORCHESTRA_RUN_ID")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit("orchestra: question command needs --run or $ORCHESTRA_RUN_ID")
+
+
+def cmd_ask(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    sender = _identity(args, cfg)
+    run_id = _question_run_id(args)
+    question = " ".join(args.question).strip()
+    recommended = args.default.strip()
+    if not question or not recommended:
+        raise SystemExit("orchestra: both the question and --default fallback must be non-empty")
+    if len(question) > 4000 or len(recommended) > 4000:
+        raise SystemExit("orchestra: question and fallback are limited to 4000 characters each")
+
+    con = db.connect(root)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise SystemExit(f"orchestra: no run {run_id}")
+        if run["agent"] != sender:
+            raise SystemExit(
+                f"orchestra: run {run_id} belongs to {run['agent']}; ask as that worker"
+            )
+        if not run["allow_question"]:
+            raise SystemExit(
+                f"orchestra: run {run_id} was not dispatched with --allow-question; "
+                "continue with a documented assumption"
+            )
+        if run["status"] != "running":
+            raise SystemExit(f"orchestra: run {run_id} is {run['status']}, not running")
+        if not run["session_ref"]:
+            raise SystemExit(
+                f"orchestra: run {run_id}'s session is not resumable yet; "
+                "continue with the recommended default"
+            )
+        if con.execute("SELECT 1 FROM questions WHERE run_id=?", (run_id,)).fetchone():
+            raise SystemExit(
+                f"orchestra: run {run_id} already used its one blocking question"
+            )
+        wait_seconds = int(run["question_wait_seconds"])
+        asked_at, deadline_at = db.now(), db.after(wait_seconds)
+        con.execute(
+            "INSERT INTO questions(run_id, sender, recipient, question, recommended_default, "
+            "asked_at, deadline_at) VALUES(?,?,?,?,?,?,?)",
+            (run_id, sender, run["requested_by"], question, recommended, asked_at, deadline_at),
+        )
+        body = (
+            f"[QUESTION run {run_id}] {question}\n"
+            f"Recommended default: {recommended}\n"
+            f"Auto-resumes with that default in {wait_seconds} seconds.\n"
+            f"Answer: `orchestra answer {run_id} \"<answer>\" --as {run['requested_by']}`"
+        )
+        con.execute(
+            "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, created_at) "
+            "VALUES(?,?,?,?,?, 'question', ?)",
+            (sender, run["requested_by"], body, run["work_item"], run_id, asked_at),
+        )
+        con.execute("UPDATE runs SET status='waiting_input' WHERE id=?", (run_id,))
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+    print(
+        f"run {run_id} paused for one answer; it will use the recommended default "
+        f"after {wait_seconds} seconds"
+    )
+
+
+def cmd_answer(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    answered_by = _identity(args, cfg)
+    run_id = args.run_id
+    answer = " ".join(args.answer).strip()
+    if not answer:
+        raise SystemExit("orchestra: answer must not be empty")
+    if len(answer) > 4000:
+        raise SystemExit("orchestra: answer is limited to 4000 characters")
+
+    con = db.connect(root)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT q.*, r.status AS run_status, r.requested_by FROM questions q "
+            "JOIN runs r ON r.id=q.run_id WHERE q.run_id=?",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            raise SystemExit(f"orchestra: run {run_id} has no blocking question")
+        if row["recipient"] != answered_by:
+            raise SystemExit(
+                f"orchestra: question for run {run_id} is addressed to {row['recipient']}"
+            )
+        if row["status"] != "waiting" or row["run_status"] != "waiting_input":
+            raise SystemExit(
+                f"orchestra: question for run {run_id} is already {row['status']}"
+            )
+        answered_at = db.now()
+        con.execute(
+            "UPDATE questions SET status='answered', answered_at=?, answered_by=?, answer=? "
+            "WHERE run_id=? AND status='waiting'",
+            (answered_at, answered_by, answer, run_id),
+        )
+        con.execute(
+            "UPDATE messages SET read_at=COALESCE(read_at, ?) "
+            "WHERE run_id=? AND kind='question'",
+            (answered_at, run_id),
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+    print(f"answered run {run_id}; the worker will resume its saved session")
 
 
 def cmd_queue(args):
@@ -1039,6 +1181,10 @@ def main():
     s.add_argument("--brief-file", help="read mission text from a file")
     s.add_argument("--worktree", action="store_true", help="isolate in a git worktree (skills auto-synced)")
     s.add_argument("--sync", action="store_true", help="block until the run finishes")
+    s.add_argument("--allow-question", action="store_true",
+                   help="allow one genuine blocking question with an automatic fallback")
+    s.add_argument("--question-wait", type=int, metavar="SECONDS",
+                   help="answer window for --allow-question (default: config or 1800)")
     s.add_argument("--no-quota-warn", action="store_true",
                    help="suppress the warn-only provider-headroom check (default: on)")
     ident(s)
@@ -1133,6 +1279,21 @@ def main():
     s.add_argument("message", nargs="+")
     ident(s)
     s.set_defaults(fn=cmd_queue)
+
+    s = sub.add_parser("ask", help="use an opted-in run's one blocking question and pause it")
+    s.add_argument("question", nargs="+")
+    s.add_argument("--default", required=True,
+                   help="recommended fallback used automatically when unanswered")
+    s.add_argument("--run", dest="run_id", type=int,
+                   help="active run id (default: $ORCHESTRA_RUN_ID)")
+    ident(s)
+    s.set_defaults(fn=cmd_ask)
+
+    s = sub.add_parser("answer", help="answer a paused worker and resume its saved session")
+    s.add_argument("run_id", type=int)
+    s.add_argument("answer", nargs="+")
+    ident(s)
+    s.set_defaults(fn=cmd_answer)
 
     s = sub.add_parser("interrupt", help="guaranteed delivery to a RUNNING worker: "
                                          "pause it, inject the message, resume the mission")

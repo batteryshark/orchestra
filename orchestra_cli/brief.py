@@ -18,14 +18,23 @@ def work_snapshot(root: Path, item: str) -> str:
 def compose(*, root: Path, run_id: int, agent: dict, mission: str,
             work_item: str | None, team: str | None, requester: str,
             workdir: str, extra_context: str | None = None,
-            lead_run: int | None = None) -> str:
+            lead_run: int | None = None, allow_question: bool = False,
+            question_wait_seconds: int = 1800) -> str:
     name = agent["name"]
+    autonomy = (
+        "Work autonomously and make reasonable assumptions. You have ONE blocking-question "
+        "escape hatch for a genuinely unsafe or materially wasteful ambiguity; its strict "
+        "protocol is below. Do not use it for ordinary implementation preferences."
+        if allow_question else
+        "Work autonomously. Do not ask questions or wait for replies — make reasonable choices "
+        "and record them."
+    )
     parts = [f"""# Orchestra worker brief — run {run_id}
 
 You are **{name}** ({agent.get('role', 'worker agent')}), a worker agent in the project at `{root}`.
 Team: {team or '(none)'} · Dispatched by: **{requester}**
 
-Work autonomously. Do not ask questions or wait for replies — make reasonable choices and record them. Your working directory is `{workdir}`; keep all file changes inside it.
+{autonomy} Your working directory is `{workdir}`; keep all file changes inside it.
 
 ## Mission
 
@@ -55,7 +64,7 @@ Coordination runs through the `orchestra` CLI and the `work` CLI, both on PATH. 
 2. **Progress** — {'append to the work item log after each meaningful step: `work log ' + work_item + ' "<what happened>"`' if work_item else 'record meaningful progress with `orchestra note "<progress>" --as ' + name + '`'}
 3. **Findings** — anything teammates or the orchestrator should know (discoveries, gotchas, decisions made, dead ends): `orchestra note "<finding>" --as {name} --tags <tag,...>`
 4. **Peers** — message a teammate: `orchestra send <agent> "<msg>" --as {name}`; see who exists: `orchestra roster`. Check your inbox between major steps.
-5. **Blockers** — `orchestra send {requester} "<question/blocker>" --as {name}`, then continue with a documented assumption rather than blocking.
+5. **Blockers** — {('Only for missing authority/credentials, irreversible risk, conflicting requirements, or ambiguity likely to waste substantial work, you may pause ONCE: `orchestra ask "<one concrete question>" --default "<recommended fallback you can safely execute>" --as ' + name + ' --run ' + str(run_id) + '`. This stops your turn and waits up to ' + str(question_wait_seconds) + ' seconds; an answer or your declared fallback resumes this same session. For everything else, continue with a documented assumption.' if allow_question else '`orchestra send ' + requester + ' "<question/blocker>" --as ' + name + '`, then continue with a documented assumption rather than blocking.')}
 6. **Finish (mandatory)** — send a handoff before you stop:
    `orchestra send {requester} "HANDOFF run {run_id}: <what you did, files touched, what remains / follow-ups>" --as {name} --run {run_id}`
 """ + (f"""   Then update the tracker: log verification evidence for EACH requirement/acceptance criterion you satisfied:

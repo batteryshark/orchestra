@@ -28,6 +28,9 @@ commands. Run completions and worker handoffs arrive in YOUR inbox under that na
    - Fan out one mission to several agents: repeat `--to` (e.g. `--to glm --to minimax`).
    - Independent missions: separate dispatch calls — they all run concurrently in the background.
    - `--worktree` gives the worker an isolated git worktree (skills folders auto-synced).
+   - Default workers never block. For a genuinely risky ambiguity, `--allow-question` grants
+     one question with a required fallback; answer it with `orchestra answer <run> "..."`.
+     Unanswered questions auto-resume with that fallback after the bounded wait window.
    - A supervised worker can delegate a bounded child batch with
      `orchestra spawn --to <agent> "mission"`. Children are backend-neutral and use isolated
      worktrees by default. The lead should commit any work children need before spawning;

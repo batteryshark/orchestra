@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from orchestra_cli import paths
@@ -36,6 +36,20 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL,
   read_at TEXT
 );
+CREATE TABLE IF NOT EXISTS questions (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER UNIQUE NOT NULL REFERENCES runs(id),
+  sender TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  question TEXT NOT NULL,
+  recommended_default TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'waiting',
+  asked_at TEXT NOT NULL,
+  deadline_at TEXT NOT NULL,
+  answered_at TEXT,
+  answered_by TEXT,
+  answer TEXT
+);
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY,
   agent TEXT NOT NULL,
@@ -53,6 +67,8 @@ CREATE TABLE IF NOT EXISTS runs (
   lead_run INTEGER,
   child_depth INTEGER NOT NULL DEFAULT 0,
   child_wakeup_run INTEGER,
+  allow_question INTEGER NOT NULL DEFAULT 0,
+  question_wait_seconds INTEGER NOT NULL DEFAULT 1800,
   pid INTEGER,
   session_ref TEXT,
   status TEXT NOT NULL DEFAULT 'spawning',
@@ -77,6 +93,12 @@ RUN_TERMINAL = ("done", "failed", "timeout", "killed")
 
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def after(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def _has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
@@ -121,6 +143,20 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE runs ADD COLUMN child_depth INTEGER NOT NULL DEFAULT 0")
     if not _has_column(con, "runs", "child_wakeup_run"):
         con.execute("ALTER TABLE runs ADD COLUMN child_wakeup_run INTEGER")
+    if not _has_column(con, "runs", "allow_question"):
+        con.execute("ALTER TABLE runs ADD COLUMN allow_question INTEGER NOT NULL DEFAULT 0")
+    if not _has_column(con, "runs", "question_wait_seconds"):
+        con.execute(
+            "ALTER TABLE runs ADD COLUMN question_wait_seconds INTEGER NOT NULL DEFAULT 1800"
+        )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS questions ("
+        "id INTEGER PRIMARY KEY, run_id INTEGER UNIQUE NOT NULL REFERENCES runs(id), "
+        "sender TEXT NOT NULL, recipient TEXT NOT NULL, question TEXT NOT NULL, "
+        "recommended_default TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'waiting', "
+        "asked_at TEXT NOT NULL, deadline_at TEXT NOT NULL, answered_at TEXT, "
+        "answered_by TEXT, answer TEXT)"
+    )
     con.execute("CREATE INDEX IF NOT EXISTS idx_runs_lead_run ON runs(lead_run)")
 
 

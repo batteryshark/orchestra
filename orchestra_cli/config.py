@@ -3,6 +3,10 @@ from pathlib import Path
 
 from orchestra_cli import paths
 
+DEFAULT_QUESTION_WAIT_SECONDS = 1800
+MIN_QUESTION_WAIT_SECONDS = 10
+MAX_QUESTION_WAIT_SECONDS = 86400
+
 DEFAULT_CONFIG = """\
 # Orchestra roster + settings. Global file: ~/.config/orchestra/config.toml
 # Project overrides: .orchestra/config.toml (same shape, merged over global).
@@ -10,6 +14,7 @@ DEFAULT_CONFIG = """\
 [settings]
 timeout = 3600            # per-run seconds before the supervisor kills a worker
 supervisor_checkin_interval = 600  # seconds between safe progress check-ins for long runs
+question_wait_timeout = 1800  # opted-in blocking question fallback (30 minutes)
 default_requester = "orchestrator"
 # quota_warn = true (default) — print a one-shot cached headroom advisory before
 # each dispatch when the target coding plan is below the runway floor; never
@@ -134,6 +139,19 @@ def agent_cfg(cfg: dict, name: str) -> dict:
     a.setdefault("role", "worker agent")
     a.setdefault("ensemble", False)
     return a
+
+
+def question_wait_seconds(raw) -> int:
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit("orchestra: question wait timeout must be an integer number of seconds")
+    if not MIN_QUESTION_WAIT_SECONDS <= seconds <= MAX_QUESTION_WAIT_SECONDS:
+        raise SystemExit(
+            f"orchestra: question wait timeout must be between "
+            f"{MIN_QUESTION_WAIT_SECONDS} and {MAX_QUESTION_WAIT_SECONDS} seconds"
+        )
+    return seconds
 
 
 def ensure_global_config() -> Path:

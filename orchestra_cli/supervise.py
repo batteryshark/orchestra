@@ -84,6 +84,47 @@ def _ts_to_epoch(ts: str) -> float:
     return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
 
 
+def _wait_for_question(con, run, *, poll_interval: float = PROC_POLL_INTERVAL) -> tuple[dict | None, float]:
+    """Wait cheaply for a human answer or atomically apply the declared fallback."""
+    started = time.time()
+    while True:
+        current = con.execute("SELECT status FROM runs WHERE id=?", (run["id"],)).fetchone()
+        if not current or current["status"] == "killed":
+            return None, time.time() - started
+        question = con.execute(
+            "SELECT * FROM questions WHERE run_id=?", (run["id"],)
+        ).fetchone()
+        if not question:
+            return None, time.time() - started
+        if question["status"] != "waiting":
+            return dict(question), time.time() - started
+        if time.time() >= _ts_to_epoch(question["deadline_at"]):
+            resolved_at = db.now()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                fresh = con.execute(
+                    "SELECT * FROM questions WHERE run_id=?", (run["id"],)
+                ).fetchone()
+                if fresh and fresh["status"] == "waiting":
+                    con.execute(
+                        "UPDATE questions SET status='defaulted', answered_at=?, "
+                        "answered_by='orchestra', answer=recommended_default "
+                        "WHERE run_id=? AND status='waiting'",
+                        (resolved_at, run["id"]),
+                    )
+                    con.execute(
+                        "UPDATE messages SET read_at=COALESCE(read_at, ?) "
+                        "WHERE run_id=? AND kind='question'",
+                        (resolved_at, run["id"]),
+                    )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            continue
+        time.sleep(poll_interval)
+
+
 def _checkin_interval_seconds(raw) -> int | None:
     if raw is False or raw is None:
         return None
@@ -242,13 +283,16 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
               delivery_events: list[dict] | None = None,
               poll_interval: float = PROC_POLL_INTERVAL) -> tuple[str, int | None]:
     """Start one worker process; wait with timeout + early session-ref capture.
-    Returns (outcome, exit_code) where outcome is 'exit'|'timeout'|'usage_limit'."""
+    Returns (outcome, exit_code) where outcome is
+    'exit'|'timeout'|'usage_limit'|'waiting_input'."""
     with open(log_path, "ab") as log:
         latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
         if latest and latest["status"] in db.RUN_TERMINAL:
             return "exit", None
         for event in delivery_events or []:
-            log.write((json.dumps({"type": "orchestra.delivery", **event},
+            payload = dict(event)
+            event_type = payload.pop("type", "orchestra.delivery")
+            log.write((json.dumps({"type": event_type, **payload},
                                   ensure_ascii=False, separators=(",", ":")) + "\n").encode())
         log.write((" ".join(cmd[:6]) + " ...\n").encode())
         log.flush()
@@ -291,6 +335,10 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                 _wait_after_term(proc)
                 return "usage_limit", None
             latest = con.execute("SELECT status, session_ref FROM runs WHERE id=?", (run_id,)).fetchone()
+            if latest and latest["status"] == "waiting_input":
+                _terminate_process_group(proc.pid)
+                _wait_after_term(proc)
+                return "waiting_input", None
             if latest and latest["status"] in db.RUN_TERMINAL:
                 _terminate_process_group(proc.pid)
                 _wait_after_term(proc)
@@ -381,6 +429,51 @@ def supervise(root: Path, run_id: int) -> int:
                                        delivery_events=delivery_events)
         delivery_events = []
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+
+        if outcome == "waiting_input" or run["status"] == "waiting_input":
+            if not run["session_ref"]:
+                status = "failed"
+                break
+            question, waited = _wait_for_question(con, run)
+            deadline += waited
+            checkin_state["last_sent_at"] = float(
+                checkin_state.get("last_sent_at") or time.time()
+            ) + waited
+            latest = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if latest and latest["status"] == "killed":
+                status = "killed"
+                break
+            if not question:
+                status = "failed"
+                break
+            resume_ref = run["session_ref"]
+            resolution = question["status"]
+            answer = question["answer"] or question["recommended_default"]
+            prompt = (
+                f"Your one blocking question was {resolution}.\n\n"
+                f"Question: {question['question']}\n"
+                f"Recommended default: {question['recommended_default']}\n"
+                f"Answer to apply: {answer}\n\n"
+                "Continue the original mission now, applying that answer. Do not ask another "
+                "blocking question; make reasonable assumptions and finish with the normal HANDOFF."
+            )
+            delivery_events = [{
+                "type": "orchestra.question",
+                "question_id": question["id"],
+                "sender": question["sender"],
+                "recipient": question["recipient"],
+                "question": question["question"],
+                "recommended_default": question["recommended_default"],
+                "status": resolution,
+                "answer": answer,
+                "answered_by": question["answered_by"],
+                "asked_at": question["asked_at"],
+                "deadline_at": question["deadline_at"],
+                "answered_at": question["answered_at"],
+            }]
+            con.execute("UPDATE runs SET status='running' WHERE id=?", (run_id,))
+            con.commit()
+            continue
 
         if outcome == "timeout":
             status = "timeout"

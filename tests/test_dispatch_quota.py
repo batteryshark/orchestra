@@ -85,6 +85,8 @@ class DispatchQuotaHookTests(unittest.TestCase):
             worktree=False,
             sync=False,
             no_quota_warn=no_quota_warn,
+            allow_question=False,
+            question_wait=None,
             as_=None,
         )
 
@@ -99,6 +101,36 @@ class DispatchQuotaHookTests(unittest.TestCase):
         self._run_dispatch(args)
         self.assertEqual(self._stub.calls, 0,
                          "no_quota_warn should skip the snapshot call")
+
+    def test_question_capability_is_default_off_and_explicitly_bounded(self) -> None:
+        default_args = self._make_args("minimax", no_quota_warn=True)
+        self._run_dispatch(default_args)
+        opted_args = self._make_args("minimax", no_quota_warn=True)
+        opted_args.allow_question = True
+        opted_args.question_wait = 60
+        self._run_dispatch(opted_args)
+
+        con = db.connect(self.root)
+        try:
+            rows = list(con.execute(
+                "SELECT allow_question, question_wait_seconds, brief_path FROM runs ORDER BY id"
+            ))
+        finally:
+            con.close()
+        self.assertEqual(rows[0]["allow_question"], 0)
+        self.assertNotIn("orchestra ask", Path(rows[0]["brief_path"]).read_text())
+        self.assertEqual(rows[1]["allow_question"], 1)
+        self.assertEqual(rows[1]["question_wait_seconds"], 60)
+        opted_brief = Path(rows[1]["brief_path"]).read_text()
+        self.assertIn("ONE blocking-question", opted_brief)
+        self.assertIn("orchestra ask", opted_brief)
+        self.assertIn("waits up to 60 seconds", opted_brief)
+
+    def test_question_wait_override_requires_opt_in(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.question_wait = 60
+        with self.assertRaisesRegex(SystemExit, "requires --allow-question"):
+            self._run_dispatch(args)
 
     def test_default_on_emits_warning_before_run_insert(self) -> None:
         critical = ProviderResult(

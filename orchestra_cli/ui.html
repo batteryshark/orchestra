@@ -55,6 +55,7 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
   font-weight:600; color:#fff }
 .s-running { background:var(--blue); animation:pulse 1.6s infinite }
 .s-spawning { background:var(--amber) }
+.s-waiting_input { background:var(--amber); animation:pulse 1.6s infinite }
 .s-done { background:var(--green) } .s-failed,.s-timeout { background:var(--red) }
 .s-killed { background:var(--gray) }
 @keyframes pulse { 50% { opacity:.55 } }
@@ -89,6 +90,18 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
   text-transform:uppercase }
 .titem.delivery .event-route { color:var(--muted); font-size:11.5px; margin-left:7px }
 .titem.delivery .event-body { margin-top:6px; white-space:pre-wrap; overflow-wrap:anywhere }
+.titem.question { border:1px solid color-mix(in srgb, var(--amber) 50%, var(--line));
+  border-left:4px solid var(--amber); border-radius:8px; margin:10px 0; padding:10px 12px;
+  background:color-mix(in srgb, var(--amber) 7%, transparent) }
+.titem.question.resolved { border-left-color:var(--green);
+  background:color-mix(in srgb, var(--green) 6%, transparent) }
+.titem.question .question-title { font-size:12px; font-weight:700; text-transform:uppercase;
+  letter-spacing:.035em }
+.titem.question .event-route { color:var(--muted); font-size:11.5px; margin-left:7px }
+.titem.question .question-body { margin-top:7px; white-space:pre-wrap; overflow-wrap:anywhere }
+.titem.question .question-default,.titem.question .question-answer { margin-top:7px;
+  padding-left:10px; border-left:2px solid var(--line); white-space:pre-wrap; overflow-wrap:anywhere }
+.titem.question .question-action { margin-top:8px; color:var(--muted); font-size:11.5px }
 details { border:1px solid var(--line); border-radius:8px; margin:6px 0 }
 details summary { cursor:pointer; padding:5px 10px; font-size:12.5px; user-select:none;
   display:flex; gap:8px; align-items:center }
@@ -258,7 +271,7 @@ function elapsed(start, end){
   return h ? `${h}h${String(m).padStart(2,'0')}m` : m ? `${m}m${String(s).padStart(2,'0')}s` : `${s}s`;
 }
 function statusLabel(status){
-  return status === 'killed' ? 'stopped by user' : status;
+  return status === 'killed' ? 'stopped by user' : status === 'waiting_input' ? 'waiting for answer' : status;
 }
 function statusChip(status){
   return `<span class="chip s-${esc(status)}">${esc(statusLabel(status))}</span>`;
@@ -374,6 +387,13 @@ function itemHtml(it, i){
     const icon = mode === 'interrupt' ? '&#128680;' : mode === 'checkin' ? '&#9200;' : '&#128236;';
     const label = mode === 'interrupt' ? 'interrupt delivered to inbox' : mode === 'checkin' ? 'supervisor check-in' : 'queued for runner';
     return `<div class="titem delivery ${mode}"><div><span class="event-title">${icon} ${label}</span><span class="event-route">${esc(it.sender||'orchestra')} → ${esc(it.recipient||'runner')}</span></div>${it.body?`<div class="event-body">${esc(it.body)}</div>`:''}</div>`;
+  }
+  if (it.kind === 'question') {
+    const waiting = it.status === 'waiting';
+    const title = waiting ? '&#10067; worker question' : it.status === 'defaulted' ? '&#9203; auto-resumed with fallback' : '&#9989; question answered';
+    const answer = !waiting && it.answer ? `<div class="question-answer"><span class="muted">answer${it.answered_by?` from ${esc(it.answered_by)}`:''}</span><br>${esc(it.answer)}</div>` : '';
+    const action = waiting ? `<div class="question-action">Answer with <span class="mono">orchestra answer ${esc(selected)} "..."</span> · fallback at ${esc(it.deadline_at||'')}</div>` : '';
+    return `<div class="titem question ${waiting?'waiting':'resolved'}"><div><span class="question-title">${title}</span><span class="event-route">${esc(it.sender||'runner')} → ${esc(it.recipient||'orchestrator')}</span></div><div class="question-body">${esc(it.question||'')}</div><div class="question-default"><span class="muted">recommended fallback</span><br>${esc(it.recommended_default||'')}</div>${answer}${action}</div>`;
   }
   if (it.kind === 'prompt')  return `<details class="prompt" data-k="${i}"><summary>&#128221; initial runner prompt <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
