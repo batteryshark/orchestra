@@ -102,7 +102,10 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
   session. Use `--now` only when immediate termination is safer than letting the current tool
   finish.
 - `orchestra queue <run> "message"` schedules a non-urgent continuation after the current run.
-- `orchestra reply <run> "message"` resumes a completed run's existing session.
+- `orchestra recall <message-id> --as <sender>` withdraws your queued continuation before
+  auto-delivery claims it. Queue output includes the message ID.
+- `orchestra resume <run> "message"` continues a completed run's existing session as a new,
+  linked execution attempt. `orchestra reply` remains a compatibility alias.
 
 Corrections that change current work use `interrupt` or `queue`, never bare `send`. If a
 worker never reads an inbox message, Orchestra reports it as undelivered after the run.
@@ -177,7 +180,7 @@ weak tier to a task whose primary difficulty is judgment rather than typing.
 
 Supervisors are detached parents of worker processes and cannot be hot-swapped. If a supervisor
 is gone after a reboot or predates a required upgrade, use `orchestra kill <run>` followed by
-`orchestra reply <run> "continue where you left off"`. The reply resumes the same agent session
+`orchestra resume <run> "continue where you left off"`. Resume continues the same agent session
 under a fresh supervisor. Never invoke `orchestra _supervise` manually for a live run; that can
 start a duplicate worker.
 
@@ -222,7 +225,8 @@ orchestra wait
 orchestra inbox <you> --unread --mark-read
 orchestra interrupt 7 "stop—the schema changed" --as <you>
 orchestra queue 7 "after this step, also update the compatibility test" --as <you>
-orchestra reply 7 "address the review findings and rerun the gate"
+orchestra recall 42 --as <you>
+orchestra resume 7 "address the review findings and rerun the gate"
 orchestra send <agent> --file investigation.md --as <you>
 orchestra feed
 orchestra logs 7 --pretty

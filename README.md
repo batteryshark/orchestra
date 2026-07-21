@@ -70,7 +70,9 @@ orchestra dispatch --to kimi --allow-question --as codex "implement the risky mi
 orchestra status
 orchestra wait
 orchestra inbox codex --unread --mark-read
-orchestra reply 7 "good; now cover malformed input"
+orchestra resume 7 "good; now cover malformed input"
+orchestra queue 8 "afterward, update the compatibility test" --as codex
+orchestra recall 42 --as codex
 orchestra interrupt 8 "stop—the schema changed" --as codex
 orchestra interrupt 8 "stop immediately" --now --as codex
 orchestra logs 7 --pretty
@@ -83,6 +85,10 @@ Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-
 Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
 
 `orchestra interrupt` waits for the next completed action boundary reported by the active backend before stopping and resuming the worker, so routine redirection does not terminate a tool during a file write. OpenCode step finishes, Codex completed tool items, and Claude tool results are recognized. Use `--now` only when stopping immediately is more important than preserving the current tool operation. If the worker exits before another boundary, Orchestra resumes the same session immediately with the pending message. Periodic supervisor check-ins use the same safe path.
+
+`orchestra queue` prints the queued message ID, which also appears in run details. Recall an obsolete follow-up with `orchestra recall MESSAGE_ID --as SENDER` before the current run finishes. Recall and auto-delivery are atomic: once the follow-up has been claimed for session resume, Orchestra refuses to recall it.
+
+`orchestra resume RUN "message"` continues the run's existing backend session without reopening its immutable execution record. Orchestra creates a new run attempt linked through `parent_run`; if the selected run already has completed continuations, it resumes the latest attempt in that chain. An active continuation is never resumed concurrently. The older `orchestra reply` spelling remains as a compatibility alias.
 
 ## Hand off a wave to another orchestrator
 
@@ -182,7 +188,7 @@ Claude usage refreshes from Claude Code's live `/usage` view in the background. 
 
 Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and configured optional integrations.
 
-Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra reply` resumes the same worker rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra resume` continues the same worker context rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
 
 The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables the max-thinking variant for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
 

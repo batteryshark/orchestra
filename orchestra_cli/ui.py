@@ -590,8 +590,8 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 con = db.connect(project)
                 r = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
                 deliveries = list(con.execute(
-                    "SELECT id, sender, recipient, body, kind, created_at, delivery_offset, "
-                    "delivered_at FROM messages "
+                    "SELECT id, sender, recipient, body, kind, created_at, read_at, "
+                    "delivery_offset, delivered_at, recalled_at, recalled_by FROM messages "
                     "WHERE run_id=? AND (kind IN ('queued','interrupt','checkin') "
                     "OR body LIKE '[INTERRUPT]%') ORDER BY id",
                     (run_id,),
@@ -616,7 +616,12 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                 if brief_st:
                     etag += f"-{brief_st.st_size}-{int(brief_st.st_mtime)}"
                 if deliveries:
-                    etag += f"-m{deliveries[-1]['id']}-{len(deliveries)}"
+                    delivery_state = json.dumps([
+                        [message["id"], message["read_at"], message["delivery_offset"],
+                         message["delivered_at"], message["recalled_at"]]
+                        for message in deliveries
+                    ], separators=(",", ":")).encode()
+                    etag += f"-m{hashlib.md5(delivery_state).hexdigest()}"
                 if question:
                     etag += f"-q{question['id']}-{question['status']}-{question['answered_at'] or ''}"
                 client_etag = (parse_qs(url.query).get("etag") or [None])[0]
@@ -638,6 +643,13 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                     body = message["body"]
                     if delivery == "interrupt" and body.startswith("[INTERRUPT]"):
                         body = body.removeprefix("[INTERRUPT]").lstrip()
+                    if message["recalled_at"]:
+                        phase = "recalled"
+                    elif delivery == "queued":
+                        phase = "pending" if message["read_at"] is None else "delivered"
+                    else:
+                        phase = ("pending" if message["delivery_offset"] is not None
+                                 and message["delivered_at"] is None else "delivered")
                     items.append({
                         "kind": "delivery",
                         "message_id": message["id"],
@@ -646,8 +658,9 @@ def make_handler(root: Path, registry: list[dict] | None = None):
                         "recipient": _fmt(message["recipient"], 120),
                         "body": _fmt(body, MAX_INPUT),
                         "created_at": _fmt(message["created_at"], 80),
-                        "phase": ("pending" if message["delivery_offset"] is not None
-                                  and message["delivered_at"] is None else "delivered"),
+                        "phase": phase,
+                        "recalled_at": _fmt(message["recalled_at"], 80),
+                        "recalled_by": _fmt(message["recalled_by"], 120),
                     })
                 serialized_questions = {item.get("question_id") for item in items
                                         if item.get("kind") == "question"}

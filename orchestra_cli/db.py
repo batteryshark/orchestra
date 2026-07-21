@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL,
   read_at TEXT,
   delivery_offset INTEGER,
-  delivered_at TEXT
+  delivered_at TEXT,
+  recalled_at TEXT,
+  recalled_by TEXT
 );
 CREATE TABLE IF NOT EXISTS questions (
   id INTEGER PRIMARY KEY,
@@ -127,6 +129,10 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE messages ADD COLUMN delivery_offset INTEGER")
     if not _has_column(con, "messages", "delivered_at"):
         con.execute("ALTER TABLE messages ADD COLUMN delivered_at TEXT")
+    if not _has_column(con, "messages", "recalled_at"):
+        con.execute("ALTER TABLE messages ADD COLUMN recalled_at TEXT")
+    if not _has_column(con, "messages", "recalled_by"):
+        con.execute("ALTER TABLE messages ADD COLUMN recalled_by TEXT")
 
     # W-0007: memorable run identities. The column is added without a UNIQUE
     # constraint so existing pre-W-0007 rows (all slug = NULL) are valid;
@@ -167,6 +173,7 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         "answered_by TEXT, answer TEXT)"
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_runs_lead_run ON runs(lead_run)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run)")
 
 
 def connect(root: Path) -> sqlite3.Connection:

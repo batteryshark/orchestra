@@ -66,9 +66,12 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .runitem:hover { background:var(--sel) }
 .runitem.sel { background:var(--sel); box-shadow:inset 3px 0 0 var(--blue) }
 .runitem.child { border-left:2px solid color-mix(in srgb, var(--blue) 35%, var(--line)) }
+.runitem.continuation { border-left:2px solid color-mix(in srgb, var(--green) 45%, var(--line)) }
 .runitem .top { display:flex; gap:8px; align-items:center }
 .runitem .title { font-size:12px; color:var(--muted); margin-top:2px;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.lineage-link { color:var(--blue); background:none; border:0; padding:0; cursor:pointer;
+  font:inherit; text-decoration:underline; text-decoration-color:color-mix(in srgb, var(--blue) 35%, transparent) }
 
 /* transcript panel */
 #panel { display:flex; flex-direction:column; min-height:0 }
@@ -86,6 +89,7 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
   background:color-mix(in srgb, var(--red) 6%, transparent) }
 .titem.delivery.checkin { border-left-color:var(--think) }
 .titem.delivery.pending { border-left-color:var(--amber); border-style:dashed }
+.titem.delivery.recalled { border-left-color:var(--muted); opacity:.72 }
 .titem.delivery .event-title { font-size:12px; font-weight:700; letter-spacing:.035em;
   text-transform:uppercase }
 .titem.delivery .event-route { color:var(--muted); font-size:11.5px; margin-left:7px }
@@ -689,16 +693,48 @@ function setIfChanged(id, html){
 }
 
 function renderRuns(){
-  const byLead = new Map();
-  state.runs.forEach(r => { if(r.lead_run){ const a=byLead.get(r.lead_run)||[]; a.push(r); byLead.set(r.lead_run,a); } });
-  const visibleIds = new Set(state.runs.map(r=>r.id));
-  const owned = new Set(state.runs.filter(r=>r.lead_run&&visibleIds.has(r.lead_run)).map(r=>r.id));
+  const byId = new Map(state.runs.map(r => [r.id, r]));
+  const children = new Map();
+  const owned = new Set();
+  state.runs.forEach(r => {
+    // A continuation belongs directly beneath its previous attempt. Native
+    // child ownership is the fallback edge for runs that start a new session.
+    const owner = r.parent_run && byId.has(r.parent_run) ? r.parent_run
+      : r.lead_run && byId.has(r.lead_run) ? r.lead_run : null;
+    if (owner === null || owner === r.id) return;
+    const group = children.get(owner) || [];
+    group.push(r);
+    children.set(owner, group);
+    owned.add(r.id);
+  });
+  const newestCache = new Map();
+  function newestDescendantId(r, visiting=new Set()){
+    if (newestCache.has(r.id)) return newestCache.get(r.id);
+    if (visiting.has(r.id)) return r.id;
+    const next = new Set(visiting); next.add(r.id);
+    let newest = r.id;
+    (children.get(r.id)||[]).forEach(child => {
+      newest = Math.max(newest, newestDescendantId(child, next));
+    });
+    newestCache.set(r.id, newest);
+    return newest;
+  }
   const ordered = [];
-  function add(r){ ordered.push(r); [...(byLead.get(r.id)||[])].reverse().forEach(add); }
-  [...state.runs].reverse().filter(r=>!owned.has(r.id)).forEach(add);
-  const html = ordered.map(r => `
-    <div class="runitem ${r.lead_run?'child':''} ${!selTm&&r.id===selected?'sel':''}" style="padding-left:${14+Math.min(Number(r.child_depth||0),4)*14}px" onclick="pick(${r.id})">
+  const seen = new Set();
+  function add(r, depth=0){
+    if (seen.has(r.id)) return;
+    seen.add(r.id); ordered.push({r, depth});
+    [...(children.get(r.id)||[])].sort((a,b)=>a.id-b.id).forEach(child=>add(child, depth+1));
+  }
+  state.runs.filter(r=>!owned.has(r.id))
+    .sort((a,b)=>newestDescendantId(b)-newestDescendantId(a))
+    .forEach(r=>add(r));
+  // Corrupt or cyclic lineage should not make a run disappear from the UI.
+  [...state.runs].reverse().forEach(r=>add(r));
+  const html = ordered.map(({r, depth}) => `
+    <div class="runitem ${r.parent_run?'continuation':r.lead_run?'child':''} ${!selTm&&r.id===selected?'sel':''}" style="padding-left:${14+Math.min(depth,5)*14}px" onclick="pick(${r.id})">
       <div class="top"><span class="mono">#${r.id}</span>${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
+        ${r.parent_run?`<span class="mono muted" title="continues run #${r.parent_run}">&#8618; #${r.parent_run}</span>`:''}
         ${r.lead_run?`<span class="mono muted" title="child of run #${r.lead_run}">↳ #${r.lead_run}</span>`:''}
         <b>${esc(r.agent)}</b>
         ${statusChip(r.status)}
@@ -708,6 +744,18 @@ function renderRuns(){
     </div>`).join('') || '<div class="runitem muted">no runs yet</div>';
   setIfChanged('runlist', html);
   tickElapsed();
+}
+
+function continuationLineage(r){
+  const byId = new Map((state?.runs||[]).map(run=>[run.id, run]));
+  const seen = new Set([r.id]);
+  let current = r, root = r.id, depth = 0;
+  while (current.parent_run){
+    root = current.parent_run; depth += 1;
+    if (seen.has(root) || !byId.has(root)) break;
+    seen.add(root); current = byId.get(root);
+  }
+  return {root, depth};
 }
 
 function pick(id){ userPicked = true; select(id); }
@@ -777,10 +825,12 @@ function itemHtml(it, i){
   if (it.kind === 'delivery') {
     const mode = ['interrupt','checkin','queued'].includes(it.delivery) ? it.delivery : 'queued';
     const pending = it.phase === 'pending';
-    const icon = mode === 'interrupt' ? '&#128680;' : mode === 'checkin' ? '&#9200;' : '&#128236;';
-    const label = pending ? (mode === 'checkin' ? 'check-in awaiting safe boundary' : 'interrupt awaiting safe boundary') : mode === 'interrupt' ? 'interrupt delivered to inbox' : mode === 'checkin' ? 'supervisor check-in delivered' : 'queued for runner';
+    const recalled = it.phase === 'recalled';
+    const icon = recalled ? '&#8617;' : mode === 'interrupt' ? '&#128680;' : mode === 'checkin' ? '&#9200;' : '&#128236;';
+    const label = recalled ? 'queued message recalled' : pending ? (mode === 'queued' ? 'queued for runner' : mode === 'checkin' ? 'check-in awaiting safe boundary' : 'interrupt awaiting safe boundary') : mode === 'interrupt' ? 'interrupt delivered to inbox' : mode === 'checkin' ? 'supervisor check-in delivered' : 'queued follow-up delivered';
+    const messageRef = it.message_id ? ` · message #${esc(it.message_id)}` : '';
     const at = it.created_at ? ` · ${esc(it.created_at)}` : '';
-    return `<div class="titem delivery ${mode} ${pending?'pending':'delivered'}"><div><span class="event-title">${icon} ${label}</span><span class="event-route">${esc(it.sender||'orchestra')} → ${esc(it.recipient||'runner')}${at}</span></div>${it.body?`<div class="event-body">${esc(it.body)}</div>`:''}</div>`;
+    return `<div class="titem delivery ${mode} ${recalled?'recalled':pending?'pending':'delivered'}"><div><span class="event-title">${icon} ${label}</span><span class="event-route">${esc(it.sender||'orchestra')} → ${esc(it.recipient||'runner')}${messageRef}${at}</span></div>${it.body?`<div class="event-body">${esc(it.body)}</div>`:''}</div>`;
   }
   if (it.kind === 'question') {
     const waiting = it.status === 'waiting';
@@ -793,7 +843,7 @@ function itemHtml(it, i){
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'tool')    return `<details class="tool" data-k="${i}"><summary>&#128295; ${esc(it.name)} <span class="muted">· ${esc(it.status||'')}</span></summary><div class="inner">${it.input?`<div class="lbl">input</div><pre>${esc(it.input)}</pre>`:''}${it.output?`<div class="lbl">output</div><pre>${esc(it.output)}</pre>`:''}</div></details>`;
   if (it.kind === 'error')   return `<div class="titem error">${esc(it.body)}</div>`;
-  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.lead_run?`<tr><th>lead run</th><td>#${esc(it.lead_run)}</td></tr>`:''}${it.parent_run?`<tr><th>session follow-up</th><td>#${esc(it.parent_run)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
+  if (it.kind === 'details') return `<details data-k="${i}" open><summary>&#9881; configuration <span class="muted">· backend · model</span></summary><div class="inner"><table class="kv"><tr><th>backend</th><td>${esc(it.backend||'')}</td></tr><tr><th>model</th><td>${esc(it.model||'')}</td></tr>${it.team?`<tr><th>team</th><td>${esc(it.team)}</td></tr>`:''}${it.requested_by?`<tr><th>requested by</th><td>${esc(it.requested_by)}</td></tr>`:''}${it.lead_run?`<tr><th>lead run</th><td>#${esc(it.lead_run)}</td></tr>`:''}${it.parent_run?`<tr><th>continues</th><td><button class="lineage-link" onclick="select(${Number(it.parent_run)})">run #${esc(it.parent_run)}</button></td></tr><tr><th>conversation</th><td>#${esc(it.continuation_root)} · attempt ${esc(it.continuation_depth+1)}</td></tr>`:''}${it.session_ref?`<tr><th>session</th><td><span class="mono">${esc(it.session_ref.slice(0,18))}…</span></td></tr>`:''}</table></div></details>`;
   return `<div class="titem meta">${esc(it.body)}</div>`;
 }
 
@@ -801,6 +851,7 @@ function renderDetails(r){
   // Pure-data block injected as the first "details" item in the transcript
   // pane, without removing existing items below. Credentials are NEVER
   // carried on the run row — only the configured backend + model name.
+  const lineage = continuationLineage(r);
   return {
     kind:'details',
     backend:r.backend||'',
@@ -809,6 +860,8 @@ function renderDetails(r){
     requested_by:r.requested_by||'',
     lead_run:r.lead_run||null,
     parent_run:r.parent_run||null,
+    continuation_root:lineage.root,
+    continuation_depth:lineage.depth,
     session_ref:r.session_ref||'',
   };
 }
@@ -822,6 +875,7 @@ async function refreshTranscript(force){
   if (res.unchanged) return;
   tEtag = res.etag;
   const r = res.run;
+  const lineage = continuationLineage(r);
   const head = `<span class="mono">#${r.id}</span> ${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
     <b>${esc(r.agent)}</b>
     ${statusChip(r.status)}
@@ -829,6 +883,7 @@ async function refreshTranscript(force){
     ${r.model?`<span class="mono muted" title="configured model">${esc(r.model)}</span>`:''}
     ${r.work_item?`<span class="mono">${esc(r.work_item)}</span>`:''}
     ${r.branch?`<span class="mono muted">${esc(r.branch)}</span>`:''}
+    ${r.parent_run?`<button class="lineage-link" type="button" onclick="select(${Number(r.parent_run)})">continues #${esc(r.parent_run)}</button><span class="mono muted">conversation #${esc(lineage.root)} · attempt ${esc(lineage.depth+1)}</span>`:''}
     <span class="mono muted" data-start="${esc(r.started_at)}" ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span>
     ${canStopRun(r)?`<button class="danger" type="button" onclick="stopRun(${r.id})" ${stopping.has(r.id)?'disabled':''}>${stopping.has(r.id)?'stopping...':'Stop'}</button>`:''}
     <label id="follow"><input type="checkbox" id="followcb" checked> follow tail</label>`;

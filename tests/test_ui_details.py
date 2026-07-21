@@ -162,6 +162,13 @@ class DetailSerializationTests(unittest.TestCase):
              "2026-07-18T22:01:00Z"),
         )
         con.execute(
+            "INSERT INTO messages(sender, recipient, body, run_id, kind, created_at, "
+            "read_at, recalled_at, recalled_by) VALUES(?,?,?,?, 'queued', ?, ?, ?, ?)",
+            ("codex", "minimax", "Ignore the obsolete release-note request.", 1,
+             "2026-07-18T22:01:30Z", "2026-07-18T22:01:45Z",
+             "2026-07-18T22:01:45Z", "codex"),
+        )
+        con.execute(
             "INSERT INTO questions(run_id,sender,recipient,question,recommended_default,"
             "asked_at,deadline_at) VALUES(?,?,?,?,?,?,?)",
             (1, "minimax", "codex", "Which output format should I preserve?",
@@ -255,7 +262,21 @@ class DetailSerializationTests(unittest.TestCase):
                     "recipient": "minimax",
                     "body": "After this, update the release note.",
                     "created_at": "2026-07-18T22:01:00Z",
-                    "phase": "delivered",
+                    "phase": "pending",
+                    "recalled_at": "",
+                    "recalled_by": "",
+                },
+                {
+                    "kind": "delivery",
+                    "message_id": 2,
+                    "delivery": "queued",
+                    "sender": "codex",
+                    "recipient": "minimax",
+                    "body": "Ignore the obsolete release-note request.",
+                    "created_at": "2026-07-18T22:01:30Z",
+                    "phase": "recalled",
+                    "recalled_at": "2026-07-18T22:01:45Z",
+                    "recalled_by": "codex",
                 },
                 {
                     "kind": "question",
