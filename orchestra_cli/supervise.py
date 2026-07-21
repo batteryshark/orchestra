@@ -58,7 +58,7 @@ def create_followup(con, root: Path, parent: dict, requester: str, text: str,
         "workdir, branch, parent_run, lead_run, child_depth, session_ref, status, started_at) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
         (parent["agent"], parent["backend"], parent["model"],
-         title or f"follow-up to run {parent['id']}", parent["work_item"], parent["team"],
+         title or f"continuation of run {parent['id']}", parent["work_item"], parent["team"],
          requester, parent["workdir"], parent["branch"], parent["id"],
          parent.get("lead_run"), parent.get("child_depth", 0), parent["session_ref"], db.now()))
     run_id = cur.lastrowid
@@ -71,6 +71,15 @@ def create_followup(con, root: Path, parent: dict, requester: str, text: str,
     if commit:
         con.commit()
     return run_id
+
+
+def _pending_queued_followups(con, run_id: int):
+    """Queued instructions that are still eligible for atomic delivery."""
+    return list(con.execute(
+        "SELECT * FROM messages WHERE COALESCE(kind,'')='queued' "
+        "AND run_id=? AND read_at IS NULL AND recalled_at IS NULL ORDER BY id",
+        (run_id,),
+    ))
 
 
 def _work_log(root: Path, item: str, text: str) -> None:
@@ -831,8 +840,7 @@ def supervise(root: Path, run_id: int) -> int:
     # queued follow-ups: deliver by resuming the session in a fresh run
     followup_id = None
     ref_final = session_ref or run["session_ref"]
-    queued = list(con.execute("SELECT * FROM messages WHERE COALESCE(kind,'')='queued' "
-                              "AND run_id=? AND read_at IS NULL", (run_id,)))
+    queued = _pending_queued_followups(con, run_id)
     if queued and ref_final and status in ("done", "failed"):
         joined = "\n\n".join(f"From {q['sender']}: {q['body']}" for q in queued)
         text = (f"Your previous run finished ({status}). Follow-up instructions were queued "
@@ -852,7 +860,7 @@ def supervise(root: Path, run_id: int) -> int:
             f"{f' (exit {exit_code})' if exit_code not in (None, 0) else ''}."
             f"{chr(10) + 'Last output: ' + summary[:800] if summary else ''}\n"
             f"Details: `orchestra run show {run_id}` · logs: `orchestra logs {run_id}`"
-            + (f" · follow up: `orchestra reply {run_id} \"...\"`" if ref_final else "")
+            + (f" · resume: `orchestra resume {run_id} \"...\"`" if ref_final else "")
             + (f"\nQueued follow-up auto-dispatched as run {followup_id}." if followup_id else ""))
     con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
                 "VALUES('orchestra', ?, ?, ?, ?, ?)",
@@ -867,7 +875,7 @@ def supervise(root: Path, run_id: int) -> int:
                     (m["sender"],
                      f"UNDELIVERED: your message #{m['id']} to {run['agent']} "
                      f"(\"{m['body'][:120]}…\") was never read — run {run_id} finished ({status}) "
-                     f"without checking its inbox. Deliver it with `orchestra reply {run_id} \"...\"`, "
+                     f"without checking its inbox. Deliver it with `orchestra resume {run_id} \"...\"`, "
                      f"or use `orchestra interrupt <run> \"...\"` next time for guaranteed delivery.",
                      run_id, db.now()))
     con.execute("INSERT INTO feed(author, body, work_item, run_id, created_at, tags) "

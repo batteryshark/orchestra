@@ -85,11 +85,17 @@ class MigrationTests(unittest.TestCase):
             }
             self.assertIn("delivery_offset", message_cols)
             self.assertIn("delivered_at", message_cols)
+            self.assertIn("recalled_at", message_cols)
+            self.assertIn("recalled_by", message_cols)
             question_cols = {
                 r["name"] for r in con.execute("PRAGMA table_info(questions)").fetchall()
             }
             self.assertIn("recommended_default", question_cols)
             self.assertIn("deadline_at", question_cols)
+            indexes = {
+                r["name"] for r in con.execute("PRAGMA index_list(runs)").fetchall()
+            }
+            self.assertIn("idx_runs_parent_run", indexes)
         finally:
             con.close()
 

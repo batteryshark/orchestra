@@ -130,6 +130,20 @@ class RouteTests(unittest.TestCase):
         self.assertIn("'Content-Type':'application/json'", body)
         self.assertIn("status === 'killed' ? 'stopped by user' : status", body)
 
+    def test_main_dashboard_labels_recallable_queue_ids(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("queued message recalled", body)
+        self.assertIn("message #${esc(it.message_id)}", body)
+
+    def test_main_dashboard_groups_session_continuations(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("function continuationLineage(r)", body)
+        self.assertIn("r.parent_run && byId.has(r.parent_run)", body)
+        self.assertIn("conversation #${esc(lineage.root)}", body)
+        self.assertIn("continues #${esc(r.parent_run)}", body)
+
     def test_api_usage_still_served(self) -> None:
         status, headers, body = self.get("/api/usage")
         self.assertEqual(status, 200)

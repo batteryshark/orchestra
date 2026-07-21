@@ -420,49 +420,83 @@ def cmd_spawn(args):
           "resume it exactly once after the batch settles.")
 
 
+def _continuation_line(con, run_id: int):
+    """Return a run and every session continuation descended from it."""
+    return list(con.execute(
+        "WITH RECURSIVE continuation_ids(id) AS ("
+        "SELECT ? UNION SELECT r.id FROM runs r "
+        "JOIN continuation_ids c ON r.parent_run=c.id) "
+        "SELECT r.* FROM runs r JOIN continuation_ids c ON c.id=r.id ORDER BY r.id",
+        (run_id,),
+    ))
+
+
 def cmd_reply(args):
     root = paths.find_root()
     cfg = config.load(root)
     con = db.connect(root)
-    parent = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
-    if not parent:
-        raise SystemExit(f"orchestra: no run {args.run_id}")
-    if parent["status"] not in db.RUN_TERMINAL + ("interrupt",):
-        raise SystemExit(f"orchestra: run {args.run_id} is still {parent['status']} — "
-                         "use `orchestra send` to leave it a message instead")
-    if not parent["session_ref"]:
-        raise SystemExit(f"orchestra: run {args.run_id} has no session ref; dispatch a fresh run")
-    if parent["status"] == "interrupt":
-        # A detached supervisor may have died after stopping its worker but
-        # before launching the session resume. Make `reply` an explicit,
-        # recoverable handoff: terminalize the orphan before creating its child.
+    parent = None
+    run_id = None
+    try:
         con.execute("BEGIN IMMEDIATE")
-        fresh = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
-        if fresh["status"] == "interrupt":
+        requested = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
+        if not requested:
+            raise SystemExit(f"orchestra: no run {args.run_id}")
+        line = _continuation_line(con, args.run_id)
+        parent = line[-1]
+        if not parent["session_ref"]:
+            raise SystemExit(
+                f"orchestra: run {parent['id']} has no session ref; dispatch a fresh run"
+            )
+        # Session refs identify the backend conversation, so check globally
+        # rather than only below the selected lineage node. This also closes
+        # off concurrent resumes from a historical, accidentally branched tip.
+        active = list(con.execute(
+            "SELECT * FROM runs WHERE session_ref=? AND status NOT IN "
+            "('done','failed','timeout','killed','interrupt') ORDER BY id",
+            (parent["session_ref"],),
+        ))
+        if active:
+            current = active[-1]
+            raise SystemExit(
+                f"orchestra: run {args.run_id}'s session is already active as run "
+                f"{current['id']} ({current['status']}) — use `orchestra interrupt` or "
+                "`orchestra queue` instead"
+            )
+        if parent["status"] == "interrupt":
+            # A detached supervisor may have died after stopping its worker but
+            # before launching the session resume. Terminalize that orphan while
+            # holding the continuation lock, then create its next attempt.
             con.execute(
                 "UPDATE runs SET status='killed', finished_at=COALESCE(finished_at, ?) "
                 "WHERE id=? AND status='interrupt'",
-                (db.now(), args.run_id),
+                (db.now(), parent["id"]),
             )
-            con.execute("COMMIT")
-        else:
+        requester = _identity(args, cfg) or parent["requested_by"]
+        msg = " ".join(args.message)
+        followup = (
+            f"{msg}\n\n(Orchestra session continuation from run {parent['id']}. First check "
+            f"`orchestra inbox {parent['agent']} --unread --mark-read`. Preserve the existing "
+            f"session context and coordination protocol: finish with `orchestra send "
+            f"{requester} \"HANDOFF: ...\" --as {parent['agent']}`"
+            + (f", log progress with `work log {parent['work_item']} ...`"
+               if parent["work_item"] else "") + ".)"
+        )
+        run_id = supervise.create_followup(
+            con, root, dict(parent), requester, followup,
+            title=f"continuation of run {parent['id']}", commit=False,
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
             con.execute("ROLLBACK")
-            if fresh["status"] not in db.RUN_TERMINAL:
-                raise SystemExit(
-                    f"orchestra: run {args.run_id} resumed while reply was starting — "
-                    "use `orchestra send` to leave it a message instead"
-                )
-        parent = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
-    requester = _identity(args, cfg) or parent["requested_by"]
-    msg = " ".join(args.message)
-    followup = (f"{msg}\n\n(Orchestra follow-up on run {args.run_id}. First check "
-                f"`orchestra inbox {parent['agent']} --unread --mark-read`. Same coordination "
-                f"protocol: finish with `orchestra send {requester} \"HANDOFF: ...\" --as {parent['agent']}`"
-                + (f", log progress with `work log {parent['work_item']} ...`" if parent["work_item"] else "") + ".)")
-    run_id = supervise.create_followup(con, root, dict(parent), requester, followup,
-                                       title=f"reply to run {args.run_id}")
-    con.close()
-    print(f"run {run_id}: follow-up to {parent['agent']} (session {parent['session_ref'][:20]}...)")
+        raise
+    finally:
+        con.close()
+    requested_note = (f" (requested from run {args.run_id})"
+                      if parent["id"] != args.run_id else "")
+    print(f"run {run_id}: continuing run {parent['id']}'s session with "
+          f"{parent['agent']}{requested_note} (session {parent['session_ref'][:20]}...)")
     if args.sync:
         supervise.supervise(root, run_id)
     else:
@@ -695,27 +729,94 @@ def cmd_queue(args):
     root = paths.find_root()
     cfg = config.load(root)
     con = db.connect(root)
-    r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
-    if not r:
-        raise SystemExit(f"orchestra: no run {args.run_id}")
-    sender = _identity(args, cfg)
-    msg = " ".join(args.message)
-    if r["status"] in db.RUN_TERMINAL:
-        if not r["session_ref"]:
-            raise SystemExit(f"orchestra: run {args.run_id} has no session to resume — "
-                             "dispatch a fresh run instead")
-        text = (f"{msg}\n\n(Queued follow-up on run {args.run_id}. Same protocol: finish with "
-                f"`orchestra send {sender} \"HANDOFF: ...\" --as {r['agent']}`.)")
-        rid = supervise.create_followup(con, root, dict(r), sender, text)
-        supervise.spawn_supervisor(root, rid)
-        print(f"run {args.run_id} already finished — follow-up dispatched now as run {rid}")
+    followup_id = None
+    queued_id = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
+        if not r:
+            raise SystemExit(f"orchestra: no run {args.run_id}")
+        sender = _identity(args, cfg)
+        msg = " ".join(args.message)
+        if r["status"] in db.RUN_TERMINAL:
+            if not r["session_ref"]:
+                raise SystemExit(f"orchestra: run {args.run_id} has no session to resume — "
+                                 "dispatch a fresh run instead")
+            text = (f"{msg}\n\n(Queued follow-up on run {args.run_id}. Same protocol: finish with "
+                    f"`orchestra send {sender} \"HANDOFF: ...\" --as {r['agent']}`.)")
+            followup_id = supervise.create_followup(
+                con, root, dict(r), sender, text, commit=False
+            )
+        else:
+            cur = con.execute(
+                "INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
+                "VALUES(?,?,?,?, 'queued', ?)",
+                (sender, r["agent"], msg, args.run_id, db.now()),
+            )
+            queued_id = int(cur.lastrowid)
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+    if followup_id is not None:
+        supervise.spawn_supervisor(root, followup_id)
+        print(f"run {args.run_id} already finished — follow-up dispatched now as run "
+              f"{followup_id}")
     else:
-        con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
-                    "VALUES(?,?,?,?, 'queued', ?)",
-                    (sender, r["agent"], msg, args.run_id, db.now()))
-        con.commit()
-        print(f"queued — will be auto-delivered as a session follow-up when run "
-              f"{args.run_id} completes")
+        print(f"queued message {queued_id} — will be auto-delivered as a session follow-up "
+              f"when run {args.run_id} completes; recall with `orchestra recall {queued_id}`")
+
+
+def cmd_recall(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    recalled_by = _identity(args, cfg)
+    con = db.connect(root)
+    row = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM messages WHERE id=?", (args.message_id,)).fetchone()
+        if not row:
+            raise SystemExit(f"orchestra: no message {args.message_id}")
+        if row["kind"] != "queued":
+            raise SystemExit(
+                f"orchestra: message {args.message_id} is not a queued follow-up"
+            )
+        if row["sender"] != recalled_by:
+            raise SystemExit(
+                f"orchestra: queued message {args.message_id} belongs to {row['sender']}; "
+                "recall it as that sender"
+            )
+        if row["recalled_at"]:
+            raise SystemExit(f"orchestra: queued message {args.message_id} was already recalled")
+        if row["read_at"]:
+            raise SystemExit(
+                f"orchestra: queued message {args.message_id} was already delivered and "
+                "cannot be recalled"
+            )
+        recalled_at = db.now()
+        updated = con.execute(
+            "UPDATE messages SET recalled_at=?, recalled_by=?, read_at=? "
+            "WHERE id=? AND kind='queued' AND sender=? AND read_at IS NULL "
+            "AND recalled_at IS NULL",
+            (recalled_at, recalled_by, recalled_at, args.message_id, recalled_by),
+        )
+        if updated.rowcount != 1:
+            raise SystemExit(
+                f"orchestra: queued message {args.message_id} changed while recall was in "
+                "progress; inspect the run before retrying"
+            )
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+    print(f"recalled queued message {args.message_id} for run {row['run_id']}")
 
 
 def cmd_interrupt(args):
@@ -727,7 +828,7 @@ def cmd_interrupt(args):
         raise SystemExit(f"orchestra: no run {args.run_id}")
     if r["status"] in db.RUN_TERMINAL:
         raise SystemExit(f"orchestra: run {args.run_id} already {r['status']} — "
-                         f"use `orchestra reply {args.run_id} \"...\"` instead")
+                         f"use `orchestra resume {args.run_id} \"...\"` instead")
     agent = config.agent_cfg(cfg, r["agent"])
     if agent.get("ensemble"):
         raise SystemExit("orchestra: ensemble leads can't be interrupted (their team runs "
@@ -821,13 +922,16 @@ def cmd_note(args):
 def cmd_feed(args):
     root = paths.find_root()
     con = db.connect(root)
-    q, params = "SELECT * FROM feed", []
-    if args.tag:
-        q += " WHERE tags LIKE ?"
-        params.append(f"%{args.tag}%")
-    q += " ORDER BY id DESC LIMIT ?"
-    params.append(args.limit)
-    rows = list(con.execute(q, params))
+    try:
+        q, params = "SELECT * FROM feed", []
+        if args.tag:
+            q += " WHERE tags LIKE ?"
+            params.append(f"%{args.tag}%")
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(args.limit)
+        rows = list(con.execute(q, params))
+    finally:
+        con.close()
     if not rows:
         print("(feed empty)")
     for r in rows:
@@ -1290,7 +1394,14 @@ def main():
                    help="opt out of the default isolated child worktree")
     s.set_defaults(fn=cmd_spawn)
 
-    s = sub.add_parser("reply", help="continue a finished run's session with a follow-up")
+    s = sub.add_parser("resume", help="continue a finished run's existing agent session")
+    s.add_argument("run_id", type=int)
+    s.add_argument("message", nargs="+")
+    s.add_argument("--sync", action="store_true")
+    ident(s)
+    s.set_defaults(fn=cmd_reply)
+
+    s = sub.add_parser("reply", help="compatibility alias for `orchestra resume`")
     s.add_argument("run_id", type=int)
     s.add_argument("message", nargs="+")
     s.add_argument("--sync", action="store_true")
@@ -1368,6 +1479,11 @@ def main():
     s.add_argument("message", nargs="+")
     ident(s)
     s.set_defaults(fn=cmd_queue)
+
+    s = sub.add_parser("recall", help="recall an undelivered queued follow-up")
+    s.add_argument("message_id", type=int)
+    ident(s)
+    s.set_defaults(fn=cmd_recall)
 
     s = sub.add_parser("ask", help="use an opted-in run's one blocking question and pause it")
     s.add_argument("question", nargs="+")
