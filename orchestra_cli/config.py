@@ -1,3 +1,4 @@
+import sys
 import tomllib
 from pathlib import Path
 
@@ -89,8 +90,14 @@ extra_args = ["--permission-mode", "acceptEdits", "--allowedTools", "Bash Edit W
 
 
 def apply_env_passthrough(cfg: dict, env: dict) -> dict:
-    """Fill missing env vars from launchctl (macOS user-session env), so workers
-    spawned from scrubbed environments still see keys the user set globally."""
+    """Recover opted-in variables from the macOS user-session environment.
+
+    Linux and WSL workers inherit the supplied environment directly. They do
+    not have a ``launchctl`` equivalent, so missing values remain missing
+    instead of spawning a macOS-only command and swallowing the failure.
+    """
+    if sys.platform != "darwin":
+        return env
     import subprocess
     for name in cfg.get("settings", {}).get("env_passthrough", []):
         if not env.get(name):
