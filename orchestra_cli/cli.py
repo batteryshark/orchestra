@@ -21,6 +21,8 @@ from orchestra_cli import (
     ensemble,
     host,
     names,
+    operator_contract,
+    operator_store,
     paths,
     projects,
     reap,
@@ -1461,6 +1463,185 @@ def cmd_project(args):
             print(f"{r['id']:<16} {r['name']:<22} {r['root']}{avail}")
 
 
+def _registered_operator_projects() -> list[dict]:
+    rows = []
+    for entry in projects.list_registered():
+        row = dict(entry)
+        row["available"] = projects.is_orchestra_root(Path(row["root"]))
+        rows.append(row)
+    return rows
+
+
+def _require_registered_project_ids(project_ids: list[str]) -> None:
+    registered = {row["id"] for row in projects.list_registered()}
+    missing = sorted(set(project_ids) - registered)
+    if missing:
+        raise operator_store.OperatorStoreError(
+            "unregistered project ids: "
+            + ", ".join(missing)
+            + " (use `orchestra project list`)"
+        )
+
+
+def _write_new_private_file(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    try:
+        fd = os.open(path, flags, 0o600)
+        created = True
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
+    except FileExistsError as exc:
+        raise operator_store.OperatorStoreError(
+            f"refusing to overwrite existing file: {path}"
+        ) from exc
+    except OSError as exc:
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise operator_store.OperatorStoreError(
+            f"cannot write {path}: {exc}"
+        ) from exc
+
+
+def cmd_operator(args):
+    """Design and approve immutable Operator authority contracts.
+
+    This surface intentionally stops at approval.  It never labels a contract
+    active until a durable controller exists to hold a lease and reconcile it.
+    """
+    try:
+        if args.operator_cmd == "template":
+            _require_registered_project_ids(args.project)
+            data = operator_contract.template(
+                name=args.name,
+                goal=args.goal,
+                project_ids=args.project,
+                gates=args.gate,
+                target_branch=args.target_branch,
+                integration_branch=args.integration_branch,
+                non_goals=args.non_goal,
+            )
+            validated = operator_contract.validate_contract(
+                data,
+                source="generated template",
+            )
+            payload = (
+                json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            if args.output:
+                output_path = Path(args.output).expanduser()
+                _write_new_private_file(output_path, payload)
+                print(f"wrote contract template: {output_path}")
+                print(f"sha256:{validated.sha256}")
+            else:
+                sys.stdout.write(payload.decode("utf-8"))
+            return
+
+        if args.operator_cmd == "validate":
+            validated = operator_contract.load_contract(
+                Path(args.file).expanduser()
+            )
+            _require_registered_project_ids(
+                list(operator_contract.project_ids(validated.data))
+            )
+            print(
+                f"valid: {validated.data['name']} "
+                f"sha256:{validated.sha256}"
+            )
+            return
+
+        if args.operator_cmd == "draft":
+            validated = operator_contract.load_contract(
+                Path(args.file).expanduser()
+            )
+            result = operator_store.save_draft(
+                validated,
+                _registered_operator_projects(),
+            )
+            disposition = "created" if result.created else "already stored"
+            print(
+                f"{disposition}: {result.operator_id} "
+                f"{result.name} contract v{result.version}"
+            )
+            print(f"  sha256:{result.sha256}")
+            if result.changed_paths:
+                print("  changed:")
+                for path in result.changed_paths:
+                    print(f"    {path}")
+            print(
+                "  approve only after review:\n"
+                f"    orchestra operator approve {result.operator_id} "
+                f"--version {result.version} --hash {result.sha256}"
+            )
+            return
+
+        if args.operator_cmd == "approve":
+            result = operator_store.approve(
+                args.identifier,
+                version=args.version,
+                sha256=args.hash,
+                approved_by=args.by,
+            )
+            disposition = "approved" if result.created else "already approved"
+            print(
+                f"{disposition}: {result.operator_id} "
+                f"contract v{result.version} sha256:{result.sha256}"
+            )
+            print("  no operation is active")
+            return
+
+        if args.operator_cmd == "list":
+            statuses = operator_store.list_statuses()
+            if args.json:
+                print(json.dumps(statuses, indent=2, sort_keys=True))
+                return
+            if not statuses:
+                print("(no Operators — create a contract with `orchestra operator template`)")
+                return
+            for index, status in enumerate(statuses):
+                if index:
+                    print()
+                print(operator_store.render_status(status))
+            return
+
+        if args.operator_cmd == "show":
+            status = operator_store.get_status(args.identifier)
+            if args.json:
+                print(json.dumps(status, indent=2, sort_keys=True))
+            else:
+                print(operator_store.render_status(status))
+            return
+
+        if args.operator_cmd == "export":
+            contract = operator_store.get_contract(
+                args.identifier,
+                version=args.version,
+            )
+            payload = contract.canonical_bytes
+            if args.output:
+                output_path = Path(args.output).expanduser()
+                _write_new_private_file(output_path, payload)
+                print(f"exported canonical contract: {output_path}")
+                print(f"sha256:{contract.sha256}")
+            else:
+                sys.stdout.write(payload.decode("utf-8"))
+            return
+
+        raise operator_store.OperatorStoreError(
+            f"unsupported operator command {args.operator_cmd!r}"
+        )
+    except (
+        operator_contract.ContractError,
+        operator_store.OperatorStoreError,
+    ) as exc:
+        raise SystemExit(f"orchestra: {exc}") from exc
+
+
 def cmd_supervise(args):
     sys.exit(supervise.supervise(Path(args.root), args.run_id))
 
@@ -1659,6 +1840,82 @@ def main():
                                   "(never deletes project data)")
     p_forget.add_argument("id_or_path", nargs="?", help="project id or canonical path to remove")
     s.set_defaults(fn=cmd_project)
+
+    s = sub.add_parser(
+        "operator",
+        help="design and approve durable autonomous-operation contracts",
+    )
+    ops = s.add_subparsers(dest="operator_cmd", required=True)
+    op_template = ops.add_parser(
+        "template",
+        help="write a complete conservative contract for owner refinement",
+    )
+    op_template.add_argument("name", help="human-readable Operator name")
+    op_template.add_argument("--goal", required=True, help="first observable goal")
+    op_template.add_argument(
+        "--project",
+        action="append",
+        required=True,
+        help="registered project id (repeatable)",
+    )
+    op_template.add_argument(
+        "--gate",
+        action="append",
+        required=True,
+        help="required acceptance gate (repeatable)",
+    )
+    op_template.add_argument(
+        "--non-goal",
+        action="append",
+        default=[],
+        help="explicit exclusion (repeatable)",
+    )
+    op_template.add_argument("--target-branch", default="main")
+    op_template.add_argument("--integration-branch", default="main")
+    op_template.add_argument(
+        "--output",
+        help="write a new owner-private file instead of stdout (never overwrites)",
+    )
+
+    op_validate = ops.add_parser(
+        "validate",
+        help="validate a contract and print its canonical approval hash",
+    )
+    op_validate.add_argument("file")
+
+    op_draft = ops.add_parser(
+        "draft",
+        help="store an immutable contract draft in the user control plane",
+    )
+    op_draft.add_argument("file")
+
+    op_approve = ops.add_parser(
+        "approve",
+        help="approve the latest contract version by exact SHA-256",
+    )
+    op_approve.add_argument("identifier", help="Operator id or name")
+    op_approve.add_argument("--version", type=int, required=True)
+    op_approve.add_argument("--hash", required=True)
+    op_approve.add_argument("--by", default="owner", help="approval audit label")
+
+    op_list = ops.add_parser("list", help="list deterministic Operator status")
+    op_list.add_argument("--json", action="store_true")
+
+    op_show = ops.add_parser("show", help="show one deterministic Operator status")
+    op_show.add_argument("identifier", help="Operator id or name")
+    op_show.add_argument("--json", action="store_true")
+
+    op_export = ops.add_parser(
+        "export",
+        help="reconstruct canonical contract bytes from durable state",
+    )
+    op_export.add_argument("identifier", help="Operator id or name")
+    op_export.add_argument("--version", type=int)
+    op_export.add_argument(
+        "--output",
+        help="write a new owner-private file instead of stdout (never overwrites)",
+    )
+    s.set_defaults(fn=cmd_operator)
 
     s = sub.add_parser("queue", help="queue a follow-up for a running worker; auto-delivered "
                                      "(session resume) when its current run completes")

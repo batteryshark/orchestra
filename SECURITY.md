@@ -6,4 +6,10 @@
 
 Provider credentials stay in the server process. The browser API receives normalized quota state, never API keys, access tokens, credential file contents, or Codex reset-credit identifiers.
 
+Operator contracts and approvals are private control-plane state. Orchestra
+stores them in an owner-only directory and SQLite file, rejects
+credential-bearing contract fields, and snapshots only registered project
+bindings. Do not put credentials in free-text goals, gates, or escalation
+notes; those fields are durable by design.
+
 Report vulnerabilities through [GitHub's private vulnerability reporting](https://github.com/batteryshark/orchestra/security/advisories/new). Do not include secrets or private run logs in a public issue.

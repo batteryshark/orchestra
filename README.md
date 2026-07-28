@@ -96,6 +96,47 @@ Workers remain fully autonomous by default. For a mission where a wrong assumpti
 
 `orchestra resume RUN "message"` continues the run's existing backend session without reopening its immutable execution record. Orchestra creates a new run attempt linked through `parent_run`; if the selected run already has completed continuations, it resumes the latest attempt in that chain. An active continuation is never resumed concurrently. The older `orchestra reply` spelling remains as a compatibility alias.
 
+## Design an Operator contract
+
+The first Operator control-plane slice turns an autonomy discussion into a
+strict, versioned authority contract. Start with a registered project ID and
+an explicit goal and acceptance gate:
+
+```sh
+orchestra project list
+orchestra operator template "PIU fidelity" \
+  --project PROJECT_ID \
+  --goal "close the verified fidelity backlog" \
+  --gate "the full project test suite passes" \
+  --non-goal "redesign authentic behavior without evidence" \
+  --output operator-contract.json
+
+# Refine scope, authority, budgets, routing, escalation, and completion,
+# then validate and store an immutable version.
+orchestra operator validate operator-contract.json
+orchestra operator draft operator-contract.json
+
+# Use the exact version and SHA-256 printed by `draft`.
+orchestra operator approve OPERATOR_ID --version 1 --hash SHA256
+orchestra operator show OPERATOR_ID
+orchestra operator list
+orchestra operator export OPERATOR_ID --version 1 --output approved-contract.json
+```
+
+Contracts reject unknown fields, credential-bearing keys, unregistered project
+references, unbounded resource settings, quality-tier downgrades, and attempts
+to delegate non-negotiable actions such as history rewrites or deletion of
+unique work. Drafts and approvals are immutable; amendments create a new
+version and return the Operator to `awaiting_approval`. Approval is deliberately
+not activation: this slice never reports an operation as active because the
+durable reconciliation controller has not been implemented yet.
+
+The canonical contract bytes, project binding snapshot, approval, and audit
+events live in the owner-private user control plane at
+`~/.config/orchestra/operator.db` (override with
+`ORCHESTRA_OPERATOR_DB`). The full controller and roster design is documented
+in [Orchestra Operator](docs/operator-design.md).
+
 ## Hand off a wave to another orchestrator
 
 An orchestration wave is resumable by a fresh session of the same orchestrator, or by a different one entirely, without depending on the leaving orchestrator's conversation state. Two commands do the work:
@@ -242,6 +283,9 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
   3). Stopping a lead cascades to its active descendants. Supervised workers cannot call
   top-level `orchestra dispatch`; they must use `orchestra spawn`.
 - The user-level registry stores project identifiers and roots for the shared UI.
+- The owner-private user-level Operator database stores immutable authority
+  contracts, project snapshots, hash-bound approvals, and audit events. It does
+  not contain provider credentials or project-local run state.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.
 
