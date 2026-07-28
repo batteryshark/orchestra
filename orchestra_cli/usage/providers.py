@@ -24,6 +24,7 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from orchestra_cli.usage.credentials import (
     CredentialError,
@@ -31,6 +32,7 @@ from orchestra_cli.usage.credentials import (
     opencode_api_key,
 )
 from orchestra_cli.usage.models import (
+    AccountBalance,
     ProviderResult,
     QuotaWindow,
     RateLimitResetCredits,
@@ -41,6 +43,9 @@ from orchestra_cli.usage.models import (
 MINIMAX_USAGE_URL = "https://www.minimax.io/v1/token_plan/remains"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+TOGETHER_BALANCE_URL = (
+    "https://api.together.ai/api/billing/organizations/{organization_id}/ongoing-balance"
+)
 MAX_RESPONSE_BYTES = 524_288
 HTTP_TIMEOUT_SECONDS = 8.0
 CODEX_TIMEOUT_SECONDS = 12.0
@@ -217,6 +222,22 @@ def _quota_number(value: Any) -> float | None:
     else:
         return None
     return number if math.isfinite(number) else None
+
+
+def _environment_value(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value or not shutil.which("launchctl"):
+        return value
+    try:
+        return subprocess.run(
+            ["launchctl", "getenv", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
 
 
 def _kimi_window(
@@ -413,6 +434,87 @@ def collect_zai(*, json_fetcher: JsonFetcher = fetch_json) -> ProviderResult:
         status="ok",
         plan="GLM Coding Plan",
         windows=windows,
+        source=credential.source,
+    )
+
+
+def parse_together_balance(payload: dict[str, Any]) -> AccountBalance:
+    cents = _quota_number(payload.get("totalOngoingBalanceCents"))
+    if cents is None or cents < 0:
+        raise ProviderRequestError("Together returned no usable prepaid balance")
+    return AccountBalance(currency="USD", remaining=round(cents / 100, 2))
+
+
+def collect_together(*, json_fetcher: JsonFetcher = fetch_json) -> ProviderResult:
+    try:
+        credential = opencode_api_key(
+            ("togetherai",),
+            ("TOGETHER_API_KEY",),
+        )
+    except CredentialMissing:
+        return error_result(
+            "together",
+            "Together AI",
+            "not_configured",
+            "Connect Together AI in OpenCode or set TOGETHER_API_KEY.",
+        )
+    except CredentialError:
+        return error_result(
+            "together",
+            "Together AI",
+            "unavailable",
+            "Together AI credentials could not be read.",
+        )
+
+    organization_id = _environment_value("TOGETHER_ORG_ID")
+    if not organization_id:
+        return ProviderResult(
+            id="together",
+            name="Together AI",
+            status="not_configured",
+            plan="Prepaid credits",
+            message=(
+                "Together AI is connected. Set TOGETHER_ORG_ID to show the "
+                "organization's prepaid balance."
+            ),
+            source=credential.source,
+        )
+
+    try:
+        payload = json_fetcher(
+            TOGETHER_BALANCE_URL.format(
+                organization_id=quote(organization_id, safe="")
+            ),
+            {
+                "Authorization": f"Bearer {credential.value}",
+                "Content-Type": "application/json",
+                "User-Agent": "orchestra-cli/0.1",
+            },
+            HTTP_TIMEOUT_SECONDS,
+        )
+        account_balance = parse_together_balance(payload)
+    except ProviderRequestError as exc:
+        if exc.status_code in (401, 403):
+            return error_result(
+                "together",
+                "Together AI",
+                "auth_required",
+                "Together AI rejected billing access for this key or organization.",
+                source=credential.source,
+            )
+        return error_result(
+            "together",
+            "Together AI",
+            "unavailable",
+            str(exc),
+            source=credential.source,
+        )
+    return ProviderResult(
+        id="together",
+        name="Together AI",
+        status="ok",
+        plan="Prepaid credits",
+        account_balance=account_balance,
         source=credential.source,
     )
 

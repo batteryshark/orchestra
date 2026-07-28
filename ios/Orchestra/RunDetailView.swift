@@ -209,6 +209,8 @@ struct TranscriptItemView: View {
             }
         case "delivery":
             deliveryCard
+        case "handoff":
+            handoffCard
         case "question":
             questionCard
         case "error":
@@ -274,6 +276,20 @@ struct TranscriptItemView: View {
         case "checkin": "Supervisor check-in"
         default: "Queued message"
         }
+    }
+
+    private var handoffCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Final handoff", systemImage: "checkmark.seal.fill")
+                .font(.headline)
+                .foregroundStyle(.green)
+            if let sender = item.sender, let recipient = item.recipient {
+                Text("\(sender) → \(recipient)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let body = item.body, !body.isEmpty { WrappedText(text: body) }
+        }
+        .panelStyle(tint: .green)
     }
 
     private var deliveryIcon: String {

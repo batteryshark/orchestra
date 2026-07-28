@@ -90,6 +90,8 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .titem.delivery.checkin { border-left-color:var(--think) }
 .titem.delivery.pending { border-left-color:var(--amber); border-style:dashed }
 .titem.delivery.recalled { border-left-color:var(--muted); opacity:.72 }
+.titem.delivery.handoff { border-left-color:var(--green);
+  background:color-mix(in srgb, var(--green) 6%, transparent) }
 .titem.delivery .event-title { font-size:12px; font-weight:700; letter-spacing:.035em;
   text-transform:uppercase }
 .titem.delivery .event-route { color:var(--muted); font-size:11.5px; margin-left:7px }
@@ -433,17 +435,31 @@ function runwayCreditsHtml(credits){
   const expiry = credits.expires_at ? ` · ${runwayReset(credits.expires_at).replace('resets', 'expires')}` : '';
   return `<div class="runway-credits"><strong>${esc(count)} ${label}</strong> available${esc(expiry)}</div>`;
 }
+function runwayMoney(provider){
+  const balance = provider && provider.account_balance;
+  const remaining = Number(balance && balance.remaining);
+  if (!balance || balance.currency !== 'USD' || !Number.isFinite(remaining)) return null;
+  const spent = balance.spent == null ? NaN : Number(balance.spent);
+  return {
+    compact: `$${remaining.toFixed(2)}`,
+    title: `$${remaining.toFixed(2)} balance`,
+    html: `<div class="runway-credits"><strong>$${esc(remaining.toFixed(2))}</strong> balance${
+      Number.isFinite(spent) ? ` · $${esc(spent.toFixed(2))} spent${balance.spent_scope ? ` (${esc(balance.spent_scope)})` : ''}` : ''
+    }</div>`
+  };
+}
 function runwayProviderHtml(provider, wasOpen){
   const windows = Array.isArray(provider.windows) ? provider.windows : [];
-  const tone = runwayTone(provider.headroom_percent);
+  const money = runwayMoney(provider);
+  const tone = money ? 'healthy' : runwayTone(provider.headroom_percent);
   const status = provider.status === 'ok' ? 'live' : provider.status === 'stale' ? 'cached' : provider.status === 'auth_required' ? 'login needed' : provider.status === 'not_configured' ? 'setup needed' : 'offline';
-  const body = windows.length ? windows.map(runwayWindowHtml).join('') :
+  const body = windows.length ? windows.map(runwayWindowHtml).join('') : money ? '' :
     `<div class="runway-empty">${esc(provider.message || 'No usage snapshot is available.')}</div>`;
   return `<details class="runway-provider" data-runway-provider="${esc(provider.id)}" ${wasOpen ? 'open' : ''}>
     <summary><span class="runway-monogram" aria-hidden="true">${esc(RUNWAY_MONOGRAMS[provider.id] || provider.name.slice(0,2))}</span>
       <span class="runway-provider-title"><strong>${esc(provider.name)}</strong><span>${esc(provider.plan || 'Coding plan')} · ${esc(status)}</span></span>
-      <span class="runway-headroom ${tone}">${esc(runwayPercent(provider.headroom_percent))}</span></summary>
-    <div class="runway-provider-body">${runwayCreditsHtml(provider.rate_limit_resets)}${body}${provider.source ? `<div class="runway-provider-message">via ${esc(provider.source)}</div>` : ''}</div>
+      <span class="runway-headroom ${tone}">${esc(money ? money.compact : runwayPercent(provider.headroom_percent))}</span></summary>
+    <div class="runway-provider-body">${runwayCreditsHtml(provider.rate_limit_resets)}${money ? money.html : ''}${body}${provider.source ? `<div class="runway-provider-message">via ${esc(provider.source)}</div>` : ''}</div>
   </details>`;
 }
 function renderRunway(data){
@@ -453,13 +469,14 @@ function renderRunway(data){
     '<div class="runway-error">No providers are configured.</div>';
   runwayRail.querySelectorAll('.runway-rail-provider').forEach(el => el.remove());
   providers.forEach(provider => {
-    const tone = runwayTone(provider.headroom_percent);
+    const money = runwayMoney(provider);
+    const tone = money ? 'healthy' : runwayTone(provider.headroom_percent);
     const button = document.createElement('button');
     button.className = `runway-rail-provider ${tone}`;
     button.type = 'button';
-    button.title = `${provider.name}: ${runwayPercent(provider.headroom_percent)} headroom`;
+    button.title = `${provider.name}: ${money ? money.title : `${runwayPercent(provider.headroom_percent)} headroom`}`;
     button.setAttribute('aria-label', button.title);
-    button.innerHTML = `<span class="runway-monogram" aria-hidden="true">${esc(RUNWAY_MONOGRAMS[provider.id] || provider.name.slice(0,2))}</span><span class="runway-rail-value">${esc(runwayPercent(provider.headroom_percent))}</span>`;
+    button.innerHTML = `<span class="runway-monogram" aria-hidden="true">${esc(RUNWAY_MONOGRAMS[provider.id] || provider.name.slice(0,2))}</span><span class="runway-rail-value">${esc(money ? money.compact : runwayPercent(provider.headroom_percent))}</span>`;
     button.addEventListener('click', () => runwayOpenProvider(provider.id));
     runwayRail.appendChild(button);
   });
@@ -838,6 +855,10 @@ function itemHtml(it, i){
     const answer = !waiting && it.answer ? `<div class="question-answer"><span class="muted">answer${it.answered_by?` from ${esc(it.answered_by)}`:''}</span><br>${esc(it.answer)}</div>` : '';
     const action = waiting ? `<div class="question-action">Answer with <span class="mono">orchestra answer ${esc(selected)} "..."</span> · fallback at ${esc(it.deadline_at||'')}</div>` : '';
     return `<div class="titem question ${waiting?'waiting':'resolved'}"><div><span class="question-title">${title}</span><span class="event-route">${esc(it.sender||'runner')} → ${esc(it.recipient||'orchestrator')}</span></div><div class="question-body">${esc(it.question||'')}</div><div class="question-default"><span class="muted">recommended fallback</span><br>${esc(it.recommended_default||'')}</div>${answer}${action}</div>`;
+  }
+  if (it.kind === 'handoff') {
+    const at = it.created_at ? ` · ${esc(it.created_at)}` : '';
+    return `<div class="titem delivery handoff"><div><span class="event-title">&#9989; final handoff</span><span class="event-route">${esc(it.sender||'runner')} → ${esc(it.recipient||'orchestrator')}${at}</span></div><div class="event-body">${esc(it.body||'')}</div></div>`;
   }
   if (it.kind === 'prompt')  return `<details class="prompt" data-k="${i}"><summary>&#128221; initial runner prompt <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;
   if (it.kind === 'thinking')return `<details class="think" data-k="${i}"><summary>&#129504; thinking <span class="muted">· ${it.body.length} chars</span></summary><div class="inner"><pre>${esc(it.body)}</pre></div></details>`;

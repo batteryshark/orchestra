@@ -36,6 +36,9 @@ def _project(*, checkin_interval: int = 0, timeout: int = 30) -> tuple[tempfile.
         "[settings]\n"
         f"timeout = {timeout}\n"
         f"supervisor_checkin_interval = {checkin_interval}\n"
+        "\n[agents.glm]\n"
+        'backend = "opencode"\n'
+        'model = "zhipuai-coding-plan/glm-5.2"\n'
     )
     db.connect(root).close()
     return tmp, root
@@ -103,6 +106,36 @@ class SupervisorUsageLimitTests(unittest.TestCase):
         self.assertIsNotNone(row["finished_at"])
         self.assertIn("Provider usage limit exhausted", row["summary"])
         self.assertIn("reroute the work to another agent", message["body"])
+
+    def test_structured_claude_five_hour_limit_is_authoritative(self) -> None:
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as log:
+            events = [
+                {
+                    "type": "rate_limit_event",
+                    "rate_limit_info": {
+                        "status": "rejected",
+                        "resetsAt": 1_784_955_600,
+                        "rateLimitType": "five_hour",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "error": "rate_limit",
+                    "message": {
+                        "content": [{
+                            "type": "text",
+                            "text": "You've hit your monthly spend limit",
+                        }],
+                    },
+                },
+            ]
+            log.write("\n".join(json.dumps(event) for event in events))
+            log.flush()
+
+            text = supervise._usage_limit_text(log.name)
+
+        self.assertIn("Claude 5-hour usage limit reached", text)
+        self.assertNotIn("monthly spend", text)
 
     def test_usage_limit_mentions_in_non_error_events_do_not_trigger(self) -> None:
         self.tmp, root = _project(checkin_interval=0, timeout=30)
@@ -236,6 +269,16 @@ class SupervisorCheckinTests(unittest.TestCase):
     def test_periodic_checkin_interrupts_once_and_resumes_same_session(self) -> None:
         self.tmp, root = _project(checkin_interval=1, timeout=30)
         run_id = _insert_run(root)
+        con = db.connect(root)
+        try:
+            con.execute(
+                "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+                "VALUES('reviewer', 'glm', 'ordinary inbox note', ?, ?)",
+                (run_id, db.now()),
+            )
+            con.commit()
+        finally:
+            con.close()
         zai_collector = mock.Mock(return_value=ProviderResult(
             id="zai",
             name="Z.AI",
@@ -279,15 +322,20 @@ class SupervisorCheckinTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual([c[0] for c in calls], [None, "ses-checkin"])
-        self.assertIn("IMMEDIATELY run `orchestra inbox glm --unread --mark-read`", calls[1][1])
+        self.assertIn("PROGRESS CHECK-IN", calls[1][1])
+        self.assertIn("No inbox lookup is needed", calls[1][1])
+        self.assertNotIn("orchestra inbox", calls[1][1])
         con = db.connect(root)
         try:
             row = con.execute("SELECT status, session_ref, summary FROM runs WHERE id=?",
                               (run_id,)).fetchone()
             checkins = list(con.execute(
-                "SELECT body, delivery_offset, delivered_at FROM messages "
+                "SELECT body, delivery_offset, delivered_at, read_at FROM messages "
                 "WHERE recipient='glm' AND kind='checkin'"
             ))
+            ordinary = con.execute(
+                "SELECT read_at FROM messages WHERE body='ordinary inbox note'"
+            ).fetchone()
         finally:
             con.close()
         self.assertEqual(row["status"], "done")
@@ -296,6 +344,8 @@ class SupervisorCheckinTests(unittest.TestCase):
         self.assertIn("PROGRESS CHECK-IN", checkins[0]["body"])
         self.assertIsNotNone(checkins[0]["delivery_offset"])
         self.assertIsNotNone(checkins[0]["delivered_at"])
+        self.assertIsNotNone(checkins[0]["read_at"])
+        self.assertIsNone(ordinary["read_at"])
         delivery_events = [
             json.loads(line)
             for line in (root / "run.jsonl").read_text().splitlines()
@@ -523,11 +573,11 @@ class SafeBoundaryTests(unittest.TestCase):
         tmp, root = _project(checkin_interval=0, timeout=10)
         self.addCleanup(tmp.cleanup)
         run_id = _insert_run(root)
-        calls: list[str | None] = []
+        calls: list[tuple[str | None, str]] = []
 
         def build_cmd(agent, *, workdir, title, prompt, resume_ref=None,
                       add_dirs=None, attach=None):
-            calls.append(resume_ref)
+            calls.append((resume_ref, prompt))
             if resume_ref is None:
                 code = (
                     "import json,time;"
@@ -584,15 +634,18 @@ class SafeBoundaryTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [0])
-        self.assertEqual(calls, [None, "ses-natural"])
+        self.assertEqual([call[0] for call in calls], [None, "ses-natural"])
+        self.assertIn("Apply this", calls[1][1])
+        self.assertNotIn("orchestra inbox", calls[1][1])
         con = db.connect(root)
         try:
             message = con.execute(
-                "SELECT delivered_at FROM messages WHERE kind='interrupt'"
+                "SELECT delivered_at, read_at FROM messages WHERE kind='interrupt'"
             ).fetchone()
         finally:
             con.close()
         self.assertIsNotNone(message["delivered_at"])
+        self.assertIsNotNone(message["read_at"])
 
 
 class BlockingQuestionTests(unittest.TestCase):

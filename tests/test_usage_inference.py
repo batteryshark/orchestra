@@ -49,6 +49,12 @@ class InferProviderTests(unittest.TestCase):
         self.assertEqual(infer_provider("opencode", "zhipuai-coding-plan/glm-5.2"), "zai")
         self.assertEqual(infer_provider("opencode", "zai-coding-plan/glm-5.2"), "zai")
 
+    def test_maps_together_api_models_to_together(self) -> None:
+        self.assertEqual(
+            infer_provider("opencode", "togetherai/zai-org/GLM-5.2"),
+            "together",
+        )
+
     def test_maps_kimi_for_coding_to_kimi(self) -> None:
         self.assertEqual(infer_provider("opencode", "kimi-for-coding/k3"), "kimi")
         self.assertEqual(

@@ -3,8 +3,8 @@
 Messaging semantics it enforces:
 - `orchestra interrupt` records a pending delivery and waits for a completed
   backend action before stopping the worker. `--now` retains the immediate
-  stop path. Both RESUME the same session with an instruction to read the
-  inbox, so delivery to a running worker is guaranteed (not best-effort).
+  stop path. Both RESUME the same session with the delivered message embedded
+  directly in the prompt, so delivery is guaranteed without an inbox tool call.
 - A run that finishes with unread inbox messages bounces a notice back to each
   sender — a message to a worker can never rot silently.
 """
@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra_cli import config, db, host, paths, runners
+from orchestra_cli import brief, child_runs, config, db, host, paths, runners
 from orchestra_cli.usage import DEFAULT_COLLECTORS, infer_from_agent
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
@@ -53,17 +53,29 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
 def create_followup(con, root: Path, parent: dict, requester: str, text: str,
                     title: str | None = None, *, commit: bool = True) -> int:
     """New run row that resumes parent's session with `text` as the prompt."""
+    allow_question = int(bool(parent.get("allow_question", 0)))
+    question_wait = int(parent.get("question_wait_seconds") or 1800)
     cur = con.execute(
         "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, "
-        "workdir, branch, parent_run, lead_run, child_depth, session_ref, status, started_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+        "workdir, branch, parent_run, lead_run, child_depth, session_ref, allow_question, "
+        "question_wait_seconds, status, started_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
         (parent["agent"], parent["backend"], parent["model"],
          title or f"continuation of run {parent['id']}", parent["work_item"], parent["team"],
          requester, parent["workdir"], parent["branch"], parent["id"],
-         parent.get("lead_run"), parent.get("child_depth", 0), parent["session_ref"], db.now()))
+         parent.get("lead_run"), parent.get("child_depth", 0), parent["session_ref"],
+         allow_question, question_wait, db.now()))
     run_id = cur.lastrowid
     bp = paths.briefs_dir(root) / f"run-{run_id}.md"
-    bp.write_text(text)
+    bp.write_text(brief.compose_continuation(
+        run_id=run_id,
+        parent_run=parent["id"],
+        requester=requester,
+        instructions=text,
+        work_item=parent.get("work_item"),
+        allow_question=bool(allow_question),
+        question_wait_seconds=question_wait,
+    ))
     lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
     lp.touch()
     con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",
@@ -254,6 +266,9 @@ def _usage_limit_text(log_path: str, *, max_bytes: int = 262144) -> str | None:
             except ValueError:
                 obj = None
             if obj is not None:
+                claude_limit = runners.claude_rate_limit_text(obj)
+                if claude_limit:
+                    return claude_limit
                 candidates = _error_event_strings(obj)
         for candidate in candidates:
             compact = " ".join(candidate.split())
@@ -265,12 +280,9 @@ def _usage_limit_text(log_path: str, *, max_bytes: int = 262144) -> str | None:
 def _insert_checkin_message(con, run, run_id: int) -> dict:
     created_at = db.now()
     body = (
-        f"PROGRESS CHECK-IN run {run_id}: send {run['requested_by']} a short progress "
-        f"update with `orchestra send {run['requested_by']} \"PROGRESS run {run_id}: ...\" "
-        f"--as {run['agent']} --run {run_id}`, then continue the original mission."
+        f"PROGRESS CHECK-IN run {run_id}: send a short update with "
+        "`orchestra report \"<progress>\"`, then continue the original mission."
     )
-    if run["work_item"]:
-        body += f" Also record durable progress with `work log {run['work_item']} ...`."
     cur = con.execute(
         "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, created_at) "
         "VALUES('orchestra', ?, ?, ?, ?, 'checkin', ?)",
@@ -414,6 +426,26 @@ def _delivery_event_from_message(message, *, phase: str) -> dict:
     }
 
 
+def _resume_delivery_prompt(events: list[dict]) -> str:
+    """Render exact delivered messages for a backend-session resume.
+
+    The supervisor already owns these bodies, so asking the worker to invoke
+    ``orchestra inbox`` would add a subprocess/tool round trip without adding
+    information. Keep sender and delivery kind visible so a check-in cannot be
+    mistaken for an operator correction.
+    """
+    messages = "\n\n".join(
+        f"[{event['delivery']} from {event['sender']}]\n{event['body']}"
+        for event in events
+    )
+    return (
+        "Apply the following delivered message(s) now, then continue the original mission. "
+        "No inbox lookup is needed for these messages.\n\n"
+        f"{messages}\n\n"
+        'Before stopping, send the normal `orchestra handoff "<summary>"`.'
+    )
+
+
 def _mark_pending_delivered(con, run_id: int) -> list[dict]:
     rows = list(con.execute(
         "SELECT id, sender, recipient, body, kind, created_at FROM messages "
@@ -463,8 +495,22 @@ def _command_preview(cmd: list[str]) -> str:
     return " ".join(preview) + " ..."
 
 
+def _service_child_control(con, root: Path, run_id: int, cfg: dict) -> None:
+    """Broker worker spawn requests from the supervisor's security context."""
+    pending = con.execute(
+        "SELECT 1 FROM spawn_requests WHERE lead_run=? AND status='pending' LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    if pending:
+        child_runs.process_pending(con, root, cfg, run_id, spawn_supervisor)
+    # A batch can settle before the lead's backend session id reaches the DB.
+    # Rechecking from the lead supervisor closes that race.
+    child_runs.maybe_wake_lead(con, root, run_id)
+
+
 def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
               agent: dict | None = None,
+              cfg: dict | None = None,
               checkin_interval: int | None = None,
               checkin_state: dict | None = None,
               delivery_events: list[dict] | None = None,
@@ -562,6 +608,8 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                         con.execute("UPDATE runs SET session_ref=? WHERE id=?", (ref, run_id))
                         con.commit()
                         have_ref = True
+                root = Path(env.get("ORCHESTRA_ROOT", workdir))
+                _service_child_control(con, root, run_id, cfg or config.load(root))
                 usage_text = _usage_limit_text(log_path)
                 if usage_text:
                     con.execute(
@@ -634,7 +682,12 @@ def supervise(root: Path, run_id: int) -> int:
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not run:
         raise SystemExit(f"orchestra: run {run_id} not found")
-    con.execute("UPDATE runs SET supervisor_protocol=1 WHERE id=?", (run_id,))
+    # Claim the run for THIS supervisor process. Without this the only pid on
+    # the row is the agent's, and a supervisor that dies before writing the
+    # completion UPDATE leaves a run stuck at 'running' that nothing can tell
+    # apart from a live one. See reap.reap_orphans.
+    con.execute("UPDATE runs SET supervisor_protocol=1, supervisor_pid=? WHERE id=?",
+                (os.getpid(), run_id))
     con.commit()
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cfg = config.load(root)
@@ -678,6 +731,7 @@ def supervise(root: Path, run_id: int) -> int:
         outcome, exit_code = _run_proc(con, run, cmd, run["workdir"], env,
                                        run["log_path"], run_id, deadline,
                                        agent=agent,
+                                       cfg=cfg,
                                        checkin_interval=checkin_interval,
                                        checkin_state=checkin_state,
                                        delivery_events=delivery_events,
@@ -767,23 +821,31 @@ def supervise(root: Path, run_id: int) -> int:
                 "SELECT id, sender, recipient, body, kind, created_at FROM messages "
                 "WHERE run_id=? AND recipient=? "
                 "AND (kind IN ('interrupt','checkin') OR body LIKE '[INTERRUPT]%') "
+                "AND read_at IS NULL "
                 "ORDER BY id",
                 (run_id, run["agent"]),
             ).fetchall()
+            resume_events = []
             for message in messages:
                 message_id = int(message["id"])
-                if message_id in announced_message_ids:
-                    continue
-                delivery_events.append(
-                    _delivery_event_from_message(message, phase="delivered")
+                event = _delivery_event_from_message(message, phase="delivered")
+                resume_events.append(event)
+                if message_id not in announced_message_ids:
+                    delivery_events.append(event)
+                    announced_message_ids.add(message_id)
+            if resume_events:
+                ids = ",".join(str(event["message_id"]) for event in resume_events)
+                con.execute(
+                    f"UPDATE messages SET read_at=COALESCE(read_at, ?) WHERE id IN ({ids})",
+                    (db.now(),),
                 )
-                announced_message_ids.add(message_id)
-            prompt = (f"The orchestrator delivered an in-flight message. "
-                      f"IMMEDIATELY run `orchestra inbox {run['agent']} --unread --mark-read`, "
-                      f"apply what it says, then continue your original mission. Finish with the "
-                      f"normal HANDOFF to {run['requested_by']} "
-                      f"(`orchestra send {run['requested_by']} \"HANDOFF run {run_id}: ...\" "
-                      f"--as {run['agent']} --run {run_id}`).")
+                con.commit()
+                prompt = _resume_delivery_prompt(resume_events)
+            else:
+                prompt = (
+                    "Continue the original mission after the completed action boundary. "
+                    'Before stopping, send the normal `orchestra handoff "<summary>"`.'
+                )
             continue
         status = "done" if exit_code == 0 else "failed"
         break
@@ -815,6 +877,12 @@ def supervise(root: Path, run_id: int) -> int:
     if latest and latest["status"] == "killed":
         status = "killed"
         exit_code = None
+    child_runs.fail_unprocessed(
+        con,
+        run_id,
+        f"lead run {run_id} finished ({status}) before its outer supervisor "
+        "could accept the spawn request",
+    )
 
     session_ref, last_text = runners.parse_log(run["log_path"])
     if status == "timeout" and run["summary"] and run["summary"].startswith("Stalled:"):
@@ -845,11 +913,7 @@ def supervise(root: Path, run_id: int) -> int:
         joined = "\n\n".join(f"From {q['sender']}: {q['body']}" for q in queued)
         text = (f"Your previous run finished ({status}). Follow-up instructions were queued "
                 f"for you while you worked — apply them now:\n\n{joined}\n\n"
-                f"Also check `orchestra inbox {run['agent']} --unread --mark-read` for anything "
-                f"else. Finish with `orchestra send {queued[0]['sender']} \"HANDOFF: ...\" "
-                f"--as {run['agent']}`"
-                + (f", and log progress with `work log {run['work_item']} ...`"
-                   if run["work_item"] else "") + ".")
+                "Finish with `orchestra handoff \"<summary>\"`.")
         parent = dict(run)
         parent["session_ref"] = ref_final
         followup_id = create_followup(con, root, parent, queued[0]["sender"], text)
@@ -866,10 +930,11 @@ def supervise(root: Path, run_id: int) -> int:
                 "VALUES('orchestra', ?, ?, ?, ?, ?)",
                 (run["requested_by"], body, run["work_item"], run_id, db.now()))
     # bounce unread mail: a finished worker will never read its inbox again
-    for m in con.execute("SELECT * FROM messages WHERE recipient=? AND read_at IS NULL "
+    for m in con.execute("SELECT * FROM messages WHERE recipient=? AND run_id=? "
+                         "AND read_at IS NULL "
                          "AND created_at>=? AND sender != 'orchestra' "
                          "AND COALESCE(kind,'') != 'queued'",
-                         (run["agent"], run["started_at"])):
+                         (run["agent"], run_id, run["started_at"])):
         con.execute("INSERT INTO messages(sender, recipient, body, run_id, created_at) "
                     "VALUES('orchestra', ?, ?, ?, ?)",
                     (m["sender"],
@@ -885,7 +950,6 @@ def supervise(root: Path, run_id: int) -> int:
     # A child finishing may settle its lead's batch; a lead finishing after
     # already-settled children also needs the same check. The DB claim makes
     # concurrent child supervisors produce at most one continuation.
-    from orchestra_cli import child_runs
     child_wakeup_id = child_runs.maybe_wake_lead(con, root, run_id)
     if run["work_item"]:
         _work_log(root, run["work_item"],

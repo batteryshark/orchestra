@@ -73,4 +73,30 @@ struct OrchestraTests {
         #expect(snapshot.providers.first?.headroomPercent == nil)
         #expect(snapshot.providers.first?.message == "Login needed")
     }
+
+    @Test func multiDayDurationIncludesDaysHoursAndMinutes() {
+        let seconds = ((161 * 60) + 3) * 60
+
+        #expect(OrchestraFormatting.duration(seconds) == "6d 17h 3m")
+    }
+
+    @Test func transcriptPayloadDecodesFinalHandoff() throws {
+        let payload = #"""
+        {
+          "etag":"done-1-h42","unchanged":false,"run":null,
+          "items":[{
+            "kind":"handoff","message_id":42,
+            "sender":"codex-luna","recipient":"orchestrator",
+            "body":"HANDOFF run 7: complete","created_at":"2026-07-22T10:00:00Z"
+          }]
+        }
+        """#.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let response = try decoder.decode(TranscriptResponse.self, from: payload)
+
+        #expect(response.items?.first?.kind == "handoff")
+        #expect(response.items?.first?.messageId == 42)
+        #expect(response.items?.first?.body == "HANDOFF run 7: complete")
+    }
 }

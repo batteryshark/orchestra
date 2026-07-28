@@ -81,6 +81,10 @@ class DoctorScopeTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(cli, "_maybe_root", return_value=None))
             stack.enter_context(mock.patch.object(cli.config, "load", return_value=cfg))
             stack.enter_context(mock.patch.object(cli.shutil, "which", return_value=None))
+            stack.enter_context(mock.patch.object(
+                cli.availability, "discover",
+                return_value={"backends": [], "providers": [], "roster": []},
+            ))
             if status is not None:
                 stack.enter_context(mock.patch.object(
                     cli.ensemble, "plugin_status", return_value=status,
@@ -115,6 +119,8 @@ class DispatchBoundaryTests(unittest.TestCase):
         cfg = default_config()
         with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
                 mock.patch.object(cli.config, "load", return_value=cfg), \
+                mock.patch.object(cli.availability, "check_profiles",
+                                  return_value=({}, [], [])), \
                 mock.patch.object(cli, "_spawn_supervisor") as spawn:
             cli.cmd_dispatch(dispatch_args("minimax"))
         spawn.assert_called_once()
@@ -136,6 +142,8 @@ class DispatchBoundaryTests(unittest.TestCase):
         missing = self.root / "missing-opencode.json"
         with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
                 mock.patch.object(cli.config, "load", return_value=cfg), \
+                mock.patch.object(cli.availability, "check_profiles",
+                                  return_value=({}, [], [])), \
                 mock.patch.object(cli.ensemble, "OPENCODE_CONFIG", missing), \
                 mock.patch.object(cli, "_spawn_supervisor") as spawn:
             with self.assertRaises(SystemExit) as raised:
@@ -145,6 +153,35 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.assertFalse((self.root / ".orchestra" / "logs").exists())
         self.assertFalse((self.root / ".orchestra" / "briefs").exists())
         spawn.assert_not_called()
+
+    def test_unavailable_profile_fails_before_database_or_supervisor(self) -> None:
+        cfg = default_config()
+        issue = "minimax: opencode CLI is not installed or not on PATH"
+        with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
+                mock.patch.object(cli.config, "load", return_value=cfg), \
+                mock.patch.object(cli.availability, "check_profiles",
+                                  return_value=({}, [issue], [])), \
+                mock.patch.object(cli, "_spawn_supervisor") as spawn, \
+                self.assertRaisesRegex(SystemExit, "unavailable launch profile"):
+            cli.cmd_dispatch(dispatch_args("minimax"))
+        spawn.assert_not_called()
+        self.assertFalse(paths.db_path(self.root).exists())
+
+    def test_unknown_profile_warns_but_dispatches(self) -> None:
+        cfg = default_config()
+        warning = "minimax: model discovery timed out"
+        stderr = io.StringIO()
+        with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
+                mock.patch.object(cli.config, "load", return_value=cfg), \
+                mock.patch.object(cli.availability, "check_profiles",
+                                  return_value=({}, [], [warning])), \
+                mock.patch.object(cli, "_spawn_supervisor") as spawn, \
+                contextlib.redirect_stderr(stderr):
+            cli.cmd_dispatch(dispatch_args("minimax"))
+        spawn.assert_called_once()
+        self.assertIn("availability unknown", stderr.getvalue())
+        self.assertIn(warning, stderr.getvalue())
+        self.assertTrue(paths.db_path(self.root).exists())
 
 
 class StoreBoundaryTests(unittest.TestCase):

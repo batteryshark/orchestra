@@ -144,6 +144,7 @@ struct TeammateTranscriptResponse: Decodable, Sendable {
 
 struct TranscriptItem: Decodable, Sendable {
     let kind: String
+    let messageId: Int?
     let body: String?
     let name: String?
     let status: String?
@@ -258,8 +259,10 @@ enum OrchestraFormatting {
     }
 
     static func duration(_ seconds: Int) -> String {
-        let hours = seconds / 3_600
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
         let minutes = (seconds % 3_600) / 60
+        if days > 0 { return "\(days)d \(hours)h \(minutes)m" }
         if hours > 0 { return "\(hours)h \(minutes)m" }
         if minutes > 0 { return "\(minutes)m" }
         return "\(seconds)s"

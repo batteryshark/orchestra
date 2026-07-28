@@ -105,6 +105,8 @@ class RouteTests(unittest.TestCase):
         self.assertIn("refreshRunway", body)
         self.assertIn("runwayOpenProvider", body)
         self.assertIn("runwayCreditsHtml(provider.rate_limit_resets)", body)
+        self.assertIn("function runwayMoney(provider)", body)
+        self.assertIn("provider.account_balance", body)
         self.assertIn("toggleAttribute('inert', !open)", body)
         self.assertIn("@media (max-width:1199px)", body)
         self.assertIn("brand-mark", body)
@@ -129,6 +131,12 @@ class RouteTests(unittest.TestCase):
         self.assertIn("api/runs/${id}/stop", body)
         self.assertIn("'Content-Type':'application/json'", body)
         self.assertIn("status === 'killed' ? 'stopped by user' : status", body)
+
+    def test_main_dashboard_renders_final_handoff_items(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("it.kind === 'handoff'", body)
+        self.assertIn("final handoff", body)
 
     def test_main_dashboard_labels_recallable_queue_ids(self) -> None:
         status, _headers, body = self.get("/")

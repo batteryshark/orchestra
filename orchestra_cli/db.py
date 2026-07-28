@@ -69,18 +69,39 @@ CREATE TABLE IF NOT EXISTS runs (
   branch TEXT,
   parent_run INTEGER,
   lead_run INTEGER,
+  spawn_request_id INTEGER,
   child_depth INTEGER NOT NULL DEFAULT 0,
   child_wakeup_run INTEGER,
+  child_wakeup_message INTEGER,
   allow_question INTEGER NOT NULL DEFAULT 0,
   question_wait_seconds INTEGER NOT NULL DEFAULT 1800,
   supervisor_protocol INTEGER NOT NULL DEFAULT 0,
   pid INTEGER,
+  supervisor_pid INTEGER,
   session_ref TEXT,
   status TEXT NOT NULL DEFAULT 'spawning',
   exit_code INTEGER,
   summary TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS spawn_requests (
+  id INTEGER PRIMARY KEY,
+  lead_run INTEGER NOT NULL REFERENCES runs(id),
+  requested_by TEXT NOT NULL,
+  targets_json TEXT NOT NULL,
+  mission TEXT NOT NULL,
+  title TEXT,
+  context TEXT,
+  shared_workdir INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  child_run_ids_json TEXT,
+  error TEXT,
+  wakeup_run INTEGER,
+  wakeup_message INTEGER,
+  notified_at TEXT,
+  created_at TEXT NOT NULL,
+  processed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS feed (
   id INTEGER PRIMARY KEY,
@@ -152,10 +173,14 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
     # session continuation, so child ownership must remain a separate edge.
     if not _has_column(con, "runs", "lead_run"):
         con.execute("ALTER TABLE runs ADD COLUMN lead_run INTEGER")
+    if not _has_column(con, "runs", "spawn_request_id"):
+        con.execute("ALTER TABLE runs ADD COLUMN spawn_request_id INTEGER")
     if not _has_column(con, "runs", "child_depth"):
         con.execute("ALTER TABLE runs ADD COLUMN child_depth INTEGER NOT NULL DEFAULT 0")
     if not _has_column(con, "runs", "child_wakeup_run"):
         con.execute("ALTER TABLE runs ADD COLUMN child_wakeup_run INTEGER")
+    if not _has_column(con, "runs", "child_wakeup_message"):
+        con.execute("ALTER TABLE runs ADD COLUMN child_wakeup_message INTEGER")
     if not _has_column(con, "runs", "allow_question"):
         con.execute("ALTER TABLE runs ADD COLUMN allow_question INTEGER NOT NULL DEFAULT 0")
     if not _has_column(con, "runs", "question_wait_seconds"):
@@ -164,6 +189,15 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         )
     if not _has_column(con, "runs", "supervisor_protocol"):
         con.execute("ALTER TABLE runs ADD COLUMN supervisor_protocol INTEGER NOT NULL DEFAULT 0")
+
+    # W-0040: orphan reaping. ``pid`` is the AGENT process; a supervisor that
+    # dies between its worker exiting and the completion UPDATE strands the run
+    # at 'running' forever, with nothing to notice. Recording the SUPERVISOR's
+    # own pid makes that state detectable: no supervisor alive and not terminal
+    # means orphaned, full stop. Rows predating this column fall back to a
+    # slower log-quiescence heuristic (see reap.py).
+    if not _has_column(con, "runs", "supervisor_pid"):
+        con.execute("ALTER TABLE runs ADD COLUMN supervisor_pid INTEGER")
     con.execute(
         "CREATE TABLE IF NOT EXISTS questions ("
         "id INTEGER PRIMARY KEY, run_id INTEGER UNIQUE NOT NULL REFERENCES runs(id), "
@@ -172,8 +206,35 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         "asked_at TEXT NOT NULL, deadline_at TEXT NOT NULL, answered_at TEXT, "
         "answered_by TEXT, answer TEXT)"
     )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS spawn_requests ("
+        "id INTEGER PRIMARY KEY, "
+        "lead_run INTEGER NOT NULL REFERENCES runs(id), "
+        "requested_by TEXT NOT NULL, targets_json TEXT NOT NULL, "
+        "mission TEXT NOT NULL, title TEXT, context TEXT, "
+        "shared_workdir INTEGER NOT NULL DEFAULT 0, "
+        "status TEXT NOT NULL DEFAULT 'pending', "
+        "child_run_ids_json TEXT, error TEXT, wakeup_run INTEGER, "
+        "wakeup_message INTEGER, notified_at TEXT, created_at TEXT NOT NULL, "
+        "processed_at TEXT)"
+    )
+    for column, sql_type in (
+        ("wakeup_run", "INTEGER"),
+        ("wakeup_message", "INTEGER"),
+        ("notified_at", "TEXT"),
+    ):
+        if not _has_column(con, "spawn_requests", column):
+            con.execute(f"ALTER TABLE spawn_requests ADD COLUMN {column} {sql_type}")
     con.execute("CREATE INDEX IF NOT EXISTS idx_runs_lead_run ON runs(lead_run)")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_spawn_request "
+        "ON runs(spawn_request_id)"
+    )
     con.execute("CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run)")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spawn_requests_lead_status "
+        "ON spawn_requests(lead_run, status)"
+    )
 
 
 def connect(root: Path) -> sqlite3.Connection:

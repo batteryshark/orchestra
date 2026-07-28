@@ -73,15 +73,18 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
 
 ## The orchestration loop
 
-1. **Orient.** Read project instructions and pending messages. Inspect the live roster with
-   `orchestra roster`; configuration and model availability may have changed. Check
-   `orchestra usage` before a costly wave.
+1. **Orient.** Read project instructions and pending messages. Inspect configured launch profiles
+   with `orchestra roster`, then run `orchestra discover` because installed backends, authenticated
+   providers, and model availability vary by machine. Check `orchestra usage` before a costly wave.
 2. **Plan durably.** Split the goal into bounded work items, record dependencies and important
    decisions, and identify the evidence required for acceptance.
 3. **Dispatch deliberately.** Use one work item per mission whenever possible. Use separate
-   asynchronous dispatches for independent work; repeat `--to` only when intentionally asking
-   multiple agents for independent treatments of the same brief. Use `--worktree` when edits
-   need isolation.
+   asynchronous dispatches for independent work. The same roster profile may back several
+   concurrent runs; repeat `--to` only when intentionally asking multiple runs for independent
+   treatments of the same brief. Those targets may use the same profile or different profiles.
+   Use `--worktree` when edits need isolation. Inside a supervised worker, use
+   `orchestra spawn` instead of `orchestra dispatch`; the outer supervisor brokers child setup
+   and launch so it does not inherit the worker backend's sandbox.
 4. **Monitor without serializing yourself.** Use `orchestra status` and `orchestra runs --active`.
    Background `orchestra wait` if useful; continue integration or review work meanwhile.
 5. **Correct through the right channel.** Use the messaging semantics below. When doctrine or
@@ -126,11 +129,16 @@ A handoff is a compact evidence index, not a substitute for durable artifacts. I
 - any proposed change to orchestrator-owned state;
 - precise next steps and reviewer instructions.
 
-End with a message tied to the run and work item when available:
+End with the run-bound worker command, which derives the sender, requester, run ID, and work
+item from the supervised process:
 
 ```sh
-orchestra send <requester> --file handoff.md --as <worker> --run <run-id> --work W-0001
+orchestra handoff "<result, evidence, remaining risks>"
 ```
+
+Workers do not update or move tracker items while finishing. Orchestra persists their
+run-bound reports and handoffs first; the orchestrator verifies that evidence and owns tracker
+transitions. Tracker availability must never delay or suppress a worker handoff.
 
 A run without a handoff is unverified. Read `orchestra logs <run> --pretty`, inspect its
 artifacts, and reconstruct the evidence before accepting it.
@@ -153,17 +161,36 @@ checks scope rather than merely trusting the implementer's green output.
 
 ## Roster and routing
 
-Treat `orchestra roster` as live configuration. Route by the declared role and current task,
-not by a stale model list embedded in documentation.
+Treat `orchestra roster` as configured intent and `orchestra discover` as live execution evidence.
+A roster entry is a reusable **launch profile**:
+it packages a backend, model, reasoning configuration, arguments, and intended role. It is not
+a singleton worker, a reserved seat, or a signal that exactly one instance should be active.
+Every dispatch creates a distinct run, and any profile may have zero, one, or several active
+runs when the missions are independent and the real provider and project limits permit it.
+Do not dispatch a profile merely because it appears in the roster. Discovery reports installed
+backend CLIs, authenticated or configured providers, available OpenCode models, and whether each
+profile is `available`, `unavailable`, or `unknown`. Dispatch rejects proven-unavailable profiles;
+an unknown result warns and continues because not every backend exposes a trustworthy model list.
 
-- Use workhorse agents for mechanical edits, bounded implementation, and test expansion.
-- Use stronger generalists for ambiguous feature work and integration.
-- Reserve heavy reasoning tiers for architecture, difficult debugging, security boundaries,
+Build each wave from capability fit and current capacity, not from a desire to have one of every
+profile running or to distribute work evenly. Compare the mission's reasoning, implementation,
+context, latency, and verification needs with the declared roles, then check `orchestra usage`.
+Several profiles may draw from the same provider quota, so budget that shared headroom across the
+whole wave. Usage data is advisory and may be stale or unavailable; it informs routing but does
+not replace judgment about model strengths, risk, or task ownership.
+
+- Use workhorse profiles for mechanical edits, bounded implementation, and test expansion.
+- Use stronger generalist profiles for ambiguous feature work and integration.
+- Reserve heavy reasoning profiles for architecture, difficult debugging, security boundaries,
   uncertain investigations, and independent verification.
-- Use multiple agents only when independence, diversity of reasoning, or parallelism adds value.
+- It is fine for a model to be weaker in some dimensions: assign work inside its strengths and
+  add review or escalation where its weaknesses matter.
+- Use multiple runs only when independence, diversity of reasoning, or parallelism adds value.
 
 Do not spend a heavy tier on grunt work merely because it is available, and do not assign a
-weak tier to a task whose primary difficulty is judgment rather than typing.
+weak tier to a task whose primary difficulty is judgment rather than typing. When multiple runs
+share one profile identity, prefer run-addressed controls such as `interrupt`, `queue`, and
+`resume`; a bare `send` targets the profile's shared inbox rather than one particular run.
 
 ## Rules of engagement
 
@@ -216,6 +243,8 @@ host access. This does not broaden the worker's authorized project scope.
 
 ```sh
 orchestra roster
+orchestra discover
+orchestra discover kimi
 orchestra usage
 orchestra status
 orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>

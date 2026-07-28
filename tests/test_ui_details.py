@@ -43,6 +43,49 @@ class TranscriptNormalizationTests(unittest.TestCase):
         thinking = [item["body"] for item in transcript if item["kind"] == "thinking"]
         self.assertEqual(thinking, ["Inspect the loader.", "Now patch it."])
 
+    def test_claude_five_hour_limit_suppresses_synthetic_monthly_spend_copy(self) -> None:
+        events = [
+            {
+                "type": "rate_limit_event",
+                "session_id": "session-1",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "resetsAt": 1_784_955_600,
+                    "rateLimitType": "five_hour",
+                },
+            },
+            {
+                "type": "assistant",
+                "session_id": "session-1",
+                "error": "rate_limit",
+                "message": {
+                    "id": "synthetic",
+                    "content": [{
+                        "type": "text",
+                        "text": "You've hit your monthly spend limit",
+                    }],
+                },
+            },
+            {
+                "type": "result",
+                "is_error": True,
+                "api_error_status": 429,
+                "result": "You've hit your monthly spend limit",
+            },
+        ]
+
+        transcript = ui.parse_transcript(
+            "\n".join(json.dumps(event) for event in events)
+        )
+
+        self.assertEqual(transcript, [{
+            "kind": "error",
+            "body": (
+                "Claude 5-hour usage limit reached; "
+                "resets at 2026-07-25T05:00:00+00:00"
+            ),
+        }])
+
     def test_interrupt_delivery_replaces_runner_command_noise(self) -> None:
         transcript = ui.parse_transcript("\n".join([
             "opencode run --dir /tmp/worktree --format json ...",
@@ -176,6 +219,24 @@ class DetailSerializationTests(unittest.TestCase):
              "2026-07-18T22:32:00Z"),
         )
         con.execute(
+            "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+            "VALUES(?,?,?,?,?)",
+            ("minimax", "codex", "HANDOFF run 1: superseded draft", 1,
+             "2026-07-18T22:02:30Z"),
+        )
+        con.execute(
+            "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+            "VALUES(?,?,?,?,?)",
+            ("minimax", "codex", "PROGRESS run 1: intermediate detail", 1,
+             "2026-07-18T22:03:00Z"),
+        )
+        con.execute(
+            "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+            "VALUES(?,?,?,?,?)",
+            ("minimax", "codex", "HANDOFF run 1: completed the requested work", 1,
+             "2026-07-18T22:04:00Z"),
+        )
+        con.execute(
             "INSERT INTO runs(agent, backend, model, title, work_item, "
             "team, requested_by, workdir, slug, status, started_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -292,8 +353,36 @@ class DetailSerializationTests(unittest.TestCase):
                     "deadline_at": "2026-07-18T22:32:00Z",
                     "answered_at": "",
                 },
+                {
+                    "kind": "handoff",
+                    "message_id": 5,
+                    "sender": "minimax",
+                    "recipient": "codex",
+                    "body": "HANDOFF run 1: completed the requested work",
+                    "created_at": "2026-07-18T22:04:00Z",
+                },
             ],
         )
+        self.assertNotIn("PROGRESS run 1", json.dumps(payload["items"]))
+        self.assertNotIn("superseded draft", json.dumps(payload["items"]))
+
+    def test_handoff_is_not_duplicated_when_exact_model_text_is_visible(self) -> None:
+        log_path = self.root / "run-1.jsonl"
+        original = log_path.read_text()
+        handoff = "HANDOFF run 1: completed the requested work"
+        try:
+            log_path.write_text(json.dumps({
+                "part": {"type": "text", "id": "a", "text": handoff}
+            }) + "\n")
+            payload = self.get("/api/transcript/1")
+        finally:
+            log_path.write_text(original)
+
+        self.assertEqual(
+            [item for item in payload["items"] if item["kind"] == "text"],
+            [{"kind": "text", "body": handoff}],
+        )
+        self.assertFalse(any(item["kind"] == "handoff" for item in payload["items"]))
 
     def test_state_payload_includes_slug_for_dashboard_render(self) -> None:
         # The sidebar shows slugs; check both rows are exposed.
@@ -411,6 +500,33 @@ class LiveRefreshCacheHeaderTests(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertTrue(payload.get("unchanged"))
         self.assertEqual(payload.get("etag"), etag)
+
+    def test_late_handoff_invalidates_transcript_etag(self) -> None:
+        baseline = json.loads(self._get_raw("/api/transcript/1")[2].decode("utf-8"))
+        con = db.connect(self.root)
+        message_id = None
+        try:
+            cur = con.execute(
+                "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+                "VALUES(?,?,?,?,?)",
+                ("minimax", "codex", "HANDOFF run 1: late final result", 1, db.now()),
+            )
+            message_id = cur.lastrowid
+            con.commit()
+            status, _headers, body = self._get_raw(
+                f"/api/transcript/1?etag={baseline['etag']}"
+            )
+        finally:
+            if message_id is not None:
+                con.execute("DELETE FROM messages WHERE id=?", (message_id,))
+                con.commit()
+            con.close()
+
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertNotEqual(payload["etag"], baseline["etag"])
+        self.assertNotIn("unchanged", payload)
+        self.assertEqual(payload["items"][-1]["kind"], "handoff")
 
     def test_state_response_sets_no_store(self) -> None:
         # /api/state is also polled every 2.5s by the dashboard; if the

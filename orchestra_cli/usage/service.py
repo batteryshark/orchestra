@@ -17,6 +17,7 @@ from orchestra_cli.usage.providers import (
     collect_codex,
     collect_kimi,
     collect_minimax,
+    collect_together,
     collect_zai,
 )
 
@@ -36,6 +37,7 @@ DEFAULT_COLLECTORS: tuple[tuple[str, str, Collector], ...] = (
     ("kimi", "Moonshot AI", collect_kimi),
     ("claude", "Claude", collect_claude),
     ("zai", "Z.AI", collect_zai),
+    ("together", "Together AI", collect_together),
     ("codex", "Codex", collect_codex),
 )
 

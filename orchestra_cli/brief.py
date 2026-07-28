@@ -1,7 +1,78 @@
 """Compose the worker brief injected into every dispatched agent."""
+import json
 import shutil
 import subprocess
 from pathlib import Path
+
+
+def _checked_lines(items: object) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    lines = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("text"):
+            continue
+        mark = "x" if item.get("checked") else " "
+        lines.append(f"- [{mark}] {item['text']}")
+    return lines
+
+
+def _render_work_snapshot(raw: str) -> str:
+    """Turn ``work show`` JSON into a small, human-oriented dispatch snapshot.
+
+    Unknown/non-JSON output is preserved because older slash-work versions may
+    already provide a readable display.
+    """
+    try:
+        item = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if not isinstance(item, dict):
+        return raw
+
+    title = item.get("title")
+    heading = f"**{item.get('id', 'Work item')}**"
+    if title:
+        heading += f" — {title}"
+    lines = [heading]
+
+    summary = [
+        str(value) for value in (
+            item.get("status"),
+            item.get("priority"),
+            item.get("type"),
+        ) if value not in (None, "", [], {})
+    ]
+    if summary:
+        lines.append(" · ".join(summary))
+
+    for label, key in (
+        ("Project", "projectPath"),
+        ("Parent", "parentId"),
+        ("Depends on", "dependsOn"),
+        ("Blocked by", "blockedBy"),
+        ("Tags", "tags"),
+    ):
+        value = item.get(key)
+        if value in (None, "", [], {}):
+            continue
+        display = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+        lines.append(f"- {label}: {display}")
+
+    sections = item.get("sections") if isinstance(item.get("sections"), dict) else {}
+    goal = sections.get("goal")
+    if goal:
+        lines.extend(("", "**Goal**", str(goal).strip()))
+
+    for label, key in (
+        ("Requirements", "requirements"),
+        ("Acceptance criteria", "acceptanceCriteria"),
+    ):
+        checklist = _checked_lines(item.get(key))
+        if checklist:
+            lines.extend(("", f"**{label}**", *checklist))
+
+    return "\n".join(lines).strip()
 
 
 def work_snapshot(root: Path, item: str) -> str:
@@ -10,31 +81,92 @@ def work_snapshot(root: Path, item: str) -> str:
     try:
         out = subprocess.run(["work", "show", item], cwd=root, capture_output=True,
                              text=True, timeout=20).stdout.strip()
-        return out[:6000]
+        return _render_work_snapshot(out)[:6000]
     except Exception:
         return ""
+
+
+def _coordination(*, run_id: int, requester: str, work_item: str | None,
+                  allow_question: bool, question_wait_seconds: int) -> str:
+    question = (
+        f'You may pause once with `orchestra ask "<question>" --default "<safe fallback>"`; '
+        f"Orchestra waits up to {question_wait_seconds} seconds, then resumes with the answer "
+        "or fallback."
+        if allow_question else
+        'For a blocker, notify the requester with `orchestra report "BLOCKER: <details>"` '
+        "and continue with a documented assumption."
+    )
+    progress = (
+        'Send meaningful progress with `orchestra report "<update>"`; Orchestra attaches '
+        f"it to {work_item} automatically."
+        if work_item else
+        'Send meaningful progress with `orchestra report "<update>"`.'
+    )
+    return f"""## Coordination
+
+Orchestra exports this process's identity and run ID; commands infer them automatically.
+
+- Start with `orchestra inbox --unread --mark-read`.
+- Batch independent read-only searches, file reads, and diagnostics in one tool-call group.
+  Keep dependent operations and overlapping writes sequential.
+- If you lead a decomposable mission, delegate bounded pieces with
+  `orchestra spawn --to <agent> "<mission>"`. Never call top-level
+  `orchestra dispatch` from a supervised run.
+- {progress}
+- Send findings or peer messages with `orchestra note` / `orchestra send`; check `orchestra roster` when needed.
+- {question}
+- Before stopping, send `orchestra handoff "<files, verification, remaining work>"`.
+- Do not update or move tracker items directly; Orchestra records the run-bound report/handoff,
+  and the requester owns tracker state transitions.
+
+Follow any applicable project `SKILL.md` in `.agents/skills/`, `.claude/skills/`,
+`.opencode/skill/`, or `.codex/skills/`.
+"""
+
+
+def compose_continuation(*, run_id: int, parent_run: int, requester: str,
+                         instructions: str, work_item: str | None,
+                         allow_question: bool = False,
+                         question_wait_seconds: int = 1800) -> str:
+    """Wrap incremental instructions for a real backend-session continuation."""
+    question = (
+        f'\nYou may still pause once with `orchestra ask "<question>" --default '
+        f'"<safe fallback>"`; the wait is {question_wait_seconds} seconds.'
+        if allow_question else ""
+    )
+    return f"""# Run {run_id} — continuation of run {parent_run}
+
+The original mission, project instructions, and coordination contract remain in this
+session. Apply this follow-up; it overrides earlier instructions only where they conflict.
+
+{instructions.strip()}
+{question}
+
+Before stopping, send `orchestra handoff "<result, verification, remaining risks>"`."""
 
 
 def compose(*, root: Path, run_id: int, agent: dict, mission: str,
             work_item: str | None, team: str | None, requester: str,
             workdir: str, extra_context: str | None = None,
             lead_run: int | None = None, allow_question: bool = False,
-            question_wait_seconds: int = 1800) -> str:
+            question_wait_seconds: int = 1800, slug: str | None = None) -> str:
     name = agent["name"]
+    run_label = f"{run_id} · {slug}" if slug else str(run_id)
     autonomy = (
         "Work autonomously and make reasonable assumptions. You have ONE blocking-question "
-        "escape hatch for a genuinely unsafe or materially wasteful ambiguity; its strict "
-        "protocol is below. Do not use it for ordinary implementation preferences."
+        "option for unsafe or materially wasteful ambiguity; see Coordination."
         if allow_question else
-        "Work autonomously. Do not ask questions or wait for replies — make reasonable choices "
-        "and record them."
+        "Work autonomously. If something is unclear, make a reasonable documented assumption."
     )
-    parts = [f"""# Orchestra worker brief — run {run_id}
+    location = f"Project and working directory: `{workdir}`."
+    if str(root) != workdir:
+        location = f"Project: `{root}` · Working directory: `{workdir}`."
+    team_text = f" · Team: {team}" if team else ""
+    parts = [f"""# Run {run_label}
 
-You are **{name}** ({agent.get('role', 'worker agent')}), a worker agent in the project at `{root}`.
-Team: {team or '(none)'} · Dispatched by: **{requester}**
+Profile: **{name}** · Requested by: **{requester}**{team_text}
 
-{autonomy} Your working directory is `{workdir}`; keep all file changes inside it.
+{autonomy} {location} Keep file changes inside the working directory.
 
 ## Mission
 
@@ -44,9 +176,8 @@ Team: {team or '(none)'} · Dispatched by: **{requester}**
         snap = work_snapshot(root, work_item)
         parts.append(f"""## Tracked work item: {work_item}
 
-This mission is tracked in the slash-work project tracker (the durable source of truth).
-Run `work show {work_item}` for full context and `work agent operations` if you need the protocol.
-""" + (f"Snapshot at dispatch time:\n\n```\n{snap}\n```\n" if snap else ""))
+The tracker is the durable source of truth. Run `work show {work_item}` for full context.
+""" + (f"\n{snap}\n" if snap else ""))
     if extra_context:
         parts.append(f"## Additional context\n\n{extra_context}\n")
     if lead_run is not None:
@@ -56,35 +187,17 @@ This is an isolated child of lead run **{lead_run}**. Return a focused result; d
 merge your branch automatically. Your completion and branch are reported to the lead.
 You may use `orchestra spawn` only if project policy permits another depth level.
 """)
-    parts.append(f"""## Coordination protocol (required)
-
-Coordination runs through the `orchestra` CLI and the `work` CLI, both on PATH. Identify yourself with `--as {name}` on orchestra commands (ORCHESTRA_SELF and ORCHESTRA_RUN_ID are also exported for you).
-
-1. **Start** — read pending messages: `orchestra inbox {name} --unread --mark-read`
-2. **Progress** — {'append to the work item log after each meaningful step: `work log ' + work_item + ' "<what happened>"`' if work_item else 'record meaningful progress with `orchestra note "<progress>" --as ' + name + '`'}
-3. **Findings** — anything teammates or the orchestrator should know (discoveries, gotchas, decisions made, dead ends): `orchestra note "<finding>" --as {name} --tags <tag,...>`
-4. **Peers** — message a teammate: `orchestra send <agent> "<msg>" --as {name}`; see who exists: `orchestra roster`. Check your inbox between major steps.
-5. **Blockers** — {('Only for missing authority/credentials, irreversible risk, conflicting requirements, or ambiguity likely to waste substantial work, you may pause ONCE: `orchestra ask "<one concrete question>" --default "<recommended fallback you can safely execute>" --as ' + name + ' --run ' + str(run_id) + '`. This stops your turn and waits up to ' + str(question_wait_seconds) + ' seconds; an answer or your declared fallback resumes this same session. For everything else, continue with a documented assumption.' if allow_question else '`orchestra send ' + requester + ' "<question/blocker>" --as ' + name + '`, then continue with a documented assumption rather than blocking.')}
-6. **Finish (mandatory)** — send a handoff before you stop:
-   `orchestra send {requester} "HANDOFF run {run_id}: <what you did, files touched, what remains / follow-ups>" --as {name} --run {run_id}`
-""" + (f"""   Then update the tracker: log verification evidence for EACH requirement/acceptance criterion you satisfied:
-   `work log {work_item} "VERIFIED: <criterion> — <evidence>"`
-   Then try `work move {work_item} review --note "<summary>"`. If Work refuses because checklist boxes are
-   unchecked (they are only togglable via the Work UI/API), that is fine — leave the status as-is; your
-   VERIFIED log lines are what the reviewer needs. Never move an item to done.
-""" if work_item else "") + """
-## Skills
-
-Before starting, check the project's skill folders for relevant guides and follow any that apply:
-`.agents/skills/`, `.claude/skills/`, `.opencode/skill/`, `.codex/skills/` (each skill is a folder with a SKILL.md).
-""")
+    parts.append(_coordination(
+        run_id=run_id, requester=requester, work_item=work_item,
+        allow_question=allow_question, question_wait_seconds=question_wait_seconds,
+    ))
     if agent.get("ensemble"):
         pool = agent.get("model_pool", [])
-        parts.append(f"""## Ensemble lead instructions
+        parts.append(f"""## Team lead
 
-You have opencode-ensemble team tools (team_create, team_spawn, team_message, team_broadcast, team_tasks_add, team_tasks_list, team_claim, team_tasks_complete, team_results, team_merge, team_status, team_shutdown, team_cleanup).
-You are the LEAD: split the mission into parallel tasks on the team task board, spawn teammates over this model pool: {', '.join(pool) or '(configured pool)'}, coordinate via team messages, merge results with team_merge, then team_shutdown and team_cleanup. Report the consolidated outcome through the normal handoff protocol above.
-
-IMPORTANT — lifecycle: your session runs on a persistent orchestra host, so your team survives even if your turn ends; teammate reports will wake you in a new turn. Still, PREFER finishing in one turn: after spawning, poll team_status/team_results until every task is complete, then team_merge, verify the merged files exist in the project, team_shutdown, team_cleanup, and only then hand off. If you are woken by a teammate message instead, continue from where the team actually is (check team_status first). The mission is complete ONLY when you send the HANDOFF message — orchestra detects completion by it.
+Use the OpenCode Ensemble tools to split independent tasks across this pool:
+{', '.join(pool) or '(configured pool)'}. Track results, merge deliberately, verify the combined
+work, then shut down and clean up the team before sending the normal handoff. The persistent
+host may wake this session when teammates finish; check team status before continuing.
 """)
     return "\n".join(parts)

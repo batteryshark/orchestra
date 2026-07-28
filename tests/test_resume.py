@@ -66,9 +66,38 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(resumed["status"], "spawning")
         prompt = Path(resumed["brief_path"]).read_text()
         self.assertIn("Continue the investigation", prompt)
-        self.assertIn(f"session continuation from run {original_id}", prompt)
+        self.assertIn(f"continuation of run {original_id}", prompt)
+        self.assertIn("original mission, project instructions", prompt)
+        self.assertIn("orchestra handoff", prompt)
         spawn.assert_called_once_with(self.root, resumed["id"])
         self.assertIn(f"continuing run {original_id}'s session", output.call_args.args[0])
+
+    def test_resume_preserves_question_capability(self) -> None:
+        original_id = self._run()
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "UPDATE runs SET allow_question=1, question_wait_seconds=60 WHERE id=?",
+                (original_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        self._resume(original_id, "Continue safely")
+
+        con = db.connect(self.root)
+        try:
+            resumed = con.execute(
+                "SELECT * FROM runs WHERE parent_run=?", (original_id,)
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(resumed["allow_question"], 1)
+        self.assertEqual(resumed["question_wait_seconds"], 60)
+        prompt = Path(resumed["brief_path"]).read_text()
+        self.assertIn("orchestra ask", prompt)
+        self.assertIn("wait is 60 seconds", prompt)
 
     def test_resuming_earlier_attempt_continues_latest_terminal_tip(self) -> None:
         root_id = self._run()

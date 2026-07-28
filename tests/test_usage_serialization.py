@@ -10,6 +10,7 @@ import json
 import unittest
 
 from orchestra_cli.usage.models import (
+    AccountBalance,
     ProviderResult,
     QuotaWindow,
     RateLimitResetCredits,
@@ -48,6 +49,23 @@ class SafeSerializationTests(unittest.TestCase):
         # source is just a label saying WHICH credential store was used,
         # never the key itself.
         self.assertNotIn(SAMPLE_KEY, payload)
+
+    def test_account_balance_exposes_only_normalized_money(self) -> None:
+        result = ProviderResult(
+            id="together",
+            name="Together AI",
+            status="ok",
+            account_balance=AccountBalance(
+                currency="USD",
+                remaining=19.99,
+                spent=0.01,
+                spent_scope="current period",
+            ),
+        )
+        payload = result.to_dict()
+        self.assertEqual(payload["account_balance"]["remaining"], 19.99)
+        self.assertNotIn("organization", json.dumps(payload).lower())
+        self.assertNotIn(SAMPLE_KEY, json.dumps(payload))
 
     def test_window_only_exposes_public_shape(self) -> None:
         w = QuotaWindow.from_remaining(

@@ -80,6 +80,8 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(row["allow_question"], 0)
             self.assertEqual(row["question_wait_seconds"], 1800)
             self.assertEqual(row["supervisor_protocol"], 0)
+            self.assertIn("spawn_request_id", row.keys())
+            self.assertIn("child_wakeup_message", row.keys())
             message_cols = {
                 r["name"] for r in con.execute("PRAGMA table_info(messages)").fetchall()
             }
@@ -96,6 +98,13 @@ class MigrationTests(unittest.TestCase):
                 r["name"] for r in con.execute("PRAGMA index_list(runs)").fetchall()
             }
             self.assertIn("idx_runs_parent_run", indexes)
+            spawn_columns = {
+                r["name"] for r in con.execute(
+                    "PRAGMA table_info(spawn_requests)"
+                ).fetchall()
+            }
+            self.assertIn("targets_json", spawn_columns)
+            self.assertIn("notified_at", spawn_columns)
         finally:
             con.close()
 

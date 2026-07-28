@@ -6,9 +6,11 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from orchestra_cli import (
+    availability,
     brief,
     cancel,
     child_runs,
@@ -21,6 +23,7 @@ from orchestra_cli import (
     names,
     paths,
     projects,
+    reap,
     runners,
     supervise,
     tailscale,
@@ -33,11 +36,23 @@ from orchestra_cli.usage import (
     infer_provider,
     render_warning_lines,
 )
+from orchestra_cli.usage.spend import with_project_spend
 
 
 def _identity(args, cfg) -> str:
     return getattr(args, "as_", None) or os.environ.get("ORCHESTRA_SELF") \
         or cfg["settings"].get("default_requester", "orchestrator")
+
+
+def _run_id(args) -> int | None:
+    explicit = getattr(args, "run", None)
+    if explicit is not None:
+        return explicit
+    value = os.environ.get("ORCHESTRA_RUN_ID")
+    try:
+        return int(value) if value else None
+    except ValueError:
+        return None
 
 
 _spawn_supervisor = supervise.spawn_supervisor
@@ -164,15 +179,81 @@ def cmd_send(args):
             raise SystemExit(
                 f"orchestra: cannot read message file '{message_path}': {exc}"
             ) from exc
+    run_id = _run_id(args)
     con = db.connect(root)
     try:
+        if run_id is None:
+            active = list(con.execute(
+                "SELECT id, slug FROM runs WHERE agent=? "
+                "AND status NOT IN ('done','failed','timeout','killed') ORDER BY id",
+                (args.to,),
+            ))
+            if len(active) == 1:
+                run_id = int(active[0]["id"])
+            elif len(active) > 1:
+                choices = ", ".join(
+                    f"{row['id']} ({row['slug'] or 'no slug'})" for row in active
+                )
+                raise SystemExit(
+                    f"orchestra: recipient '{args.to}' is ambiguous across active runs: "
+                    f"{choices}. Use `orchestra interrupt RUN \"...\"` for guaranteed "
+                    "delivery, or pass `--run RUN`."
+                )
         con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
                     "VALUES(?,?,?,?,?,?)",
-                    (sender, args.to, body, args.work, args.run, db.now()))
+                    (sender, args.to, body, args.work, run_id, db.now()))
         con.commit()
     finally:
         con.close()
     print(f"sent {sender} -> {args.to}")
+
+
+def _worker_message(args, *, handoff: bool) -> None:
+    root = paths.find_root()
+    raw_run_id = os.environ.get("ORCHESTRA_RUN_ID")
+    identity = os.environ.get("ORCHESTRA_SELF")
+    try:
+        run_id = int(raw_run_id) if raw_run_id else None
+    except ValueError:
+        run_id = None
+    if run_id is None or not identity:
+        raise SystemExit(
+            f"orchestra: {'handoff' if handoff else 'report'} is worker-only and requires "
+            "a supervised run"
+        )
+
+    body = " ".join(args.message).strip()
+    if not body:
+        raise SystemExit(f"orchestra: empty {'handoff' if handoff else 'report'}")
+
+    con = db.connect(root)
+    try:
+        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise SystemExit(f"orchestra: supervised run {run_id} not found")
+        if run["agent"] != identity:
+            raise SystemExit(
+                f"orchestra: supervised identity mismatch for run {run_id}"
+            )
+        prefix = "HANDOFF" if handoff else "REPORT"
+        text = f"{prefix} run {run_id}: {body}"
+        con.execute(
+            "INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (run["agent"], run["requested_by"], text, run["work_item"], run_id, db.now()),
+        )
+        con.commit()
+    finally:
+        con.close()
+    print(f"{prefix.lower()} sent for run {run_id} -> {run['requested_by']}")
+
+
+def cmd_report(args):
+    _worker_message(args, handoff=False)
+
+
+def cmd_handoff(args):
+    _worker_message(args, handoff=True)
 
 
 def cmd_broadcast(args):
@@ -201,12 +282,25 @@ def cmd_inbox(args):
     cfg = config.load(root)
     con = db.connect(root)
     who = args.name or _identity(args, cfg)
-    q = "SELECT * FROM messages WHERE recipient=?"
-    if not args.all:
-        q += " AND read_at IS NULL" if args.unread else ""
-    rows = list(con.execute(q + " ORDER BY id", (who,)))
-    if not args.all and not args.unread:
-        rows = [r for r in rows if r["read_at"] is None]
+    active_run = _run_id(args) if args.name is None else None
+    try:
+        q = "SELECT * FROM messages WHERE recipient=?"
+        params: list[object] = [who]
+        if active_run is not None:
+            q += " AND run_id=?"
+            params.append(active_run)
+        if not args.all:
+            q += " AND read_at IS NULL" if args.unread else ""
+        rows = list(con.execute(q + " ORDER BY id", params))
+        if not args.all and not args.unread:
+            rows = [r for r in rows if r["read_at"] is None]
+        if args.mark_read and rows:
+            con.execute(f"UPDATE messages SET read_at=? WHERE id IN "
+                        f"({','.join(str(r['id']) for r in rows)}) AND read_at IS NULL",
+                        (db.now(),))
+            con.commit()
+    finally:
+        con.close()
     if args.json:
         print(json.dumps([dict(r) for r in rows], indent=2))
     elif not rows:
@@ -217,10 +311,6 @@ def cmd_inbox(args):
             extra = " ".join(x for x in [f"work:{r['work_item']}" if r["work_item"] else "",
                                          f"run:{r['run_id']}" if r["run_id"] else ""] if x)
             print(f"[{r['id']}] {r['created_at']} from {r['sender']}{tag} {extra}\n  {r['body']}\n")
-    if args.mark_read and rows:
-        con.execute(f"UPDATE messages SET read_at=? WHERE id IN "
-                    f"({','.join(str(r['id']) for r in rows)}) AND read_at IS NULL", (db.now(),))
-        con.commit()
 
 
 def _quota_warnings_enabled(cfg: dict) -> bool:
@@ -270,6 +360,12 @@ def _assess_quota_warnings(cfg: dict, targets: list[str]) -> tuple[list[str], li
 def cmd_dispatch(args):
     root = paths.find_root()
     cfg = config.load(root)
+    if os.environ.get("ORCHESTRA_RUN_ID"):
+        raise SystemExit(
+            "orchestra: supervised workers cannot use top-level `orchestra dispatch`; "
+            "use `orchestra spawn --to AGENT \"mission\"` so the outer supervisor "
+            "can launch children outside the worker sandbox"
+        )
     requester = _identity(args, cfg)
     mission = " ".join(args.mission)
     if args.brief_file:
@@ -278,6 +374,18 @@ def cmd_dispatch(args):
         raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
 
     target_agents = [(target, config.agent_cfg(cfg, target)) for target in args.to]
+    _availability_report, unavailable, availability_warnings = \
+        availability.check_profiles(cfg, target_agents)
+    if unavailable:
+        detail = "\n".join(f"  - {item}" for item in unavailable)
+        raise SystemExit(
+            "orchestra: unavailable launch profile(s):\n"
+            f"{detail}\nRun `orchestra discover` after installing or authenticating the "
+            "required backend/provider."
+        )
+    for warning in dict.fromkeys(availability_warnings):
+        print(f"orchestra: availability unknown for {warning} — dispatch continuing",
+              file=sys.stderr)
     ensemble_targets = [name for name, agent in target_agents if agent.get("ensemble")]
     if ensemble_targets:
         ensemble.require_plugin(ensemble_targets)
@@ -357,7 +465,7 @@ def cmd_dispatch(args):
                              work_item=args.work, team=args.team, requester=requester,
                              workdir=workdir, extra_context=args.context,
                              allow_question=allow_question,
-                             question_wait_seconds=question_wait)
+                             question_wait_seconds=question_wait, slug=slug)
         bp = paths.briefs_dir(root) / f"run-{run_id}.md"
         bp.write_text(text)
         lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
@@ -399,22 +507,56 @@ def cmd_spawn(args):
         mission = Path(args.brief_file).read_text()
     if not mission.strip():
         raise SystemExit("orchestra: empty child mission (pass text, or --brief-file)")
-    targets = [(target, config.agent_cfg(cfg, target)) for target in args.to]
-    ensemble_targets = [name for name, agent in targets if agent.get("ensemble")]
-    if ensemble_targets:
-        ensemble.require_plugin(ensemble_targets)
+    for target in args.to:
+        config.agent_cfg(cfg, target)
     con = db.connect(root)
     try:
         parent = child_runs.validate_parent(con, cfg, parent_id, identity)
-        run_ids = child_runs.create(
-            con, root, cfg, parent, list(args.to), mission,
+        request_id = child_runs.enqueue(
+            con, parent, list(args.to), mission,
             title=args.title, context=args.context,
             shared_workdir=args.shared_workdir,
         )
+        deadline = time.monotonic() + 30
+        request = None
+        while time.monotonic() < deadline:
+            request = con.execute(
+                "SELECT * FROM spawn_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if request and request["status"] in ("accepted", "failed"):
+                break
+            time.sleep(0.1)
+        if request and request["status"] == "pending":
+            timed_out = con.execute(
+                "UPDATE spawn_requests SET status='failed', error=?, processed_at=? "
+                "WHERE id=? AND status='pending'",
+                ("outer supervisor did not accept the request within 30 seconds",
+                 db.now(), request_id),
+            )
+            con.commit()
+            if timed_out.rowcount == 1:
+                request = con.execute(
+                    "SELECT * FROM spawn_requests WHERE id=?", (request_id,)
+                ).fetchone()
     finally:
         con.close()
+    if request and request["status"] == "processing":
+        print(
+            f"spawn request {request_id}: accepted by the outer supervisor for "
+            f"lead run {parent_id}; child setup is still in progress"
+        )
+        return
+    if not request:
+        raise SystemExit(
+            f"orchestra: spawn request {request_id} disappeared before acknowledgement"
+        )
+    if request["status"] == "failed":
+        raise SystemExit(
+            f"orchestra: spawn request {request_id} failed without terminating "
+            f"lead run {parent_id}: {request['error'] or 'unknown broker error'}"
+        )
+    run_ids = json.loads(request["child_run_ids_json"] or "[]")
     for run_id in run_ids:
-        _spawn_supervisor(root, run_id)
         print(f"child run {run_id}: spawned for lead run {parent_id}")
     print("Child completions will notify this lead; if it exits first, Orchestra will "
           "resume it exactly once after the batch settles.")
@@ -474,16 +616,8 @@ def cmd_reply(args):
             )
         requester = _identity(args, cfg) or parent["requested_by"]
         msg = " ".join(args.message)
-        followup = (
-            f"{msg}\n\n(Orchestra session continuation from run {parent['id']}. First check "
-            f"`orchestra inbox {parent['agent']} --unread --mark-read`. Preserve the existing "
-            f"session context and coordination protocol: finish with `orchestra send "
-            f"{requester} \"HANDOFF: ...\" --as {parent['agent']}`"
-            + (f", log progress with `work log {parent['work_item']} ...`"
-               if parent["work_item"] else "") + ".)"
-        )
         run_id = supervise.create_followup(
-            con, root, dict(parent), requester, followup,
+            con, root, dict(parent), requester, msg,
             title=f"continuation of run {parent['id']}", commit=False,
         )
         con.execute("COMMIT")
@@ -506,6 +640,8 @@ def cmd_reply(args):
 def cmd_runs(args):
     root = paths.find_root()
     con = db.connect(root)
+    for item in reap.reap_orphans(con, root):
+        print(f"reconciled: {item['note']}", file=sys.stderr)
     q = "SELECT * FROM runs" + (" WHERE status NOT IN ('done','failed','timeout','killed')"
                                 if args.active else "") + " ORDER BY id"
     rows = list(con.execute(q))
@@ -524,6 +660,7 @@ def cmd_runs(args):
 def cmd_run_show(args):
     root = paths.find_root()
     con = db.connect(root)
+    reap.reap_orphans(con, root)
     r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
     if not r:
         raise SystemExit(f"orchestra: no run {args.run_id}")
@@ -568,6 +705,7 @@ def cmd_wait(args):
     import time
     root = paths.find_root()
     con = db.connect(root)
+    reap.reap_orphans(con, root)
     if args.run_ids:
         targets = set(args.run_ids)
     else:
@@ -594,6 +732,10 @@ def cmd_wait(args):
                 return
         if pending:
             time.sleep(2)
+            # An orphaned run never changes state on its own, so without this
+            # the wait below would block until the timeout — or forever.
+            for item in reap.reap_orphans(con, root):
+                print(f"reconciled: {item['note']}", file=sys.stderr)
     print("all runs finished — check your inbox: `orchestra inbox <you> --unread --mark-read`")
 
 
@@ -742,10 +884,8 @@ def cmd_queue(args):
             if not r["session_ref"]:
                 raise SystemExit(f"orchestra: run {args.run_id} has no session to resume — "
                                  "dispatch a fresh run instead")
-            text = (f"{msg}\n\n(Queued follow-up on run {args.run_id}. Same protocol: finish with "
-                    f"`orchestra send {sender} \"HANDOFF: ...\" --as {r['agent']}`.)")
             followup_id = supervise.create_followup(
-                con, root, dict(r), sender, text, commit=False
+                con, root, dict(r), sender, msg, commit=False
             )
         else:
             cur = con.execute(
@@ -913,7 +1053,7 @@ def cmd_note(args):
     author = _identity(args, cfg)
     con.execute("INSERT INTO feed(author, body, tags, work_item, run_id, created_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (author, args.body, args.tags or "", args.work, args.run, db.now()))
+                (author, args.body, args.tags or "", args.work, _run_id(args), db.now()))
     con.commit()
     _work_log(root, args.work, f"[{author}] {args.body}")
     print("noted")
@@ -1088,27 +1228,30 @@ def cmd_takeover(args):
     sys.stdout.write(brief_text)
 
 
+def cmd_discover(args):
+    root = _maybe_root()
+    cfg = config.load(root)
+    report = availability.discover(cfg, refresh=getattr(args, "refresh", False))
+    if getattr(args, "json", False):
+        payload = dict(report)
+        if getattr(args, "query", None) is not None:
+            payload["model_matches"] = availability.search_models(report, args.query)
+        print(json.dumps(payload, indent=2))
+        return
+    print("orchestra discover\n")
+    print(availability.render(report, getattr(args, "query", None)))
+
+
 def cmd_doctor(args):
     root = _maybe_root()
     cfg = config.load(root)
+    report = availability.discover(cfg, refresh=getattr(args, "refresh", False))
     print("orchestra doctor\n")
-    for tool in ["opencode", "codex", "claude", "work", "git"]:
+    print(availability.render(report))
+    print("\nauxiliary tools:")
+    for tool in ["work", "git"]:
         path = shutil.which(tool)
-        print(f"  {tool:<9} {'OK  ' + path if path else 'MISSING'}")
-    models = ""
-    if shutil.which("opencode"):
-        try:
-            models = subprocess.run(["opencode", "models"], capture_output=True,
-                                    text=True, timeout=60).stdout
-        except Exception:
-            pass
-    print("\n  roster:")
-    for name, a in sorted(cfg.get("agents", {}).items()):
-        m = a.get("model")
-        status = "ok"
-        if a.get("backend") == "opencode" and m and models and m not in models:
-            status = f"MODEL NOT FOUND in `opencode models`"
-        print(f"    {name:<12} {a.get('backend'):<9} {m or '(default)':<42} {status}")
+        print(f"  {tool:<9} {'available · ' + path if path else 'unavailable'}")
     ensemble_agents = ensemble.configured_agents(cfg)
     if ensemble_agents:
         status = ensemble.plugin_status()
@@ -1148,9 +1291,30 @@ def _format_reset_credits(resets: dict | None) -> str:
     return f" · {count} {credits_label}"
 
 
+def _format_account_balance(balance: dict | None) -> str:
+    if not isinstance(balance, dict):
+        return ""
+    remaining = balance.get("remaining")
+    currency = balance.get("currency")
+    if not isinstance(remaining, (int, float)) or currency != "USD":
+        return ""
+    note = f" · ${remaining:.2f} balance"
+    spent = balance.get("spent")
+    if isinstance(spent, (int, float)):
+        scope = balance.get("spent_scope")
+        note += f" · ${spent:.2f} spent"
+        if isinstance(scope, str) and scope.strip():
+            note += f" ({scope.strip()})"
+    return note
+
+
 def cmd_usage(args):
     print("## provider runway")
-    snap = default_service().snapshot(force=args.refresh)
+    root = _maybe_root()
+    snap = with_project_spend(
+        default_service().snapshot(force=args.refresh),
+        root,
+    )
     rec = snap.get("recommendation") or {}
     if rec:
         print(f"  best runway: {rec.get('provider_name')} "
@@ -1170,15 +1334,15 @@ def cmd_usage(args):
         # providers leave it None and we render the count line only when
         # the wire carries an actual Codex reset-credit record.
         reset_note = _format_reset_credits(resets)
+        balance_note = _format_account_balance(row.get("account_balance"))
         print(f"  {row.get('name'):<{provider_name_width}} [{row.get('status'):<12}] {plan:<22} "
-              f"headroom {headroom_s}{reset_note}")
+              f"headroom {headroom_s}{reset_note}{balance_note}")
 
     print()
     # --- per-project worker token burn: this is project-local data, the only
     # piece the shared service doesn't already provide. Keep it. The runs
     # lookup is read into memory inside a try/finally so the connection
     # closes even when the project has zero runs (the empty-agg path).
-    root = _maybe_root()
     if not root:
         return
     rows: list = []
@@ -1249,7 +1413,7 @@ def cmd_ui(args):
         )
     try:
         ui.serve(
-            paths.find_root(),
+            _maybe_root(),
             port=args.port,
             open_browser=not args.no_open,
             host=args.host,
@@ -1322,7 +1486,16 @@ def main():
     s.set_defaults(fn=cmd_roster)
 
     s = sub.add_parser("doctor", help="check tools, models, and config health")
+    s.add_argument("--refresh", action="store_true",
+                   help="refresh OpenCode's model catalog before checking")
     s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("discover", help="discover runnable backends, providers, models, and profiles")
+    s.add_argument("query", nargs="?", help="case-insensitive model search text")
+    s.add_argument("--refresh", action="store_true",
+                   help="refresh OpenCode's model catalog before checking")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_discover)
 
     s = sub.add_parser("team", help="manage teams")
     ts = s.add_subparsers(dest="team_cmd", required=True)
@@ -1347,6 +1520,20 @@ def main():
     s.add_argument("--run", type=int, help="related run id")
     ident(s)
     s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser(
+        "report",
+        help="send a run-bound update to this worker's requester",
+    )
+    s.add_argument("message", nargs="+")
+    s.set_defaults(fn=cmd_report)
+
+    s = sub.add_parser(
+        "handoff",
+        help="send this supervised run's final handoff to its requester",
+    )
+    s.add_argument("message", nargs="+")
+    s.set_defaults(fn=cmd_handoff)
 
     s = sub.add_parser("broadcast", help="message every member of a team")
     s.add_argument("body")

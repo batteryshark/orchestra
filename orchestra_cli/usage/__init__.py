@@ -1,14 +1,15 @@
 """Native provider-quota subsystem for Orchestra.
 
 This package ported from the standalone ``usage-widget`` prototype keeps
-credential discovery server-side, normalizes MiniMax / Claude / Z.AI / Codex
-quotas into shared dataclasses, and exposes them through ``UsageService``,
+credential discovery server-side, normalizes coding-plan quotas and Together
+AI's prepaid balance into shared dataclasses, and exposes them through ``UsageService``,
 which is cached per-process so callers within the same Orchestra project do
 not trigger extra API calls.
 """
 
 from orchestra_cli.usage.inference import infer_from_agent, infer_provider
 from orchestra_cli.usage.models import (
+    AccountBalance,
     ProviderResult,
     QuotaWindow,
     RateLimitResetCredits,
@@ -30,6 +31,7 @@ from orchestra_cli.usage.warning import (
 
 
 __all__ = [
+    "AccountBalance",
     "DEFAULT_COLLECTORS",
     "ProviderResult",
     "QuotaWarning",

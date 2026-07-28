@@ -10,14 +10,16 @@ from unittest.mock import patch
 from orchestra_cli.usage.credentials import opencode_api_key
 from orchestra_cli.usage.providers import (
     ProviderRequestError,
-    collect_kimi,
     collect_claude,
+    collect_kimi,
+    collect_together,
     parse_claude,
     parse_claude_usage_screen,
     parse_codex,
     parse_codex_reset_credits,
     parse_kimi,
     parse_minimax,
+    parse_together_balance,
     parse_zai,
     read_recent_codex_snapshot,
 )
@@ -83,6 +85,55 @@ class ZaiParserTests(unittest.TestCase):
         self.assertEqual([window.label for window in windows], ["5-hour", "Weekly", "Monthly"])
         self.assertEqual([window.scope for window in windows], ["Coding tokens", "Coding tokens", "MCP tools"])
         self.assertEqual([window.remaining_percent for window in windows], [40.0, 70.0, 100.0])
+
+
+class TogetherBalanceTests(unittest.TestCase):
+    def test_parses_prepaid_balance_cents(self) -> None:
+        balance = parse_together_balance({"totalOngoingBalanceCents": 2177.86119})
+        self.assertEqual(balance.currency, "USD")
+        self.assertEqual(balance.remaining, 21.78)
+        self.assertIsNone(balance.spent)
+
+    def test_rejects_missing_or_negative_balance(self) -> None:
+        with self.assertRaises(ProviderRequestError):
+            parse_together_balance({})
+        with self.assertRaises(ProviderRequestError):
+            parse_together_balance({"totalOngoingBalanceCents": -1})
+
+    def test_collector_uses_saved_opencode_key_and_org_id(self) -> None:
+        with (
+            patch("orchestra_cli.usage.providers.opencode_api_key") as credential_reader,
+            patch.dict("os.environ", {"TOGETHER_ORG_ID": "org / fixture"}, clear=False),
+        ):
+            credential_reader.return_value.value = "fixture-secret"
+            credential_reader.return_value.source = "OpenCode (togetherai)"
+            calls = []
+
+            def fetcher(url, headers, timeout):
+                calls.append((url, headers, timeout))
+                return {"totalOngoingBalanceCents": 1999}
+
+            result = collect_together(json_fetcher=fetcher)
+
+        credential_reader.assert_called_once_with(
+            ("togetherai",), ("TOGETHER_API_KEY",)
+        )
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.account_balance.remaining, 19.99)
+        self.assertIn("org%20%2F%20fixture", calls[0][0])
+        self.assertNotIn("fixture-secret", json.dumps(result.to_dict()))
+
+    def test_collector_explains_missing_org_id(self) -> None:
+        with (
+            patch("orchestra_cli.usage.providers.opencode_api_key") as credential_reader,
+            patch("orchestra_cli.usage.providers._environment_value", return_value=""),
+        ):
+            credential_reader.return_value.value = "fixture-secret"
+            credential_reader.return_value.source = "OpenCode (togetherai)"
+            result = collect_together()
+
+        self.assertEqual(result.status, "not_configured")
+        self.assertIn("TOGETHER_ORG_ID", result.message)
 
 
 class KimiParserTests(unittest.TestCase):

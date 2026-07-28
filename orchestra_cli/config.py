@@ -35,6 +35,10 @@ env_passthrough = []
 
 
 # --- roster ---------------------------------------------------------------
+# Each entry is a reusable launch profile, not a singleton worker. Multiple
+# independent runs may use the same profile concurrently, subject to provider
+# headroom and project concurrency/ownership limits. `orchestra discover`
+# distinguishes configured profiles from the backends/models available here.
 # backend: opencode | codex | claude
 # model:   backend-specific model id (opencode: provider/model, codex: model name)
 # ensemble = true opts an opencode agent into the optional OpenCode Ensemble
@@ -79,6 +83,10 @@ backend = "codex"
 model = "gpt-5.5"
 effort = "high"
 role = "fast engineer for medium tasks"
+# Bounded trial: JavaScript/V8 orchestration can collapse independent tool
+# calls into one model step. Keep this profile-scoped while Codex marks the
+# feature under development; do not pair it with code_mode_only yet.
+extra_args = ["--enable", "code_mode"]
 
 [agents.claude]
 backend = "claude"

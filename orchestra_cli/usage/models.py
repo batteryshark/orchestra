@@ -83,6 +83,16 @@ class RateLimitResetCredits:
 
 
 @dataclass(slots=True)
+class AccountBalance:
+    """Safe monetary account summary for prepaid API providers."""
+
+    currency: str
+    remaining: float
+    spent: float | None = None
+    spent_scope: str | None = None
+
+
+@dataclass(slots=True)
 class ProviderResult:
     id: str
     name: str
@@ -92,6 +102,7 @@ class ProviderResult:
     message: str | None = None
     source: str | None = None
     rate_limit_resets: RateLimitResetCredits | None = None
+    account_balance: AccountBalance | None = None
     fetched_at: str = field(default_factory=utc_now_iso)
 
     @property

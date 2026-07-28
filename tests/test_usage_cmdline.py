@@ -38,6 +38,28 @@ class CmdUsageResetCreditFormatTests(unittest.TestCase):
         self.assertEqual(self._format({"available_count": "zero"}), "")
 
 
+class CmdUsageAccountBalanceFormatTests(unittest.TestCase):
+    def test_balance_and_spend_render_as_money(self) -> None:
+        self.assertEqual(
+            cli._format_account_balance(
+                {
+                    "currency": "USD",
+                    "remaining": 19.99,
+                    "spent": 0.01,
+                    "spent_scope": "current period",
+                }
+            ),
+            " · $19.99 balance · $0.01 spent (current period)",
+        )
+
+    def test_invalid_or_non_usd_balance_is_omitted(self) -> None:
+        self.assertEqual(cli._format_account_balance(None), "")
+        self.assertEqual(
+            cli._format_account_balance({"currency": "EUR", "remaining": 20}),
+            "",
+        )
+
+
 class CmdUsageProviderLineRenderingTests(unittest.TestCase):
     """cmd_usage should print the reset-credit note for Codex even when
     available_count is zero, and omit it for providers that don't carry a

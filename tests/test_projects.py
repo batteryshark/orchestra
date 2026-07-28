@@ -305,6 +305,56 @@ class SingleProjectBackcompatTests(_UIBase):
         self.assertEqual(payload["root"], str(self.proj_a.resolve()))
 
 
+class RegistryOnlyStartupTests(unittest.TestCase):
+    """The system-wide UI does not require a project in its launch cwd."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self._reg = self.tmp / "projects.json"
+        self._saved_env = os.environ.get("ORCHESTRA_PROJECTS_FILE")
+        os.environ["ORCHESTRA_PROJECTS_FILE"] = str(self._reg)
+        self.project = _init_project(self.tmp / "registered")
+        self.entry = projects.register(self.project)
+        self.server = _Server(ui.make_handler(None))
+
+    def tearDown(self) -> None:
+        self.server.stop()
+        if self._saved_env is None:
+            os.environ.pop("ORCHESTRA_PROJECTS_FILE", None)
+        else:
+            os.environ["ORCHESTRA_PROJECTS_FILE"] = self._saved_env
+        self._tmp.cleanup()
+
+    def test_registry_supplies_default_without_launch_root(self) -> None:
+        status, _, body = self.server.get("/api/projects")
+        self.assertEqual(status, 200)
+        directory = json.loads(body)
+        self.assertEqual(directory["defaultProjectId"], self.entry["id"])
+
+        status, _, body = self.server.get("/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["root"], str(self.project.resolve()))
+
+    def test_empty_registry_can_be_populated_after_startup(self) -> None:
+        projects.unregister(self.entry["id"])
+
+        status, _, body = self.server.get("/api/projects")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body),
+            {"defaultProjectId": None, "projects": []},
+        )
+        status, _, body = self.server.get("/api/state")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error"], "no projects available")
+
+        entry = projects.register(self.project)
+        status, _, body = self.server.get("/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["project_id"], entry["id"])
+
+
 class PickerBoundaryTests(_UIBase):
     """The browser picker cannot accept typed paths or browse the
     filesystem — it only ever switches among allowlisted ids. This

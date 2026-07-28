@@ -31,6 +31,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 from orchestra_cli import cli, db
 from orchestra_cli.usage.models import ProviderResult, QuotaWindow
@@ -62,15 +63,18 @@ class DispatchQuotaHookTests(unittest.TestCase):
         self._orig_find_root = cli.paths.find_root
         self._orig_default = cli.default_service
         self._orig_spawn = cli._spawn_supervisor
+        self._orig_check_profiles = cli.availability.check_profiles
         self._stub = _StubService(None)
         cli.paths.find_root = lambda: self.root  # type: ignore[assignment]
         cli.default_service = lambda: self._stub  # type: ignore[assignment]
         cli._spawn_supervisor = lambda *a, **kw: None  # type: ignore[assignment]
+        cli.availability.check_profiles = lambda *_args, **_kwargs: ({}, [], [])
 
     def tearDown(self) -> None:
         cli.paths.find_root = self._orig_find_root  # type: ignore[assignment]
         cli.default_service = self._orig_default  # type: ignore[assignment]
         cli._spawn_supervisor = self._orig_spawn
+        cli.availability.check_profiles = self._orig_check_profiles
         self.tmp.cleanup()
 
     def _make_args(self, *to: str, no_quota_warn: bool = False) -> Namespace:
@@ -101,6 +105,22 @@ class DispatchQuotaHookTests(unittest.TestCase):
         self._run_dispatch(args)
         self.assertEqual(self._stub.calls, 0,
                          "no_quota_warn should skip the snapshot call")
+
+    def test_supervised_worker_must_use_brokered_spawn(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        with mock.patch.dict(
+            "os.environ",
+            {"ORCHESTRA_RUN_ID": "41", "ORCHESTRA_SELF": "codex"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(SystemExit, "orchestra spawn"):
+                self._run_dispatch(args)
+        con = db.connect(self.root)
+        try:
+            count = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(count, 0)
 
     def test_question_capability_is_default_off_and_explicitly_bounded(self) -> None:
         default_args = self._make_args("minimax", no_quota_warn=True)

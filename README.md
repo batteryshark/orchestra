@@ -32,6 +32,7 @@ git clone https://github.com/batteryshark/orchestra.git
 cd orchestra
 uv tool install --editable .
 orchestra doctor
+orchestra discover
 ```
 
 Initialize a project from its root:
@@ -125,13 +126,16 @@ orchestra takeover --checkpoint .orchestra/checkpoints/codex-...json --as claude
 
 ## One dashboard, many projects
 
-Start the UI from any initialized project:
+Start the system-wide UI from any directory:
 
 ```sh
 orchestra ui
 ```
 
-The process reads a user-level project registry on every request, so projects can be added while it is already running:
+The current directory does not need to be an Orchestra project. The process
+reads the user-level registry at `~/.config/orchestra/projects.json` on every
+request, so projects can be added while it is already running. `orchestra init`
+registers a project automatically; projects can also be managed explicitly:
 
 ```sh
 orchestra project register /path/to/another-project
@@ -178,7 +182,9 @@ to control access, as described in [SECURITY.md](SECURITY.md).
 
 ## Provider runway
 
-The dashboard's right-side runway rail keeps the current headroom for configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts visible while you work. Select a provider—or the Usage button on narrower screens—to open quota windows and refresh controls without leaving the dashboard. Existing `/runway` bookmarks open this drawer. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
+The dashboard's right-side runway rail keeps the current headroom for configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts visible while you work, and can show Together AI's prepaid USD balance when `TOGETHER_ORG_ID` is available. Select a provider—or the Usage button on narrower screens—to open quota windows and refresh controls without leaving the dashboard. Existing `/runway` bookmarks open this drawer. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
+
+Together credentials are read from OpenCode's `togetherai` connection (or `TOGETHER_API_KEY`). Its organization-level balance also requires the non-secret `TOGETHER_ORG_ID`. The balance is live account data; the adjacent spend value is deliberately labeled with the selected Orchestra project because it sums only Together-backed OpenCode costs recorded in that project's run logs.
 
 `orchestra usage` prints the same state in the terminal. Before dispatch, Orchestra can warn when a target's known coding-plan headroom is at or below 20 percent. The advisory never reroutes a run and fails open if usage is unavailable. Disable it with `quota_warn = false` or `--no-quota-warn`.
 
@@ -186,9 +192,11 @@ Claude usage refreshes from Claude Code's live `/usage` view in the background. 
 
 ## Configuration
 
-Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` to check configured backends, models, executable availability, and configured optional integrations.
+Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` for full installation health or `orchestra discover` for the live execution catalog. `orchestra discover TEXT` searches model IDs, `--json` returns the credential-free structured report, and `--refresh` asks OpenCode to refresh its model catalog.
 
-Roster entries choose a backend (`opencode`, `codex`, or `claude`), model, and optional arguments. Session references are recorded so `orchestra resume` continues the same worker context rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+Roster entries are reusable launch profiles, not singleton workers or capacity slots. Each profile chooses a backend (`opencode`, `codex`, or `claude`), model, reasoning configuration, role, and optional arguments; every dispatch creates a distinct run, so several independent runs may use the same profile concurrently. Choose a wave by task fit and current `orchestra usage` headroom rather than trying to keep exactly one of each profile active. Profiles can share a provider quota, and usage data is advisory, so routing still requires judgment about model strengths, weaknesses, risk, and project concurrency limits. Session references are recorded so `orchestra resume` continues the same worker context rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+
+Discovery separates configured intent from live evidence. It verifies that backend executables exist, checks Codex and Claude authentication, and reads OpenCode's configured provider/model catalog. Dispatch refuses profiles proven unavailable before creating a run. If a CLI does not expose a trustworthy model catalog—or a bounded probe fails—the profile is labeled `unknown` and dispatch continues with an explicit warning instead of guessing. OpenCode profiles with an explicit model are rejected when that provider/model is absent from `opencode models`.
 
 The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables the max-thinking variant for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
 
@@ -220,10 +228,14 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
 - `.orchestra/` in each project stores its SQLite run state, project configuration, and durable handoff checkpoints.
 - Supervised workers can create native child runs with `orchestra spawn --to AGENT "mission"`.
   Child ownership is distinct from backend session follow-ups, works across OpenCode, Codex,
-  and Claude runners, and is shown hierarchically in the dashboard. Children use isolated git
-  worktrees by default; Orchestra reports their branches and never auto-merges them. Defaults
-  are deliberately bounded by `settings.child_max_depth`, `child_max_per_run`, and
-  `child_max_active` (1, 3, and 3). Stopping a lead cascades to its active descendants.
+  and Claude runners, and is shown hierarchically in the dashboard. Spawn requests are brokered
+  by the lead's outer supervisor, so worktree creation and child CLI startup do not inherit the
+  lead worker's backend sandbox. Children use isolated git worktrees by default; Orchestra
+  reports their branches and never auto-merges them. A settled batch safely interrupts an active
+  lead at an action boundary or resumes a completed lead exactly once. Defaults are deliberately
+  bounded by `settings.child_max_depth`, `child_max_per_run`, and `child_max_active` (1, 3, and
+  3). Stopping a lead cascades to its active descendants. Supervised workers cannot call
+  top-level `orchestra dispatch`; they must use `orchestra spawn`.
 - The user-level registry stores project identifiers and roots for the shared UI.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.

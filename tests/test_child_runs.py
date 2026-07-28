@@ -19,14 +19,16 @@ def _project() -> tuple[tempfile.TemporaryDirectory, Path]:
 
 def _run(root: Path, *, agent: str = "codex", status: str = "running",
          lead_run: int | None = None, depth: int = 0,
-         session_ref: str | None = None, pid: int | None = None) -> int:
+         session_ref: str | None = None, pid: int | None = None,
+         spawn_request_id: int | None = None) -> int:
     con = db.connect(root)
     try:
         cur = con.execute(
             "INSERT INTO runs(agent,backend,model,title,requested_by,workdir,status,"
-            "lead_run,child_depth,session_ref,pid,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "lead_run,spawn_request_id,child_depth,session_ref,pid,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (agent, "codex", "test", "test", "orchestrator", str(root), status,
-             lead_run, depth, session_ref, pid, db.now()),
+             lead_run, spawn_request_id, depth, session_ref, pid, db.now()),
         )
         con.commit()
         return int(cur.lastrowid)
@@ -179,6 +181,99 @@ class ChildWakeupTests(unittest.TestCase):
         self.assertEqual(row["parent_run"], child)
         self.assertEqual(row["lead_run"], lead)
         self.assertEqual(row["child_depth"], 1)
+
+
+class SpawnBrokerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp, self.root = _project()
+        self.cfg = config.load(self.root)
+        self.lead = _run(self.root, session_ref="lead-session")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_outer_supervisor_claims_request_and_launches_children(self) -> None:
+        con = db.connect(self.root)
+        launched: list[tuple[Path, int]] = []
+        try:
+            parent = con.execute("SELECT * FROM runs WHERE id=?", (self.lead,)).fetchone()
+            request_id = child_runs.enqueue(
+                con, parent, ["minimax"], "inspect one bounded area",
+                shared_workdir=True,
+            )
+
+            results = child_runs.process_pending(
+                con, self.root, self.cfg, self.lead,
+                lambda root, run_id: launched.append((root, run_id)),
+            )
+
+            request = con.execute(
+                "SELECT * FROM spawn_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            child = con.execute(
+                "SELECT * FROM runs WHERE spawn_request_id=?", (request_id,)
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(results[0]["status"], "accepted")
+        self.assertEqual(request["status"], "accepted")
+        self.assertEqual(child["lead_run"], self.lead)
+        self.assertEqual(child["spawn_request_id"], request_id)
+        self.assertEqual(launched, [(self.root, child["id"])])
+
+    def test_broker_failure_does_not_fail_the_lead(self) -> None:
+        self.cfg["settings"]["child_max_per_run"] = 0
+        con = db.connect(self.root)
+        try:
+            parent = con.execute("SELECT * FROM runs WHERE id=?", (self.lead,)).fetchone()
+            request_id = child_runs.enqueue(con, parent, ["minimax"], "too many")
+
+            results = child_runs.process_pending(
+                con, self.root, self.cfg, self.lead,
+                lambda _root, _run_id: None,
+            )
+
+            request = con.execute(
+                "SELECT * FROM spawn_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            lead = con.execute("SELECT status FROM runs WHERE id=?", (self.lead,)).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertIn("child count limit", request["error"])
+        self.assertEqual(lead["status"], "running")
+
+    def test_settled_batch_interrupts_active_lead_exactly_once(self) -> None:
+        con = db.connect(self.root)
+        try:
+            parent = con.execute("SELECT * FROM runs WHERE id=?", (self.lead,)).fetchone()
+            request_id = child_runs.enqueue(con, parent, ["minimax"], "inspect")
+            con.execute(
+                "UPDATE spawn_requests SET status='accepted', child_run_ids_json='[2]', "
+                "processed_at=? WHERE id=?",
+                (db.now(), request_id),
+            )
+            con.commit()
+            child = _run(
+                self.root, agent="minimax", status="done", lead_run=self.lead,
+                depth=1, spawn_request_id=request_id,
+            )
+
+            self.assertIsNone(child_runs.maybe_wake_lead(con, self.root, child))
+            self.assertIsNone(child_runs.maybe_wake_lead(con, self.root, child))
+            request = con.execute(
+                "SELECT * FROM spawn_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            messages = list(con.execute(
+                "SELECT * FROM messages WHERE run_id=? AND kind='interrupt'",
+                (self.lead,),
+            ))
+        finally:
+            con.close()
+        self.assertIsNotNone(request["notified_at"])
+        self.assertEqual(request["wakeup_message"], messages[0]["id"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("All child runs", messages[0]["body"])
 
 
 class SupervisorChildEnvironmentTests(unittest.TestCase):

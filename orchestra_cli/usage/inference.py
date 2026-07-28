@@ -3,7 +3,7 @@
 Inference uses the actual coding-plan prefixes recorded by OpenCode:
 ``minimax-coding-plan`` / ``minimax-cn-coding-plan`` map to ``minimax``;
 ``kimi-for-coding`` maps to ``kimi``; ``zhipuai-coding-plan`` /
-``zai-coding-plan`` map to ``zai``. Backend matches
+``zai-coding-plan`` map to ``zai``; ``togetherai`` maps to ``together``. Backend matches
 for Claude (``claude``) and Codex (``codex``). Anything else returns ``None``
 (unknown), which the dispatcher treats as fail-open.
 """
@@ -14,12 +14,10 @@ from typing import Mapping
 
 def infer_provider(backend: str | None, model: str | None) -> str | None:
     """Return the provider id used by the usage collectors, or ``None`` when
-    the backend/model pair is not one of the four supported coding plans.
+    the backend/model pair is not one of the supported quota or prepaid providers.
 
-    Only real coding-plan prefixes are matched. Bare ``glm-*`` or ``claude-*``
-    model ids from non-coding providers are intentionally NOT matched — those
-    are normal Anthropic / Zhipu AI endpoints, not the quota'd coding plans
-    tracked here.
+    Only explicit provider prefixes are matched. Bare ``glm-*`` or ``claude-*``
+    model ids from unrelated providers are intentionally not inferred.
     """
     backend = (backend or "").lower()
     model = (model or "").lower()
@@ -36,6 +34,8 @@ def infer_provider(backend: str | None, model: str | None) -> str | None:
         return "kimi"
     if model.startswith(("zhipuai-coding-plan/", "zai-coding-plan/")):
         return "zai"
+    if model.startswith("togetherai/"):
+        return "together"
     return None
 
 

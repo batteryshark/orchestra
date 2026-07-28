@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from orchestra_cli import cli, db
 
@@ -52,6 +54,20 @@ class SendFileTests(unittest.TestCase):
         finally:
             con.close()
 
+    def _insert_active_run(self, *, agent: str, slug: str) -> int:
+        con = db.connect(self.root)
+        try:
+            cur = con.execute(
+                "INSERT INTO runs(agent, backend, title, requested_by, workdir, slug, "
+                "status, started_at) VALUES(?, 'opencode', 'task', 'codex', ?, ?, "
+                "'running', ?)",
+                (agent, str(self.root), slug, db.now()),
+            )
+            con.commit()
+            return int(cur.lastrowid)
+        finally:
+            con.close()
+
     def test_file_sends_complete_large_utf8_message(self) -> None:
         body = ("Investigation finding: café\n" * 600) + "final conclusion\n"
         self.assertGreater(len(body.encode("utf-8")), 10_000)
@@ -77,6 +93,161 @@ class SendFileTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
         self.assertEqual(self._messages()[0]["body"], "inline handoff")
+
+    def test_supervised_run_identity_and_run_id_are_inferred(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": "323"},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(
+                ["send", "codex", "HANDOFF run 323: done"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("sent glm -> codex", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["sender"], "glm")
+        self.assertEqual(message["run_id"], 323)
+
+    def test_implicit_worker_inbox_only_reads_its_run(self) -> None:
+        con = db.connect(self.root)
+        try:
+            con.executemany(
+                "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+                "VALUES('codex', 'glm', ?, ?, ?)",
+                [
+                    ("interrupt for chilly_ferret", 323, db.now()),
+                    ("interrupt for eager_badger", 324, db.now()),
+                ],
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": "323"},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(
+                ["inbox", "--unread", "--mark-read"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("interrupt for chilly_ferret", stdout)
+        self.assertNotIn("interrupt for eager_badger", stdout)
+        messages = self._messages()
+        self.assertIsNotNone(messages[0]["read_at"])
+        self.assertIsNone(messages[1]["read_at"])
+
+    def test_explicit_profile_inbox_remains_profile_wide(self) -> None:
+        con = db.connect(self.root)
+        try:
+            con.executemany(
+                "INSERT INTO messages(sender, recipient, body, run_id, created_at) "
+                "VALUES('codex', 'glm', ?, ?, ?)",
+                [("run 323", 323, db.now()), ("run 324", 324, db.now())],
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": "323"},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(["inbox", "glm", "--unread"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("run 323", stdout)
+        self.assertIn("run 324", stdout)
+
+    def test_operator_send_auto_targets_only_active_profile_run(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        code, _, stderr = self._run_main(["send", "glm", "please check this"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(self._messages()[0]["run_id"], run_id)
+
+    def test_operator_send_rejects_ambiguous_active_profile(self) -> None:
+        first = self._insert_active_run(agent="glm", slug="chilly_ferret")
+        second = self._insert_active_run(agent="glm", slug="eager_badger")
+
+        code, _, stderr = self._run_main(["send", "glm", "please check this"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("ambiguous across active runs", stderr)
+        self.assertIn(f"{first} (chilly_ferret)", stderr)
+        self.assertIn(f"{second} (eager_badger)", stderr)
+        self.assertIn("orchestra interrupt RUN", stderr)
+        self.assertEqual(self._messages(), [])
+
+    def test_worker_report_derives_route_from_supervised_run(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(["report", "tests", "are", "passing"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"report sent for run {run_id} -> codex", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["sender"], "glm")
+        self.assertEqual(message["recipient"], "codex")
+        self.assertEqual(message["run_id"], run_id)
+        self.assertEqual(message["body"], f"REPORT run {run_id}: tests are passing")
+
+    def test_worker_handoff_derives_route_and_canonical_prefix(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(["handoff", "implemented", "and", "verified"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"handoff sent for run {run_id} -> codex", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["sender"], "glm")
+        self.assertEqual(message["recipient"], "codex")
+        self.assertEqual(message["run_id"], run_id)
+        self.assertEqual(message["body"], f"HANDOFF run {run_id}: implemented and verified")
+
+    def test_worker_handoff_rejects_identity_mismatch(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "minimax", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, _, stderr = self._run_main(["handoff", "not", "my", "run"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("supervised identity mismatch", stderr)
+        self.assertEqual(self._messages(), [])
+
+    def test_worker_handoff_requires_supervisor_environment(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            code, _, stderr = self._run_main(["handoff", "done"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("worker-only", stderr)
+        self.assertEqual(self._messages(), [])
 
     def test_inline_body_and_file_are_mutually_exclusive(self) -> None:
         source = self.root / "handoff.md"
