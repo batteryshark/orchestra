@@ -3,7 +3,8 @@
 Project databases remain authoritative for project-local runs and messages.
 This database is user-level state: it records immutable contract versions,
 hash-bound approvals, project bindings at draft time, and an append-only audit
-trail.  It does not yet claim that a controller is active.
+trail. Runtime operation state is layered onto the same private database by
+``operator_runtime`` and remains separate from project-local run databases.
 """
 from __future__ import annotations
 

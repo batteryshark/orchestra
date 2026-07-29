@@ -21,7 +21,11 @@ from orchestra_cli import (
     ensemble,
     host,
     names,
+    operator_controller,
     operator_contract,
+    operator_replay,
+    operator_roster,
+    operator_runtime,
     operator_store,
     paths,
     projects,
@@ -1509,11 +1513,7 @@ def _write_new_private_file(path: Path, payload: bytes) -> None:
 
 
 def cmd_operator(args):
-    """Design and approve immutable Operator authority contracts.
-
-    This surface intentionally stops at approval.  It never labels a contract
-    active until a durable controller exists to hold a lease and reconcile it.
-    """
+    """Manage Operator contracts, policy, operations, and replay."""
     try:
         if args.operator_cmd == "template":
             _require_registered_project_ids(args.project)
@@ -1632,14 +1632,239 @@ def cmd_operator(args):
                 sys.stdout.write(payload.decode("utf-8"))
             return
 
+        if args.operator_cmd == "roster":
+            if args.roster_cmd == "bootstrap":
+                root = paths.find_root()
+                policy = operator_roster.bootstrap_policy(config.load(root))
+                version, created = operator_roster.save_policy(
+                    policy, source=f"bootstrap:{root}"
+                )
+                if args.output:
+                    _write_new_private_file(
+                        Path(args.output).expanduser(),
+                        (json.dumps(policy.data, indent=2) + "\n").encode(),
+                    )
+                print(
+                    f"{'created' if created else 'already stored'} roster policy "
+                    f"v{version} sha256:{policy.sha256}"
+                )
+                print(
+                    "  review inferred tiers, capabilities, contraindications, and "
+                    "shared quota pools before approval"
+                )
+                return
+            if args.roster_cmd == "draft":
+                policy = operator_roster.parse_policy(
+                    Path(args.file).expanduser().read_text(encoding="utf-8"),
+                    source=args.file,
+                )
+                version, created = operator_roster.save_policy(
+                    policy, source=f"file:{args.file}"
+                )
+                print(
+                    f"{'created' if created else 'already stored'} roster policy "
+                    f"v{version} sha256:{policy.sha256}"
+                )
+                return
+            if args.roster_cmd == "approve":
+                created = operator_roster.approve_policy(
+                    version=args.version,
+                    sha256=args.hash,
+                    approved_by=args.by,
+                )
+                print(f"{'approved' if created else 'already approved'} roster policy v{args.version}")
+                return
+            if args.roster_cmd == "show":
+                version, policy = operator_roster.latest_policy(
+                    require_approved=not args.include_draft
+                )
+                if args.json:
+                    print(json.dumps(
+                        {"version": version, "sha256": policy.sha256, **policy.data},
+                        indent=2,
+                    ))
+                else:
+                    print(f"roster policy v{version} sha256:{policy.sha256}")
+                    for profile in policy.data["profiles"]:
+                        print(
+                            f"  {profile['name']:<14} {profile['tier']:<10} "
+                            f"{profile['backend']}/{profile['model'] or 'default'} "
+                            f"{'enabled' if profile['enabled'] else 'disabled'}"
+                        )
+                return
+
+        if args.operator_cmd == "start":
+            operator_roster.latest_policy()
+            operation = operator_runtime.start_operation(
+                args.identifier,
+                mode=args.mode,
+                priority=args.priority,
+                registered_projects=_registered_operator_projects(),
+            )
+            print(
+                f"started {operation['id']} in {operation['mode']} mode "
+                f"with {len(operation['goals'])} goal(s)"
+            )
+            if not args.no_background:
+                pid = _spawn_operator_controller(operation["id"])
+                operator_runtime.set_controller_pid(operation["id"], pid)
+                print(f"  controller pid {pid}")
+            return
+
+        if args.operator_cmd == "tick":
+            result = operator_controller.tick(args.identifier)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+
+        if args.operator_cmd == "run":
+            operator_controller.run(args.identifier)
+            return
+
+        if args.operator_cmd in {"pause", "resume", "stop"}:
+            target_state = {
+                "pause": "paused",
+                "resume": "active",
+                "stop": "stopped",
+            }[args.operator_cmd]
+            current = operator_runtime.get_operation(args.identifier)
+            updated = operator_runtime.set_operation_state(
+                current["id"], target_state, reason=args.reason
+            )
+            if args.operator_cmd in {"pause", "stop"} and current["controller_pid"]:
+                _stop_operator_controller(int(current["controller_pid"]))
+            if args.operator_cmd == "resume" and not args.no_background:
+                pid = _spawn_operator_controller(updated["id"])
+                operator_runtime.set_controller_pid(updated["id"], pid)
+            print(f"{updated['id']}: {target_state}")
+            return
+
+        if args.operator_cmd == "operations":
+            rows = operator_runtime.list_operations()
+            if args.json:
+                print(json.dumps(rows, indent=2, sort_keys=True))
+            elif not rows:
+                print("(no operations)")
+            else:
+                for row in rows:
+                    print(
+                        f"{row['id']}  {row['mode']:<6} {row['state']:<14} "
+                        f"goals={sum(g['state'] == 'accepted' for g in row['goals'])}/"
+                        f"{len(row['goals'])} decisions={row['open_decisions']}"
+                    )
+            return
+
+        if args.operator_cmd == "status":
+            operation = operator_runtime.get_operation(args.identifier)
+            payload = {
+                **operation,
+                "work": operator_runtime.work_items(operation["id"]),
+                "decisions": operator_runtime.decisions(operation["id"], state="open"),
+                "actions": operator_runtime.pending_actions(operation["id"]),
+                "resources": operator_runtime.resource_leases(operation["id"]),
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(
+                    f"{operation['id']}  {operation['mode']} / {operation['state']}  "
+                    f"controller={operation['controller_pid'] or 'stopped'}"
+                )
+                print(
+                    "  work: "
+                    + (", ".join(
+                        f"{key}={value}" for key, value in sorted(
+                            operation["work_counts"].items()
+                        )
+                    ) or "none")
+                )
+                print(f"  open decisions: {operation['open_decisions']}")
+                for goal in operation["goals"]:
+                    print(f"  {goal['id']}: {goal['state']} — {goal['outcome']}")
+            return
+
+        if args.operator_cmd == "decisions":
+            rows = operator_runtime.decisions(
+                args.identifier, state=None if args.all else "open"
+            )
+            print(json.dumps(rows, indent=2, sort_keys=True))
+            return
+
+        if args.operator_cmd == "answer":
+            operator_runtime.answer_decision(
+                args.decision_id, answer=args.answer, answered_by=args.by
+            )
+            print(f"{args.decision_id}: answered")
+            return
+
+        if args.operator_cmd == "replay":
+            if args.replay_cmd == "import-archive":
+                row = operator_replay.import_archive(
+                    Path(args.archive), member=args.member, label=args.label
+                )
+                print(json.dumps(row, indent=2, sort_keys=True))
+                return
+            if args.replay_cmd == "import-live":
+                source = Path(args.database).expanduser()
+                row = (
+                    operator_replay.import_project(source)
+                    if source.is_dir()
+                    else operator_replay.import_live_database(source, label=args.label)
+                )
+                print(json.dumps(row, indent=2, sort_keys=True))
+                return
+            if args.replay_cmd == "list":
+                print(json.dumps(operator_replay.list_sources(), indent=2, sort_keys=True))
+                return
+            if args.replay_cmd == "show":
+                print(json.dumps(
+                    operator_replay.replay_state(args.source_id, at=args.at),
+                    indent=2,
+                    sort_keys=True,
+                ))
+                return
+
         raise operator_store.OperatorStoreError(
             f"unsupported operator command {args.operator_cmd!r}"
         )
     except (
         operator_contract.ContractError,
         operator_store.OperatorStoreError,
+        operator_runtime.RuntimeError,
+        operator_roster.RosterError,
+        operator_replay.ReplayError,
+        operator_controller.ControllerError,
     ) as exc:
         raise SystemExit(f"orchestra: {exc}") from exc
+
+
+def _spawn_operator_controller(operation_id: str) -> int:
+    command = [sys.executable, "-m", "orchestra_cli", "_operator_control", operation_id]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return int(process.pid)
+
+
+def _stop_operator_controller(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+
+
+def cmd_operator_control(args):
+    operator_controller.run(args.operation_id)
 
 
 def cmd_supervise(args):
@@ -1915,6 +2140,76 @@ def main():
         "--output",
         help="write a new owner-private file instead of stdout (never overwrites)",
     )
+
+    op_roster = ops.add_parser(
+        "roster", help="manage the versioned owner-approved model roster and quota pools"
+    )
+    op_rosters = op_roster.add_subparsers(dest="roster_cmd", required=True)
+    roster_bootstrap = op_rosters.add_parser(
+        "bootstrap", help="infer a reviewable policy draft from current launch profiles"
+    )
+    roster_bootstrap.add_argument("--output")
+    roster_draft = op_rosters.add_parser("draft", help="store a reviewed roster policy")
+    roster_draft.add_argument("file")
+    roster_approve = op_rosters.add_parser("approve", help="approve the latest policy by hash")
+    roster_approve.add_argument("--version", type=int, required=True)
+    roster_approve.add_argument("--hash", required=True)
+    roster_approve.add_argument("--by", default="owner")
+    roster_show = op_rosters.add_parser("show")
+    roster_show.add_argument("--include-draft", action="store_true")
+    roster_show.add_argument("--json", action="store_true")
+
+    op_start = ops.add_parser(
+        "start", help="activate an approved contract and start its durable controller"
+    )
+    op_start.add_argument("identifier", help="Operator id or name")
+    op_start.add_argument("--mode", choices=["shadow", "live"], default="shadow")
+    op_start.add_argument("--priority", type=int, default=50)
+    op_start.add_argument(
+        "--no-background", action="store_true", help="create state without starting a controller"
+    )
+
+    op_tick = ops.add_parser("tick", help="run one lease-held reconciliation attempt")
+    op_tick.add_argument("identifier", help="operation, Operator id, or Operator name")
+    op_run = ops.add_parser("run", help="run the controller in the foreground until terminal")
+    op_run.add_argument("identifier", help="operation, Operator id, or Operator name")
+    for command in ("pause", "resume", "stop"):
+        control = ops.add_parser(command, help=f"{command} an operation")
+        control.add_argument("identifier")
+        control.add_argument("--reason", default=f"owner requested {command}")
+        if command == "resume":
+            control.add_argument("--no-background", action="store_true")
+
+    op_operations = ops.add_parser("operations", help="list current and historical operations")
+    op_operations.add_argument("--json", action="store_true")
+    op_status = ops.add_parser("status", help="show goals, work, decisions, and controller state")
+    op_status.add_argument("identifier")
+    op_status.add_argument("--json", action="store_true")
+    op_decisions = ops.add_parser("decisions", help="list owner decisions")
+    op_decisions.add_argument("identifier")
+    op_decisions.add_argument("--all", action="store_true")
+    op_answer = ops.add_parser("answer", help="answer an escalated Operator decision")
+    op_answer.add_argument("decision_id")
+    op_answer.add_argument("answer")
+    op_answer.add_argument("--by", default="owner")
+
+    op_replay = ops.add_parser("replay", help="import and inspect historical run evidence")
+    op_replays = op_replay.add_subparsers(dest="replay_cmd", required=True)
+    replay_archive = op_replays.add_parser(
+        "import-archive", help="import only the Orchestra database from a ZIP"
+    )
+    replay_archive.add_argument("archive")
+    replay_archive.add_argument("--member", default=".orchestra/orchestra.db")
+    replay_archive.add_argument("--label")
+    replay_live = op_replays.add_parser(
+        "import-live", help="read a live project database without mutating it"
+    )
+    replay_live.add_argument("database", help="project root or orchestra.db")
+    replay_live.add_argument("--label")
+    op_replays.add_parser("list")
+    replay_show = op_replays.add_parser("show")
+    replay_show.add_argument("source_id")
+    replay_show.add_argument("--at", help="UTC replay clock bound")
     s.set_defaults(fn=cmd_operator)
 
     s = sub.add_parser("queue", help="queue a follow-up for a running worker; auto-delivered "
@@ -2006,6 +2301,10 @@ def main():
     s.add_argument("run_id", type=int)
     s.add_argument("--root", required=True)
     s.set_defaults(fn=cmd_supervise)
+
+    s = sub.add_parser("_operator_control")
+    s.add_argument("operation_id")
+    s.set_defaults(fn=cmd_operator_control)
 
     args = p.parse_args()
     args.fn(args)

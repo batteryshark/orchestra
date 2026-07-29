@@ -100,6 +100,11 @@ def _redact(text: str | None) -> str | None:
     return out
 
 
+def redact_sensitive_text(text: str | None) -> str | None:
+    """Public credential redaction shared by durable control-plane state."""
+    return _redact(text)
+
+
 def _truncate(s, limit: int) -> str | None:
     if not isinstance(s, str):
         return s

@@ -1,6 +1,6 @@
 # Orchestra Operator
 
-Status: design draft
+Status: implemented v1 contract and controller
 
 Audience: Orchestra maintainers and early operators
 
@@ -1414,16 +1414,14 @@ The design reuses current primitives:
 | Dashboard and iOS app | Status and decision surfaces |
 | Slash-work integration | Durable user-facing work tracker |
 
-These are inputs, not yet a scheduler. Current discovery primarily answers
-whether a configured backend/model appears launchable. Current runway
-recommendation prefers provider headroom, and dispatch treats low quota as a
-warning rather than reserving capacity or selecting a different qualified
-profile. Provider inference may also group profiles more coarsely than their
-real subscription allowances. The implementation should replace that
-decision boundary instead of layering more weights onto the existing
-largest-headroom recommendation.
+The Operator implementation turns these inputs into a scheduler. Ordinary
+manual dispatch remains warn-only for compatibility, while Operator dispatch
+uses an approved structured roster, hard eligibility filters, live launch
+evidence, durable shared-pool reservations, heavy-tier reserves, manual-run
+load, health state, and a recorded fallback chain. Unknown capacity is treated
+conservatively rather than promoted to headroom.
 
-New core components are:
+Implemented core components are:
 
 - Operator control database and schema;
 - contract designer, validator, and versioner;
@@ -1440,6 +1438,38 @@ New core components are:
 - resource measurement, leases, and worktree garbage collection;
 - decision and digest APIs;
 - historical replay harness.
+
+### 14.1 Implemented control surfaces
+
+The `orchestra operator` CLI is the canonical owner surface:
+
+- `template`, `validate`, `draft`, `approve`, and `export` manage immutable,
+  hash-bound contracts;
+- `roster bootstrap|draft|approve|show` manages model qualifications,
+  contraindications, shared quota pools, and owner approval;
+- `start --mode shadow|live`, `tick`, `run`, `pause`, `resume`, and `stop`
+  manage durable operation lifecycles;
+- `operations`, `status`, `decisions`, and `answer` provide concise progress
+  and escalation handling;
+- `replay import-archive|import-live|list|show` imports metadata-only evidence
+  and reconstructs deterministic historical state at a UTC clock bound.
+
+The shared dashboard exposes the same owner data through
+`GET /api/operators`, `GET /api/operators/{id}`, and a JSON-only
+`POST /api/operator-decisions/{id}/answer`. These endpoints intentionally do
+not expose provider credentials, raw historical transcripts, or arbitrary
+filesystem selection.
+
+Live activation requires at least one required, direct, bounded verification
+command for every project. Shell and environment launchers are rejected.
+Verification runs in its own process group, output is bounded and redacted,
+and timeouts terminate the group. Integration is serialized by a renewable
+project lease. Worktree cleanup is a separate authority-checked action and
+requires a clean tree plus Git ancestry proof that no unique state remains.
+
+The PIU evidence corpus is a standing replay fixture: the preservation ZIP
+imports as 508 runs, 2,075 messages, and 743 feed events, while consistent
+read-only snapshots of the six current project databases import 117 runs.
 
 ## 15. Failure behavior
 

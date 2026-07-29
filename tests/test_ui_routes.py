@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -16,7 +17,14 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from orchestra_cli import db, ui
+from orchestra_cli import (
+    db,
+    operator_contract,
+    operator_runtime,
+    operator_store,
+    projects,
+    ui,
+)
 from orchestra_cli.usage.models import ProviderResult, QuotaWindow
 from orchestra_cli.usage.service import UsageService
 
@@ -54,6 +62,53 @@ class RouteTests(unittest.TestCase):
         cls.root = Path(cls.tmp.name)
         (cls.root / ".orchestra").mkdir(parents=True, exist_ok=True)
         db.connect(cls.root).close()
+        cls._saved_operator_db = os.environ.get("ORCHESTRA_OPERATOR_DB")
+        os.environ["ORCHESTRA_OPERATOR_DB"] = str(cls.root / "operator.db")
+        project_id = projects.project_id(cls.root)
+        contract = operator_contract.validate_contract(
+            operator_contract.template(
+                name="Dashboard operator",
+                goal="Show durable progress",
+                project_ids=[project_id],
+                gates=["status is visible"],
+            )
+        )
+        draft = operator_store.save_draft(
+            contract,
+            [{
+                "id": project_id,
+                "name": "dashboard",
+                "root": str(cls.root),
+                "available": True,
+            }],
+        )
+        operator_store.approve(
+            draft.operator_id,
+            version=draft.version,
+            sha256=draft.sha256,
+            approved_by="owner",
+        )
+        cls.operation = operator_runtime.start_operation(
+            draft.operator_id,
+            mode="shadow",
+            priority=50,
+            registered_projects=[{
+                "id": project_id,
+                "name": "dashboard",
+                "root": str(cls.root),
+                "available": True,
+            }],
+        )
+        cls.decision_id = operator_runtime.create_decision(
+            cls.operation["id"],
+            idempotency_key="dashboard-test",
+            question="Continue?",
+            why_now="test",
+            options=[{"id": "yes", "label": "Yes"}],
+            recommendation="yes",
+            evidence={},
+            blocking_scope={},
+        )
 
         cls._stub = _Stubbed()
         cls._real_default = ui.default_service
@@ -71,6 +126,10 @@ class RouteTests(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join(timeout=2)
         ui.default_service = cls._real_default  # type: ignore[assignment]
+        if cls._saved_operator_db is None:
+            os.environ.pop("ORCHESTRA_OPERATOR_DB", None)
+        else:
+            os.environ["ORCHESTRA_OPERATOR_DB"] = cls._saved_operator_db
         cls.tmp.cleanup()
 
     def get(self, path: str) -> tuple[int, dict[str, str], str]:
@@ -82,12 +141,45 @@ class RouteTests(unittest.TestCase):
         conn.close()
         return resp.status, headers, body
 
+    def post(self, path: str, payload: dict) -> tuple[int, dict]:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=4)
+        body = json.dumps(payload)
+        conn.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        decoded = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        return resp.status, decoded
+
     def test_runway_bookmark_redirects_to_dashboard_drawer(self) -> None:
         status, headers, body = self.get("/runway")
         self.assertEqual(status, 302)
         self.assertEqual(headers.get("location"), "/?runway=open")
         self.assertEqual(headers.get("cache-control"), "no-store")
         self.assertEqual(body, "")
+
+    def test_operator_status_and_decision_endpoints(self) -> None:
+        status, headers, body = self.get("/api/operators")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("cache-control"), "no-store")
+        listing = json.loads(body)
+        self.assertEqual(listing["operations"][0]["id"], self.operation["id"])
+
+        status, _, body = self.get(f"/api/operators/{self.operation['id']}")
+        self.assertEqual(status, 200)
+        detail = json.loads(body)
+        self.assertEqual(detail["open_decisions"], 1)
+
+        status, payload = self.post(
+            f"/api/operator-decisions/{self.decision_id}/answer",
+            {"answer": "yes", "by": "dashboard-owner"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"], "answered")
 
     def test_old_runway_assets_are_not_served(self) -> None:
         status, _headers, body = self.get("/runway-assets/styles.css")

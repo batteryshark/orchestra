@@ -128,8 +128,33 @@ references, unbounded resource settings, quality-tier downgrades, and attempts
 to delegate non-negotiable actions such as history rewrites or deletion of
 unique work. Drafts and approvals are immutable; amendments create a new
 version and return the Operator to `awaiting_approval`. Approval is deliberately
-not activation: this slice never reports an operation as active because the
-durable reconciliation controller has not been implemented yet.
+not activation. An operation starts only when its contract and roster policy
+are both owner-approved:
+
+```sh
+# Infer the current roster, review the file, then approve its exact hash.
+orchestra operator roster bootstrap --output roster-policy.json
+orchestra operator roster draft roster-policy.json
+orchestra operator roster approve --version 1 --hash SHA256
+
+# Shadow records routes and proposed actions without dispatching.
+orchestra operator start OPERATOR_ID --mode shadow
+orchestra operator status OPERATION_ID
+
+# Live requires a direct bounded verifier for every project.
+orchestra operator start OPERATOR_ID --mode live
+orchestra operator decisions OPERATION_ID
+orchestra operator answer DECISION_ID approve
+orchestra operator pause OPERATION_ID
+orchestra operator resume OPERATION_ID
+```
+
+The background controller is lease-held and restartable. It filters and ranks
+qualified profiles, accounts for shared quotas and manual active runs,
+dispatches isolated branches, enforces change budgets, verifies and
+independently reviews results, integrates only after gates, and reclaims only
+clean worktrees whose unique state is proven integrated. Shadow and live use
+the same reconciliation path; shadow stops at durable action proposals.
 
 The canonical contract bytes, project binding snapshot, approval, and audit
 events live in the owner-private user control plane at
@@ -285,7 +310,10 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
 - The user-level registry stores project identifiers and roots for the shared UI.
 - The owner-private user-level Operator database stores immutable authority
   contracts, project snapshots, hash-bound approvals, and audit events. It does
-  not contain provider credentials or project-local run state.
+  not contain provider credentials or project-local run state. It also stores
+  goals, work state, decisions, controller and resource leases, capacity
+  reservations, routing explanations, recovery councils, action intents,
+  observations, and replay metadata.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.
 

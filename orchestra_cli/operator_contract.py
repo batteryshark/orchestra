@@ -90,6 +90,9 @@ _SECRET_KEYS = {
 _GOAL_ID = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 _PROJECT_ID = re.compile(r"^[0-9a-f]{16}$")
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_SHELL_EXECUTABLES = {
+    "bash", "cmd", "dash", "env", "fish", "powershell", "pwsh", "sh", "zsh",
+}
 
 
 class ContractError(ValueError):
@@ -230,6 +233,7 @@ def template(
         "authority": dict(DEFAULT_AUTHORITY),
         "quality": {
             "gates": list(gates),
+            "verification": [],
             "independent_review": [
                 "architecture, acceptance-methodology, and release changes"
             ],
@@ -487,6 +491,21 @@ class _Validator:
         self._escalation(root.get("escalation"))
         self._reporting(root.get("reporting"))
         self._completion(root.get("completion"))
+        scope = root.get("scope")
+        quality = root.get("quality")
+        if isinstance(scope, dict) and isinstance(quality, dict):
+            scoped = set(scope.get("projects") or [])
+            verification = quality.get("verification")
+            if isinstance(verification, list):
+                for index, item in enumerate(verification):
+                    if (
+                        isinstance(item, dict)
+                        and item.get("project_id") not in scoped
+                    ):
+                        self.error(
+                            f"$.quality.verification[{index}].project_id",
+                            "must reference a project in $.scope.projects",
+                        )
 
     def _secret_keys(self, value: Any, path: str) -> None:
         if isinstance(value, dict):
@@ -589,9 +608,82 @@ class _Validator:
         data = self.obj(
             value,
             "$.quality",
-            {"gates", "independent_review", "change_discipline", "change_budget"},
+            {
+                "gates",
+                "verification",
+                "independent_review",
+                "change_discipline",
+                "change_budget",
+            },
         )
         self.text_list(data.get("gates"), "$.quality.gates", minimum=1)
+        verification = data.get("verification")
+        if not isinstance(verification, list):
+            self.error("$.quality.verification", "must be an array")
+            verification = []
+        elif len(verification) > MAX_LIST_ITEMS:
+            self.error(
+                "$.quality.verification",
+                f"must contain at most {MAX_LIST_ITEMS} items",
+            )
+        seen_verification: set[tuple[str, str]] = set()
+        for index, raw in enumerate(verification[: MAX_LIST_ITEMS + 1]):
+            path = f"$.quality.verification[{index}]"
+            item = self.obj(
+                raw,
+                path,
+                {
+                    "name",
+                    "project_id",
+                    "argv",
+                    "timeout_seconds",
+                    "required",
+                    "phase",
+                },
+            )
+            name = self.text(item.get("name"), f"{path}.name", max_chars=160)
+            project_id = self.text(
+                item.get("project_id"),
+                f"{path}.project_id",
+                max_chars=64,
+            )
+            if project_id is not None and not _PROJECT_ID.fullmatch(project_id):
+                self.error(
+                    f"{path}.project_id",
+                    "must be a 16-character lowercase hex registered project id",
+                )
+            argv = self.text_list(
+                item.get("argv"),
+                f"{path}.argv",
+                minimum=1,
+                max_chars=4096,
+            )
+            if argv and Path(argv[0]).is_absolute():
+                self.error(
+                    f"{path}.argv[0]",
+                    "must be a PATH-resolved command, not an absolute executable",
+                )
+            if argv and Path(argv[0]).name.casefold() in _SHELL_EXECUTABLES:
+                self.error(
+                    f"{path}.argv[0]",
+                    "must invoke a verifier directly; shell and env launchers are forbidden",
+                )
+            self.integer(
+                item.get("timeout_seconds"),
+                f"{path}.timeout_seconds",
+                minimum=1,
+                maximum=86_400,
+            )
+            self.boolean(item.get("required"), f"{path}.required")
+            self.choice(
+                item.get("phase"),
+                f"{path}.phase",
+                {"worktree", "integration", "both"},
+            )
+            key = (project_id or "", name or "")
+            if key in seen_verification:
+                self.error(path, "verification names must be unique per project")
+            seen_verification.add(key)
         self.text_list(
             data.get("independent_review"),
             "$.quality.independent_review",

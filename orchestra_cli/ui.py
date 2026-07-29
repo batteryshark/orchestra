@@ -33,7 +33,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from orchestra_cli import cancel, config, db, ensemble, host, projects, runners, tailscale
+from orchestra_cli import (
+    cancel,
+    config,
+    db,
+    ensemble,
+    host,
+    operator_runtime,
+    operator_store,
+    projects,
+    runners,
+    tailscale,
+)
 from orchestra_cli.usage import default_service
 from orchestra_cli.usage.spend import with_project_spend
 
@@ -586,6 +597,26 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                 # The picker source of truth. Always served off the
                 # global registry; no project header needed.
                 self._json(self._projects_listing())
+            elif path == "/api/operators":
+                self._json({
+                    "contracts": operator_store.list_statuses(),
+                    "operations": operator_runtime.list_operations(),
+                })
+            elif path.startswith("/api/operators/"):
+                identifier = path.rsplit("/", 1)[1]
+                try:
+                    operation = operator_runtime.get_operation(identifier)
+                    self._json({
+                        **operation,
+                        "work": operator_runtime.work_items(operation["id"]),
+                        "decisions": operator_runtime.decisions(
+                            operation["id"], state="open"
+                        ),
+                        "actions": operator_runtime.pending_actions(operation["id"]),
+                        "resources": operator_runtime.resource_leases(operation["id"]),
+                    })
+                except operator_runtime.RuntimeError as exc:
+                    self._json({"error": str(exc)}, 404)
             elif path == "/api/state":
                 project = self._resolve_project(url)
                 if project is None:
@@ -801,6 +832,28 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
         def do_POST(self):
             url = urlparse(self.path)
             path = url.path
+            if path.startswith("/api/operator-decisions/") and path.endswith("/answer"):
+                ok, payload = self._read_json_post()
+                if not ok:
+                    return
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    return self._json({"error": "not found"}, 404)
+                answer = payload.get("answer")
+                answered_by = payload.get("by", "dashboard-owner")
+                if not isinstance(answer, str) or not answer.strip():
+                    return self._json({"error": "answer must be a non-empty string"}, 400)
+                if not isinstance(answered_by, str) or not answered_by.strip():
+                    return self._json({"error": "by must be a non-empty string"}, 400)
+                try:
+                    operator_runtime.answer_decision(
+                        parts[2],
+                        answer=answer,
+                        answered_by=answered_by,
+                    )
+                except operator_runtime.RuntimeError as exc:
+                    return self._json({"error": str(exc)}, 409)
+                return self._json({"decision_id": parts[2], "state": "answered"})
             if path.startswith("/api/runs/") and path.endswith("/stop"):
                 ok, _payload = self._read_json_post()
                 if not ok:
