@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_TAG = "orchestra.operator-contract/v1"
+SCHEMA_TAG_V1 = "orchestra.operator-contract/v1"
+SCHEMA_TAG = "orchestra.operator-contract/v2"
 MAX_CONTRACT_BYTES = 256 * 1024
 MAX_TEXT_CHARS = 16_384
 MAX_LIST_ITEMS = 128
@@ -201,6 +202,22 @@ def project_ids(contract: dict[str, Any]) -> tuple[str, ...]:
     return tuple(contract["scope"]["projects"])
 
 
+def is_v2(contract: dict[str, Any]) -> bool:
+    return contract.get("schema") == SCHEMA_TAG
+
+
+def project_scope(
+    contract: dict[str, Any], project_id: str
+) -> tuple[list[str], list[str]]:
+    """Return repository-relative include/exclude rules for one project."""
+    if not is_v2(contract):
+        return list(contract["scope"]["include"]), list(contract["scope"]["exclude"])
+    for rule in contract["scope"]["project_rules"]:
+        if rule["project_id"] == project_id:
+            return list(rule["include"]), list(rule["exclude"])
+    raise ContractError(f"contract has no scope rule for project {project_id}")
+
+
 def template(
     *,
     name: str,
@@ -211,13 +228,24 @@ def template(
     integration_branch: str = "main",
     non_goals: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a complete conservative v1 contract for owner refinement."""
+    """Build a complete conservative v2 contract for owner refinement."""
+    if not project_ids:
+        raise ContractError("an Operator contract needs at least one project id")
+    primary_project = project_ids[0]
     return {
         "schema": SCHEMA_TAG,
         "name": name,
         "intent": {
             "summary": goal,
-            "goals": [{"id": "G1", "outcome": goal, "priority": 1}],
+            "goals": [{
+                "id": "G1",
+                "outcome": goal,
+                "priority": 1,
+                "project_id": primary_project,
+                "depends_on": [],
+                "requires_review": False,
+                "read_dependencies": [],
+            }],
             "non_goals": list(non_goals or []),
         },
         "scope": {
@@ -226,6 +254,10 @@ def template(
             "integration_branch": integration_branch,
             "include": [],
             "exclude": [],
+            "project_rules": [
+                {"project_id": project_id, "include": [], "exclude": []}
+                for project_id in project_ids
+            ],
             "source_of_truth": [
                 "repository instructions and declared verification evidence"
             ],
@@ -478,8 +510,13 @@ class _Validator:
         self._secret_keys(value, "$")
         if not root:
             return
-        if root.get("schema") != SCHEMA_TAG:
-            self.error("$.schema", f"must equal {SCHEMA_TAG!r}")
+        schema = root.get("schema")
+        if schema not in {SCHEMA_TAG_V1, SCHEMA_TAG}:
+            self.error(
+                "$.schema",
+                f"must equal {SCHEMA_TAG_V1!r} or {SCHEMA_TAG!r}",
+            )
+        self.schema = schema
         self.text(root.get("name"), "$.name", max_chars=160)
         self._intent(root.get("intent"))
         self._scope(root.get("scope"))
@@ -506,6 +543,69 @@ class _Validator:
                             f"$.quality.verification[{index}].project_id",
                             "must reference a project in $.scope.projects",
                         )
+        if schema == SCHEMA_TAG and isinstance(scope, dict):
+            scoped = set(scope.get("projects") or [])
+            goals = (root.get("intent") or {}).get("goals")
+            if isinstance(goals, list):
+                goal_ids = {
+                    item.get("id") for item in goals if isinstance(item, dict)
+                }
+                for index, item in enumerate(goals):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("project_id") not in scoped:
+                        self.error(
+                            f"$.intent.goals[{index}].project_id",
+                            "must reference a project in $.scope.projects",
+                        )
+                    for dep in item.get("depends_on") or []:
+                        if dep not in goal_ids:
+                            self.error(
+                                f"$.intent.goals[{index}].depends_on",
+                                f"references unknown goal {dep!r}",
+                            )
+                        if dep == item.get("id"):
+                            self.error(
+                                f"$.intent.goals[{index}].depends_on",
+                                "a goal cannot depend on itself",
+                            )
+                    for project_id in item.get("read_dependencies") or []:
+                        if project_id not in scoped:
+                            self.error(
+                                f"$.intent.goals[{index}].read_dependencies",
+                                f"references unscoped project {project_id!r}",
+                            )
+                        if project_id == item.get("project_id"):
+                            self.error(
+                                f"$.intent.goals[{index}].read_dependencies",
+                                "must not include the goal's writable project",
+                            )
+                dependency_graph = {
+                    item["id"]: list(item.get("depends_on") or [])
+                    for item in goals
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                }
+                visiting: set[str] = set()
+                visited: set[str] = set()
+
+                def visit(goal_id: str) -> None:
+                    if goal_id in visiting:
+                        self.error(
+                            "$.intent.goals",
+                            f"dependency cycle includes {goal_id!r}",
+                        )
+                        return
+                    if goal_id in visited:
+                        return
+                    visiting.add(goal_id)
+                    for dependency in dependency_graph.get(goal_id, []):
+                        if dependency in dependency_graph:
+                            visit(dependency)
+                    visiting.remove(goal_id)
+                    visited.add(goal_id)
+
+                for goal_id in dependency_graph:
+                    visit(goal_id)
 
     def _secret_keys(self, value: Any, path: str) -> None:
         if isinstance(value, dict):
@@ -533,7 +633,15 @@ class _Validator:
         seen: set[str] = set()
         for index, raw in enumerate(goals[: MAX_LIST_ITEMS + 1]):
             path = f"$.intent.goals[{index}]"
-            goal = self.obj(raw, path, {"id", "outcome", "priority"})
+            goal_keys = {"id", "outcome", "priority"}
+            if getattr(self, "schema", None) == SCHEMA_TAG:
+                goal_keys |= {
+                    "project_id",
+                    "depends_on",
+                    "requires_review",
+                    "read_dependencies",
+                }
+            goal = self.obj(raw, path, goal_keys)
             goal_id = self.text(goal.get("id"), f"{path}.id", max_chars=32)
             if goal_id is not None and not _GOAL_ID.fullmatch(goal_id):
                 self.error(
@@ -551,6 +659,38 @@ class _Validator:
                 minimum=1,
                 maximum=100,
             )
+            if getattr(self, "schema", None) == SCHEMA_TAG:
+                project_id = self.text(
+                    goal.get("project_id"), f"{path}.project_id", max_chars=64
+                )
+                if project_id is not None and not _PROJECT_ID.fullmatch(project_id):
+                    self.error(
+                        f"{path}.project_id",
+                        "must be a 16-character lowercase hex registered project id",
+                    )
+                dependencies = self.text_list(
+                    goal.get("depends_on"), f"{path}.depends_on", max_chars=32
+                )
+                for dep_index, dep in enumerate(dependencies):
+                    if not _GOAL_ID.fullmatch(dep):
+                        self.error(
+                            f"{path}.depends_on[{dep_index}]",
+                            "must be a valid goal id",
+                        )
+                self.boolean(
+                    goal.get("requires_review"), f"{path}.requires_review"
+                )
+                read_dependencies = self.text_list(
+                    goal.get("read_dependencies"),
+                    f"{path}.read_dependencies",
+                    max_chars=64,
+                )
+                for dep_index, project_id in enumerate(read_dependencies):
+                    if not _PROJECT_ID.fullmatch(project_id):
+                        self.error(
+                            f"{path}.read_dependencies[{dep_index}]",
+                            "must be a registered project id",
+                        )
         self.text_list(data.get("non_goals"), "$.intent.non_goals", max_chars=2048)
 
     def _scope(self, value: Any) -> None:
@@ -562,6 +702,8 @@ class _Validator:
             "exclude",
             "source_of_truth",
         }
+        if getattr(self, "schema", None) == SCHEMA_TAG:
+            keys.add("project_rules")
         data = self.obj(value, "$.scope", keys)
         projects = self.text_list(
             data.get("projects"),
@@ -589,6 +731,34 @@ class _Validator:
             minimum=1,
             max_chars=2048,
         )
+        if getattr(self, "schema", None) == SCHEMA_TAG:
+            rules = data.get("project_rules")
+            if not isinstance(rules, list):
+                self.error("$.scope.project_rules", "must be an array")
+                rules = []
+            elif len(rules) != len(projects):
+                self.error(
+                    "$.scope.project_rules",
+                    "must contain exactly one rule for every scoped project",
+                )
+            seen_rules: set[str] = set()
+            for index, raw in enumerate(rules[: MAX_LIST_ITEMS + 1]):
+                path = f"$.scope.project_rules[{index}]"
+                rule = self.obj(raw, path, {"project_id", "include", "exclude"})
+                project_id = self.text(
+                    rule.get("project_id"), f"{path}.project_id", max_chars=64
+                )
+                if project_id not in projects:
+                    self.error(
+                        f"{path}.project_id",
+                        "must reference a project in $.scope.projects",
+                    )
+                if project_id in seen_rules:
+                    self.error(f"{path}.project_id", "must be unique")
+                if project_id:
+                    seen_rules.add(project_id)
+                self.text_list(rule.get("include"), f"{path}.include", max_chars=2048)
+                self.text_list(rule.get("exclude"), f"{path}.exclude", max_chars=2048)
 
     def _authority(self, value: Any) -> None:
         data = self.obj(value, "$.authority", set(AUTHORITY_ACTIONS))

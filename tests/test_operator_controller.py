@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,6 +24,22 @@ class OperatorControllerTests(unittest.TestCase):
         self.control = self.tmp / "operator.db"
         self.root = self.tmp / "project"
         (self.root / ".orchestra").mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-b", "main", str(self.root)],
+            check=True,
+            capture_output=True,
+        )
+        (self.root / ".gitignore").write_text(".orchestra/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", ".gitignore"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.root), "commit", "--allow-empty", "-m", "init"],
+            check=True,
+            capture_output=True,
+        )
         db.connect(self.root).close()
         self.project_id = "d" * 16
         self.project = {
@@ -208,6 +225,47 @@ class OperatorControllerTests(unittest.TestCase):
         self.assertEqual(second["work_counts"], {"accepted": 1})
         self.assertEqual(verify.call_count, 2)
         integrate.assert_called_once()
+
+    def test_integration_precondition_failure_creates_owner_decision(self) -> None:
+        operation = self.operation(mode="live")
+        work = operator_runtime.work_items(operation["id"], path=self.control)[0]
+        operator_runtime.bind_work_run(
+            work["id"],
+            profile="worker",
+            run_id=11,
+            branch="orchestra/run-11",
+            base_head="abc123",
+            path=self.control,
+        )
+        work = operator_runtime.work_items(operation["id"], path=self.control)[0]
+        contract = operator_store.get_contract(
+            operation["operator_id"], path=self.control
+        ).data
+        events: list[dict] = []
+        with mock.patch(
+            "orchestra_cli.operator_controller.operator_broker.integrate",
+            side_effect=operator_broker.BrokerError("integration checkout is dirty"),
+        ):
+            operator_controller._integrate(
+                operation,
+                work,
+                contract,
+                {"files": 1, "added_lines": 1},
+                {"passed": True, "commands": []},
+                events,
+                path=self.control,
+            )
+        refreshed = operator_runtime.get_operation(operation["id"], path=self.control)
+        self.assertEqual(refreshed["state"], "needs_decision")
+        self.assertEqual(
+            operator_runtime.work_items(operation["id"], path=self.control)[0]["state"],
+            "needs_decision",
+        )
+        decisions = operator_runtime.decisions(
+            operation["id"], state="open", path=self.control
+        )
+        self.assertEqual(len(decisions), 1)
+        self.assertIn("cannot be integrated safely", decisions[0]["question"])
 
 
 if __name__ == "__main__":

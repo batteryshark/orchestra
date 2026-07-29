@@ -658,10 +658,12 @@ acceptance distinction.
 
 ### 8.2 Integration checkouts
 
-The Operator should not assume the person's current checkout is clean or
-available. For automatic integration, each active project gets at most one
-reusable, Operator-owned integration checkout under a predictable,
-resource-accounted path.
+The Operator does not assume the person's current checkout is clean or
+available. The current implementation activates live work only when every
+declared integration checkout is clean, is on the approved branch, and is not
+already owned by another live operation. It rechecks those conditions on every
+reconciliation pass. A failure creates one blocking owner decision before any
+new dispatch or integration.
 
 The integration checkout:
 
@@ -671,6 +673,14 @@ The integration checkout:
 - runs post-integration gates;
 - advances the target branch only through the configured strategy;
 - never overwrites unrelated user changes.
+
+Each goal names one writable project and carries explicit dependency edges.
+Workers receive one isolated worktree in that repository. Cross-project inputs
+are Git-commit-pinned, size-capped archive snapshots with recorded SHA-256
+digests; live repository symlinks are forbidden. Project-specific scopes and
+verification are applied using the work item's project ID. Multi-repository
+integration follows the accepted dependency order, while each repository
+retains its own lease and post-integration gates.
 
 Cross-project changes are grouped as a change set. Their commits and
 verification are prepared independently, while merge order and partial-failure
@@ -1715,8 +1725,8 @@ Acceptance:
 
 ### Slice E: multi-project operation and owner surfaces
 
-- change sets spanning registered projects;
-- cross-project dependency and integration ordering;
+- change sets spanning registered projects (implemented in contract v2);
+- cross-project dependency and integration ordering (implemented);
 - dashboard and iOS operation overview;
 - roster, pool, reservation, and routing-explanation views;
 - decision answer and contract-amendment flows;

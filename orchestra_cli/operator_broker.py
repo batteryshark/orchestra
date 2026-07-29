@@ -6,6 +6,11 @@ import signal
 import sqlite3
 import subprocess
 import fnmatch
+import hashlib
+import tarfile
+import tempfile
+import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,9 +27,14 @@ from orchestra_cli import (
 )
 
 MAX_CAPTURE_BYTES = 128 * 1024
+MAX_INPUT_SNAPSHOT_BYTES = 256 * 1024 * 1024
 
 
 class BrokerError(RuntimeError):
+    pass
+
+
+class ContainmentError(BrokerError):
     pass
 
 
@@ -35,6 +45,7 @@ class Dispatch:
     workdir: str
     branch: str | None
     base_head: str | None
+    input_snapshots: tuple[dict[str, Any], ...] = ()
 
 
 def dispatch(
@@ -48,9 +59,11 @@ def dispatch(
     start_supervisor: bool = True,
     start_point: str | None = None,
     comparison_base: str | None = None,
+    read_inputs: list[dict[str, str]] | None = None,
 ) -> Dispatch:
     """Create exactly one ordinary Orchestra run through a checked profile."""
     root = root.resolve()
+    assert_worktree_namespace(root)
     cfg = config.load(root)
     agent = config.agent_cfg(cfg, profile_name)
     _report, unavailable, _warnings = availability.check_profiles(
@@ -100,6 +113,10 @@ def dispatch(
             )
             created_worktree = True
             workdir = str(created)
+            assert_worktree_contained(Path(workdir))
+        snapshots = materialize_read_inputs(
+            Path(workdir), list(read_inputs or [])
+        )
         text = brief.compose(
             root=root,
             run_id=run_id,
@@ -112,7 +129,14 @@ def dispatch(
             extra_context=(
                 "This is Operator-controlled bounded work. Keep the smallest coherent "
                 "change, do not broaden scope, commit your finished changes, and report "
-                "verification evidence in the handoff."
+                "verification evidence in the handoff. Read-only dependency snapshots "
+                "are listed below; never access live sibling repositories or create "
+                "links outside this worktree.\n"
+                + "\n".join(
+                    f"- {item['project_id']} at {item['path']} "
+                    f"(commit {item['commit']}, sha256 {item['sha256']})"
+                    for item in snapshots
+                )
             ),
             allow_question=False,
             question_wait_seconds=1800,
@@ -150,7 +174,9 @@ def dispatch(
         con.close()
     if start_supervisor:
         supervise.spawn_supervisor(root, run_id)
-    return Dispatch(run_id, profile_name, workdir, branch, base_head)
+    return Dispatch(
+        run_id, profile_name, workdir, branch, base_head, tuple(snapshots)
+    )
 
 
 def run_status(root: Path, run_id: int) -> dict[str, Any] | None:
@@ -251,6 +277,8 @@ def verify(
     *,
     phase: str,
 ) -> dict[str, Any]:
+    if workdir.parent.name == "worktrees":
+        assert_worktree_contained(workdir)
     results = []
     for command in commands:
         if command["phase"] not in {phase, "both"}:
@@ -318,6 +346,7 @@ def integrate(root: Path, *, branch: str, target_branch: str) -> str:
 
 def resource_snapshot(root: Path) -> dict[str, Any]:
     worktrees = paths.worktrees_dir(root)
+    assert_worktree_namespace(root)
     size: int | None = 0
     if worktrees.is_dir():
         try:
@@ -369,6 +398,7 @@ def reclaim_integrated(root: Path, *, run_id: int, branch: str, target_branch: s
         capture_output=True,
         text=True,
     )
+    _remove_input_snapshots(workdir)
     return True
 
 
@@ -400,6 +430,7 @@ def reclaim_transferred_worktree(
     )
     if removed.returncode != 0:
         raise BrokerError(removed.stderr.strip())
+    _remove_input_snapshots(workdir)
     return True
 
 
@@ -413,3 +444,142 @@ def _git(root: Path, args: list[str]) -> str:
     if completed.returncode != 0:
         raise BrokerError((completed.stderr or completed.stdout).strip())
     return completed.stdout
+
+
+def _remove_input_snapshots(workdir: Path) -> None:
+    snapshot_root = workdir.parent / f"{workdir.name}-inputs"
+    namespace = workdir.parent.resolve(strict=True)
+    if not snapshot_root.exists():
+        return
+    if (
+        snapshot_root.is_symlink()
+        or snapshot_root.parent.resolve(strict=True) != namespace
+        or snapshot_root.name != f"{workdir.name}-inputs"
+    ):
+        raise BrokerError(f"refusing to remove unsafe snapshot path {snapshot_root}")
+    shutil.rmtree(snapshot_root)
+
+
+def assert_worktree_namespace(root: Path) -> None:
+    """Reject bridges from the shared worktree namespace into other projects."""
+    worktrees = paths.worktrees_dir(root.resolve())
+    if not worktrees.exists():
+        return
+    if worktrees.is_symlink() or not worktrees.is_dir():
+        raise ContainmentError(f"unsafe Operator worktree namespace: {worktrees}")
+    for entry in worktrees.iterdir():
+        if entry.is_symlink():
+            raise ContainmentError(
+                f"external links are forbidden in Operator worktree namespace: {entry}"
+            )
+
+
+def assert_worktree_contained(workdir: Path) -> None:
+    """Ensure a run and every link it contains remain inside its own worktree."""
+    workdir = workdir.absolute()
+    try:
+        resolved = workdir.resolve(strict=True)
+    except OSError as exc:
+        raise ContainmentError(
+            f"cannot resolve Operator worktree {workdir}: {exc}"
+        ) from exc
+    namespace = workdir.parent.resolve(strict=True)
+    if resolved.parent != namespace or not workdir.name.startswith("run-"):
+        raise ContainmentError(f"worktree escapes the Operator namespace: {workdir}")
+    visited = 0
+    for candidate in resolved.rglob("*"):
+        visited += 1
+        if visited > 200_000:
+            raise ContainmentError("worktree link audit exceeded 200000 paths")
+        if not candidate.is_symlink():
+            continue
+        try:
+            target = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ContainmentError(
+                f"broken link in Operator worktree: {candidate}: {exc}"
+            ) from exc
+        if target != resolved and resolved not in target.parents:
+            raise ContainmentError(
+                f"link escapes Operator worktree: {candidate} -> {target}"
+            )
+
+
+def materialize_read_inputs(
+    workdir: Path, inputs: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """Copy declared Git commits into isolated, read-only snapshot directories."""
+    if not inputs:
+        return []
+    destination_root = workdir.parent / f"{workdir.name}-inputs"
+    destination_root.mkdir(mode=0o700)
+    snapshots: list[dict[str, Any]] = []
+    for item in inputs:
+        project_id = item["project_id"]
+        source = Path(item["root"]).resolve(strict=True)
+        commit = _git(source, ["rev-parse", f"{item['commit']}^{{commit}}"]).strip()
+        destination = destination_root / project_id
+        if destination.exists():
+            raise ContainmentError(f"duplicate read dependency {project_id}")
+        destination.mkdir(mode=0o700)
+        with tempfile.NamedTemporaryFile(prefix="orchestra-input-", suffix=".tar") as archive:
+            with tempfile.TemporaryFile() as archive_errors:
+                process = subprocess.Popen(
+                    ["git", "-C", str(source), "archive", "--format=tar", commit],
+                    stdout=archive,
+                    stderr=archive_errors,
+                )
+                deadline = time.monotonic() + 120
+                while process.poll() is None:
+                    size = archive.tell()
+                    if size > MAX_INPUT_SNAPSHOT_BYTES:
+                        process.kill()
+                        process.wait()
+                        raise ContainmentError(
+                            f"read dependency {project_id} exceeds "
+                            f"{MAX_INPUT_SNAPSHOT_BYTES} bytes"
+                        )
+                    if time.monotonic() >= deadline:
+                        process.kill()
+                        process.wait()
+                        raise ContainmentError(
+                            f"read dependency {project_id} archive timed out"
+                        )
+                    time.sleep(0.02)
+                size = archive.tell()
+                if size > MAX_INPUT_SNAPSHOT_BYTES:
+                    raise ContainmentError(
+                        f"read dependency {project_id} exceeds "
+                        f"{MAX_INPUT_SNAPSHOT_BYTES} bytes"
+                    )
+                if process.returncode != 0:
+                    archive_errors.seek(0)
+                    raise ContainmentError(
+                        archive_errors.read().decode("utf-8", "replace").strip()
+                    )
+            archive.flush()
+            archive.seek(0)
+            digest = hashlib.sha256()
+            while chunk := archive.read(1024 * 1024):
+                digest.update(chunk)
+            archive.seek(0)
+            with tarfile.open(fileobj=archive, mode="r:") as bundle:
+                members = bundle.getmembers()
+                if any(member.issym() or member.islnk() for member in members):
+                    raise ContainmentError(
+                        f"read dependency {project_id} contains links; "
+                        "snapshot materialization is fail-closed"
+                    )
+                bundle.extractall(destination, filter="data")
+        for candidate in destination.rglob("*"):
+            candidate.chmod(0o555 if candidate.is_dir() else 0o444)
+        destination.chmod(0o555)
+        snapshots.append({
+            "project_id": project_id,
+            "commit": commit,
+            "sha256": digest.hexdigest(),
+            "bytes": size,
+            "path": str(destination),
+        })
+    destination_root.chmod(0o555)
+    return snapshots

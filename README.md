@@ -131,6 +131,20 @@ version and return the Operator to `awaiting_approval`. Approval is deliberately
 not activation. An operation starts only when its contract and roster policy
 are both owner-approved:
 
+For multi-project live work, use the generated
+`orchestra.operator-contract/v2` shape and refine it before approval:
+
+- every goal declares exactly one writable `project_id`;
+- `depends_on` records dispatch and integration order;
+- `requires_review` is an explicit contract decision, not a keyword guess;
+- `scope.project_rules` contains repository-relative include/exclude rules for
+  each project;
+- `read_dependencies` names projects copied from exact Git commits into
+  bounded, hashed, isolated snapshots.
+
+Legacy v1 contracts remain readable, but live v1 activation is fail-closed when
+more than one project is scoped.
+
 ```sh
 # Infer the current roster, review the file, then approve its exact hash.
 orchestra operator roster bootstrap --output roster-policy.json
@@ -154,7 +168,10 @@ qualified profiles, accounts for shared quotas and manual active runs,
 dispatches isolated branches, enforces change budgets, verifies and
 independently reviews results, integrates only after gates, and reclaims only
 clean worktrees whose unique state is proven integrated. Shadow and live use
-the same reconciliation path; shadow stops at durable action proposals.
+the same reconciliation path; shadow stops at durable action proposals. Live
+activation also requires clean integration branches and rejects symlinks in
+the Operator worktree namespace. If those preconditions later drift, the
+controller pauses for one owner decision instead of retrying.
 
 The canonical contract bytes, project binding snapshot, approval, and audit
 events live in the owner-private user control plane at

@@ -143,6 +143,40 @@ def _reconcile(
         version=operation["contract_version"],
         path=path,
     ).data
+    try:
+        operator_runtime.assert_live_operation_safe(operation)
+    except operator_runtime.RuntimeError as exc:
+        reason = str(exc)
+        operator_runtime.create_decision(
+            operation["id"],
+            idempotency_key="containment:" + hashlib.sha256(
+                reason.encode("utf-8")
+            ).hexdigest()[:24],
+            question="The live project containment precondition failed. How should the checkout be restored?",
+            why_now=(
+                "Operator stopped before dispatching or integrating more work because "
+                "a shared integration checkout is dirty, on the wrong branch, or "
+                "contains an external worktree link."
+            ),
+            options=[
+                {"id": "owner-restores", "label": "Owner restores a clean checkout"},
+                {"id": "stop", "label": "Stop the operation"},
+            ],
+            recommendation=(
+                "Preserve any unique work, remove external links, and restore the "
+                "approved clean integration branch before resuming."
+            ),
+            evidence={"error": reason},
+            blocking_scope={"projects": operation["projects"]},
+            path=path,
+        )
+        stopped = operator_runtime.set_operation_state(
+            operation["id"],
+            "needs_decision",
+            reason=reason,
+            path=path,
+        )
+        return _summary(stopped, [{"kind": "containment_precondition", "error": reason}])
     wall_limit = contract["resources"]["max_wall_clock_seconds"]
     if wall_limit is not None:
         activated = datetime.strptime(
@@ -297,10 +331,11 @@ def _verify_and_integrate(
     complexity = operator_broker.measure_change(
         root, base_head=work["base_head"], branch=work["branch"]
     )
+    work_scope = work["requirements"]["scope"]
     scope_violations = operator_broker.scope_violations(
         complexity.get("changed_paths") or [],
-        include=contract["scope"]["include"],
-        exclude=contract["scope"]["exclude"],
+        include=work_scope["include"],
+        exclude=work_scope["exclude"],
     )
     if scope_violations:
         scope_action = operator_runtime.propose_action(
@@ -567,10 +602,13 @@ def _integrate(
             branch=work["branch"],
             target_branch=work["integration_branch"],
         )
+        merge_applied = True
+        operator_runtime.update_project_expected_head(
+            operation["id"], work["project_key"], head, path=path
+        )
         operator_runtime.finish_action(
             action["id"], state="applied", result={"head": head}, path=path
         )
-        merge_applied = True
         integration_verification = operator_broker.verify(
             Path(work["root"]),
             [
@@ -718,6 +756,47 @@ def _integrate(
             operator_runtime.finish_action(
                 action["id"], state="failed", error=str(exc), path=path
             )
+            operator_runtime.record_work_result(
+                work["id"],
+                state="needs_decision",
+                complexity=complexity,
+                verification=verification,
+                failure_fingerprint=_fingerprint({"integration_error": str(exc)}),
+                path=path,
+            )
+            operator_runtime.create_decision(
+                operation["id"],
+                idempotency_key=f"integration-precondition:{work['id']}:{work['project_run_id']}",
+                question="The verified branch cannot be integrated safely. How should the integration checkout be restored?",
+                why_now=(
+                    "The merge was not applied. Repeating it cannot fix a dirty, "
+                    "mis-owned, or wrong-branch integration checkout."
+                ),
+                options=[
+                    {"id": "owner-restores", "label": "Owner restores the checkout"},
+                    {"id": "stop", "label": "Stop the operation"},
+                ],
+                recommendation="Preserve unique work and restore a clean owned checkout.",
+                evidence={"error": str(exc), "branch": work["branch"]},
+                blocking_scope={
+                    "work_item_id": work["id"],
+                    "project_id": work["contract_project_id"],
+                },
+                work_item_id=work["id"],
+                path=path,
+            )
+            operator_runtime.set_operation_state(
+                operation["id"],
+                "needs_decision",
+                reason=f"integration precondition failed: {exc}",
+                path=path,
+            )
+            events.append({
+                "kind": "integration_precondition",
+                "work": work["id"],
+                "error": str(exc),
+            })
+            return
         raise
     finally:
         project_heartbeat_stop.set()
@@ -746,11 +825,16 @@ def _dispatch_ready(
     )
     slots = max(0, contract["resources"]["max_active_runs"] - len(active))
     active_profiles = _active_project_profiles(operation)
-    for work in operator_runtime.work_items(
+    ready_work = [
+        work
+        for work in operator_runtime.work_items(
         operation["id"],
         states=("ready", "failed_retryable", "needs_revision"),
         path=path,
-    )[:slots]:
+        )
+        if operator_runtime.dependencies_satisfied(work, path=path)
+    ]
+    for work in ready_work[:slots]:
         if work["attempt_count"] >= contract["resources"]["max_attempts_per_item"]:
             _escalate_stuck(operation, work, contract, events, path=path)
             continue
@@ -846,6 +930,20 @@ def _dispatch_ready(
                 isolated=True,
                 start_point=predecessor["branch"] if predecessor else None,
                 comparison_base=predecessor["base_head"] if predecessor else None,
+                read_inputs=[
+                    {
+                        "project_id": project_id,
+                        "root": next(
+                            project["root"]
+                            for project in operation["projects"]
+                            if project["project_id"] == project_id
+                        ),
+                        "commit": "HEAD",
+                    }
+                    for project_id in work["requirements"].get(
+                        "read_dependencies", []
+                    )
+                ],
             )
             operator_runtime.bind_work_run(
                 work["id"],
@@ -869,6 +967,27 @@ def _dispatch_ready(
                 },
                 path=path,
             )
+            for snapshot in dispatched.input_snapshots:
+                source_project = next(
+                    project
+                    for project in operation["projects"]
+                    if project["project_id"] == snapshot["project_id"]
+                )
+                operator_runtime.register_resource_lease(
+                    operation["id"],
+                    work_item_id=work["id"],
+                    project_key=source_project["project_key"],
+                    kind="read_input_snapshot",
+                    resource_path=snapshot["path"],
+                    project_run_id=dispatched.run_id,
+                    unique_state=False,
+                    measured_bytes=snapshot["bytes"],
+                    details={
+                        "commit": snapshot["commit"],
+                        "sha256": snapshot["sha256"],
+                    },
+                    path=path,
+                )
             if predecessor:
                 _propose_predecessor_cleanup(
                     operation,
@@ -901,6 +1020,46 @@ def _dispatch_ready(
                 context={"error": str(exc), "work_item_id": work["id"]},
                 path=path,
             )
+            if isinstance(exc, operator_broker.ContainmentError):
+                operator_runtime.record_work_result(
+                    work["id"],
+                    state="needs_decision",
+                    failure_fingerprint=_fingerprint({"containment": str(exc)}),
+                    path=path,
+                )
+                operator_runtime.create_decision(
+                    operation["id"],
+                    idempotency_key=(
+                        f"dispatch-containment:{work['id']}:"
+                        f"{work['attempt_count'] + 1}"
+                    ),
+                    question="The isolated work environment could not be created safely. How should its containment issue be resolved?",
+                    why_now=(
+                        "Operator refused to dispatch into an external link, "
+                        "oversized snapshot, or otherwise uncontained path."
+                    ),
+                    options=[
+                        {"id": "owner-restores", "label": "Owner restores containment"},
+                        {"id": "stop", "label": "Stop the operation"},
+                    ],
+                    recommendation="Remove the bridge or narrow the declared input, then resume.",
+                    evidence={"error": str(exc)},
+                    blocking_scope={"work_item_id": work["id"]},
+                    work_item_id=work["id"],
+                    path=path,
+                )
+                operator_runtime.set_operation_state(
+                    operation["id"],
+                    "needs_decision",
+                    reason=f"dispatch containment failed: {exc}",
+                    path=path,
+                )
+                events.append({
+                    "kind": "dispatch_containment",
+                    "work": work["id"],
+                    "error": str(exc),
+                })
+                return
             raise
 
 
@@ -1280,11 +1439,15 @@ def run_workdir(root: Path, run_id: int) -> str:
 
 
 def _mission(contract: dict[str, Any], work: dict[str, Any]) -> str:
+    work_scope = work["requirements"]["scope"]
     return (
         f"Goal: {work['description']}\n\n"
         f"Required gates: {json.dumps(contract['quality']['gates'])}\n"
-        f"Allowed scope: {json.dumps(contract['scope']['include'])}\n"
-        f"Excluded scope: {json.dumps(contract['scope']['exclude'])}\n"
+        f"Writable project: {work['contract_project_id']}\n"
+        f"Allowed repository-relative scope: {json.dumps(work_scope['include'])}\n"
+        f"Excluded repository-relative scope: {json.dumps(work_scope['exclude'])}\n"
+        f"Read-only project snapshots: "
+        f"{json.dumps(work['requirements'].get('read_dependencies', []))}\n"
         f"Change budget: {json.dumps(work['change_budget'])}\n\n"
         "Implement only the smallest coherent change needed for this outcome. "
         "Avoid speculative abstractions, unrelated cleanup, new dependencies, and "

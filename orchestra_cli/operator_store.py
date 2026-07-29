@@ -263,7 +263,7 @@ def save_draft(
             (
                 operator_id,
                 version,
-                operator_contract.SCHEMA_TAG,
+                contract.data["schema"],
                 contract.canonical_json,
                 contract.sha256,
                 created_at,

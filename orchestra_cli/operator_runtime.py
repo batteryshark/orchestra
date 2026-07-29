@@ -13,6 +13,7 @@ import os
 import secrets
 import socket
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS operation_projects (
   root TEXT NOT NULL,
   target_branch TEXT NOT NULL,
   integration_branch TEXT NOT NULL,
+  expected_head TEXT,
   PRIMARY KEY(operation_id, project_key),
   UNIQUE(operation_id, contract_project_id)
 );
@@ -337,6 +339,20 @@ class Lease:
 def connect(path: Path | None = None) -> sqlite3.Connection:
     con = operator_store.connect(path)
     con.executescript(RUNTIME_SCHEMA)
+    columns = {
+        row["name"] for row in con.execute("PRAGMA table_info(operation_projects)")
+    }
+    if "expected_head" not in columns:
+        try:
+            con.execute("ALTER TABLE operation_projects ADD COLUMN expected_head TEXT")
+        except sqlite3.OperationalError:
+            refreshed = {
+                row["name"]
+                for row in con.execute("PRAGMA table_info(operation_projects)")
+            }
+            if "expected_head" not in refreshed:
+                raise
+        con.commit()
     return con
 
 
@@ -374,6 +390,14 @@ def start_operation(
             "operation scope is no longer registered: " + ", ".join(missing)
         )
     if mode == "live":
+        if (
+            contract.data.get("schema") == operator_contract.SCHEMA_TAG_V1
+            and len(scoped_ids) > 1
+        ):
+            raise RuntimeError(
+                "live multi-project operations require an "
+                "orchestra.operator-contract/v2 contract"
+            )
         if contract.data["resources"]["max_cost_usd"] is not None:
             raise RuntimeError(
                 "live activation cannot enforce max_cost_usd because project runs "
@@ -399,6 +423,14 @@ def start_operation(
                 "live activation requires a required verification command for "
                 "every project; missing: " + ", ".join(uncovered)
             )
+        live_heads = {}
+        for project_id in scoped_ids:
+            live_heads[project_id] = _live_project_preflight(
+                Path(str(registered[project_id]["root"])),
+                expected_branch=contract.data["scope"]["integration_branch"],
+            )
+    else:
+        live_heads = {}
 
     con = connect(path)
     try:
@@ -412,6 +444,26 @@ def start_operation(
             raise RuntimeError(
                 f"Operator {operator_status['id']} already has live operation "
                 f"{existing['id']}"
+            )
+        claimed_projects = list(
+            con.execute(
+                "SELECT DISTINCT p.contract_project_id, o.id "
+                "FROM operation_projects p JOIN operations o ON o.id=p.operation_id "
+                "WHERE p.contract_project_id IN ("
+                + ",".join("?" for _ in scoped_ids)
+                + ") AND o.mode='live' "
+                "AND o.state NOT IN ('achieved','stopped','failed')",
+                scoped_ids,
+            )
+        ) if mode == "live" else []
+        if claimed_projects:
+            claims = ", ".join(
+                f"{row['contract_project_id']} by {row['id']}"
+                for row in claimed_projects
+            )
+            raise RuntimeError(
+                "live project ownership is already held by another operation: "
+                + claims
             )
         operation_id = _new_id("opn")
         timestamp = operator_store.now()
@@ -440,8 +492,8 @@ def start_operation(
             con.execute(
                 "INSERT INTO operation_projects("
                 "operation_id, project_key, contract_project_id, name, root, "
-                "target_branch, integration_branch"
-                ") VALUES(?,?,?,?,?,?,?)",
+                "target_branch, integration_branch, expected_head"
+                ") VALUES(?,?,?,?,?,?,?,?)",
                 (
                     operation_id,
                     project_key,
@@ -450,9 +502,11 @@ def start_operation(
                     str(row["root"])[:4096],
                     contract.data["scope"]["target_branch"],
                     contract.data["scope"]["integration_branch"],
+                    live_heads.get(project_id),
                 ),
             )
         primary_project = project_keys[scoped_ids[0]]
+        goal_rows: list[tuple[dict[str, Any], int, str]] = []
         for goal in contract.data["intent"]["goals"]:
             cursor = con.execute(
                 "INSERT INTO operator_goals("
@@ -468,14 +522,30 @@ def start_operation(
                     timestamp,
                 ),
             )
-            _insert_initial_work(
+            goal_project_id = (
+                goal["project_id"]
+                if operator_contract.is_v2(contract.data)
+                else scoped_ids[0]
+            )
+            work_id = _insert_initial_work(
                 con,
                 operation_id=operation_id,
                 goal_id=int(cursor.lastrowid),
-                project_key=primary_project,
+                project_key=project_keys.get(goal_project_id, primary_project),
                 goal=goal,
                 contract=contract.data,
                 timestamp=timestamp,
+            )
+            goal_rows.append((goal, int(cursor.lastrowid), work_id))
+        work_by_goal = {goal["id"]: work_id for goal, _goal_id, work_id in goal_rows}
+        for goal, _goal_id, work_id in goal_rows:
+            dependencies = [
+                work_by_goal[dependency]
+                for dependency in goal.get("depends_on", [])
+            ]
+            con.execute(
+                "UPDATE operator_work_items SET dependencies_json=? WHERE id=?",
+                (_json(dependencies), work_id),
             )
         _event(
             con,
@@ -1918,7 +1988,7 @@ def _insert_initial_work(
     goal: dict[str, Any],
     contract: dict[str, Any],
     timestamp: str,
-) -> None:
+) -> str:
     outcome = goal["outcome"]
     lowered = outcome.casefold()
     if any(word in lowered for word in ("architecture", "redesign", "integration")):
@@ -1931,8 +2001,18 @@ def _insert_initial_work(
         task_class,
         "generalist",
     )
-    requires_review = task_class == "architecture" or any(
-        word in lowered for word in ("security", "release", "migration")
+    requires_review = (
+        bool(goal["requires_review"])
+        if operator_contract.is_v2(contract)
+        else task_class == "architecture"
+        or any(word in lowered for word in ("security", "release", "migration"))
+    )
+    work_id = _new_id("ow")
+    project_id = goal.get("project_id")
+    include, exclude = (
+        operator_contract.project_scope(contract, project_id)
+        if project_id
+        else (contract["scope"]["include"], contract["scope"]["exclude"])
     )
     con.execute(
         "INSERT INTO operator_work_items("
@@ -1941,7 +2021,7 @@ def _insert_initial_work(
         "dependencies_json, change_budget_json, requires_review, created_at, updated_at"
         ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
-            _new_id("ow"),
+            work_id,
             operation_id,
             goal_id,
             project_key,
@@ -1954,7 +2034,8 @@ def _insert_initial_work(
             "high" if requires_review else "normal",
             _json({
                 "goal_key": goal["id"],
-                "scope": contract["scope"],
+                "scope": {"include": include, "exclude": exclude},
+                "read_dependencies": goal.get("read_dependencies", []),
                 "quality_gates": contract["quality"]["gates"],
             }),
             "[]",
@@ -1964,6 +2045,125 @@ def _insert_initial_work(
             timestamp,
         ),
     )
+    return work_id
+
+
+def dependencies_satisfied(work: dict[str, Any], *, path: Path | None = None) -> bool:
+    dependencies = list(work.get("dependencies") or [])
+    if not dependencies:
+        return True
+    con = connect(path)
+    try:
+        rows = list(
+            con.execute(
+                "SELECT id, state FROM operator_work_items WHERE id IN ("
+                + ",".join("?" for _ in dependencies)
+                + ")",
+                dependencies,
+            )
+        )
+        return (
+            len(rows) == len(dependencies)
+            and all(row["state"] == "accepted" for row in rows)
+        )
+    finally:
+        con.close()
+
+
+def assert_live_operation_safe(operation: dict[str, Any]) -> None:
+    if operation["mode"] != "live":
+        return
+    for project in operation["projects"]:
+        actual_head = _live_project_preflight(
+            Path(project["root"]),
+            expected_branch=project["integration_branch"],
+        )
+        expected_head = project.get("expected_head")
+        if not expected_head:
+            raise RuntimeError(
+                f"live project has no activation HEAD baseline: {project['root']}"
+            )
+        if actual_head != expected_head:
+            raise RuntimeError(
+                f"live integration checkout HEAD drifted for {project['root']}: "
+                f"expected {expected_head}, found {actual_head}"
+            )
+
+
+def update_project_expected_head(
+    operation_id: str,
+    project_key: str,
+    head: str,
+    *,
+    path: Path | None = None,
+) -> None:
+    con = connect(path)
+    try:
+        cursor = con.execute(
+            "UPDATE operation_projects SET expected_head=? "
+            "WHERE operation_id=? AND project_key=?",
+            (_bounded_text(head, 128), operation_id, project_key),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("operation project baseline could not be advanced")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _live_project_preflight(root: Path, *, expected_branch: str) -> str:
+    root = root.resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"live project root does not exist: {root}")
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        branch = subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot inspect live project {root}: {exc}") from exc
+    if status.returncode != 0 or branch.returncode != 0:
+        detail = (status.stderr or branch.stderr).strip()
+        raise RuntimeError(f"live project is not a readable Git checkout: {root}: {detail}")
+    if status.stdout.strip():
+        raise RuntimeError(f"live integration checkout is dirty: {root}")
+    current = branch.stdout.strip()
+    if current != expected_branch:
+        raise RuntimeError(
+            f"live integration checkout {root} is on {current!r}, "
+            f"expected {expected_branch!r}"
+        )
+    worktrees = root / ".orchestra" / "worktrees"
+    if worktrees.is_symlink():
+        raise RuntimeError(
+            f"unsafe symlink used as Operator worktree namespace: {worktrees}"
+        )
+    if worktrees.is_dir():
+        for entry in worktrees.iterdir():
+            if entry.is_symlink():
+                raise RuntimeError(
+                    f"unsafe symlink in Operator worktree namespace: {entry}"
+                )
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot resolve live integration HEAD for {root}: {exc}") from exc
+    if head.returncode != 0:
+        raise RuntimeError(f"cannot resolve live integration HEAD for {root}")
+    return head.stdout.strip()
 
 
 def _maybe_accept_goal(
@@ -2051,6 +2251,7 @@ def _operation_dict(con: sqlite3.Connection, operation: sqlite3.Row) -> dict[str
             "root": row["root"],
             "target_branch": row["target_branch"],
             "integration_branch": row["integration_branch"],
+            "expected_head": row["expected_head"],
         }
         for row in con.execute(
             "SELECT * FROM operation_projects WHERE operation_id=? "

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,22 @@ class OperatorRuntimeTests(unittest.TestCase):
         self.db_path = self.tmp / "state" / "operator.db"
         self.project_root = self.tmp / "project"
         (self.project_root / ".orchestra").mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-b", "main", str(self.project_root)],
+            check=True,
+            capture_output=True,
+        )
+        (self.project_root / ".gitignore").write_text(".orchestra/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.project_root), "add", ".gitignore"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.project_root), "commit", "--allow-empty", "-m", "init"],
+            check=True,
+            capture_output=True,
+        )
         self.project = {
             "id": PROJECT_ID,
             "name": "runtime-project",
