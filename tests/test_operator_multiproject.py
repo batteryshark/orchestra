@@ -175,7 +175,7 @@ class MultiProjectContainmentTests(unittest.TestCase):
         self.assertTrue(work[1]["requires_review"])
         self.assertEqual(work[1]["requirements"]["read_dependencies"], [PROJECT_A])
 
-    def test_dirty_live_integration_checkout_is_rejected(self) -> None:
+    def test_dirty_live_integration_checkout_starts_queued_for_retry(self) -> None:
         contract = self.multiproject_contract()
         contract["quality"]["verification"] = [
             {
@@ -192,14 +192,17 @@ class MultiProjectContainmentTests(unittest.TestCase):
         (self.root_b / "config" / "premiere2.toml").write_text(
             "unrelated = true\n", encoding="utf-8"
         )
-        with self.assertRaisesRegex(operator_runtime.RuntimeError, "dirty"):
-            operator_runtime.start_operation(
-                draft.operator_id,
-                mode="live",
-                priority=50,
-                registered_projects=self.projects,
-                path=self.db,
-            )
+        operation = operator_runtime.start_operation(
+            draft.operator_id,
+            mode="live",
+            priority=50,
+            registered_projects=self.projects,
+            path=self.db,
+        )
+        self.assertEqual(operation["state"], "queued")
+        admission = operator_runtime.inspect_live_operation(operation)
+        self.assertEqual(admission["violations"], [])
+        self.assertIn("dirty", admission["blockers"][0]["reason"])
 
     def test_clean_external_commit_is_detected_as_head_drift(self) -> None:
         contract = self.multiproject_contract()

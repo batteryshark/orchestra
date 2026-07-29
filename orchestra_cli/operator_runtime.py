@@ -26,6 +26,9 @@ LEASE_SECONDS = 45
 
 OPERATION_TERMINAL = {"achieved", "stopped", "failed"}
 OPERATION_STATES = {
+    "queued",
+    "running",
+    "verifying",
     "active",
     "waiting",
     "needs_decision",
@@ -73,8 +76,12 @@ CREATE TABLE IF NOT EXISTS operations (
   id TEXT PRIMARY KEY,
   operator_id TEXT NOT NULL REFERENCES operators(id),
   contract_version INTEGER NOT NULL,
+  roster_version INTEGER,
+  roster_sha256 TEXT,
+  admitted_at TEXT,
   mode TEXT NOT NULL CHECK(mode IN ('shadow', 'live')),
   state TEXT NOT NULL,
+  state_reason TEXT,
   priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 100),
   controller_pid INTEGER,
   created_at TEXT NOT NULL,
@@ -353,6 +360,18 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
             if "expected_head" not in refreshed:
                 raise
         con.commit()
+    operation_columns = {
+        row["name"] for row in con.execute("PRAGMA table_info(operations)")
+    }
+    if "roster_version" not in operation_columns:
+        con.execute("ALTER TABLE operations ADD COLUMN roster_version INTEGER")
+    if "roster_sha256" not in operation_columns:
+        con.execute("ALTER TABLE operations ADD COLUMN roster_sha256 TEXT")
+    if "admitted_at" not in operation_columns:
+        con.execute("ALTER TABLE operations ADD COLUMN admitted_at TEXT")
+    if "state_reason" not in operation_columns:
+        con.execute("ALTER TABLE operations ADD COLUMN state_reason TEXT")
+    con.commit()
     return con
 
 
@@ -366,6 +385,8 @@ def start_operation(
     mode: str,
     priority: int,
     registered_projects: Iterable[dict[str, Any]],
+    roster_version: int | None = None,
+    roster_sha256: str | None = None,
     path: Path | None = None,
 ) -> dict[str, Any]:
     if mode not in {"shadow", "live"}:
@@ -378,6 +399,8 @@ def start_operation(
             f"Operator {operator_status['id']} latest contract is not approved"
         )
     contract = operator_store.get_contract(operator_status["id"], path=path)
+    if (roster_version is None) != (roster_sha256 is None):
+        raise RuntimeError("roster version and hash must be pinned together")
     registered = {
         row["id"]: dict(row)
         for row in registered_projects
@@ -423,11 +446,16 @@ def start_operation(
                 "live activation requires a required verification command for "
                 "every project; missing: " + ", ".join(uncovered)
             )
-        live_heads = {}
+        live_heads: dict[str, str | None] = {}
         for project_id in scoped_ids:
-            live_heads[project_id] = _live_project_preflight(
+            inspection = inspect_live_project(
                 Path(str(registered[project_id]["root"])),
                 expected_branch=contract.data["scope"]["integration_branch"],
+            )
+            if inspection["violation"]:
+                raise RuntimeError(str(inspection["violation"]))
+            live_heads[project_id] = (
+                str(inspection["head"]) if inspection["ready"] else None
             )
     else:
         live_heads = {}
@@ -469,15 +497,18 @@ def start_operation(
         timestamp = operator_store.now()
         con.execute(
             "INSERT INTO operations("
-            "id, operator_id, contract_version, mode, state, priority, "
-            "created_at, activated_at, updated_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?)",
+            "id, operator_id, contract_version, roster_version, roster_sha256, "
+            "mode, state, state_reason, priority, created_at, activated_at, updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 operation_id,
                 operator_status["id"],
                 operator_status["contract_version"],
+                roster_version,
+                roster_sha256,
                 mode,
-                "active",
+                "queued",
+                "awaiting deterministic admission",
                 priority,
                 timestamp,
                 timestamp,
@@ -557,6 +588,8 @@ def start_operation(
                 "priority": priority,
                 "contract_version": operator_status["contract_version"],
                 "contract_sha256": operator_status["contract_sha256"],
+                "roster_version": roster_version,
+                "roster_sha256": roster_sha256,
                 "projects": scoped_ids,
             },
             timestamp,
@@ -617,9 +650,16 @@ def set_operation_state(
         timestamp = operator_store.now()
         stopped_at = timestamp if state in OPERATION_TERMINAL else None
         con.execute(
-            "UPDATE operations SET state=?, updated_at=?, stopped_at=COALESCE(?, stopped_at) "
+            "UPDATE operations SET state=?, state_reason=?, updated_at=?, "
+            "stopped_at=COALESCE(?, stopped_at) "
             "WHERE id=?",
-            (state, timestamp, stopped_at, operation["id"]),
+            (
+                state,
+                _bounded_text(reason, 4096),
+                timestamp,
+                stopped_at,
+                operation["id"],
+            ),
         )
         _event(
             con,
@@ -1122,7 +1162,7 @@ def answer_decision(
         )
         if remaining == 0:
             con.execute(
-                "UPDATE operations SET state='active', updated_at=? "
+                "UPDATE operations SET state='queued', updated_at=? "
                 "WHERE id=? AND state='needs_decision'",
                 (timestamp, decision["operation_id"]),
             )
@@ -1298,6 +1338,53 @@ def claim_action(
                 (action_id,),
             ).fetchone()
         )
+    finally:
+        con.close()
+
+
+def requeue_auto_action(
+    action_id: int,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Make a controller-deferred automatic action claimable after backpressure."""
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        action = con.execute(
+            "SELECT * FROM operator_action_intents WHERE id=?",
+            (action_id,),
+        ).fetchone()
+        if action is None:
+            raise RuntimeError(f"unknown action {action_id}")
+        operation = _resolve_operation(con, action["operation_id"])
+        contract = operator_store.get_contract(
+            operation["operator_id"],
+            version=operation["contract_version"],
+            path=path,
+        )
+        if contract.data["authority"][action["authority_action"]] != "auto":
+            raise RuntimeError("only contract-automatic actions may be requeued")
+        if action["state"] == "waiting":
+            con.execute(
+                "UPDATE operator_action_intents SET state='authorized', updated_at=? "
+                "WHERE id=?",
+                (operator_store.now(), action_id),
+            )
+        elif action["state"] != "authorized":
+            raise RuntimeError(
+                f"action {action_id} in {action['state']} cannot be requeued"
+            )
+        con.commit()
+        return _action_dict(
+            con.execute(
+                "SELECT * FROM operator_action_intents WHERE id=?",
+                (action_id,),
+            ).fetchone()
+        )
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 
@@ -2074,23 +2161,54 @@ def dependencies_satisfied(work: dict[str, Any], *, path: Path | None = None) ->
 
 
 def assert_live_operation_safe(operation: dict[str, Any]) -> None:
+    admission = inspect_live_operation(operation)
+    problems = [*admission["violations"], *admission["blockers"]]
+    if problems:
+        raise RuntimeError(str(problems[0]["reason"]))
+
+
+def inspect_live_operation(
+    operation: dict[str, Any],
+) -> dict[str, list[dict[str, str]]]:
+    """Classify live-project state without turning backpressure into a decision."""
+    blockers: list[dict[str, str]] = []
+    violations: list[dict[str, str]] = []
     if operation["mode"] != "live":
-        return
+        return {"blockers": blockers, "violations": violations}
     for project in operation["projects"]:
-        actual_head = _live_project_preflight(
+        inspection = inspect_live_project(
             Path(project["root"]),
             expected_branch=project["integration_branch"],
         )
+        if inspection["violation"]:
+            violations.append({
+                "project_id": project["project_id"],
+                "reason": str(inspection["violation"]),
+            })
+            continue
+        if not inspection["ready"]:
+            blockers.append({
+                "project_id": project["project_id"],
+                "reason": str(inspection["wait_reason"]),
+            })
+            continue
         expected_head = project.get("expected_head")
         if not expected_head:
-            raise RuntimeError(
-                f"live project has no activation HEAD baseline: {project['root']}"
-            )
-        if actual_head != expected_head:
-            raise RuntimeError(
-                f"live integration checkout HEAD drifted for {project['root']}: "
-                f"expected {expected_head}, found {actual_head}"
-            )
+            blockers.append({
+                "project_id": project["project_id"],
+                "reason": (
+                    f"live project has no admitted HEAD baseline: {project['root']}"
+                ),
+            })
+        elif inspection["head"] != expected_head:
+            violations.append({
+                "project_id": project["project_id"],
+                "reason": (
+                    f"live integration checkout HEAD drifted for {project['root']}: "
+                    f"expected {expected_head}, found {inspection['head']}"
+                ),
+            })
+    return {"blockers": blockers, "violations": violations}
 
 
 def update_project_expected_head(
@@ -2114,10 +2232,99 @@ def update_project_expected_head(
         con.close()
 
 
+def pin_operation_roster(
+    operation_id: str,
+    *,
+    version: int,
+    sha256: str,
+    path: Path | None = None,
+) -> None:
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT roster_version, roster_sha256 FROM operations WHERE id=?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"unknown operation {operation_id!r}")
+        if row["roster_version"] is not None:
+            if int(row["roster_version"]) != version or row["roster_sha256"] != sha256:
+                raise RuntimeError("operation roster pin is immutable")
+            con.commit()
+            return
+        con.execute(
+            "UPDATE operations SET roster_version=?, roster_sha256=?, updated_at=? "
+            "WHERE id=? AND roster_version IS NULL",
+            (version, _bounded_text(sha256, 128), operator_store.now(), operation_id),
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def mark_operation_admitted(
+    operation_id: str,
+    *,
+    path: Path | None = None,
+) -> None:
+    con = connect(path)
+    try:
+        timestamp = operator_store.now()
+        changed = con.execute(
+            "UPDATE operations SET admitted_at=COALESCE(admitted_at, ?), updated_at=? "
+            "WHERE id=?",
+            (timestamp, timestamp, operation_id),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError(f"unknown operation {operation_id!r}")
+        con.commit()
+    finally:
+        con.close()
+
+
 def _live_project_preflight(root: Path, *, expected_branch: str) -> str:
+    inspection = inspect_live_project(root, expected_branch=expected_branch)
+    problem = inspection["violation"] or inspection["wait_reason"]
+    if problem:
+        raise RuntimeError(str(problem))
+    return str(inspection["head"])
+
+
+def inspect_live_project(root: Path, *, expected_branch: str) -> dict[str, Any]:
+    """Return ready/waiting/violation state for one shared integration checkout."""
     root = root.resolve()
     if not root.is_dir():
-        raise RuntimeError(f"live project root does not exist: {root}")
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": f"live project root does not exist: {root}",
+            "violation": None,
+        }
+    worktrees = root / ".orchestra" / "worktrees"
+    if worktrees.is_symlink():
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": None,
+            "violation": (
+                f"unsafe symlink used as Operator worktree namespace: {worktrees}"
+            ),
+        }
+    if worktrees.is_dir():
+        for entry in worktrees.iterdir():
+            if entry.is_symlink():
+                return {
+                    "ready": False,
+                    "head": None,
+                    "wait_reason": None,
+                    "violation": (
+                        f"unsafe symlink in Operator worktree namespace: {entry}"
+                    ),
+                }
     try:
         status = subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain"],
@@ -2132,29 +2339,40 @@ def _live_project_preflight(root: Path, *, expected_branch: str) -> str:
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"cannot inspect live project {root}: {exc}") from exc
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": f"cannot inspect live project {root}: {exc}",
+            "violation": None,
+        }
     if status.returncode != 0 or branch.returncode != 0:
         detail = (status.stderr or branch.stderr).strip()
-        raise RuntimeError(f"live project is not a readable Git checkout: {root}: {detail}")
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": None,
+            "violation": (
+                f"live project is not a readable Git checkout: {root}: {detail}"
+            ),
+        }
     if status.stdout.strip():
-        raise RuntimeError(f"live integration checkout is dirty: {root}")
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": f"live integration checkout is dirty: {root}",
+            "violation": None,
+        }
     current = branch.stdout.strip()
     if current != expected_branch:
-        raise RuntimeError(
-            f"live integration checkout {root} is on {current!r}, "
-            f"expected {expected_branch!r}"
-        )
-    worktrees = root / ".orchestra" / "worktrees"
-    if worktrees.is_symlink():
-        raise RuntimeError(
-            f"unsafe symlink used as Operator worktree namespace: {worktrees}"
-        )
-    if worktrees.is_dir():
-        for entry in worktrees.iterdir():
-            if entry.is_symlink():
-                raise RuntimeError(
-                    f"unsafe symlink in Operator worktree namespace: {entry}"
-                )
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": (
+                f"live integration checkout {root} is on {current!r}, "
+                f"expected {expected_branch!r}"
+            ),
+            "violation": None,
+        }
     try:
         head = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -2163,10 +2381,25 @@ def _live_project_preflight(root: Path, *, expected_branch: str) -> str:
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"cannot resolve live integration HEAD for {root}: {exc}") from exc
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": f"cannot resolve live integration HEAD for {root}: {exc}",
+            "violation": None,
+        }
     if head.returncode != 0:
-        raise RuntimeError(f"cannot resolve live integration HEAD for {root}")
-    return head.stdout.strip()
+        return {
+            "ready": False,
+            "head": None,
+            "wait_reason": f"cannot resolve live integration HEAD for {root}",
+            "violation": None,
+        }
+    return {
+        "ready": True,
+        "head": head.stdout.strip(),
+        "wait_reason": None,
+        "violation": None,
+    }
 
 
 def _maybe_accept_goal(
@@ -2263,15 +2496,23 @@ def _operation_dict(con: sqlite3.Connection, operation: sqlite3.Row) -> dict[str
         )
     ]
     state = operation["state"]
-    if state == "active" and open_decisions:
+    if state in {"active", "queued", "running", "verifying", "waiting"} and open_decisions:
         state = "needs_decision"
     return {
         "id": operation["id"],
         "operator_id": operation["operator_id"],
         "contract_version": int(operation["contract_version"]),
+        "roster_version": (
+            int(operation["roster_version"])
+            if operation["roster_version"] is not None
+            else None
+        ),
+        "roster_sha256": operation["roster_sha256"],
+        "admitted_at": operation["admitted_at"],
         "mode": operation["mode"],
         "state": state,
         "stored_state": operation["state"],
+        "state_reason": operation["state_reason"],
         "priority": int(operation["priority"]),
         "controller_pid": operation["controller_pid"],
         "created_at": operation["created_at"],

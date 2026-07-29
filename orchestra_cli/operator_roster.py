@@ -1,4 +1,4 @@
-"""Versioned roster policy, shared capacity, routing, and recovery councils."""
+"""Versioned roster policy, shared capacity, routing, and legacy council records."""
 from __future__ import annotations
 
 import hashlib
@@ -223,6 +223,7 @@ class Route:
     considered: tuple[dict[str, Any], ...]
     explanation: str
     decision_id: int
+    blocker: str | None
 
 
 @dataclass(frozen=True)
@@ -580,6 +581,36 @@ def latest_policy(
         con.close()
 
 
+def policy_version(
+    version: int,
+    *,
+    require_approved: bool = True,
+    path: Path | None = None,
+) -> RosterPolicy:
+    con = connect(path)
+    try:
+        join = (
+            "JOIN roster_policy_approvals a ON a.version=v.version "
+            "AND a.content_sha256=v.content_sha256"
+            if require_approved
+            else ""
+        )
+        row = con.execute(
+            "SELECT v.content_json, v.content_sha256 "
+            f"FROM roster_policy_versions v {join} WHERE v.version=?",
+            (version,),
+        ).fetchone()
+        if row is None:
+            suffix = "approved " if require_approved else ""
+            raise RosterError(f"no {suffix}roster policy v{version} exists")
+        policy = parse_policy(row["content_json"], source=f"roster policy v{version}")
+        if policy.sha256 != row["content_sha256"]:
+            raise RosterError(f"roster policy v{version} hash mismatch")
+        return policy
+    finally:
+        con.close()
+
+
 def record_capacity_snapshot(
     policy: RosterPolicy,
     snapshot: Mapping[str, Any],
@@ -647,6 +678,7 @@ def route(
     capacity: Mapping[str, Mapping[str, Any]],
     active_by_profile: Mapping[str, int] | None = None,
     reviewer_profile: str | None = None,
+    structural_only: bool = False,
     path: Path | None = None,
 ) -> Route:
     active_by_profile = active_by_profile or {}
@@ -678,9 +710,12 @@ def route(
             )
         if name in forbidden:
             reasons.append("forbidden by contract")
-        if live.get("state") == "unavailable":
+        if not structural_only and live.get("state") == "unavailable":
             reasons.append("launch evidence proves unavailable")
-        if health_state in {"quarantined", "disabled", "unavailable"}:
+        if (
+            not structural_only
+            and health_state in {"quarantined", "disabled", "unavailable"}
+        ):
             reasons.append(f"health state is {health_state}")
         if TIERS[profile["tier"]] < required_tier:
             reasons.append(f"tier {profile['tier']} is below {work['minimum_tier']}")
@@ -700,10 +735,11 @@ def route(
             for pool in policy.data["pools"]
             if pool["id"] in pools
         }
-        for pool_id, limit in pool_limits.items():
-            active = _active_reservation_count(pool_id, path=path)
-            if active + active_by_pool.get(pool_id, 0) >= limit["max_concurrency"]:
-                reasons.append(f"capacity pool {pool_id} has no concurrency slot")
+        if not structural_only:
+            for pool_id, limit in pool_limits.items():
+                active = _active_reservation_count(pool_id, path=path)
+                if active + active_by_pool.get(pool_id, 0) >= limit["max_concurrency"]:
+                    reasons.append(f"capacity pool {pool_id} has no concurrency slot")
         score = 0.0
         if not reasons:
             score += 100
@@ -742,14 +778,38 @@ def route(
     )
     selected = eligible[0]["profile"] if eligible else None
     fallbacks = tuple(row["profile"] for row in eligible[1:])
+    transient_prefixes = (
+        "capacity pool ",
+        "launch evidence proves unavailable",
+        "health state is quarantined",
+        "health state is unavailable",
+    )
+    transient_candidates = [
+        row for row in candidates
+        if row["reasons"]
+        and all(
+            any(reason.startswith(prefix) for prefix in transient_prefixes)
+            for reason in row["reasons"]
+        )
+    ]
+    blocker = None
     if selected:
         explanation = (
             f"{selected} is the highest-ranked profile that satisfies the "
             f"{work['minimum_tier']} quality floor, {work['task_class']} capability, "
             f"{work['actuation_mode']} mode, health, independence, and pool constraints"
         )
+    elif transient_candidates:
+        blocker = "transient"
+        explanation = (
+            "qualified profiles exist but temporary capacity or availability "
+            "backpressure prevents dispatch"
+        )
     else:
-        explanation = "no profile satisfies every hard eligibility constraint"
+        blocker = "policy"
+        explanation = (
+            "no approved profile satisfies the task's structural eligibility constraints"
+        )
     con = connect(path)
     try:
         cursor = con.execute(
@@ -778,7 +838,14 @@ def route(
         decision_id = int(cursor.lastrowid)
     finally:
         con.close()
-    return Route(selected, fallbacks, tuple(candidates), explanation, decision_id)
+    return Route(
+        selected,
+        fallbacks,
+        tuple(candidates),
+        explanation,
+        decision_id,
+        blocker,
+    )
 
 
 def reserve(

@@ -1694,16 +1694,19 @@ def cmd_operator(args):
                 return
 
         if args.operator_cmd == "start":
-            operator_roster.latest_policy()
+            roster_version, roster_policy = operator_roster.latest_policy()
             operation = operator_runtime.start_operation(
                 args.identifier,
                 mode=args.mode,
                 priority=args.priority,
                 registered_projects=_registered_operator_projects(),
+                roster_version=roster_version,
+                roster_sha256=roster_policy.sha256,
             )
             print(
-                f"started {operation['id']} in {operation['mode']} mode "
-                f"with {len(operation['goals'])} goal(s)"
+                f"queued {operation['id']} in {operation['mode']} mode "
+                f"with {len(operation['goals'])} goal(s), roster "
+                f"v{operation['roster_version']}"
             )
             if not args.no_background:
                 pid = _spawn_operator_controller(operation["id"])
@@ -1723,7 +1726,7 @@ def cmd_operator(args):
         if args.operator_cmd in {"pause", "resume", "stop"}:
             target_state = {
                 "pause": "paused",
-                "resume": "active",
+                "resume": "queued",
                 "stop": "stopped",
             }[args.operator_cmd]
             current = operator_runtime.get_operation(args.identifier)
@@ -1769,6 +1772,7 @@ def cmd_operator(args):
                     f"{operation['id']}  {operation['mode']} / {operation['state']}  "
                     f"controller={operation['controller_pid'] or 'stopped'}"
                 )
+                print(f"  reason: {operation['state_reason'] or 'none'}")
                 print(
                     "  work: "
                     + (", ".join(

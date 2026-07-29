@@ -97,7 +97,7 @@ class OperatorRuntimeTests(unittest.TestCase):
     def test_shadow_start_materializes_goals_projects_and_ready_work(self) -> None:
         draft, operation = self.start_shadow()
         self.assertEqual(operation["operator_id"], draft.operator_id)
-        self.assertEqual(operation["state"], "active")
+        self.assertEqual(operation["state"], "queued")
         self.assertEqual(operation["mode"], "shadow")
         self.assertEqual(operation["goals"][0]["state"], "active")
         self.assertEqual(len(operation["projects"]), 1)
@@ -393,6 +393,14 @@ class OperatorRuntimeTests(unittest.TestCase):
             path=self.db_path,
         )
         self.assertEqual(waiting["state"], "waiting")
+        with self.assertRaisesRegex(
+            operator_runtime.RuntimeError,
+            "only contract-automatic actions may be requeued",
+        ):
+            operator_runtime.requeue_auto_action(
+                waiting["id"],
+                path=self.db_path,
+            )
         decision = operator_runtime.decisions(
             operation["id"],
             state="open",

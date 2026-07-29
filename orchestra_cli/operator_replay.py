@@ -373,7 +373,8 @@ def operation_snapshot(
         "operation": {
             key: operation[key]
             for key in (
-                "id", "operator_id", "contract_version", "mode", "state",
+                "id", "operator_id", "contract_version", "roster_version",
+                "roster_sha256", "admitted_at", "mode", "state", "state_reason",
                 "priority", "goals", "work_counts", "open_decisions",
             )
         },

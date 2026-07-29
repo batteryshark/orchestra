@@ -340,7 +340,7 @@ def template(
             "permitted_fallbacks": [
                 "retry within budget",
                 "reroute to another contract-qualified profile",
-                "convene one bounded recovery council",
+                "wait for declared environmental backpressure to clear",
             ],
             "retry_limit": 3,
             "decision_deadline_seconds": None,

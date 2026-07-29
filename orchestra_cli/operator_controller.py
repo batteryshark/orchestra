@@ -143,40 +143,56 @@ def _reconcile(
         version=operation["contract_version"],
         path=path,
     ).data
-    try:
-        operator_runtime.assert_live_operation_safe(operation)
-    except operator_runtime.RuntimeError as exc:
-        reason = str(exc)
-        operator_runtime.create_decision(
-            operation["id"],
-            idempotency_key="containment:" + hashlib.sha256(
-                reason.encode("utf-8")
-            ).hexdigest()[:24],
-            question="The live project containment precondition failed. How should the checkout be restored?",
-            why_now=(
-                "Operator stopped before dispatching or integrating more work because "
-                "a shared integration checkout is dirty, on the wrong branch, or "
-                "contains an external worktree link."
-            ),
-            options=[
-                {"id": "owner-restores", "label": "Owner restores a clean checkout"},
-                {"id": "stop", "label": "Stop the operation"},
-            ],
-            recommendation=(
-                "Preserve any unique work, remove external links, and restore the "
-                "approved clean integration branch before resuming."
-            ),
-            evidence={"error": reason},
-            blocking_scope={"projects": operation["projects"]},
-            path=path,
-        )
-        stopped = operator_runtime.set_operation_state(
-            operation["id"],
-            "needs_decision",
-            reason=reason,
-            path=path,
-        )
-        return _summary(stopped, [{"kind": "containment_precondition", "error": reason}])
+    if operation["mode"] == "live":
+        operation = _refresh_unstarted_baselines(operation, path=path)
+        admission = operator_runtime.inspect_live_operation(operation)
+        if admission["blockers"]:
+            waiting = operator_runtime.set_operation_state(
+                operation["id"],
+                "waiting",
+                reason="; ".join(row["reason"] for row in admission["blockers"]),
+                path=path,
+            )
+            return _summary(waiting, [{
+                "kind": "waiting",
+                "reason": "integration checkout unavailable",
+                "blockers": admission["blockers"],
+            }])
+        if admission["violations"]:
+            reason = "; ".join(row["reason"] for row in admission["violations"])
+            evidence_hash = hashlib.sha256(
+                json.dumps(admission["violations"], sort_keys=True).encode("utf-8")
+            ).hexdigest()[:24]
+            operator_runtime.create_decision(
+                operation["id"],
+                idempotency_key=f"admission-violation:{evidence_hash}",
+                question=(
+                    "Operator detected a persistent containment or admitted-baseline "
+                    "violation. How should the preserved state be handled?"
+                ),
+                why_now=(
+                    "This is not temporary capacity or checkout backpressure; the "
+                    "approved execution boundary changed after admission."
+                ),
+                options=[
+                    {"id": "inspect", "label": "Inspect preserved state"},
+                    {"id": "stop", "label": "Stop the operation"},
+                ],
+                recommendation="Preserve state and inspect the boundary change.",
+                evidence={"violations": admission["violations"]},
+                blocking_scope={"projects": operation["projects"]},
+                path=path,
+            )
+            stopped = operator_runtime.set_operation_state(
+                operation["id"],
+                "needs_decision",
+                reason=reason,
+                path=path,
+            )
+            return _summary(stopped, [{
+                "kind": "admission_violation",
+                "violations": admission["violations"],
+            }])
     if operation["mode"] == "live":
         active_resources = operator_runtime.resource_leases(
             operation["id"], active_only=True, path=path
@@ -265,7 +281,62 @@ def _reconcile(
                 "kind": "resource_budget_exhausted",
                 "resource": "wall_clock",
             }])
-    _version, policy = operator_roster.latest_policy(path=path)
+    if operation["roster_version"] is None:
+        roster_version, policy = operator_roster.latest_policy(path=path)
+        operator_runtime.pin_operation_roster(
+            operation["id"],
+            version=roster_version,
+            sha256=policy.sha256,
+            path=path,
+        )
+        operation = operator_runtime.get_operation(operation["id"], path=path)
+    else:
+        roster_version = int(operation["roster_version"])
+        policy = operator_roster.policy_version(roster_version, path=path)
+        if policy.sha256 != operation["roster_sha256"]:
+            raise ControllerError(
+                f"operation roster v{roster_version} hash no longer matches its pin"
+            )
+    if operation["admitted_at"] is None:
+        admission_errors = _roster_admission_errors(
+            operation, contract, policy, path=path
+        )
+        if admission_errors:
+            evidence_hash = hashlib.sha256(
+                json.dumps(admission_errors, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:24]
+            operator_runtime.create_decision(
+                operation["id"],
+                idempotency_key=f"roster-admission:{evidence_hash}",
+                question=(
+                    "The pinned contract and roster cannot produce the required "
+                    "implementation/review lanes. Revise or stop?"
+                ),
+                why_now=(
+                    "Admission failed before any worker was dispatched. Runtime "
+                    "capacity and unrelated work are not part of this decision."
+                ),
+                options=[
+                    {"id": "revise", "label": "Revise outside operation"},
+                    {"id": "stop", "label": "Stop the operation"},
+                ],
+                recommendation="Stop and approve a coherent contract/roster pair.",
+                evidence={"errors": admission_errors},
+                blocking_scope={"operation_id": operation["id"]},
+                path=path,
+            )
+            blocked = operator_runtime.set_operation_state(
+                operation["id"],
+                "needs_decision",
+                reason="contract and pinned roster failed admission",
+                path=path,
+            )
+            return _summary(blocked, [{
+                "kind": "admission_rejected",
+                "errors": admission_errors,
+            }])
+        operator_runtime.mark_operation_admitted(operation["id"], path=path)
+        operation = operator_runtime.get_operation(operation["id"], path=path)
     snapshot = operator_replay.operation_snapshot(operation_id, path=path)
     try:
         usage_snapshot = default_service().snapshot()
@@ -299,7 +370,6 @@ def _reconcile(
         else:
             _apply_pending_cleanup_actions(operation, events, path=path)
             _reconcile_inflight(operation, contract, policy, events, path=path)
-            _reconcile_councils(operation, contract, policy, events, path=path)
             refreshed = operator_runtime.get_operation(operation_id, path=path)
             if refreshed["state"] not in {"paused", "needs_decision"}:
                 _dispatch_ready(
@@ -322,10 +392,11 @@ def _reconcile(
                     path=path,
                 )
                 events.append({"kind": "operation_achieved"})
-            elif refreshed["state"] == "waiting":
-                operator_runtime.set_operation_state(
-                    operation_id, "active", reason="reconciliation resumed", path=path
-                )
+            elif (
+                refreshed["state"] not in {"needs_decision", "paused"}
+                and not any(event.get("kind") == "waiting" for event in events)
+            ):
+                _synchronize_execution_state(refreshed, path=path)
         final = operator_runtime.get_operation(operation_id, path=path)
         operator_runtime.finish_attempt(
             attempt,
@@ -500,8 +571,17 @@ def _verify_and_integrate(
         events.append({"kind": "verification_failed", "work": work["id"]})
         return
     if work["requires_review"]:
-        _dispatch_review(operation, work, contract, policy, complexity, verification, path=path)
-        events.append({"kind": "review_dispatched", "work": work["id"]})
+        if _dispatch_review(
+            operation,
+            work,
+            contract,
+            policy,
+            complexity,
+            verification,
+            events,
+            path=path,
+        ):
+            events.append({"kind": "review_dispatched", "work": work["id"]})
         return
     _integrate(operation, work, contract, complexity, verification, events, path=path)
 
@@ -555,9 +635,10 @@ def _dispatch_review(
     policy: operator_roster.RosterPolicy,
     complexity: dict[str, Any],
     verification: dict[str, Any],
+    events: list[dict[str, Any]],
     *,
     path: Path | None,
-) -> None:
+) -> bool:
     cfg = config.load(Path(work["root"]))
     report = availability.discover(cfg)
     reviewer_work = {
@@ -577,16 +658,73 @@ def _dispatch_review(
         path=path,
     )
     if not route.profile:
-        raise ControllerError("no independent reviewer satisfies the approved roster")
-    reservation = operator_roster.reserve(
-        operation["id"],
-        work["id"],
-        profile_name=route.profile,
-        policy=policy,
-        minimum_tier=work["minimum_tier"],
-        burn_band="small",
-        path=path,
-    )
+        if route.blocker == "transient":
+            operator_runtime.set_operation_state(
+                operation["id"], "waiting", reason=route.explanation, path=path
+            )
+            events.append({
+                "kind": "waiting",
+                "reason": "independent reviewer unavailable",
+                "work": work["id"],
+                "routing_decision": route.decision_id,
+            })
+            return False
+        operator_runtime.create_decision(
+            operation["id"],
+            idempotency_key=f"review-admission:{work['id']}",
+            question=(
+                f"No approved independent reviewer can verify {work['id']}. "
+                "Revise the review requirement or stop?"
+            ),
+            why_now=(
+                "Implementation finished, but the pinned roster cannot satisfy "
+                "the contract's independent-review boundary."
+            ),
+            options=[
+                {"id": "revise", "label": "Revise review plan"},
+                {"id": "stop", "label": "Stop this work item"},
+            ],
+            recommendation="Preserve the sealed output and revise outside this operation.",
+            evidence={
+                "routing_decision": route.decision_id,
+                "considered": list(route.considered),
+            },
+            blocking_scope={"work_item_id": work["id"]},
+            work_item_id=work["id"],
+            path=path,
+        )
+        operator_runtime.set_operation_state(
+            operation["id"],
+            "needs_decision",
+            reason="no structurally eligible independent reviewer",
+            path=path,
+        )
+        events.append({
+            "kind": "review_admission_rejected",
+            "work": work["id"],
+            "routing_decision": route.decision_id,
+        })
+        return False
+    try:
+        reservation = operator_roster.reserve(
+            operation["id"],
+            work["id"],
+            profile_name=route.profile,
+            policy=policy,
+            minimum_tier=work["minimum_tier"],
+            burn_band="small",
+            path=path,
+        )
+    except operator_roster.RosterError as exc:
+        operator_runtime.set_operation_state(
+            operation["id"], "waiting", reason=str(exc), path=path
+        )
+        events.append({
+            "kind": "waiting",
+            "reason": "review capacity changed before reservation",
+            "work": work["id"],
+        })
+        return False
     mission = (
         f"Independently review Operator work {work['id']} on branch {work['branch']} "
         f"against base {work['base_head']} and the contract gates. Do not edit. "
@@ -647,6 +785,7 @@ def _dispatch_review(
         verification=verification,
         path=path,
     )
+    return True
 
 
 def _finish_review(
@@ -724,6 +863,11 @@ def _integrate(
         work_item_id=work["id"],
         path=path,
     )
+    if (
+        action["state"] == "waiting"
+        and contract["authority"]["merge_after_gates"] == "auto"
+    ):
+        action = operator_runtime.requeue_auto_action(action["id"], path=path)
     if operation["mode"] == "shadow" or action["state"] != "authorized":
         return
     claimed = operator_runtime.claim_action(action["id"], path=path)
@@ -916,6 +1060,23 @@ def _integrate(
         events.append({"kind": "work_accepted", "work": work["id"], "head": head})
     except Exception as exc:
         if not merge_applied:
+            if _is_transient_integration_error(exc):
+                operator_runtime.finish_action(
+                    action["id"], state="waiting", error=str(exc), path=path
+                )
+                operator_runtime.set_operation_state(
+                    operation["id"],
+                    "waiting",
+                    reason=f"integration checkout unavailable: {exc}",
+                    path=path,
+                )
+                events.append({
+                    "kind": "waiting",
+                    "reason": "integration checkout unavailable",
+                    "work": work["id"],
+                    "error": str(exc),
+                })
+                return
             operator_runtime.finish_action(
                 action["id"], state="failed", error=str(exc), path=path
             )
@@ -1012,22 +1173,16 @@ def _dispatch_ready(
         ):
             operator_runtime.set_operation_state(
                 operation["id"],
-                "needs_decision",
-                reason="worktree or disk resource ceiling reached",
+                "waiting",
+                reason="worktree or disk admission ceiling reached",
                 path=path,
             )
-            operator_runtime.create_decision(
-                operation["id"],
-                idempotency_key=f"resource:{work['project_key']}",
-                question="Resource ceiling blocks safe isolated work. What should be reclaimed or changed?",
-                why_now="The approved disk/worktree budget cannot admit another run.",
-                options=[{"id": "reclaim", "label": "Reclaim safe integrated worktrees"}],
-                recommendation="Inspect dirty and unique work before changing the ceiling.",
-                evidence=usage,
-                blocking_scope={"project_key": work["project_key"]},
-                work_item_id=work["id"],
-                path=path,
-            )
+            events.append({
+                "kind": "waiting",
+                "reason": "worktree or disk admission ceiling reached",
+                "work": work["id"],
+                "resources": usage,
+            })
             return
         cfg = config.load(Path(work["root"]))
         report = availability.discover(cfg)
@@ -1041,6 +1196,58 @@ def _dispatch_ready(
             active_by_profile=active_profiles,
             path=path,
         )
+        if not route.profile:
+            if route.blocker == "transient":
+                operator_runtime.set_operation_state(
+                    operation["id"],
+                    "waiting",
+                    reason=route.explanation,
+                    path=path,
+                )
+                events.append({
+                    "kind": "waiting",
+                    "reason": "worker capacity unavailable",
+                    "work": work["id"],
+                    "routing_decision": route.decision_id,
+                })
+                return
+            operator_runtime.create_decision(
+                operation["id"],
+                idempotency_key=f"admission:{work['id']}",
+                question=(
+                    f"No approved live worker can execute {work['id']}. "
+                    "Revise the task or stop it?"
+                ),
+                why_now=(
+                    "The task has not been attempted. Its tier, capability, "
+                    "actuation, containment, or owner-policy requirements are "
+                    "structurally incompatible with the approved roster."
+                ),
+                options=[
+                    {"id": "revise", "label": "Revise bounded task"},
+                    {"id": "stop", "label": "Stop this work item"},
+                ],
+                recommendation="Revise the task or roster outside this operation.",
+                evidence={
+                    "routing_decision": route.decision_id,
+                    "considered": list(route.considered),
+                },
+                blocking_scope={"work_item_id": work["id"]},
+                work_item_id=work["id"],
+                path=path,
+            )
+            operator_runtime.set_operation_state(
+                operation["id"],
+                "needs_decision",
+                reason="no structurally eligible live worker",
+                path=path,
+            )
+            events.append({
+                "kind": "admission_rejected",
+                "work": work["id"],
+                "routing_decision": route.decision_id,
+            })
+            return
         action = operator_runtime.propose_action(
             operation["id"],
             attempt_id=None,
@@ -1060,20 +1267,28 @@ def _dispatch_ready(
                 "authority": action["state"],
             })
             continue
-        if not route.profile:
-            _escalate_stuck(operation, work, contract, events, path=path)
-            continue
         if action["state"] != "authorized":
             continue
-        reservation = operator_roster.reserve(
-            operation["id"],
-            work["id"],
-            profile_name=route.profile,
-            policy=policy,
-            minimum_tier=work["minimum_tier"],
-            burn_band="heavy" if work["minimum_tier"] == "heavy" else "normal",
-            path=path,
-        )
+        try:
+            reservation = operator_roster.reserve(
+                operation["id"],
+                work["id"],
+                profile_name=route.profile,
+                policy=policy,
+                minimum_tier=work["minimum_tier"],
+                burn_band="heavy" if work["minimum_tier"] == "heavy" else "normal",
+                path=path,
+            )
+        except operator_roster.RosterError as exc:
+            operator_runtime.set_operation_state(
+                operation["id"], "waiting", reason=str(exc), path=path
+            )
+            events.append({
+                "kind": "waiting",
+                "reason": "worker capacity changed before reservation",
+                "work": work["id"],
+            })
+            return
         claimed = operator_runtime.claim_action(action["id"], path=path)
         if not claimed:
             operator_roster.release_reservation(reservation.group, path=path)
@@ -1384,7 +1599,12 @@ def _retry_or_escalate(
     )
     events.append({"kind": state, "work": work["id"], "failure": fingerprint})
     if state == "failed_terminal":
-        _escalate_stuck(operation, work, contract, events, path=path)
+        refreshed = next(
+            row
+            for row in operator_runtime.work_items(operation["id"], path=path)
+            if row["id"] == work["id"]
+        )
+        _escalate_stuck(operation, refreshed, contract, events, path=path)
 
 
 def _escalate_stuck(
@@ -1395,200 +1615,41 @@ def _escalate_stuck(
     *,
     path: Path | None,
 ) -> None:
-    try:
-        council = operator_roster.create_council(
-            operation["id"],
-            work["id"],
-            failure_fingerprint=work["failure_fingerprint"] or "attempts_exhausted",
-            evidence={
-                "problem": (
-                    f"Work remains stuck after {work['attempt_count']} attempts: "
-                    f"{work['title']}"
-                ),
-                "failure_fingerprint": work["failure_fingerprint"],
-                "requirements": work["requirements"],
-            },
-            contract=contract,
-            policy=operator_roster.latest_policy(path=path)[1],
-            path=path,
-        )
-    except operator_roster.RosterError as exc:
-        operator_runtime.set_operation_state(
-            operation["id"],
-            "needs_decision",
-            reason="no containment-safe recovery quorum",
-            path=path,
-        )
-        operator_runtime.create_decision(
-            operation["id"],
-            idempotency_key=f"stuck:{work['id']}:{work['attempt_count']}",
-            question=f"Work {work['id']} is stuck and no safe recovery quorum is available.",
-            why_now=(
-                "Automatic attempts are exhausted and the configured reviewers "
-                "cannot all be admitted under the live containment policy."
-            ),
-            options=[
-                {"id": "revise", "label": "Approve a bounded revised action"},
-                {"id": "stop", "label": "Stop this work item"},
-            ],
-            recommendation="Revise the work or roster without weakening containment.",
-            evidence={"roster_error": str(exc)},
-            blocking_scope={"work_item_id": work["id"]},
-            work_item_id=work["id"],
-            path=path,
-        )
-        events.append(
-            {
-                "kind": "recovery_quorum_unavailable",
-                "work": work["id"],
-                "error": str(exc),
-            }
-        )
-        return
+    if int(work["attempt_count"]) < 1:
+        raise ControllerError("cannot escalate work that has never dispatched an attempt")
     operator_runtime.set_operation_state(
-        operation["id"], "needs_decision", reason=f"recovery council {council['id']}", path=path
+        operation["id"],
+        "needs_decision",
+        reason="bounded worker attempts exhausted",
+        path=path,
     )
     operator_runtime.create_decision(
         operation["id"],
         idempotency_key=f"stuck:{work['id']}:{work['attempt_count']}",
-        question=f"Work {work['id']} is stuck. Review the bounded recovery council.",
-        why_now="Automatic attempts are exhausted; authority cannot be broadened by consensus.",
+        question=f"Work {work['id']} exhausted its approved attempts. Revise or stop?",
+        why_now=(
+            "At least one contained worker ran and the approved retry budget is "
+            "exhausted. No model council can change scope or authority."
+        ),
         options=[
             {"id": "revise", "label": "Approve a bounded revised action"},
             {"id": "stop", "label": "Stop this work item"},
         ],
-        recommendation="Wait for independent council opinions before choosing.",
-        evidence={"council_id": council["id"]},
+        recommendation="Inspect the preserved attempt evidence before revising.",
+        evidence={
+            "attempt_count": work["attempt_count"],
+            "failure_fingerprint": work["failure_fingerprint"],
+            "requirements": work["requirements"],
+        },
         blocking_scope={"work_item_id": work["id"]},
         work_item_id=work["id"],
         path=path,
     )
-    events.append({"kind": "recovery_council", "id": council["id"], "work": work["id"]})
-
-
-def _reconcile_councils(
-    operation: dict[str, Any],
-    contract: dict[str, Any],
-    policy: operator_roster.RosterPolicy,
-    events: list[dict[str, Any]],
-    *,
-    path: Path | None,
-) -> None:
-    con = operator_roster.connect(path)
-    try:
-        ids = [
-            row["id"]
-            for row in con.execute(
-                "SELECT id FROM recovery_councils "
-                "WHERE operation_id=? AND state='collecting' ORDER BY created_at",
-                (operation["id"],),
-            )
-        ]
-    finally:
-        con.close()
-    work_by_id = {
-        row["id"]: row
-        for row in operator_runtime.work_items(operation["id"], path=path)
-    }
-    for council_id in ids:
-        council = operator_roster.get_council(council_id, path=path)
-        work = work_by_id[council["work_item_id"]]
-        for member in council["members"]:
-            if member["state"] == "pending":
-                mission = (
-                    "Independently diagnose this stuck Operator work from the supplied "
-                    "evidence. Do not coordinate with other reviewers and do not edit. "
-                    "Return one line beginning OPERATOR_COUNCIL: followed by a JSON object "
-                    "with exactly diagnosis, evidence, hypotheses, action_key, next_action, "
-                    "smallest_surface, deferred, confidence, risks. action_key must be a "
-                    "stable lowercase identifier so independently identical proposals can "
-                    f"form quorum.\n\nEvidence: {json.dumps(council['evidence'])}"
-                )
-                reservation = operator_roster.reserve(
-                    operation["id"],
-                    work["id"],
-                    profile_name=member["profile_name"],
-                    policy=policy,
-                    minimum_tier="heavy",
-                    burn_band="small",
-                    path=path,
-                )
-                try:
-                    dispatched = operator_broker.dispatch(
-                        root=Path(work["root"]),
-                        profile_name=member["profile_name"],
-                        mission=mission,
-                        work_item_id=work["id"],
-                        requester=f"operator-council:{council_id}",
-                        isolated=True,
-                        containment_mode="operator-read",
-                        workspace_limit_bytes=int(
-                            contract["resources"]["max_worktree_bytes"]
-                        ),
-                    )
-                    operator_roster.bind_reservation(
-                        reservation.group,
-                        project_run_id=dispatched.run_id,
-                        path=path,
-                    )
-                    operator_runtime.register_resource_lease(
-                        operation["id"],
-                        work_item_id=work["id"],
-                        project_key=work["project_key"],
-                        kind="operator_council_clone",
-                        resource_path=dispatched.workdir,
-                        project_run_id=dispatched.run_id,
-                        unique_state=False,
-                        details={"containment_mode": "operator-read"},
-                        path=path,
-                    )
-                except Exception:
-                    operator_roster.release_reservation(reservation.group, path=path)
-                    raise
-                operator_roster.bind_council_run(
-                    council_id,
-                    member["profile_name"],
-                    dispatched.run_id,
-                    path=path,
-                )
-                events.append({
-                    "kind": "council_member_dispatched",
-                    "council": council_id,
-                    "profile": member["profile_name"],
-                    "run": dispatched.run_id,
-                })
-            elif member["state"] == "running":
-                run = operator_broker.run_status(
-                    Path(work["root"]), int(member["project_run_id"])
-                )
-                if not run or run["status"] not in db.RUN_TERMINAL:
-                    continue
-                operator_roster.release_run_reservations(
-                    int(member["project_run_id"]),
-                    state="consumed" if run["status"] == "done" else "released",
-                    path=path,
-                )
-                opinion = _parse_council_opinion(
-                    str(run.get("summary") or ""),
-                    profile=member["profile_name"],
-                )
-                resolved = operator_roster.submit_council_opinion(
-                    council_id, member["profile_name"], opinion, path=path
-                )
-                _reclaim_readonly_run(
-                    operation, work, int(member["project_run_id"]), path=path
-                )
-                events.append({
-                    "kind": "council_opinion",
-                    "council": council_id,
-                    "profile": member["profile_name"],
-                })
-                if resolved["state"] in {"quorum", "split"}:
-                    events.append({
-                        "kind": f"council_{resolved['state']}",
-                        "council": council_id,
-                        "synthesis": resolved["synthesis"],
-                    })
+    events.append({
+        "kind": "attempts_exhausted",
+        "work": work["id"],
+        "attempt_count": work["attempt_count"],
+    })
 
 
 def _reclaim_readonly_run(
@@ -1615,35 +1676,132 @@ def _reclaim_readonly_run(
                 },
                 path=path,
             )
-
-
-def _parse_council_opinion(summary: str, *, profile: str) -> dict[str, Any]:
-    marker = "OPERATOR_COUNCIL:"
-    if marker in summary:
-        candidate = summary.rsplit(marker, 1)[1].strip()
-        try:
-            decoded = json.loads(candidate)
-            if isinstance(decoded, dict):
-                return decoded
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return {
-        "diagnosis": "The reviewer did not return a conforming structured opinion.",
-        "evidence": [summary[-1000:]] if summary else [],
-        "hypotheses": [],
-        "action_key": f"invalid_opinion_{_fingerprint(profile)}",
-        "next_action": "Do not act on this opinion.",
-        "smallest_surface": [],
-        "deferred": ["all implementation"],
-        "confidence": 0,
-        "risks": ["unstructured or failed council response"],
-    }
-
-
 def _controller_connect(path: Path | None):
     con = operator_runtime.connect(path)
     con.executescript(CONTROLLER_SCHEMA)
     return con
+
+
+def _refresh_unstarted_baselines(
+    operation: dict[str, Any],
+    *,
+    path: Path | None,
+) -> dict[str, Any]:
+    """Admit the latest clean commit until the first Operator run is dispatched."""
+    work = operator_runtime.work_items(operation["id"], path=path)
+    if any(row["attempt_count"] or row["project_run_id"] for row in work):
+        return operation
+    changed = False
+    for project in operation["projects"]:
+        inspection = operator_runtime.inspect_live_project(
+            Path(project["root"]),
+            expected_branch=project["integration_branch"],
+        )
+        if not inspection["ready"]:
+            continue
+        head = str(inspection["head"])
+        if project.get("expected_head") != head:
+            operator_runtime.update_project_expected_head(
+                operation["id"], project["project_key"], head, path=path
+            )
+            changed = True
+    return (
+        operator_runtime.get_operation(operation["id"], path=path)
+        if changed
+        else operation
+    )
+
+
+def _roster_admission_errors(
+    operation: dict[str, Any],
+    contract: dict[str, Any],
+    policy: operator_roster.RosterPolicy,
+    *,
+    path: Path | None,
+) -> list[dict[str, Any]]:
+    """Prove every goal has a contained implementer and independent reviewer pair."""
+    errors: list[dict[str, Any]] = []
+    for work in operator_runtime.work_items(operation["id"], path=path):
+        implementation = operator_roster.route(
+            operation,
+            work,
+            contract,
+            policy,
+            availability_report={"roster": []},
+            capacity={},
+            structural_only=True,
+            path=path,
+        )
+        implementers = {
+            row["profile"] for row in implementation.considered if row["eligible"]
+        }
+        if not implementers:
+            errors.append({
+                "work_item_id": work["id"],
+                "stage": "implementation",
+                "routing_decision": implementation.decision_id,
+                "reason": implementation.explanation,
+            })
+            continue
+        if not work["requires_review"]:
+            continue
+        reviewer_work = {
+            **work,
+            "task_class": "review",
+            "actuation_mode": "review_only",
+        }
+        review = operator_roster.route(
+            operation,
+            reviewer_work,
+            contract,
+            policy,
+            availability_report={"roster": []},
+            capacity={},
+            structural_only=True,
+            path=path,
+        )
+        reviewers = {
+            row["profile"] for row in review.considered if row["eligible"]
+        }
+        if contract["routing"]["reviewer_must_differ"]:
+            has_pair = any(
+                implementer != reviewer
+                for implementer in implementers
+                for reviewer in reviewers
+            )
+        else:
+            has_pair = bool(implementers and reviewers)
+        if not has_pair:
+            errors.append({
+                "work_item_id": work["id"],
+                "stage": "independent_review",
+                "implementation_profiles": sorted(implementers),
+                "review_profiles": sorted(reviewers),
+                "routing_decision": review.decision_id,
+                "reason": "no structurally valid implementer/reviewer pair",
+            })
+    return errors
+
+
+def _synchronize_execution_state(
+    operation: dict[str, Any],
+    *,
+    path: Path | None,
+) -> None:
+    counts = operation["work_counts"]
+    if any(counts.get(state, 0) for state in ("verifying", "integrating", "handed_off")):
+        state = "verifying"
+        reason = "worker output is being verified"
+    elif any(counts.get(state, 0) for state in ("dispatched", "running")):
+        state = "running"
+        reason = "one or more contained workers are active"
+    else:
+        state = "queued"
+        reason = "no contained worker is active"
+    if operation["stored_state"] != state:
+        operator_runtime.set_operation_state(
+            operation["id"], state, reason=reason, path=path
+        )
 
 
 def _active_project_profiles(operation: dict[str, Any]) -> dict[str, int]:
@@ -1701,12 +1859,24 @@ def _mission(contract: dict[str, Any], work: dict[str, Any]) -> str:
         f"Change budget: {json.dumps(work['change_budget'])}\n\n"
         "Implement only the smallest coherent change needed for this outcome. "
         "Avoid speculative abstractions, unrelated cleanup, new dependencies, and "
-        "architecture expansion. Run relevant checks and commit the result."
+        "architecture expansion. Run relevant checks and leave the finished "
+        "filesystem delta uncommitted for the trusted broker to seal."
     )
 
 
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _is_transient_integration_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return (
+        "integration checkout is dirty" in text
+        or (
+            "integration checkout is on " in text
+            and "expected" in text
+        )
+    )
 
 
 def _summary(operation: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:

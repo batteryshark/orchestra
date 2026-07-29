@@ -231,6 +231,27 @@ class OperatorRosterTests(unittest.TestCase):
         self.assertFalse(kimi["eligible"])
         self.assertIn("filesystem sandbox", " ".join(kimi["reasons"]))
 
+    def test_live_router_classifies_full_pool_as_transient_backpressure(self) -> None:
+        contract, operation, work = self.start_operation()
+        route = operator_roster.route(
+            {**operation, "mode": "live"},
+            work,
+            contract,
+            self.policy,
+            availability_report={
+                "roster": [
+                    {"name": profile["name"], "state": "available"}
+                    for profile in self.policy.data["profiles"]
+                ]
+            },
+            capacity={},
+            active_by_profile={"codex-55": 100},
+            path=self.db_path,
+        )
+        self.assertIsNone(route.profile)
+        self.assertEqual(route.blocker, "transient")
+        self.assertIn("backpressure", route.explanation)
+
     def test_router_never_uses_security_contraindicated_fable(self) -> None:
         contract, operation, work = self.start_operation()
         work = {

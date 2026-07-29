@@ -151,7 +151,8 @@ orchestra operator roster bootstrap --output roster-policy.json
 orchestra operator roster draft roster-policy.json
 orchestra operator roster approve --version 1 --hash SHA256
 
-# Shadow records routes and proposed actions without dispatching.
+# Start creates a queued operation. It is not "running" until a contained
+# implementation or review run actually exists.
 orchestra operator start OPERATOR_ID --mode shadow
 orchestra operator status OPERATION_ID
 
@@ -163,15 +164,24 @@ orchestra operator pause OPERATION_ID
 orchestra operator resume OPERATION_ID
 ```
 
-The background controller is lease-held and restartable. It filters and ranks
-qualified profiles, accounts for shared quotas and manual active runs,
-dispatches isolated branches, enforces change budgets, verifies and
-independently reviews results, integrates only after gates, and reclaims only
-clean worktrees whose unique state is proven integrated. Shadow and live use
-the same reconciliation path; shadow stops at durable action proposals. Live
-activation also requires clean integration branches and rejects symlinks in
-the Operator worktree namespace. If those preconditions later drift, the
-controller pauses for one owner decision instead of retrying.
+The background controller is deterministic, lease-held, and restartable. Each
+operation pins both its approved contract and approved roster. Before any
+dispatch, admission proves that every goal has a structurally qualified
+contained implementer and—when required—an independent reviewer pair. New
+contract or roster versions never alter an existing operation.
+
+Capacity exhaustion, temporary provider unavailability, foreign runners,
+dirty or wrong-branch integration checkouts, and disk admission pressure set
+the operation to `waiting` with a persisted reason. They do not consume an
+attempt, create an action, invoke a model, open a decision, or restart the
+operation. The controller retries automatically. `needs_decision` is reserved
+for structural admission failures, containment violations, authority or
+evidence changes, baseline drift after work begins, and exhausted real worker
+attempts.
+
+Live recovery councils are not executed. Legacy council fields remain readable
+for contract compatibility, but the controller never responds to congestion or
+failed routing by creating more workers.
 
 Live workers currently require a Codex profile using the `workspace-write`
 sandbox. OpenCode and Claude profiles are excluded from live routing because
@@ -181,7 +191,7 @@ metadata is local to the clone; unlike ordinary linked worktrees, they do not
 need the integration checkout as an additional writable directory. Workers
 leave their filesystem delta uncommitted; after the sandboxed process exits,
 the trusted broker size-checks and commits that delta before review. Review and
-recovery runs use `read-only`. Worker-requested child runs and ad-hoc session
+review runs use `read-only`. Worker-requested child runs and ad-hoc session
 continuations are denied—the controller owns fan-out and retries—and any
 undeclared child, escaping symlink, or background process surviving its backend
 causes containment shutdown and an owner decision. The supervisor also
@@ -345,8 +355,9 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
   contracts, project snapshots, hash-bound approvals, and audit events. It does
   not contain provider credentials or project-local run state. It also stores
   goals, work state, decisions, controller and resource leases, capacity
-  reservations, routing explanations, recovery councils, action intents,
-  observations, and replay metadata.
+  reservations, routing explanations, action intents, observations, replay
+  metadata, and legacy recovery-council records that the live controller no
+  longer executes.
 - `ORCHESTRA.md` is the generated orchestrator playbook; agent instruction files point to it.
 - Optional slash-work data remains the durable task and decision record.
 
