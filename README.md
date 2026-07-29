@@ -102,13 +102,18 @@ The first Operator control-plane slice turns an autonomy discussion into a
 strict, versioned authority contract. Start with a registered project ID and
 an explicit goal and acceptance gate:
 
+For a conversation-first setup, paste the reusable
+[Operator bootstrap prompt](docs/operator-bootstrap-prompt.md) into a new
+Claude, Codex, or other orchestrator task. It requires an interview and
+contract preview before any explicit approval or launch.
+
 ```sh
 orchestra project list
-orchestra operator template "PIU fidelity" \
+orchestra operator template "Release readiness" \
   --project PROJECT_ID \
-  --goal "close the verified fidelity backlog" \
+  --goal "complete the bounded release backlog" \
   --gate "the full project test suite passes" \
-  --non-goal "redesign authentic behavior without evidence" \
+  --non-goal "redesign unrelated architecture" \
   --output operator-contract.json
 
 # Refine scope, authority, budgets, routing, escalation, and completion,
