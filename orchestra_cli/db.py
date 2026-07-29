@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS runs (
   allow_question INTEGER NOT NULL DEFAULT 0,
   question_wait_seconds INTEGER NOT NULL DEFAULT 1800,
   supervisor_protocol INTEGER NOT NULL DEFAULT 0,
+  containment_mode TEXT,
+  workspace_limit_bytes INTEGER,
   pid INTEGER,
   supervisor_pid INTEGER,
   session_ref TEXT,
@@ -189,6 +191,10 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         )
     if not _has_column(con, "runs", "supervisor_protocol"):
         con.execute("ALTER TABLE runs ADD COLUMN supervisor_protocol INTEGER NOT NULL DEFAULT 0")
+    if not _has_column(con, "runs", "containment_mode"):
+        con.execute("ALTER TABLE runs ADD COLUMN containment_mode TEXT")
+    if not _has_column(con, "runs", "workspace_limit_bytes"):
+        con.execute("ALTER TABLE runs ADD COLUMN workspace_limit_bytes INTEGER")
 
     # W-0040: orphan reaping. ``pid`` is the AGENT process; a supervisor that
     # dies between its worker exiting and the completion UPDATE strands the run

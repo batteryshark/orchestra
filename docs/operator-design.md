@@ -298,7 +298,7 @@ A recommended starting policy is:
 | Reserve shared capacity and choose among contract-qualified profiles | `auto` |
 | Temporarily degrade or quarantine a profile from objective health evidence | `auto` |
 | Convene a bounded recovery council and run its permitted diagnostic | `auto` |
-| Edit and commit within an isolated worker branch | `auto` |
+| Edit within an isolated worker branch; broker seals the bounded delta | `auto` |
 | Run declared verification gates | `auto` |
 | Merge a clean, reviewed branch after all declared gates | `auto` |
 | Update tracker state after independently reproducing acceptance evidence | `auto` |
@@ -343,7 +343,7 @@ Scope
 Authority
   dispatch/retry/reroute/interrupt: auto
   create derived in-scope work: auto
-  edit/commit isolated branches: auto
+  edit isolated branches and broker-seal bounded deltas: auto
   merge after declared review and gates: auto
   update tracker after acceptance: auto
   reclaim proven-eligible worktrees: auto
@@ -675,12 +675,34 @@ The integration checkout:
 - never overwrites unrelated user changes.
 
 Each goal names one writable project and carries explicit dependency edges.
-Workers receive one isolated worktree in that repository. Cross-project inputs
-are Git-commit-pinned, size-capped archive snapshots with recorded SHA-256
-digests; live repository symlinks are forbidden. Project-specific scopes and
-verification are applied using the work item's project ID. Multi-repository
-integration follows the accepted dependency order, while each repository
-retains its own lease and post-integration gates.
+Workers receive a lightweight standalone clone in that repository's
+Operator-managed workspace namespace. Its object store may read the
+integration repository through Git alternates, but its writable worktree,
+refs, index, and new objects remain local. The sandboxed worker leaves its
+delta uncommitted because the Codex workspace sandbox may protect `.git`.
+After the worker exits, the trusted broker rejects links and oversized output,
+commits the bounded delta, and presents that exact commit for verification.
+Integration fetches the verified commit from the clone while holding the
+project lease. This avoids granting a linked-worktree worker write access to
+the integration checkout's shared Git metadata.
+
+Cross-project inputs are Git-commit-pinned, size-capped archive snapshots with
+recorded SHA-256 digests; live repository symlinks are forbidden.
+Project-specific scopes and verification are applied using the work item's
+project ID. Multi-repository integration follows the accepted dependency
+order, while each repository retains its own lease and post-integration gates.
+
+Live execution admits only profiles whose launch backend supplies an
+enforceable filesystem sandbox. The current implementation admits Codex
+`workspace-write` for implementation and forces Codex `read-only` for review;
+OpenCode and Claude remain available to ordinary Orchestra workflows but are
+not live Operator workers. The supervisor supplies no project-root
+`--add-dir`, denies worker-originated child fan-out, audits the declared run
+graph and workspace links on every reconciliation pass, denies ad-hoc session
+continuations, and terminates background processes left in a contained run's
+process group. It measures live workspace usage on a bounded interval,
+terminates a worker that crosses the contract byte ceiling, and escalates with
+the workspace preserved rather than automatically cloning or retrying it.
 
 Cross-project changes are grouped as a change set. Their commits and
 verification are prepared independently, while merge order and partial-failure

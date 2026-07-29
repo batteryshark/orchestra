@@ -2001,6 +2001,9 @@ def _insert_initial_work(
         task_class,
         "generalist",
     )
+    actuation_mode = (
+        "bounded_patch" if task_class == "architecture" else "general_implementation"
+    )
     requires_review = (
         bool(goal["requires_review"])
         if operator_contract.is_v2(contract)
@@ -2030,7 +2033,7 @@ def _insert_initial_work(
             "ready",
             task_class,
             minimum_tier,
-            "general_implementation",
+            actuation_mode,
             "high" if requires_review else "normal",
             _json({
                 "goal_key": goal["id"],

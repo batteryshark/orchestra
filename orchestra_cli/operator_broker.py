@@ -19,6 +19,7 @@ from orchestra_cli import (
     availability,
     brief,
     config,
+    containment,
     db,
     names,
     paths,
@@ -28,6 +29,7 @@ from orchestra_cli import (
 
 MAX_CAPTURE_BYTES = 128 * 1024
 MAX_INPUT_SNAPSHOT_BYTES = 256 * 1024 * 1024
+MAX_SEAL_BYTES = 256 * 1024 * 1024
 
 
 class BrokerError(RuntimeError):
@@ -60,12 +62,19 @@ def dispatch(
     start_point: str | None = None,
     comparison_base: str | None = None,
     read_inputs: list[dict[str, str]] | None = None,
+    containment_mode: str | None = None,
+    start_repo: Path | None = None,
+    workspace_limit_bytes: int | None = None,
 ) -> Dispatch:
     """Create exactly one ordinary Orchestra run through a checked profile."""
     root = root.resolve()
     assert_worktree_namespace(root)
+    if containment_mode is not None and not isolated:
+        raise ContainmentError("contained Operator runs must use an isolated workspace")
     cfg = config.load(root)
     agent = config.agent_cfg(cfg, profile_name)
+    if containment_mode is not None:
+        agent = require_profile_containment(agent, containment_mode)
     _report, unavailable, _warnings = availability.check_profiles(
         cfg, [(profile_name, agent)]
     )
@@ -84,8 +93,9 @@ def dispatch(
             try:
                 cursor = con.execute(
                     "INSERT INTO runs(agent, backend, model, title, work_item, "
-                    "requested_by, workdir, slug, allow_question, status, started_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,0,'spawning',?)",
+                    "requested_by, workdir, slug, allow_question, containment_mode, "
+                    "workspace_limit_bytes, status, started_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,0,?,?,'spawning',?)",
                     (
                         profile_name,
                         agent["backend"],
@@ -95,6 +105,8 @@ def dispatch(
                         requester,
                         str(root),
                         slug,
+                        containment_mode,
+                        workspace_limit_bytes,
                         db.now(),
                     ),
                 )
@@ -108,9 +120,17 @@ def dispatch(
             raise BrokerError("could not mint a unique run slug")
         workdir = str(root)
         if isolated:
-            created, branch = worktree.create(
-                root, run_id, start_point=start_point or root_head
-            )
+            if containment_mode is not None:
+                created, branch = _create_operator_clone(
+                    root,
+                    run_id,
+                    start_point=start_point or root_head,
+                    start_repo=start_repo,
+                )
+            else:
+                created, branch = worktree.create(
+                    root, run_id, start_point=start_point or root_head
+                )
             created_worktree = True
             workdir = str(created)
             assert_worktree_contained(Path(workdir))
@@ -127,8 +147,15 @@ def dispatch(
             requester=requester,
             workdir=workdir,
             extra_context=(
-                "This is Operator-controlled bounded work. Keep the smallest coherent "
-                "change, do not broaden scope, commit your finished changes, and report "
+                "This is Operator-controlled bounded work in a filesystem-contained "
+                "workspace. Keep the smallest coherent change, do not broaden scope, "
+                + (
+                    "leave your finished changes uncommitted for the trusted "
+                    "controller to seal, "
+                    if containment_mode != "operator-read"
+                    else "do not edit or commit, "
+                )
+                + "and report "
                 "verification evidence in the handoff. Read-only dependency snapshots "
                 "are listed below; never access live sibling repositories or create "
                 "links outside this worktree.\n"
@@ -155,12 +182,16 @@ def dispatch(
         con.rollback()
         if created_worktree and run_id is not None and branch and root_head:
             try:
-                reclaim_integrated(
-                    root,
-                    run_id=run_id,
-                    branch=branch,
-                    target_branch=root_head,
-                )
+                workdir_path = paths.worktrees_dir(root) / f"run-{run_id}"
+                if containment_mode is not None:
+                    _remove_operator_clone(workdir_path)
+                else:
+                    reclaim_integrated(
+                        root,
+                        run_id=run_id,
+                        branch=branch,
+                        target_branch=root_head,
+                    )
             except (BrokerError, OSError):
                 pass
         if run_id is not None:
@@ -179,6 +210,72 @@ def dispatch(
     )
 
 
+def require_profile_containment(
+    agent: dict[str, Any], mode: str
+) -> dict[str, Any]:
+    """Return a launch profile whose filesystem policy is enforceable."""
+    try:
+        return containment.apply_profile(agent, mode)
+    except containment.ContainmentPolicyError as exc:
+        raise ContainmentError(str(exc)) from exc
+
+
+def _create_operator_clone(
+    root: Path,
+    run_id: int,
+    *,
+    start_point: str | None,
+    start_repo: Path | None,
+) -> tuple[Path, str]:
+    if not start_point:
+        raise ContainmentError("Operator clone needs an immutable start point")
+    namespace = paths.worktrees_dir(root)
+    namespace.mkdir(parents=True, exist_ok=True)
+    destination = namespace / f"run-{run_id}"
+    if destination.exists() or destination.is_symlink():
+        raise ContainmentError(f"Operator workspace already exists: {destination}")
+    source = (start_repo or root).resolve(strict=True)
+    clone = subprocess.run(
+        [
+            "git", "clone", "--shared", "--no-checkout", "--no-hardlinks",
+            str(root), str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if clone.returncode != 0:
+        raise ContainmentError((clone.stderr or clone.stdout).strip())
+    checkout_point = start_point
+    if source != root:
+        checkout_point = _git(
+            source, ["rev-parse", f"{start_point}^{{commit}}"]
+        ).strip()
+        fetched = subprocess.run(
+            [
+                "git", "-C", str(destination), "fetch", "--no-tags",
+                str(source), checkout_point,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if fetched.returncode != 0:
+            _remove_operator_clone(destination)
+            raise ContainmentError((fetched.stderr or fetched.stdout).strip())
+    branch = f"orchestra/run-{run_id}"
+    checkout = subprocess.run(
+        ["git", "-C", str(destination), "checkout", "-b", branch, checkout_point],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if checkout.returncode != 0:
+        _remove_operator_clone(destination)
+        raise ContainmentError((checkout.stderr or checkout.stdout).strip())
+    return destination, branch
+
+
 def run_status(root: Path, run_id: int) -> dict[str, Any] | None:
     con = db.connect_readonly(root)
     try:
@@ -188,7 +285,119 @@ def run_status(root: Path, run_id: int) -> dict[str, Any] | None:
         con.close()
 
 
+def operation_containment_violations(
+    root: Path,
+    operation_id: str,
+    *,
+    authorized_run_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Audit controller-authorized runs and undeclared child edges."""
+    con = db.connect_readonly(root)
+    try:
+        run_ids = list(dict.fromkeys(authorized_run_ids or []))
+        query = "SELECT * FROM runs WHERE requested_by=?"
+        params: list[Any] = [f"operator:{operation_id}"]
+        if run_ids:
+            query += " OR id IN (" + ",".join("?" for _ in run_ids) + ")"
+            params.extend(run_ids)
+        query += " ORDER BY id"
+        parents = list(con.execute(query, params))
+        violations: list[dict[str, Any]] = []
+        for parent in parents:
+            if parent["containment_mode"] not in {
+                "operator-write", "operator-read"
+            } or parent["backend"] != "codex":
+                violations.append({
+                    "kind": "uncontained_operator_run",
+                    "run_id": int(parent["id"]),
+                    "backend": parent["backend"],
+                    "containment_mode": parent["containment_mode"],
+                })
+            workdir = Path(parent["workdir"])
+            if workdir.is_dir():
+                try:
+                    assert_worktree_contained(workdir)
+                except ContainmentError as exc:
+                    violations.append({
+                        "kind": "worktree_escape",
+                        "run_id": int(parent["id"]),
+                        "error": str(exc),
+                    })
+            if (
+                parent["containment_mode"] == "operator-read"
+                and workdir.is_dir()
+                and _git(workdir, ["status", "--porcelain"]).strip()
+            ):
+                violations.append({
+                    "kind": "readonly_workspace_modified",
+                    "run_id": int(parent["id"]),
+                })
+            children = list(
+                con.execute(
+                    "WITH RECURSIVE descendants(id, lead_run, status) AS ("
+                    "SELECT id, lead_run, status FROM runs WHERE lead_run=? "
+                    "UNION ALL SELECT r.id, r.lead_run, r.status FROM runs r "
+                    "JOIN descendants d ON r.lead_run=d.id"
+                    ") SELECT * FROM descendants ORDER BY id",
+                    (parent["id"],),
+                )
+            )
+            for child in children:
+                violations.append({
+                    "kind": "undeclared_child_run",
+                    "parent_run_id": int(parent["id"]),
+                    "run_id": int(child["id"]),
+                    "status": child["status"],
+                })
+        return violations
+    finally:
+        con.close()
+
+
+def stop_operation_run_tree(
+    root: Path,
+    operation_id: str,
+    *,
+    authorized_run_ids: list[int] | None = None,
+) -> list[int]:
+    """Request immediate supervisor stops for an operation and descendants."""
+    con = db.connect(root)
+    try:
+        run_ids = list(dict.fromkeys(authorized_run_ids or []))
+        anchors = "requested_by=?"
+        params: list[Any] = [f"operator:{operation_id}"]
+        if run_ids:
+            anchors += " OR id IN (" + ",".join("?" for _ in run_ids) + ")"
+            params.extend(run_ids)
+        rows = list(
+            con.execute(
+                "WITH RECURSIVE contained(id) AS ("
+                f"SELECT id FROM runs WHERE {anchors} "
+                "UNION ALL SELECT r.id FROM runs r "
+                "JOIN contained c ON r.lead_run=c.id"
+                ") SELECT DISTINCT id FROM contained",
+                params,
+            )
+        )
+        contained_ids = [int(row["id"]) for row in rows]
+        if contained_ids:
+            con.execute(
+                "UPDATE runs SET status='interrupt' WHERE id IN ("
+                + ",".join("?" for _ in contained_ids)
+                + ") AND status NOT IN ('done','failed','timeout','killed')",
+                contained_ids,
+            )
+            con.commit()
+        return contained_ids
+    finally:
+        con.close()
+
+
 def measure_change(root: Path, *, base_head: str, branch: str) -> dict[str, Any]:
+    if _git(root, ["status", "--porcelain"]).strip():
+        raise ContainmentError(
+            "worker workspace has uncommitted changes; broker sealing is incomplete"
+        )
     ancestry = subprocess.run(
         ["git", "-C", str(root), "merge-base", "--is-ancestor", base_head, branch],
         capture_output=True,
@@ -229,6 +438,7 @@ def measure_change(root: Path, *, base_head: str, branch: str) -> dict[str, Any]
         if any(part.casefold() in {"api", "include", "public"} for part in Path(value).parts[:-1])
     ]
     return {
+        "head": _git(root, ["rev-parse", f"{branch}^{{commit}}"]).strip(),
         "files": files,
         "added_lines": added,
         "deleted_lines": deleted,
@@ -240,6 +450,89 @@ def measure_change(root: Path, *, base_head: str, branch: str) -> dict[str, Any]
         "public_api_changes": len(public_api),
         "public_api_paths": public_api[:100],
     }
+
+
+def seal_workspace(
+    workdir: Path,
+    *,
+    branch: str,
+    base_head: str,
+    max_uncommitted_bytes: int = MAX_SEAL_BYTES,
+) -> str:
+    """Commit a contained worker's bounded filesystem delta outside its sandbox."""
+    assert_worktree_contained(workdir)
+    current = _git(workdir, ["branch", "--show-current"]).strip()
+    if current != branch:
+        raise ContainmentError(
+            f"contained workspace is on {current!r}, expected {branch!r}"
+        )
+    changed_raw = subprocess.run(
+        [
+            "git", "-C", str(workdir), "ls-files",
+            "--modified", "--deleted", "--others", "--exclude-standard", "-z",
+        ],
+        capture_output=True,
+        timeout=30,
+    )
+    if changed_raw.returncode != 0:
+        raise ContainmentError(
+            changed_raw.stderr.decode("utf-8", "replace").strip()
+        )
+    uncommitted_paths = [
+        value.decode("utf-8", "surrogateescape")
+        for value in changed_raw.stdout.split(b"\0")
+        if value
+    ]
+    committed_raw = subprocess.run(
+        [
+            "git", "-C", str(workdir), "diff", "--name-only", "-z",
+            f"{base_head}..{branch}",
+        ],
+        capture_output=True,
+        timeout=30,
+    )
+    if committed_raw.returncode != 0:
+        raise ContainmentError(
+            committed_raw.stderr.decode("utf-8", "replace").strip()
+        )
+    committed_paths = [
+        value.decode("utf-8", "surrogateescape")
+        for value in committed_raw.stdout.split(b"\0")
+        if value
+    ]
+    paths_changed = list(dict.fromkeys([*committed_paths, *uncommitted_paths]))
+    total_bytes = 0
+    for relative in paths_changed:
+        candidate = workdir / relative
+        if candidate.is_symlink():
+            raise ContainmentError(
+                f"contained workspace change is a link: {relative}"
+            )
+        if candidate.is_file():
+            total_bytes += candidate.stat().st_size
+            if total_bytes > max_uncommitted_bytes:
+                raise ContainmentError(
+                    f"uncommitted workspace data exceeds {max_uncommitted_bytes} bytes"
+                )
+    if not uncommitted_paths:
+        return _git(workdir, ["rev-parse", "HEAD"]).strip()
+    _git(workdir, ["add", "-A"])
+    committed = subprocess.run(
+        [
+            "git", "-C", str(workdir),
+            "-c", "user.name=Orchestra Operator",
+            "-c", "user.email=operator@localhost",
+            "commit", "--no-gpg-sign", "-m", "Operator bounded work",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if committed.returncode != 0:
+        raise ContainmentError((committed.stderr or committed.stdout).strip())
+    if _git(workdir, ["status", "--porcelain"]).strip():
+        raise ContainmentError("contained workspace is not clean after sealing")
+    return _git(workdir, ["rev-parse", "HEAD"]).strip()
 
 
 def scope_violations(
@@ -326,7 +619,13 @@ def verify(
     }
 
 
-def integrate(root: Path, *, branch: str, target_branch: str) -> str:
+def integrate(
+    root: Path,
+    *,
+    branch: str,
+    target_branch: str,
+    source_repo: Path | None = None,
+) -> str:
     if _git(root, ["status", "--porcelain"]).strip():
         raise BrokerError("integration checkout is dirty")
     current = _git(root, ["branch", "--show-current"]).strip()
@@ -334,8 +633,21 @@ def integrate(root: Path, *, branch: str, target_branch: str) -> str:
         raise BrokerError(
             f"integration checkout is on {current!r}, expected {target_branch!r}"
         )
+    merge_target = branch
+    if source_repo is not None:
+        source_repo = source_repo.resolve(strict=True)
+        assert_worktree_contained(source_repo)
+        merge_target = _git(source_repo, ["rev-parse", f"{branch}^{{commit}}"]).strip()
+        fetched = subprocess.run(
+            ["git", "-C", str(root), "fetch", "--no-tags", str(source_repo), merge_target],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if fetched.returncode != 0:
+            raise BrokerError((fetched.stderr or fetched.stdout).strip())
     completed = subprocess.run(
-        ["git", "-C", str(root), "merge", "--no-ff", "--no-edit", branch],
+        ["git", "-C", str(root), "merge", "--no-ff", "--no-edit", merge_target],
         capture_output=True,
         text=True,
     )
@@ -380,24 +692,31 @@ def reclaim_integrated(root: Path, *, run_id: int, branch: str, target_branch: s
         return False
     if _git(workdir, ["status", "--porcelain"]).strip():
         raise BrokerError("refusing to reclaim a dirty worktree")
+    if (workdir / ".git").is_dir():
+        branch_commit = _git(workdir, ["rev-parse", f"{branch}^{{commit}}"]).strip()
+    else:
+        branch_commit = branch
     ancestor = subprocess.run(
-        ["git", "-C", str(root), "merge-base", "--is-ancestor", branch, target_branch],
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", branch_commit, target_branch],
         capture_output=True,
     )
     if ancestor.returncode != 0:
         raise BrokerError("refusing to reclaim unique, unintegrated work")
-    removed = subprocess.run(
-        ["git", "-C", str(root), "worktree", "remove", str(workdir)],
-        capture_output=True,
-        text=True,
-    )
-    if removed.returncode != 0:
-        raise BrokerError(removed.stderr.strip())
-    subprocess.run(
-        ["git", "-C", str(root), "branch", "-d", branch],
-        capture_output=True,
-        text=True,
-    )
+    if (workdir / ".git").is_dir():
+        _remove_operator_clone(workdir)
+    else:
+        removed = subprocess.run(
+            ["git", "-C", str(root), "worktree", "remove", str(workdir)],
+            capture_output=True,
+            text=True,
+        )
+        if removed.returncode != 0:
+            raise BrokerError(removed.stderr.strip())
+        subprocess.run(
+            ["git", "-C", str(root), "branch", "-d", branch],
+            capture_output=True,
+            text=True,
+        )
     _remove_input_snapshots(workdir)
     return True
 
@@ -408,29 +727,53 @@ def reclaim_transferred_worktree(
     run_id: int,
     branch: str,
     successor_branch: str,
+    successor_repo: Path | None = None,
 ) -> bool:
     workdir = paths.worktrees_dir(root) / f"run-{run_id}"
     if not workdir.is_dir():
         return False
     if _git(workdir, ["status", "--porcelain"]).strip():
         raise BrokerError("refusing to reclaim a dirty predecessor worktree")
+    comparison_repo = (successor_repo or root).resolve(strict=True)
+    predecessor_commit = _git(
+        workdir if (workdir / ".git").is_dir() else root,
+        ["rev-parse", f"{branch}^{{commit}}"],
+    ).strip()
     ancestor = subprocess.run(
-        [
-            "git", "-C", str(root), "merge-base", "--is-ancestor",
-            branch, successor_branch,
-        ],
+        ["git", "-C", str(comparison_repo), "merge-base", "--is-ancestor",
+         predecessor_commit, successor_branch],
         capture_output=True,
     )
     if ancestor.returncode != 0:
         raise BrokerError("successor branch does not preserve predecessor state")
-    removed = subprocess.run(
-        ["git", "-C", str(root), "worktree", "remove", str(workdir)],
-        capture_output=True,
-        text=True,
-    )
-    if removed.returncode != 0:
-        raise BrokerError(removed.stderr.strip())
+    if (workdir / ".git").is_dir():
+        _remove_operator_clone(workdir)
+    else:
+        removed = subprocess.run(
+            ["git", "-C", str(root), "worktree", "remove", str(workdir)],
+            capture_output=True,
+            text=True,
+        )
+        if removed.returncode != 0:
+            raise BrokerError(removed.stderr.strip())
     _remove_input_snapshots(workdir)
+    return True
+
+
+def reclaim_readonly_clone(root: Path, *, run_id: int) -> bool:
+    run = run_status(root, run_id)
+    if not run:
+        return False
+    if run.get("containment_mode") != "operator-read":
+        raise ContainmentError("refusing to reclaim a non-read-only Operator run")
+    if run["status"] not in db.RUN_TERMINAL:
+        raise ContainmentError("refusing to reclaim an active read-only Operator run")
+    workdir = Path(run["workdir"])
+    if not workdir.is_dir():
+        return False
+    if _git(workdir, ["status", "--porcelain"]).strip():
+        raise ContainmentError("read-only Operator workspace became dirty")
+    _remove_operator_clone(workdir)
     return True
 
 
@@ -444,6 +787,21 @@ def _git(root: Path, args: list[str]) -> str:
     if completed.returncode != 0:
         raise BrokerError((completed.stderr or completed.stdout).strip())
     return completed.stdout
+
+
+def _remove_operator_clone(workdir: Path) -> None:
+    workdir = workdir.absolute()
+    namespace = workdir.parent.resolve(strict=True)
+    if (
+        workdir.is_symlink()
+        or namespace.name != "worktrees"
+        or workdir.name[:4] != "run-"
+        or not workdir.name[4:].isdigit()
+        or not (workdir / ".git").is_dir()
+    ):
+        raise ContainmentError(f"refusing to remove unsafe Operator clone {workdir}")
+    shutil.rmtree(workdir)
+    _remove_input_snapshots(workdir)
 
 
 def _remove_input_snapshots(workdir: Path) -> None:

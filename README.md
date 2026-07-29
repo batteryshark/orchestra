@@ -173,6 +173,22 @@ activation also requires clean integration branches and rejects symlinks in
 the Operator worktree namespace. If those preconditions later drift, the
 controller pauses for one owner decision instead of retrying.
 
+Live workers currently require a Codex profile using the `workspace-write`
+sandbox. OpenCode and Claude profiles are excluded from live routing because
+their configured launch modes do not provide an enforceable filesystem write
+boundary. Operator workers run in lightweight standalone clones whose Git
+metadata is local to the clone; unlike ordinary linked worktrees, they do not
+need the integration checkout as an additional writable directory. Workers
+leave their filesystem delta uncommitted; after the sandboxed process exits,
+the trusted broker size-checks and commits that delta before review. Review and
+recovery runs use `read-only`. Worker-requested child runs and ad-hoc session
+continuations are denied—the controller owns fan-out and retries—and any
+undeclared child, escaping symlink, or background process surviving its backend
+causes containment shutdown and an owner decision. The supervisor also
+measures each live workspace while it runs, terminates it at the contract byte
+ceiling, and preserves it for inspection instead of retrying into more disk
+growth.
+
 The canonical contract bytes, project binding snapshot, approval, and audit
 events live in the owner-private user control plane at
 `~/.config/orchestra/operator.db` (override with

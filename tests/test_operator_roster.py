@@ -212,6 +212,25 @@ class OperatorRosterTests(unittest.TestCase):
             considered["codex"]["reasons"],
         )
 
+    def test_live_router_rejects_backend_without_filesystem_sandbox(self) -> None:
+        contract, operation, work = self.start_operation()
+        route = operator_roster.route(
+            {**operation, "mode": "live"},
+            work,
+            contract,
+            self.policy,
+            availability_report={
+                "roster": [{"name": "kimi", "state": "available"}]
+            },
+            capacity={},
+            path=self.db_path,
+        )
+        kimi = next(
+            row for row in route.considered if row["profile"] == "kimi"
+        )
+        self.assertFalse(kimi["eligible"])
+        self.assertIn("filesystem sandbox", " ".join(kimi["reasons"]))
+
     def test_router_never_uses_security_contraindicated_fable(self) -> None:
         contract, operation, work = self.start_operation()
         work = {

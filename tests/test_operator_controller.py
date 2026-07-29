@@ -202,6 +202,10 @@ class OperatorControllerTests(unittest.TestCase):
                 },
             ),
             mock.patch(
+                "orchestra_cli.operator_controller.operator_broker.seal_workspace",
+                return_value="sealed123",
+            ),
+            mock.patch(
                 "orchestra_cli.operator_controller.operator_broker.measure_change",
                 return_value={"files": 1, "added_lines": 4, "deleted_lines": 1},
             ),
@@ -266,6 +270,35 @@ class OperatorControllerTests(unittest.TestCase):
         )
         self.assertEqual(len(decisions), 1)
         self.assertIn("cannot be integrated safely", decisions[0]["question"])
+
+    def test_stuck_live_work_escalates_when_no_safe_quorum_exists(self) -> None:
+        operation = self.operation(mode="live")
+        work = operator_runtime.work_items(operation["id"], path=self.control)[0]
+        contract = operator_store.get_contract(
+            operation["operator_id"], path=self.control
+        ).data
+        events: list[dict] = []
+        with mock.patch(
+            "orchestra_cli.operator_controller.operator_roster.create_council",
+            side_effect=operator_roster.RosterError(
+                "recovery council requires at least two model families"
+            ),
+        ):
+            operator_controller._escalate_stuck(
+                operation,
+                work,
+                contract,
+                events,
+                path=self.control,
+            )
+        refreshed = operator_runtime.get_operation(operation["id"], path=self.control)
+        self.assertEqual(refreshed["state"], "needs_decision")
+        self.assertEqual(events[0]["kind"], "recovery_quorum_unavailable")
+        decisions = operator_runtime.decisions(
+            operation["id"], state="open", path=self.control
+        )
+        self.assertEqual(len(decisions), 1)
+        self.assertIn("no safe recovery quorum", decisions[0]["question"])
 
 
 if __name__ == "__main__":

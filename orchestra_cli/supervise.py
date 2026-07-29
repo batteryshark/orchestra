@@ -20,12 +20,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra_cli import brief, child_runs, config, db, host, paths, runners
+from orchestra_cli import brief, child_runs, config, containment, db, host, paths, runners
 from orchestra_cli.usage import DEFAULT_COLLECTORS, infer_from_agent
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 PROC_POLL_INTERVAL = 2
 CONTROL_POLL_INTERVAL = 0.1
+STORAGE_POLL_INTERVAL = 5.0
 DEFAULT_CHECKIN_INTERVAL = 600
 MIN_CHECKIN_INTERVAL = 1
 MAX_CHECKIN_INTERVAL = 3600
@@ -53,6 +54,11 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
 def create_followup(con, root: Path, parent: dict, requester: str, text: str,
                     title: str | None = None, *, commit: bool = True) -> int:
     """New run row that resumes parent's session with `text` as the prompt."""
+    if parent.get("containment_mode"):
+        raise RuntimeError(
+            "contained Operator runs cannot be resumed directly; "
+            "the Operator controller owns retries and continuation"
+        )
     allow_question = int(bool(parent.get("allow_question", 0)))
     question_wait = int(parent.get("question_wait_seconds") or 1800)
     cur = con.execute(
@@ -198,6 +204,49 @@ def _wait_after_term(proc: subprocess.Popen, timeout: float = 15) -> None:
             proc.wait(timeout=2)
         except Exception:
             pass
+
+
+def _terminate_residual_process_group(group_id: int, grace_seconds: float = 1.0) -> bool:
+    """Stop background descendants left after a contained backend exits."""
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    try:
+        os.killpg(group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group_id, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.02)
+    try:
+        os.killpg(group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+
+def _workspace_size_bytes(workdir: str) -> int | None:
+    try:
+        measured = subprocess.run(
+            ["du", "-sk", workdir],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if measured.returncode != 0 or not measured.stdout.split():
+            return None
+        return int(measured.stdout.split()[0]) * 1024
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
 
 
 def _json_strings(obj, *, keys: set[str] | None = None) -> list[str]:
@@ -518,7 +567,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
               poll_interval: float = PROC_POLL_INTERVAL) -> tuple[str, int | None]:
     """Start one worker process; wait with timeout + early session-ref capture.
     Returns (outcome, exit_code) where outcome is
-    'exit'|'timeout'|'usage_limit'|'waiting_input'."""
+    'exit'|'timeout'|'usage_limit'|'workspace_limit'|'waiting_input'."""
     with open(log_path, "ab") as log:
         latest = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
         if latest and latest["status"] in db.RUN_TERMINAL:
@@ -543,6 +592,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
             return "exit", proc.poll()
         started = time.time()
         next_health_check = started
+        next_storage_check = started
         have_ref = bool(run["session_ref"])
         pending_after: int | None = None
         boundary_scan_offset = 0
@@ -558,10 +608,41 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
             try:
                 exit_code = proc.wait(timeout=max(0.01, min(CONTROL_POLL_INTERVAL,
                                                             poll_interval)))
+                if (
+                    "containment_mode" in run.keys()
+                    and run["containment_mode"]
+                ):
+                    _terminate_residual_process_group(proc.pid)
                 break
             except subprocess.TimeoutExpired:
                 pass
             now = time.time()
+            workspace_limit = (
+                run["workspace_limit_bytes"]
+                if "workspace_limit_bytes" in run.keys()
+                else None
+            )
+            if workspace_limit and now >= next_storage_check:
+                next_storage_check = now + STORAGE_POLL_INTERVAL
+                workspace_bytes = _workspace_size_bytes(workdir)
+                if workspace_bytes is None:
+                    summary = "Workspace limit could not be measured: fail-closed"
+                elif workspace_bytes > int(workspace_limit):
+                    summary = (
+                        f"Workspace limit exceeded: {workspace_bytes} bytes > "
+                        f"{int(workspace_limit)} bytes"
+                    )
+                else:
+                    summary = None
+                if summary:
+                    con.execute(
+                        "UPDATE runs SET summary=? WHERE id=?",
+                        (summary, run_id),
+                    )
+                    con.commit()
+                    _terminate_process_group(proc.pid)
+                    _wait_after_term(proc)
+                    return "workspace_limit", None
             latest = con.execute("SELECT status, session_ref FROM runs WHERE id=?", (run_id,)).fetchone()
             if latest and latest["status"] == "waiting_input":
                 _terminate_process_group(proc.pid)
@@ -692,6 +773,27 @@ def supervise(root: Path, run_id: int) -> int:
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cfg = config.load(root)
     agent = config.agent_cfg(cfg, run["agent"])
+    containment_mode = (
+        run["containment_mode"]
+        if "containment_mode" in run.keys()
+        else None
+    )
+    if containment_mode:
+        try:
+            agent = containment.apply_profile(agent, containment_mode)
+        except containment.ContainmentPolicyError:
+            con.execute(
+                "UPDATE runs SET status='failed', exit_code=1, finished_at=?, summary=? "
+                "WHERE id=?",
+                (
+                    db.now(),
+                    "Operator containment policy rejected the launch profile",
+                    run_id,
+                ),
+            )
+            con.commit()
+            con.close()
+            return 1
     timeout = int(agent.get("timeout") or cfg["settings"].get(
         "timeout", config.DEFAULT_RUN_TIMEOUT_SECONDS
     ))
@@ -707,10 +809,10 @@ def supervise(root: Path, run_id: int) -> int:
     deadline = _ts_to_epoch(run["started_at"]) + timeout
 
     prompt = Path(run["brief_path"]).read_text() if run["brief_path"] else run["title"]
-    add_dirs = []
-    if run["workdir"] != str(root):
-        add_dirs.append(str(root))  # isolated runs still write .orchestra/.work at root
-    attach = host.ensure() if agent.get("ensemble") else None
+    add_dirs = containment.additional_write_dirs(
+        root, Path(run["workdir"]), containment_mode
+    )
+    attach = host.ensure() if agent.get("ensemble") and not containment_mode else None
 
     status, exit_code = "done", None
     resume_ref = run["session_ref"] if run["parent_run"] else None
@@ -789,6 +891,9 @@ def supervise(root: Path, run_id: int) -> int:
             status = "timeout"
             break
         if outcome == "usage_limit":
+            status = "failed"
+            break
+        if outcome == "workspace_limit":
             status = "failed"
             break
         if run["status"] == "killed":
@@ -893,6 +998,10 @@ def supervise(root: Path, run_id: int) -> int:
             "The worker stopped because its provider quota appears exhausted. "
             "Resume this run after capacity resets or reroute the work to another agent."
         )
+    if status == "failed" and run["summary"] and str(run["summary"]).startswith(
+        ("Workspace limit exceeded:", "Workspace limit could not be measured:")
+    ):
+        last_text = run["summary"]
     if last_msg_file and Path(last_msg_file).is_file():
         txt = Path(last_msg_file).read_text(errors="replace").strip()
         if txt:
@@ -909,7 +1018,27 @@ def supervise(root: Path, run_id: int) -> int:
     followup_id = None
     ref_final = session_ref or run["session_ref"]
     queued = _pending_queued_followups(con, run_id)
-    if queued and ref_final and status in ("done", "failed"):
+    if queued and run["containment_mode"]:
+        rejected_at = db.now()
+        con.execute(
+            f"UPDATE messages SET read_at=? WHERE id IN "
+            f"({','.join(str(q['id']) for q in queued)})",
+            (rejected_at,),
+        )
+        for queued_message in queued:
+            con.execute(
+                "INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
+                "VALUES('orchestra', ?, ?, ?, ?, ?)",
+                (
+                    queued_message["sender"],
+                    f"Follow-up #{queued_message['id']} was not dispatched: contained "
+                    "Operator runs may only be retried by their controller.",
+                    run["work_item"],
+                    run_id,
+                    rejected_at,
+                ),
+            )
+    elif queued and ref_final and status in ("done", "failed"):
         joined = "\n\n".join(f"From {q['sender']}: {q['body']}" for q in queued)
         text = (f"Your previous run finished ({status}). Follow-up instructions were queued "
                 f"for you while you worked — apply them now:\n\n{joined}\n\n"

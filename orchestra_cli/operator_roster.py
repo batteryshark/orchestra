@@ -672,6 +672,10 @@ def route(
         health_state = health.get(name, {}).get("state", "unknown")
         if not profile["enabled"]:
             reasons.append("disabled by owner policy")
+        if operation.get("mode") == "live" and profile["backend"] != "codex":
+            reasons.append(
+                "backend lacks an enforceable live Operator filesystem sandbox"
+            )
         if name in forbidden:
             reasons.append("forbidden by contract")
         if live.get("state") == "unavailable":
@@ -1049,7 +1053,19 @@ def create_council(
     evidence_json = _json(evidence)
     evidence_sha = hashlib.sha256(evidence_json.encode()).hexdigest()
     configured = list(council_policy["members"])
-    profiles = _resolve_council_profiles(configured, policy)
+    operation_con = connect(path)
+    try:
+        operation_row = operation_con.execute(
+            "SELECT mode FROM operations WHERE id=?", (operation_id,)
+        ).fetchone()
+    finally:
+        operation_con.close()
+    require_containment = bool(
+        operation_row and operation_row["mode"] == "live"
+    )
+    profiles = _resolve_council_profiles(
+        configured, policy, require_containment=require_containment
+    )
     minimum = int(council_policy["minimum_members"])
     quorum = int(council_policy["quorum"])
     if len(profiles) < minimum:
@@ -1316,6 +1332,8 @@ def _council_dict(
 def _resolve_council_profiles(
     configured: list[str],
     policy: RosterPolicy,
+    *,
+    require_containment: bool = False,
 ) -> list[dict[str, Any]]:
     by_name = {row["name"].casefold(): row for row in policy.data["profiles"]}
     selected: list[dict[str, Any]] = []
@@ -1329,7 +1347,12 @@ def _resolve_council_profiles(
                 and requested.casefold() in row["model"].casefold()
             ]
             profile = matches[0] if len(matches) == 1 else None
-        if profile and profile["enabled"] and profile["tier"] == "heavy":
+        if (
+            profile
+            and profile["enabled"]
+            and profile["tier"] == "heavy"
+            and (not require_containment or profile["backend"] == "codex")
+        ):
             if profile["name"] not in {row["name"] for row in selected}:
                 selected.append(profile)
     if len(selected) < 2:
@@ -1338,6 +1361,7 @@ def _resolve_council_profiles(
             for row in policy.data["profiles"]
             if row["enabled"]
             and row["tier"] == "heavy"
+            and (not require_containment or row["backend"] == "codex")
             and "diagnose_only" in row["actuation_modes"]
             and row["name"] not in {item["name"] for item in selected}
         ]

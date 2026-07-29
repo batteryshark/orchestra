@@ -69,6 +69,21 @@ class ChildPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "non-negative integer"):
             child_runs.limits(self.cfg)
 
+    def test_operator_worker_cannot_spawn_undeclared_child(self) -> None:
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "UPDATE runs SET containment_mode='operator-write' WHERE id=?",
+                (self.parent_id,),
+            )
+            con.commit()
+            with self.assertRaisesRegex(SystemExit, "controller owns all fan-out"):
+                child_runs.validate_parent(
+                    con, self.cfg, self.parent_id, "codex"
+                )
+        finally:
+            con.close()
+
     def test_creation_records_child_edge_and_defaults_to_worktree(self) -> None:
         con = db.connect(self.root)
         fake_wt = self.root / "child-wt"

@@ -34,6 +34,11 @@ def validate_parent(con: sqlite3.Connection, cfg: dict, run_id: int,
         raise SystemExit("orchestra: spawn identity does not match the active lead run")
     if parent["status"] != "running":
         raise SystemExit(f"orchestra: lead run {run_id} is {parent['status']}, not running")
+    if "containment_mode" in parent.keys() and parent["containment_mode"]:
+        raise SystemExit(
+            "orchestra: Operator workers cannot spawn child runs; "
+            "the controller owns all fan-out and must authorize each run"
+        )
     max_depth, _, _ = limits(cfg)
     if int(parent["child_depth"] or 0) + 1 > max_depth:
         raise SystemExit(

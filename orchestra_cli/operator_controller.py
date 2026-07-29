@@ -177,6 +177,78 @@ def _reconcile(
             path=path,
         )
         return _summary(stopped, [{"kind": "containment_precondition", "error": reason}])
+    if operation["mode"] == "live":
+        active_resources = operator_runtime.resource_leases(
+            operation["id"], active_only=True, path=path
+        )
+        run_ids_by_project = {
+            project["project_key"]: sorted({
+                int(resource["project_run_id"])
+                for resource in active_resources
+                if resource["project_key"] == project["project_key"]
+                and resource["project_run_id"] is not None
+                and resource["kind"] in {
+                    "operator_git_clone",
+                    "operator_review_clone",
+                    "operator_council_clone",
+                }
+            })
+            for project in operation["projects"]
+        }
+        violations = [
+            {
+                **violation,
+                "project_id": project["project_id"],
+            }
+            for project in operation["projects"]
+            for violation in operator_broker.operation_containment_violations(
+                Path(project["root"]),
+                operation["id"],
+                authorized_run_ids=run_ids_by_project[project["project_key"]],
+            )
+        ]
+        if violations:
+            stopped_runs = {
+                project["project_id"]: operator_broker.stop_operation_run_tree(
+                    Path(project["root"]),
+                    operation["id"],
+                    authorized_run_ids=run_ids_by_project[project["project_key"]],
+                )
+                for project in operation["projects"]
+            }
+            evidence_hash = hashlib.sha256(
+                json.dumps(violations, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:24]
+            operator_runtime.create_decision(
+                operation["id"],
+                idempotency_key=f"runtime-containment:{evidence_hash}",
+                question="Operator detected an undeclared child or filesystem escape and stopped its run tree. How should the evidence be handled?",
+                why_now=(
+                    "The live execution graph no longer matches the controller's "
+                    "authorized, sandboxed run set."
+                ),
+                options=[
+                    {"id": "inspect", "label": "Inspect preserved evidence"},
+                    {"id": "stop", "label": "Stop the operation"},
+                ],
+                recommendation=(
+                    "Keep the operation paused, preserve workspaces, and inspect "
+                    "the violating run before replacement."
+                ),
+                evidence={"violations": violations, "stopped_runs": stopped_runs},
+                blocking_scope={"projects": operation["projects"]},
+                path=path,
+            )
+            stopped = operator_runtime.set_operation_state(
+                operation["id"],
+                "needs_decision",
+                reason="runtime containment violation",
+                path=path,
+            )
+            return _summary(stopped, [{
+                "kind": "runtime_containment",
+                "violations": violations,
+            }])
     wall_limit = contract["resources"]["max_wall_clock_seconds"]
     if wall_limit is not None:
         activated = datetime.strptime(
@@ -310,6 +382,17 @@ def _reconcile_inflight(
             path=path,
         )
         if run["status"] != "done":
+            if str(run.get("summary") or "").startswith(
+                ("Workspace limit exceeded:", "Workspace limit could not be measured:")
+            ):
+                _reject_contained_output(
+                    operation,
+                    work,
+                    str(run["summary"]),
+                    events,
+                    path=path,
+                )
+                continue
             _retry_or_escalate(operation, work, contract, run["status"], events, path=path)
             continue
         _verify_and_integrate(operation, work, contract, policy, events, path=path)
@@ -328,8 +411,22 @@ def _verify_and_integrate(
         _retry_or_escalate(operation, work, contract, "missing isolated branch", events, path=path)
         return
     root = Path(work["root"])
+    worker_repo = Path(run_workdir(root, int(work["project_run_id"])))
+    try:
+        operator_broker.seal_workspace(
+            worker_repo,
+            branch=work["branch"],
+            base_head=work["base_head"],
+            max_uncommitted_bytes=min(
+                int(contract["resources"]["max_worktree_bytes"]),
+                operator_broker.MAX_SEAL_BYTES,
+            ),
+        )
+    except operator_broker.ContainmentError as exc:
+        _reject_contained_output(operation, work, str(exc), events, path=path)
+        return
     complexity = operator_broker.measure_change(
-        root, base_head=work["base_head"], branch=work["branch"]
+        worker_repo, base_head=work["base_head"], branch=work["branch"]
     )
     work_scope = work["requirements"]["scope"]
     scope_violations = operator_broker.scope_violations(
@@ -409,6 +506,48 @@ def _verify_and_integrate(
     _integrate(operation, work, contract, complexity, verification, events, path=path)
 
 
+def _reject_contained_output(
+    operation: dict[str, Any],
+    work: dict[str, Any],
+    reason: str,
+    events: list[dict[str, Any]],
+    *,
+    path: Path | None,
+) -> None:
+    operator_runtime.create_decision(
+        operation["id"],
+        idempotency_key=f"contained-output:{work['id']}:{work['project_run_id']}",
+        question=(
+            f"Contained output for work {work['id']} was rejected. "
+            "How should the preserved workspace be handled?"
+        ),
+        why_now=(
+            "The supervisor or trusted broker rejected the worker filesystem "
+            "delta before review or integration."
+        ),
+        options=[
+            {"id": "inspect", "label": "Inspect preserved workspace"},
+            {"id": "stop", "label": "Stop this work item"},
+        ],
+        recommendation="Preserve and inspect the workspace; do not weaken containment.",
+        evidence={"error": reason, "project_run_id": work["project_run_id"]},
+        blocking_scope={"work_item_id": work["id"]},
+        work_item_id=work["id"],
+        path=path,
+    )
+    operator_runtime.set_operation_state(
+        operation["id"],
+        "needs_decision",
+        reason="contained output rejected",
+        path=path,
+    )
+    events.append({
+        "kind": "contained_output_rejected",
+        "work": work["id"],
+        "error": reason,
+    })
+
+
 def _dispatch_review(
     operation: dict[str, Any],
     work: dict[str, Any],
@@ -462,10 +601,27 @@ def _dispatch_review(
             mission=mission,
             work_item_id=work["id"],
             requester=f"operator:{operation['id']}",
-            isolated=False,
+            isolated=True,
+            start_point=str(complexity.get("head") or work["branch"]),
+            start_repo=Path(run_workdir(
+                Path(work["root"]), int(work["project_run_id"])
+            )),
+            containment_mode="operator-read",
+            workspace_limit_bytes=int(contract["resources"]["max_worktree_bytes"]),
         )
         operator_roster.bind_reservation(
             reservation.group, project_run_id=dispatched.run_id, path=path
+        )
+        operator_runtime.register_resource_lease(
+            operation["id"],
+            work_item_id=work["id"],
+            project_key=work["project_key"],
+            kind="operator_review_clone",
+            resource_path=dispatched.workdir,
+            project_run_id=dispatched.run_id,
+            unique_state=False,
+            details={"containment_mode": "operator-read"},
+            path=path,
         )
     except Exception:
         operator_roster.release_reservation(reservation.group, path=path)
@@ -514,6 +670,9 @@ def _finish_review(
         run["status"] == "done"
         and "OPERATOR_REVIEW: APPROVE" in str(run.get("summary") or "")
     )
+    _reclaim_readonly_run(
+        operation, work, int(review["project_run_id"]), path=path
+    )
     con = _controller_connect(path)
     try:
         con.execute(
@@ -553,13 +712,14 @@ def _integrate(
     *,
     path: Path | None,
 ) -> None:
+    delivered_ref = str(complexity.get("head") or work["branch"])
     action = operator_runtime.propose_action(
         operation["id"],
         attempt_id=None,
         idempotency_key=f"merge:{work['id']}:{work['project_run_id']}",
         kind="merge verified isolated branch",
         authority_action="merge_after_gates",
-        target={"branch": work["branch"], "target": work["integration_branch"]},
+        target={"branch": delivered_ref, "target": work["integration_branch"]},
         evidence={"complexity": complexity, "verification": verification},
         work_item_id=work["id"],
         path=path,
@@ -599,8 +759,11 @@ def _integrate(
     try:
         head = operator_broker.integrate(
             Path(work["root"]),
-            branch=work["branch"],
+            branch=delivered_ref,
             target_branch=work["integration_branch"],
+            source_repo=Path(run_workdir(
+                Path(work["root"]), int(work["project_run_id"])
+            )),
         )
         merge_applied = True
         operator_runtime.update_project_expected_head(
@@ -920,6 +1083,9 @@ def _dispatch_ready(
                 "run_id": work["project_run_id"],
                 "branch": work["branch"],
                 "base_head": work["base_head"],
+                "workdir": run_workdir(
+                    Path(work["root"]), int(work["project_run_id"])
+                ),
             } if work["project_run_id"] and work["branch"] else None
             dispatched = operator_broker.dispatch(
                 root=Path(work["root"]),
@@ -929,7 +1095,10 @@ def _dispatch_ready(
                 requester=f"operator:{operation['id']}",
                 isolated=True,
                 start_point=predecessor["branch"] if predecessor else None,
+                start_repo=Path(predecessor["workdir"]) if predecessor else None,
                 comparison_base=predecessor["base_head"] if predecessor else None,
+                containment_mode="operator-write",
+                workspace_limit_bytes=int(contract["resources"]["max_worktree_bytes"]),
                 read_inputs=[
                     {
                         "project_id": project_id,
@@ -957,7 +1126,7 @@ def _dispatch_ready(
                 operation["id"],
                 work_item_id=work["id"],
                 project_key=work["project_key"],
-                kind="git_worktree",
+                kind="operator_git_clone",
                 resource_path=dispatched.workdir,
                 project_run_id=dispatched.run_id,
                 unique_state=True,
@@ -1096,6 +1265,7 @@ def _apply_pending_cleanup_actions(
                     run_id=int(target["run_id"]),
                     branch=target["branch"],
                     successor_branch=target["successor_branch"],
+                    successor_repo=Path(target["successor_repo"]),
                 )
             operator_runtime.finish_action(
                 action["id"], state="applied", result={"removed": removed}, path=path
@@ -1147,6 +1317,7 @@ def _propose_predecessor_cleanup(
             "run_id": predecessor["run_id"],
             "branch": predecessor["branch"],
             "successor_branch": dispatched.branch,
+            "successor_repo": dispatched.workdir,
             "resource_ids": [resource["id"] for resource in resources],
         },
         evidence={
@@ -1166,6 +1337,7 @@ def _propose_predecessor_cleanup(
             run_id=int(predecessor["run_id"]),
             branch=predecessor["branch"],
             successor_branch=dispatched.branch or "",
+            successor_repo=Path(dispatched.workdir),
         )
         operator_runtime.finish_action(
             action["id"], state="applied", result={"removed": removed}, path=path
@@ -1223,22 +1395,56 @@ def _escalate_stuck(
     *,
     path: Path | None,
 ) -> None:
-    council = operator_roster.create_council(
-        operation["id"],
-        work["id"],
-        failure_fingerprint=work["failure_fingerprint"] or "attempts_exhausted",
-        evidence={
-            "problem": (
-                f"Work remains stuck after {work['attempt_count']} attempts: "
-                f"{work['title']}"
+    try:
+        council = operator_roster.create_council(
+            operation["id"],
+            work["id"],
+            failure_fingerprint=work["failure_fingerprint"] or "attempts_exhausted",
+            evidence={
+                "problem": (
+                    f"Work remains stuck after {work['attempt_count']} attempts: "
+                    f"{work['title']}"
+                ),
+                "failure_fingerprint": work["failure_fingerprint"],
+                "requirements": work["requirements"],
+            },
+            contract=contract,
+            policy=operator_roster.latest_policy(path=path)[1],
+            path=path,
+        )
+    except operator_roster.RosterError as exc:
+        operator_runtime.set_operation_state(
+            operation["id"],
+            "needs_decision",
+            reason="no containment-safe recovery quorum",
+            path=path,
+        )
+        operator_runtime.create_decision(
+            operation["id"],
+            idempotency_key=f"stuck:{work['id']}:{work['attempt_count']}",
+            question=f"Work {work['id']} is stuck and no safe recovery quorum is available.",
+            why_now=(
+                "Automatic attempts are exhausted and the configured reviewers "
+                "cannot all be admitted under the live containment policy."
             ),
-            "failure_fingerprint": work["failure_fingerprint"],
-            "requirements": work["requirements"],
-        },
-        contract=contract,
-        policy=operator_roster.latest_policy(path=path)[1],
-        path=path,
-    )
+            options=[
+                {"id": "revise", "label": "Approve a bounded revised action"},
+                {"id": "stop", "label": "Stop this work item"},
+            ],
+            recommendation="Revise the work or roster without weakening containment.",
+            evidence={"roster_error": str(exc)},
+            blocking_scope={"work_item_id": work["id"]},
+            work_item_id=work["id"],
+            path=path,
+        )
+        events.append(
+            {
+                "kind": "recovery_quorum_unavailable",
+                "work": work["id"],
+                "error": str(exc),
+            }
+        )
+        return
     operator_runtime.set_operation_state(
         operation["id"], "needs_decision", reason=f"recovery council {council['id']}", path=path
     )
@@ -1314,11 +1520,26 @@ def _reconcile_councils(
                         mission=mission,
                         work_item_id=work["id"],
                         requester=f"operator-council:{council_id}",
-                        isolated=False,
+                        isolated=True,
+                        containment_mode="operator-read",
+                        workspace_limit_bytes=int(
+                            contract["resources"]["max_worktree_bytes"]
+                        ),
                     )
                     operator_roster.bind_reservation(
                         reservation.group,
                         project_run_id=dispatched.run_id,
+                        path=path,
+                    )
+                    operator_runtime.register_resource_lease(
+                        operation["id"],
+                        work_item_id=work["id"],
+                        project_key=work["project_key"],
+                        kind="operator_council_clone",
+                        resource_path=dispatched.workdir,
+                        project_run_id=dispatched.run_id,
+                        unique_state=False,
+                        details={"containment_mode": "operator-read"},
                         path=path,
                     )
                 except Exception:
@@ -1354,6 +1575,9 @@ def _reconcile_councils(
                 resolved = operator_roster.submit_council_opinion(
                     council_id, member["profile_name"], opinion, path=path
                 )
+                _reclaim_readonly_run(
+                    operation, work, int(member["project_run_id"]), path=path
+                )
                 events.append({
                     "kind": "council_opinion",
                     "council": council_id,
@@ -1365,6 +1589,32 @@ def _reconcile_councils(
                         "council": council_id,
                         "synthesis": resolved["synthesis"],
                     })
+
+
+def _reclaim_readonly_run(
+    operation: dict[str, Any],
+    work: dict[str, Any],
+    run_id: int,
+    *,
+    path: Path | None,
+) -> None:
+    removed = operator_broker.reclaim_readonly_clone(
+        Path(work["root"]), run_id=run_id
+    )
+    for resource in operator_runtime.resource_leases(
+        operation["id"], active_only=True, path=path
+    ):
+        if resource["project_run_id"] == run_id:
+            operator_runtime.release_resource_lease(
+                resource["id"],
+                state="released",
+                unique_state=False,
+                details={
+                    "cleanup": "contained read-only clone removal",
+                    "removed": removed,
+                },
+                path=path,
+            )
 
 
 def _parse_council_opinion(summary: str, *, profile: str) -> dict[str, Any]:
