@@ -185,17 +185,28 @@ def cmd_send(args):
             raise SystemExit(
                 f"orchestra: cannot read message file '{message_path}': {exc}"
             ) from exc
-    run_id = _run_id(args)
     con = db.connect(root)
     try:
-        if run_id is None:
+        explicit_run_id = getattr(args, "run", None)
+        target_run = None
+        if explicit_run_id is not None:
+            candidate = con.execute(
+                "SELECT * FROM runs WHERE id=?", (explicit_run_id,)
+            ).fetchone()
+            if (
+                candidate
+                and candidate["agent"] == args.to
+                and candidate["status"] not in db.RUN_TERMINAL
+            ):
+                target_run = candidate
+        else:
             active = list(con.execute(
-                "SELECT id, slug FROM runs WHERE agent=? "
+                "SELECT * FROM runs WHERE agent=? "
                 "AND status NOT IN ('done','failed','timeout','killed') ORDER BY id",
                 (args.to,),
             ))
             if len(active) == 1:
-                run_id = int(active[0]["id"])
+                target_run = active[0]
             elif len(active) > 1:
                 choices = ", ".join(
                     f"{row['id']} ({row['slug'] or 'no slug'})" for row in active
@@ -205,9 +216,45 @@ def cmd_send(args):
                     f"{choices}. Use `orchestra interrupt RUN \"...\"` for guaranteed "
                     "delivery, or pass `--run RUN`."
                 )
-        con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (sender, args.to, body, args.work, run_id, db.now()))
+
+        if target_run is not None:
+            agent = config.agent_cfg(cfg, target_run["agent"])
+            if not agent.get("ensemble"):
+                if int(target_run["supervisor_protocol"] or 0) < 1:
+                    raise SystemExit(
+                        f"orchestra: message was not sent: run {target_run['id']}'s "
+                        "supervisor cannot guarantee delivery. Stop and resume the run "
+                        "under the current Orchestra version."
+                    )
+                message_id = _record_interrupt(
+                    con,
+                    target_run,
+                    sender=sender,
+                    body=body,
+                    immediate=False,
+                )
+                print(
+                    f"message #{message_id} scheduled for {args.to} on "
+                    f"run {target_run['id']}'s "
+                    "next safe action boundary"
+                )
+                return
+
+        # No active runner can accept an injected message. Keep ordinary inbox
+        # behavior for orchestrators, inactive profiles, and ensemble leads.
+        # A supervised sender's run remains useful context for those messages.
+        run_id = explicit_run_id if explicit_run_id is not None else _run_id(args)
+        if target_run is not None:
+            run_id = int(target_run["id"])
+        elif explicit_run_id is None and args.to in cfg.get("agents", {}):
+            # Profile-wide mail is not owned by the sender's supervised run.
+            # The next run for this profile can claim the unbound message.
+            run_id = None
+        con.execute(
+            "INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (sender, args.to, body, args.work, run_id, db.now()),
+        )
         con.commit()
     finally:
         con.close()
@@ -293,7 +340,7 @@ def cmd_inbox(args):
         q = "SELECT * FROM messages WHERE recipient=?"
         params: list[object] = [who]
         if active_run is not None:
-            q += " AND run_id=?"
+            q += " AND (run_id=? OR run_id IS NULL)"
             params.append(active_run)
         if not args.all:
             q += " AND read_at IS NULL" if args.unread else ""
@@ -965,6 +1012,47 @@ def cmd_recall(args):
     print(f"recalled queued message {args.message_id} for run {row['run_id']}")
 
 
+def _record_interrupt(con, run, *, sender: str, body: str, immediate: bool) -> int:
+    """Persist one guaranteed runner delivery and place its timeline marker."""
+    created_at = db.now()
+    try:
+        pending_offset = Path(run["log_path"]).stat().st_size
+    except (OSError, TypeError):
+        pending_offset = 0
+    cur = con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, "
+                      "created_at, delivered_at, delivery_offset) "
+                      "VALUES(?,?,?,?, 'interrupt', ?, ?, ?)",
+                      (sender, run["agent"], f"[INTERRUPT] {body}",
+                       run["id"], created_at, created_at if immediate else None,
+                       pending_offset))
+    message_id = int(cur.lastrowid)
+    if immediate:
+        con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (run["id"],))
+    con.commit()
+    delivery_offset = supervise.append_delivery_event(run["log_path"], {
+        "message_id": message_id,
+        "delivery": "interrupt",
+        "sender": sender,
+        "recipient": run["agent"],
+        "body": body,
+        "created_at": created_at,
+        "phase": "delivered" if immediate else "pending",
+    })
+    if delivery_offset is not None:
+        con.execute(
+            "UPDATE messages SET delivery_offset=? "
+            "WHERE id=? AND delivered_at IS NULL",
+            (delivery_offset, message_id),
+        )
+    con.commit()
+    if immediate and run["pid"]:
+        try:
+            os.killpg(run["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return message_id
+
+
 def cmd_interrupt(args):
     root = paths.find_root()
     cfg = config.load(root)
@@ -982,11 +1070,9 @@ def cmd_interrupt(args):
                          "when teammates wake it")
     if not r["session_ref"]:
         raise SystemExit(f"orchestra: run {args.run_id}'s session isn't identified yet "
-                         "(happens ~10s after spawn) — retry in a moment, or `orchestra send` "
-                         "to queue the message")
+                         "(happens ~10s after spawn) — retry in a moment")
     sender = _identity(args, cfg)
     body = " ".join(args.message)
-    created_at = db.now()
     immediate = bool(getattr(args, "now", False))
     if not immediate and int(r["supervisor_protocol"] or 0) < 1:
         con.close()
@@ -995,37 +1081,8 @@ def cmd_interrupt(args):
             f"use `orchestra interrupt {args.run_id} \"...\" --now`, or stop and reply "
             "to resume it under the current supervisor"
         )
-    cur = con.execute("INSERT INTO messages(sender, recipient, body, run_id, kind, "
-                      "created_at, delivered_at) VALUES(?,?,?,?, 'interrupt', ?, ?)",
-                      (sender, r["agent"], f"[INTERRUPT] {body}",
-                       args.run_id, created_at, created_at if immediate else None))
-    message_id = int(cur.lastrowid)
-    if immediate:
-        con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (args.run_id,))
-    con.commit()
-    delivery_offset = supervise.append_delivery_event(r["log_path"], {
-        "message_id": message_id,
-        "delivery": "interrupt",
-        "sender": sender,
-        "recipient": r["agent"],
-        "body": body,
-        "created_at": created_at,
-        "phase": "delivered" if immediate else "pending",
-    })
-    if delivery_offset is None:
-        try:
-            delivery_offset = Path(r["log_path"]).stat().st_size
-        except (OSError, TypeError):
-            delivery_offset = 0
-    con.execute("UPDATE messages SET delivery_offset=? WHERE id=?",
-                (delivery_offset, message_id))
-    con.commit()
+    _record_interrupt(con, r, sender=sender, body=body, immediate=immediate)
     con.close()
-    if immediate and r["pid"]:
-        try:
-            os.killpg(r["pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
     if immediate:
         print(f"run {args.run_id} interrupted now — worker will resume its session, read "
               "the message, and continue the mission")
@@ -1920,14 +1977,21 @@ def main():
     ts.add_parser("list")
     s.set_defaults(fn=cmd_team)
 
-    s = sub.add_parser("send", help="send a message to an agent/orchestrator inbox")
+    s = sub.add_parser(
+        "send",
+        help="message an agent; a sole active run receives it at a safe boundary",
+    )
     s.add_argument("to")
     send_source = s.add_mutually_exclusive_group(required=True)
     send_source.add_argument("body", nargs="?", help="message text")
     send_source.add_argument("--file", dest="body_file", metavar="PATH",
                              help="read the complete message from a UTF-8 file")
     s.add_argument("--work", help="related work item (W-XXXX)")
-    s.add_argument("--run", type=int, help="related run id")
+    s.add_argument(
+        "--run",
+        type=int,
+        help="target active run id, or related run id for ordinary inbox mail",
+    )
     ident(s)
     s.set_defaults(fn=cmd_send)
 

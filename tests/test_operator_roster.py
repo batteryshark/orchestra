@@ -34,10 +34,10 @@ def _config() -> dict:
                 "model": "gpt-5.6-sol",
                 "role": "really tough thinking only — heaviest tier",
             },
-            "codex-55": {
+            "codex-terra": {
                 "backend": "codex",
-                "model": "gpt-5.5",
-                "role": "fast engineer for medium tasks",
+                "model": "gpt-5.6-terra",
+                "role": "fast Code Mode engineer for medium tasks",
             },
             "codex-spark": {
                 "backend": "codex",
@@ -132,7 +132,7 @@ class OperatorRosterTests(unittest.TestCase):
             "general_implementation",
             profiles["codex"]["actuation_modes"],
         )
-        self.assertEqual(profiles["codex-55"]["tier"], "generalist")
+        self.assertEqual(profiles["codex-terra"]["tier"], "generalist")
         self.assertEqual(profiles["minimax"]["tier"], "workhorse")
         self.assertFalse(profiles["broken"]["enabled"])
         self.assertIn("security", profiles["fable"]["contraindications"])
@@ -183,7 +183,7 @@ class OperatorRosterTests(unittest.TestCase):
         availability_report = {
             "roster": [
                 {"name": name, "state": "available"}
-                for name in ("fable", "codex", "codex-55", "kimi", "minimax")
+                for name in ("fable", "codex", "codex-terra", "kimi", "minimax")
             ]
         }
         capacity = {
@@ -245,7 +245,7 @@ class OperatorRosterTests(unittest.TestCase):
                 ]
             },
             capacity={},
-            active_by_profile={"codex-55": 100},
+            active_by_profile={"codex-terra": 100},
             path=self.db_path,
         )
         self.assertIsNone(route.profile)

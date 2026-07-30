@@ -97,8 +97,10 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
 
 ## Messaging semantics
 
-- `orchestra send <agent> "message"` writes to an inbox. A running worker reads it only when
-  it checks, so delivery is **best effort**. For long artifacts use
+- `orchestra send <agent> "message"` safely delivers to that profile's sole active run by
+  stopping at a completed action boundary and resuming the same session with the message.
+  When several runs share the profile, pass `--run`; when none is active, the message remains
+  profile-wide mail for the next run to claim. For long artifacts use
   `orchestra send <agent> --file handoff.md`.
 - `orchestra interrupt <run> "message"` is the normal in-flight correction. It waits for a
   completed action boundary, stops the worker, injects the correction, and resumes the same
@@ -110,8 +112,8 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
 - `orchestra resume <run> "message"` continues a completed run's existing session as a new,
   linked execution attempt. `orchestra reply` remains a compatibility alias.
 
-Corrections that change current work use `interrupt` or `queue`, never bare `send`. If a
-worker never reads an inbox message, Orchestra reports it as undelivered after the run.
+Use `interrupt` when the exact run is already known or `send` when the recipient profile is
+unambiguous. Use `queue` for work that should begin only after the current run finishes.
 
 Default workers do not block for clarification. For ambiguity where a wrong assumption risks
 destructive or substantially wasted work, dispatch with `--allow-question`. The worker must
@@ -190,7 +192,7 @@ not replace judgment about model strengths, risk, or task ownership.
 Do not spend a heavy tier on grunt work merely because it is available, and do not assign a
 weak tier to a task whose primary difficulty is judgment rather than typing. When multiple runs
 share one profile identity, prefer run-addressed controls such as `interrupt`, `queue`, and
-`resume`; a bare `send` targets the profile's shared inbox rather than one particular run.
+`resume`; a bare `send` refuses ambiguous active delivery instead of guessing which run owns it.
 
 ## Rules of engagement
 

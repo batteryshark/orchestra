@@ -53,7 +53,22 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
         # claude CLI >= 2.1.x rejects a trailing positional prompt when
         # --print/--output-format stream-json are set ("Input must be provided
         # either through stdin or as a prompt argument"). `-p <prompt>` works.
-        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+        cmd = [
+            "claude", "-p", prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--forward-subagent-text",
+        ]
+        # The newest Claude models default thinking.display to "omitted":
+        # they emit signed thinking blocks whose readable text is empty.
+        # Request the user-visible summary by default, while preserving an
+        # explicit roster override such as `--thinking-display omitted`.
+        if not any(
+            arg == "--thinking-display" or arg.startswith("--thinking-display=")
+            for arg in extra
+        ):
+            cmd += ["--thinking-display", "summarized"]
         if resume_ref:
             cmd += ["--resume", resume_ref]
         if model:

@@ -23,7 +23,11 @@ class SendFileTests(unittest.TestCase):
         self.original_config_load = cli.config.load
         cli.paths.find_root = lambda: self.root  # type: ignore[assignment]
         cli.config.load = lambda _root: {  # type: ignore[assignment]
-            "settings": {"default_requester": "orchestrator"}
+            "settings": {"default_requester": "orchestrator"},
+            "agents": {
+                "glm": {"backend": "opencode"},
+                "reviewer": {"backend": "opencode"},
+            },
         }
 
     def tearDown(self) -> None:
@@ -54,14 +58,34 @@ class SendFileTests(unittest.TestCase):
         finally:
             con.close()
 
-    def _insert_active_run(self, *, agent: str, slug: str) -> int:
+    def _insert_active_run(
+        self,
+        *,
+        agent: str,
+        slug: str,
+        session_ref: str | None = "ready",
+        supervisor_protocol: int = 1,
+    ) -> int:
+        log_path = self.root / f"{slug}.jsonl"
+        log_path.touch()
+        saved_session_ref = (
+            f"ses-{slug}" if session_ref == "ready" else session_ref
+        )
         con = db.connect(self.root)
         try:
             cur = con.execute(
                 "INSERT INTO runs(agent, backend, title, requested_by, workdir, slug, "
-                "status, started_at) VALUES(?, 'opencode', 'task', 'codex', ?, ?, "
-                "'running', ?)",
-                (agent, str(self.root), slug, db.now()),
+                "status, session_ref, supervisor_protocol, log_path, started_at) "
+                "VALUES(?, 'opencode', 'task', 'codex', ?, ?, 'running', ?, ?, ?, ?)",
+                (
+                    agent,
+                    str(self.root),
+                    slug,
+                    saved_session_ref,
+                    supervisor_protocol,
+                    str(log_path),
+                    db.now(),
+                ),
             )
             con.commit()
             return int(cur.lastrowid)
@@ -170,11 +194,90 @@ class SendFileTests(unittest.TestCase):
     def test_operator_send_auto_targets_only_active_profile_run(self) -> None:
         run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
 
-        code, _, stderr = self._run_main(["send", "glm", "please check this"])
+        code, stdout, stderr = self._run_main(["send", "glm", "please check this"])
 
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
-        self.assertEqual(self._messages()[0]["run_id"], run_id)
+        self.assertIn(f"scheduled for glm on run {run_id}", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["run_id"], run_id)
+        self.assertEqual(message["kind"], "interrupt")
+        self.assertIsNotNone(message["delivery_offset"])
+
+    def test_send_can_wait_in_delivery_queue_before_session_is_identified(self) -> None:
+        run_id = self._insert_active_run(
+            agent="glm",
+            slug="chilly_ferret",
+            session_ref=None,
+        )
+
+        code, stdout, stderr = self._run_main(
+            ["send", "glm", "apply this when resumable"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"scheduled for glm on run {run_id}", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["kind"], "interrupt")
+        self.assertIsNone(message["delivered_at"])
+        self.assertIsNotNone(message["delivery_offset"])
+
+    def test_send_refuses_legacy_supervisor_instead_of_claiming_delivery(self) -> None:
+        run_id = self._insert_active_run(
+            agent="glm",
+            slug="chilly_ferret",
+            supervisor_protocol=0,
+        )
+
+        code, _, stderr = self._run_main(["send", "glm", "do not lose this"])
+
+        self.assertEqual(code, 1)
+        self.assertIn(f"message was not sent: run {run_id}", stderr)
+        self.assertEqual(self._messages(), [])
+
+    def test_worker_send_targets_recipient_run_instead_of_sender_run(self) -> None:
+        recipient_run = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "reviewer", "ORCHESTRA_RUN_ID": "323"},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(
+                ["send", "glm", "cross-run finding"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"scheduled for glm on run {recipient_run}", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["sender"], "reviewer")
+        self.assertEqual(message["recipient"], "glm")
+        self.assertEqual(message["run_id"], recipient_run)
+        self.assertEqual(message["kind"], "interrupt")
+
+    def test_inactive_profile_message_is_visible_to_its_next_run(self) -> None:
+        code, _, stderr = self._run_main(
+            ["send", "reviewer", "read this when you start", "--as", "codex"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIsNone(self._messages()[0]["run_id"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "reviewer", "ORCHESTRA_RUN_ID": "404"},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(
+                ["inbox", "--unread", "--mark-read"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("read this when you start", stdout)
+        self.assertIsNotNone(self._messages()[0]["read_at"])
 
     def test_operator_send_rejects_ambiguous_active_profile(self) -> None:
         first = self._insert_active_run(agent="glm", slug="chilly_ferret")

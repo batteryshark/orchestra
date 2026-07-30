@@ -80,10 +80,13 @@ roughly 308 to 80 proxy tokens (74%).
 
 Fresh worker briefs now tell every backend to batch independent read-only
 searches, file reads, and diagnostics while keeping dependencies and
-overlapping writes sequential. The default `codex-55` profile additionally
-enables Codex's experimental `code_mode` behind a profile-scoped
-`--enable code_mode` flag. The heavier `codex` profile and other Codex profiles
-remain unchanged until the trial has comparative evidence.
+overlapping writes sequential. The default `codex-terra` profile uses
+`gpt-5.6-terra`, whose model metadata advertises Code Mode support, and enables
+Codex's experimental `code_mode` behind a profile-scoped `--enable code_mode`
+flag. The profile suppresses the generic unstable-feature banner for this
+intentional opt-in; model-compatibility warnings remain enabled. The heavier
+`codex` profile and other Codex profiles remain unchanged until the trial has
+comparative evidence.
 
 ## Next experiments, in priority order
 

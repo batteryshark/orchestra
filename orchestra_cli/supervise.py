@@ -667,7 +667,15 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                 events, boundary_scan_offset = _read_log_events(
                     log_path, boundary_scan_offset
                 )
-                if any(_is_safe_boundary(run["backend"], event) for event in events):
+                # A message may be scheduled immediately after dispatch, before
+                # the backend's resumable session id reaches the run row. Do
+                # not stop at a boundary until the same session can be resumed;
+                # a later boundary or natural process exit will deliver it.
+                if (
+                    latest
+                    and latest["session_ref"]
+                    and any(_is_safe_boundary(run["backend"], event) for event in events)
+                ):
                     delivered = _mark_pending_delivered(con, run_id)
                     con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (run_id,))
                     con.commit()

@@ -26,7 +26,7 @@ class PlaybookTemplateTests(unittest.TestCase):
         self.assertIn("singleton worker", template)
         self.assertIn("zero, one, or several active", template)
         self.assertIn("profiles may draw from the same provider quota", template)
-        self.assertIn("bare `send` targets the profile's shared inbox", template)
+        self.assertIn("bare `send` refuses ambiguous active delivery", template)
         self.assertIn("`orchestra discover` as live execution evidence", template)
         self.assertIn("Dispatch rejects proven-unavailable profiles", template)
         self.assertIn("## Project-specific doctrine", template)

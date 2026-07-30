@@ -79,15 +79,20 @@ backend = "codex"
 # effort = "high"   # override reasoning effort for workers (codex config default: xhigh)
 role = "really tough thinking only — heaviest tier, use sparingly"
 
-[agents.codex-55]
+[agents.codex-terra]
 backend = "codex"
-model = "gpt-5.5"
+model = "gpt-5.6-terra"
 effort = "high"
-role = "fast engineer for medium tasks"
+role = "fast Code Mode engineer for medium implementation and review tasks"
 # Bounded trial: JavaScript/V8 orchestration can collapse independent tool
-# calls into one model step. Keep this profile-scoped while Codex marks the
-# feature under development; do not pair it with code_mode_only yet.
-extra_args = ["--enable", "code_mode"]
+# calls into one model step. Terra advertises Code Mode support; keep the
+# feature profile-scoped while Codex marks it under development. Suppress the
+# generic unstable-feature banner for this intentional opt-in; model-specific
+# compatibility warnings remain visible.
+extra_args = [
+  "--enable", "code_mode",
+  "-c", "suppress_unstable_features_warning=true",
+]
 
 [agents.claude]
 backend = "claude"

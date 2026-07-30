@@ -250,15 +250,16 @@ class CliArgumentMutualExclusionTests(unittest.TestCase):
 
 
 class TailscaleWarningWordingTests(unittest.TestCase):
-    """The Tailnet warning must describe the mutating stop action."""
+    """The Tailnet warning must describe the mutating dashboard actions."""
 
-    def test_warning_text_describes_view_and_stop_scope(self) -> None:
+    def test_warning_text_describes_view_stop_and_restart_scope(self) -> None:
         text = ui.tailscale_warning("100.99.99.99")
         # The warning must be one canonical string the serve() function
         # prints verbatim, so any wording change is forced to update both.
         self.assertIn("Tailscale ACLs", text)
         self.assertIn("view", text.lower())
         self.assertIn("stop active runs", text.lower())
+        self.assertIn("restart the dashboard", text.lower())
         self.assertNotIn("modify", text.lower())
 
 

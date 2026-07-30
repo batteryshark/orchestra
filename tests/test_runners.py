@@ -46,9 +46,10 @@ class CodexCommandTests(unittest.TestCase):
         for flag in ("--cd", "--sandbox", "--add-dir", "--skip-git-repo-check"):
             self.assertLess(cmd.index(flag), resume_index)
 
-    def test_default_codex_55_profile_enables_bounded_code_mode_trial(self):
+    def test_default_codex_terra_profile_uses_code_mode_capable_model(self):
         cfg = tomllib.loads(config.DEFAULT_CONFIG)
-        agent = config.agent_cfg(cfg, "codex-55")
+        self.assertNotIn("codex-55", cfg["agents"])
+        agent = config.agent_cfg(cfg, "codex-terra")
 
         cmd = build_cmd(
             agent,
@@ -59,6 +60,8 @@ class CodexCommandTests(unittest.TestCase):
 
         enable_index = cmd.index("--enable")
         self.assertEqual(cmd[enable_index + 1], "code_mode")
+        self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-5.6-terra")
+        self.assertIn("suppress_unstable_features_warning=true", cmd)
         self.assertLess(enable_index, len(cmd) - 1)
         self.assertNotIn("code_mode_only", cmd)
 
@@ -82,6 +85,39 @@ class ClaudeCommandTests(unittest.TestCase):
         self.assertEqual(cmd[:3], ["claude", "-p", "do the work"])
         self.assertEqual(cmd.count("do the work"), 1)
         self.assertIn("stream-json", cmd)
+
+    def test_requests_visible_streaming_thinking_and_subagent_text(self):
+        cmd = build_cmd(
+            self.agent,
+            workdir="/workspace/project",
+            title="run-1",
+            prompt="do the work",
+        )
+
+        self.assertIn("--include-partial-messages", cmd)
+        self.assertIn("--forward-subagent-text", cmd)
+        display = cmd.index("--thinking-display")
+        self.assertEqual(cmd[display + 1], "summarized")
+
+    def test_explicit_thinking_display_override_is_preserved(self):
+        agent = {
+            **self.agent,
+            "extra_args": [
+                "--permission-mode", "acceptEdits",
+                "--thinking-display=omitted",
+            ],
+        }
+
+        cmd = build_cmd(
+            agent,
+            workdir="/workspace/project",
+            title="run-1",
+            prompt="do the work",
+        )
+
+        self.assertIn("--thinking-display=omitted", cmd)
+        self.assertNotIn("--thinking-display", cmd)
+        self.assertNotIn("summarized", cmd)
 
     def test_resume_keeps_prompt_as_print_value(self):
         cmd = build_cmd(

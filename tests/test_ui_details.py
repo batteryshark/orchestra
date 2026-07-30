@@ -28,6 +28,65 @@ class TranscriptNormalizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(ui._read_prompt(Path(tmp)))
 
+    def test_codex_resume_reused_item_ids_append_to_the_timeline(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": "first command",
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": "first command",
+                    "aggregated_output": "first output",
+                    "status": "completed",
+                },
+            },
+            # A resumed Codex invocation keeps the thread ID but restarts its
+            # item counter. Both commands must remain visible in run order.
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": "second command",
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": "second command",
+                    "aggregated_output": "second output",
+                    "status": "completed",
+                },
+            },
+        ]
+
+        transcript = ui.parse_transcript(
+            "\n".join(json.dumps(event) for event in events)
+        )
+
+        tools = [item for item in transcript if item["kind"] == "tool"]
+        self.assertEqual(
+            [(item["input"], item["output"]) for item in tools],
+            [
+                ("first command", "first output"),
+                ("second command", "second output"),
+            ],
+        )
+
     def test_suppresses_kimi_placeholder_reasoning_without_losing_real_thinking(self) -> None:
         events = [
             {"part": {"type": "reasoning", "id": "empty", "text": ""}},
@@ -42,6 +101,127 @@ class TranscriptNormalizationTests(unittest.TestCase):
 
         thinking = [item["body"] for item in transcript if item["kind"] == "thinking"]
         self.assertEqual(thinking, ["Inspect the loader.", "Now patch it."])
+
+    def test_claude_streamed_thinking_is_live_and_not_duplicated_by_final_message(self) -> None:
+        events = [
+            {
+                "type": "stream_event",
+                "parent_tool_use_id": None,
+                "event": {
+                    "type": "message_start",
+                    "message": {"id": "msg-1"},
+                },
+            },
+            {
+                "type": "stream_event",
+                "parent_tool_use_id": None,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": "Inspect the ",
+                    },
+                },
+            },
+            {
+                "type": "stream_event",
+                "parent_tool_use_id": None,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": "loader.",
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg-1",
+                    "content": [{
+                        "type": "thinking",
+                        "thinking": "Inspect the loader.",
+                    }],
+                },
+            },
+        ]
+
+        transcript = ui.parse_transcript(
+            "\n".join(json.dumps(event) for event in events)
+        )
+
+        self.assertEqual(transcript, [{
+            "kind": "thinking",
+            "body": "Inspect the loader.",
+        }])
+
+    def test_claude_progress_updates_existing_tool_and_background_task_cards(self) -> None:
+        events = [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg-1",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Bash",
+                        "input": {"command": "make test"},
+                    }],
+                },
+            },
+            {
+                "type": "tool_progress",
+                "parent_tool_use_id": "tool-1",
+                "tool_name": "Bash",
+                "elapsed_time_seconds": 30,
+            },
+            {
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-1",
+                "tool_use_id": "tool-2",
+                "task_type": "local_agent",
+                "description": "Review the parser",
+            },
+            {
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "task-1",
+                "tool_use_id": "tool-2",
+                "subagent_type": "general-purpose",
+                "description": "Running focused tests",
+                "usage": {
+                    "tool_uses": 2,
+                    "total_tokens": 1234,
+                    "duration_ms": 2500,
+                },
+            },
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "task-1",
+                "tool_use_id": "tool-2",
+                "status": "completed",
+                "summary": "Parser review complete",
+            },
+        ]
+
+        transcript = ui.parse_transcript(
+            "\n".join(json.dumps(event) for event in events)
+        )
+
+        self.assertEqual(len(transcript), 2)
+        self.assertEqual(transcript[0]["name"], "Bash")
+        self.assertEqual(transcript[0]["status"], "running · 30s")
+        self.assertEqual(transcript[1], {
+            "kind": "tool",
+            "name": "local_agent",
+            "status": "completed",
+            "input": "Review the parser",
+            "output": "Parser review complete",
+        })
 
     def test_claude_five_hour_limit_suppresses_synthetic_monthly_spend_copy(self) -> None:
         events = [

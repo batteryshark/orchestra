@@ -224,6 +224,16 @@ class RouteTests(unittest.TestCase):
         self.assertIn("'Content-Type':'application/json'", body)
         self.assertIn("status === 'killed' ? 'stopped by user' : status", body)
 
+    def test_main_dashboard_has_same_url_restart_control(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn('id="serverRestart"', body)
+        self.assertIn("async function waitForServerRestart(previousInstance)", body)
+        self.assertIn("api/server/restart", body)
+        self.assertIn("current.instance_id !== previousInstance", body)
+        self.assertIn("active runs keep running", body)
+        self.assertIn("Restart once from the terminal to enable this control.", body)
+
     def test_main_dashboard_renders_final_handoff_items(self) -> None:
         status, _headers, body = self.get("/")
         self.assertEqual(status, 200)
@@ -243,6 +253,16 @@ class RouteTests(unittest.TestCase):
         self.assertIn("r.parent_run && byId.has(r.parent_run)", body)
         self.assertIn("conversation #${esc(lineage.root)}", body)
         self.assertIn("continues #${esc(r.parent_run)}", body)
+
+    def test_main_dashboard_prioritizes_dispatch_description_in_run_rows(self) -> None:
+        status, _headers, body = self.get("/")
+        self.assertEqual(status, 200)
+        description = body.index('<div class="task-description"')
+        metadata = body.index('<div class="runmeta">', description)
+        self.assertLess(description, metadata)
+        self.assertIn("-webkit-line-clamp:2", body)
+        self.assertIn("r.title||'No task description recorded'", body)
+        self.assertIn("r.work_item?`[${r.work_item}]`", body)
 
     def test_api_usage_still_served(self) -> None:
         status, headers, body = self.get("/api/usage")

@@ -23,6 +23,12 @@ header .brand { display:inline-flex; align-items:center; gap:10px;
 header h1 { margin:0; font-size:inherit; font-weight:inherit; letter-spacing:inherit }
 header .root { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px }
 header nav { margin-left:auto; display:flex; gap:12px; align-items:center }
+.server-restart { display:inline-flex; align-items:center; gap:6px; padding:5px 9px;
+  color:var(--muted); background:var(--card) }
+.server-restart:hover { color:var(--ink); background:var(--sel) }
+.server-restart svg { width:14px; height:14px; fill:none; stroke:currentColor;
+  stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round }
+.server-restart.restarting svg { animation:runway-spin .8s linear infinite }
 .proj-sel { position:relative; display:inline-flex }
 .proj-btn { display:inline-flex; align-items:center; gap:7px;
   font:inherit; font-size:13px; padding:4px 10px; color:var(--ink);
@@ -68,7 +74,10 @@ main { padding:14px 20px; max-width:1500px; margin:0 auto; display:flex; flex-di
 .runitem.child { border-left:2px solid color-mix(in srgb, var(--blue) 35%, var(--line)) }
 .runitem.continuation { border-left:2px solid color-mix(in srgb, var(--green) 45%, var(--line)) }
 .runitem .top { display:flex; gap:8px; align-items:center }
-.runitem .title { font-size:12px; color:var(--muted); margin-top:2px;
+.runitem .task-description { display:-webkit-box; margin-top:5px; overflow:hidden;
+  -webkit-box-orient:vertical; -webkit-line-clamp:2; line-clamp:2;
+  max-height:2.7em; overflow-wrap:anywhere; font-size:12.5px; font-weight:550; line-height:1.35 }
+.runitem .runmeta { font-size:11px; color:var(--muted); margin-top:3px;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
 .lineage-link { color:var(--blue); background:none; border:0; padding:0; cursor:pointer;
   font:inherit; text-decoration:underline; text-decoration-color:color-mix(in srgb, var(--blue) 35%, transparent) }
@@ -272,7 +281,10 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
   </button>
   <div class="proj-menu" id="projMenu" role="listbox" aria-label="Orchestra projects" hidden></div>
 </div>
-<nav></nav></header>
+<nav><button class="server-restart" id="serverRestart" type="button" title="Restart on this same URL; active runs keep running">
+  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 7V3.5L13.7 5.8A7 7 0 1 0 17 11"/></svg>
+  <span id="serverRestartLabel">Restart server</span>
+</button></nav></header>
 <main>
 <div class="cols">
   <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
@@ -328,6 +340,52 @@ let state = null, selected = null, selTm = null, userPicked = false, tEtag = nul
 let lastHash = {};   // section -> serialized data, to skip re-render (keeps scroll)
 const TERMINAL = new Set(['done','failed','timeout','killed']);
 const stopping = new Set();
+const serverRestart = document.getElementById('serverRestart');
+const serverRestartLabel = document.getElementById('serverRestartLabel');
+let serverRestarting = false;
+
+async function waitForServerRestart(previousInstance){
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline){
+    await new Promise(resolve => setTimeout(resolve, 250));
+    try {
+      const res = await fetch(`api/server/status?restart=${Date.now()}`, {cache:'no-store'});
+      if (!res.ok) continue;
+      const current = await res.json();
+      if (current.instance_id && current.instance_id !== previousInstance) return;
+    } catch(e){ /* The expected gap while the listening socket is rebound. */ }
+  }
+  throw new Error('The dashboard did not come back within 15 seconds.');
+}
+
+async function restartServer(){
+  if (serverRestarting) return;
+  serverRestarting = true;
+  serverRestart.disabled = true;
+  serverRestart.classList.add('restarting');
+  serverRestartLabel.textContent = 'Restarting…';
+  try {
+    const res = await fetch('api/server/restart', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:'{}',
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok || !payload.instance_id) {
+      const upgrade = [404, 501, 503].includes(res.status)
+        ? ' Restart once from the terminal to enable this control.' : '';
+      throw new Error((payload.error || `Restart request failed (${res.status}).`) + upgrade);
+    }
+    await waitForServerRestart(payload.instance_id);
+    location.reload();
+  } catch(e) {
+    serverRestarting = false;
+    serverRestart.disabled = false;
+    serverRestart.classList.remove('restarting');
+    serverRestartLabel.textContent = 'Restart server';
+    alert(e.message || 'Dashboard restart failed.');
+  }
+}
 
 // --- provider runway (global control-plane signal) ----------------------
 // Usage is account-wide rather than project-specific, so this request does
@@ -757,7 +815,12 @@ function renderRuns(){
         ${statusChip(r.status)}
         <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
           ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span></div>
-      <div class="title">${r.backend?`<span class="mono muted">${esc(r.backend)}</span> `:''}${r.model?`<span class="mono muted">${esc((r.model||'').split('/').pop())}</span> `:''}${r.work_item?`[${esc(r.work_item)}] `:''}${esc(r.title||'')}</div>
+      <div class="task-description" title="${esc(r.title||'No task description recorded')}">${esc(r.title||'No task description recorded')}</div>
+      <div class="runmeta">${[
+        r.backend,
+        (r.model||'').split('/').pop(),
+        r.work_item?`[${r.work_item}]`:'',
+      ].filter(Boolean).map(esc).join(' · ')}</div>
     </div>`).join('') || '<div class="runitem muted">no runs yet</div>';
   setIfChanged('runlist', html);
   tickElapsed();
@@ -1016,6 +1079,7 @@ runwayClose.addEventListener('click', () => runwaySetOpen(false));
 runwayBackdrop.addEventListener('click', () => runwaySetOpen(false));
 runwayRefresh.addEventListener('click', () => insightsView === 'runtime'
   ? refreshRuntimeStats() : refreshRunway({force:true}));
+serverRestart.addEventListener('click', restartServer);
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && runwayDock.classList.contains('open')) runwaySetOpen(false);
 });

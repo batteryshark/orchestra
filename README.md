@@ -90,7 +90,9 @@ Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-
 
 Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
 
-`orchestra interrupt` waits for the next completed action boundary reported by the active backend before stopping and resuming the worker, so routine redirection does not terminate a tool during a file write. OpenCode step finishes, Codex completed tool items, and Claude tool results are recognized. Use `--now` only when stopping immediately is more important than preserving the current tool operation. If the worker exits before another boundary, Orchestra resumes the same session immediately with the pending message. Periodic supervisor check-ins use the same safe path.
+`orchestra send AGENT "message"` uses the same safe-boundary delivery when that profile has one active run. It binds the message to the recipient's run, stops after a completed action, and resumes the same session with the text injected into its prompt. If several active runs share the profile, pass `--run`; Orchestra refuses to guess. With no active run, the message remains profile-wide mail for the next run to claim.
+
+`orchestra interrupt` is the explicitly run-addressed form. It waits for the next completed action boundary reported by the active backend before stopping and resuming the worker, so routine redirection does not terminate a tool during a file write. OpenCode step finishes, Codex completed tool items, and Claude tool results are recognized. Use `--now` only when stopping immediately is more important than preserving the current tool operation. If the worker exits before another boundary, Orchestra resumes the same session immediately with the pending message. Periodic supervisor check-ins use the same safe path.
 
 `orchestra queue` prints the queued message ID, which also appears in run details. Recall an obsolete follow-up with `orchestra recall MESSAGE_ID --as SENDER` before the current run finishes. Recall and auto-delivery are atomic: once the follow-up has been claimed for session resume, Orchestra refuses to recall it.
 
@@ -264,6 +266,11 @@ orchestra project forget PROJECT_ID
 
 Use the project picker in the header to switch roots. The UI only accepts projects already present in the registry; browsers cannot submit arbitrary filesystem paths. Forgetting a project removes the registry entry and never deletes project files or `.orchestra/` data.
 
+Use **Restart server** in the dashboard header after changing Orchestra's
+Python code. The listener closes and reopens on the same URL; supervised runs
+are separate processes and keep running. UI-only edits still need only a page
+refresh. `Ctrl-C` also closes the listening socket before the CLI exits.
+
 ![Orchestra dashboard at phone width](docs/screenshots/dashboard-mobile.jpg)
 
 ### Tailnet access
@@ -272,9 +279,12 @@ Use the project picker in the header to switch roots. The UI only accepts projec
 orchestra ui --tailscale
 ```
 
-This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, logs, and stop active runs. Review [SECURITY.md](SECURITY.md) before enabling it.
+This binds only to the machine's Tailscale IPv4 address and prints the resulting URL. The default UI binds to loopback. Orchestra has no application-level authentication, so tailnet ACLs determine who can view registered projects, prompts, transcripts, and logs; stop active runs; and restart the dashboard server. Review [SECURITY.md](SECURITY.md) before enabling it.
 
-Port `4764` is preferred. An implicit port may safely fall back when busy; an explicit `--port` is pinned and fails instead. `--tailscale` cannot be combined with an explicit `--host`.
+Port `4764` is preferred. An implicit port safely falls back when another
+process—including an already-running Orchestra dashboard—still owns it; an
+explicit `--port` is pinned and fails instead. `--tailscale` cannot be combined
+with an explicit `--host`.
 
 ## iOS companion app
 
@@ -314,6 +324,13 @@ Claude usage refreshes from Claude Code's live `/usage` view in the background. 
 Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.orchestra/config.toml` overlays it. Run `orchestra doctor` for full installation health or `orchestra discover` for the live execution catalog. `orchestra discover TEXT` searches model IDs, `--json` returns the credential-free structured report, and `--refresh` asks OpenCode to refresh its model catalog.
 
 Roster entries are reusable launch profiles, not singleton workers or capacity slots. Each profile chooses a backend (`opencode`, `codex`, or `claude`), model, reasoning configuration, role, and optional arguments; every dispatch creates a distinct run, so several independent runs may use the same profile concurrently. Choose a wave by task fit and current `orchestra usage` headroom rather than trying to keep exactly one of each profile active. Profiles can share a provider quota, and usage data is advisory, so routing still requires judgment about model strengths, weaknesses, risk, and project concurrency limits. Session references are recorded so `orchestra resume` continues the same worker context rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
+
+Claude workers request summarized thinking, partial-message streaming, and
+forwarded subagent text so the dashboard can show reasoning summaries and live
+activity alongside tool calls. Claude does not expose raw chain-of-thought. A
+profile can explicitly opt out of summaries by including
+`"--thinking-display", "omitted"` in its `extra_args`; Orchestra will not add a
+conflicting display option.
 
 Discovery separates configured intent from live evidence. It verifies that backend executables exist, checks Codex and Claude authentication, and reads OpenCode's configured provider/model catalog. Dispatch refuses profiles proven unavailable before creating a run. If a CLI does not expose a trustworthy model catalog—or a bounded probe fails—the profile is labeled `unknown` and dispatch continues with an explicit warning instead of guessing. OpenCode profiles with an explicit model are rejected when that provider/model is absent from `opencode models`.
 

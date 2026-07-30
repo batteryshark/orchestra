@@ -22,7 +22,9 @@ the user-level registry.
 import errno
 import hashlib
 import json
+import os
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -66,7 +68,16 @@ PROJECT_QUERY = "project"
 
 
 class _DashboardHTTPServer(ThreadingHTTPServer):
-    """Keep routine client disconnects out of the server error log."""
+    """Dashboard listener with a same-address process-restart signal."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.instance_id = secrets.token_urlsafe(12)
+        self.restart_requested = threading.Event()
+
+    def request_restart(self) -> None:
+        self.restart_requested.set()
+        self.shutdown()
 
     def handle_error(self, request, client_address) -> None:
         error = sys.exception()
@@ -195,7 +206,10 @@ def parse_transcript(text: str) -> list[dict]:
     result reads like the tool's own transcript."""
     items: list[dict] = []
     index: dict = {}
+    codex_segment = 0
     claude_rate_limited = False
+    claude_stream_messages: dict[str, str] = {}
+    claude_task_keys: dict[str, tuple] = {}
 
     def add(key, item):
         if item.get("kind") in ("text", "thinking") and not _visible_text(item.get("body")):
@@ -206,6 +220,37 @@ def parse_transcript(text: str) -> list[dict]:
             items.append(item)
             if key is not None:
                 index[key] = item
+
+    def append_body(key, kind: str, chunk) -> None:
+        """Accumulate Claude partial-message deltas without duplicating the
+        complete assistant message that follows them."""
+        if not _visible_text(chunk):
+            return
+        if key in index:
+            index[key]["body"] = index[key].get("body", "") + chunk
+        else:
+            add(key, {"kind": kind, "body": chunk})
+
+    def update_tool(key, *, name: str, status: str = "",
+                    input_text="", output_text="") -> None:
+        """Update progress for an existing Claude tool card, or create a
+        fallback card when a progress event arrives before its tool_use."""
+        if key in index:
+            item = index[key]
+            if status:
+                item["status"] = status
+            if _visible_text(input_text) and not _visible_text(item.get("input")):
+                item["input"] = _fmt(input_text, MAX_INPUT)
+            if _visible_text(output_text):
+                item["output"] = _fmt(output_text)
+            return
+        add(key, {
+            "kind": "tool",
+            "name": name,
+            "status": status,
+            "input": _fmt(input_text, MAX_INPUT),
+            "output": _fmt(output_text),
+        })
 
     for line in text.splitlines():
         line = line.strip()
@@ -276,7 +321,11 @@ def parse_transcript(text: str) -> list[dict]:
         # --- codex --json: item.* events ---
         if t.startswith("item."):
             it = obj.get("item") or {}
-            k, typ = ("cx", it.get("id")), it.get("type")
+            # Codex restarts item IDs at item_0 on every `codex exec resume`.
+            # Orchestra appends those invocations to one run log, so scope
+            # in-place streaming updates to the current invocation instead of
+            # overwriting an earlier transcript card with the same item ID.
+            k, typ = ("cx", codex_segment, it.get("id")), it.get("type")
             if typ == "agent_message":
                 add(k, {"kind": "text", "body": it.get("text", "")})
             elif typ == "reasoning":
@@ -302,6 +351,7 @@ def parse_transcript(text: str) -> list[dict]:
                 add(k, {"kind": "error", "body": _fmt(it.get("message") or it)})
             continue
         if t == "thread.started":
+            codex_segment += 1
             add(None, {"kind": "meta", "body": f"thread {obj.get('thread_id', '')}"})
             continue
         if t == "turn.failed":
@@ -319,6 +369,116 @@ def parse_transcript(text: str) -> list[dict]:
                 "body": rate_limit_text,
             })
             claude_rate_limited = True
+            continue
+        if t == "stream_event":
+            event = obj.get("event") or {}
+            if not isinstance(event, dict):
+                continue
+            parent = obj.get("parent_tool_use_id")
+            scope = parent if isinstance(parent, str) and parent else "root"
+            event_type = event.get("type")
+            if event_type == "message_start":
+                message = event.get("message") or {}
+                message_id = message.get("id") if isinstance(message, dict) else None
+                if isinstance(message_id, str) and message_id:
+                    claude_stream_messages[scope] = message_id
+            elif event_type == "content_block_delta":
+                message_id = claude_stream_messages.get(scope)
+                delta = event.get("delta") or {}
+                block_index = event.get("index")
+                if message_id and isinstance(delta, dict):
+                    key = ("cl", message_id, block_index)
+                    if delta.get("type") == "thinking_delta":
+                        append_body(key, "thinking", delta.get("thinking"))
+                    elif delta.get("type") == "text_delta":
+                        append_body(key, "text", delta.get("text"))
+            elif event_type == "message_stop":
+                claude_stream_messages.pop(scope, None)
+            continue
+        if t == "tool_progress":
+            parent = obj.get("parent_tool_use_id")
+            if isinstance(parent, str) and parent:
+                elapsed = obj.get("elapsed_time_seconds")
+                status = "running"
+                if isinstance(elapsed, (int, float)) and elapsed >= 0:
+                    status += f" · {elapsed:g}s"
+                update_tool(
+                    ("cltool", parent),
+                    name=str(obj.get("tool_name") or "tool"),
+                    status=status,
+                )
+            continue
+        if t == "system":
+            subtype = obj.get("subtype")
+            task_id = obj.get("task_id")
+            tool_use_id = obj.get("tool_use_id")
+            if subtype == "task_started" and isinstance(task_id, str):
+                key = (
+                    ("cltool", tool_use_id)
+                    if isinstance(tool_use_id, str) and tool_use_id
+                    else ("cltask", task_id)
+                )
+                claude_task_keys[task_id] = key
+                update_tool(
+                    key,
+                    name=str(obj.get("task_type") or "background task"),
+                    status="running",
+                    input_text=obj.get("description"),
+                )
+            elif subtype == "task_progress" and isinstance(task_id, str):
+                key = claude_task_keys.get(task_id)
+                if key is None:
+                    key = (
+                        ("cltool", tool_use_id)
+                        if isinstance(tool_use_id, str) and tool_use_id
+                        else ("cltask", task_id)
+                    )
+                    claude_task_keys[task_id] = key
+                usage = obj.get("usage") or {}
+                details = [str(obj.get("description") or "").strip()]
+                if isinstance(usage, dict):
+                    tool_uses = usage.get("tool_uses")
+                    tokens = usage.get("total_tokens")
+                    duration = usage.get("duration_ms")
+                    metrics = []
+                    if isinstance(tool_uses, int):
+                        metrics.append(f"{tool_uses} tool use{'s' if tool_uses != 1 else ''}")
+                    if isinstance(tokens, int):
+                        metrics.append(f"{tokens:,} tokens")
+                    if isinstance(duration, (int, float)):
+                        metrics.append(f"{duration / 1000:g}s")
+                    if metrics:
+                        details.append(" · ".join(metrics))
+                update_tool(
+                    key,
+                    name=str(obj.get("subagent_type") or "background task"),
+                    status="running",
+                    output_text="\n".join(part for part in details if part),
+                )
+            elif subtype == "task_updated" and isinstance(task_id, str):
+                key = claude_task_keys.get(task_id)
+                patch = obj.get("patch") or {}
+                status = patch.get("status") if isinstance(patch, dict) else None
+                if key is not None and isinstance(status, str):
+                    update_tool(key, name="background task", status=status)
+            elif subtype == "task_notification" and isinstance(task_id, str):
+                key = claude_task_keys.get(task_id)
+                if key is None:
+                    key = (
+                        ("cltool", tool_use_id)
+                        if isinstance(tool_use_id, str) and tool_use_id
+                        else ("cltask", task_id)
+                    )
+                    claude_task_keys[task_id] = key
+                update_tool(
+                    key,
+                    name="background task",
+                    status=str(obj.get("status") or "completed"),
+                    output_text=obj.get("summary"),
+                )
+            # thinking_tokens, hook lifecycle, and cumulative background-task
+            # snapshots are intentionally omitted: they can add hundreds of
+            # entries without carrying user-readable reasoning or new state.
             continue
         if t == "assistant":
             if claude_rate_limited and obj.get("error") == "rate_limit":
@@ -597,6 +757,12 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                 # The picker source of truth. Always served off the
                 # global registry; no project header needed.
                 self._json(self._projects_listing())
+            elif path == "/api/server/status":
+                restart = getattr(self.server, "request_restart", None)
+                self._json({
+                    "instance_id": str(getattr(self.server, "instance_id", "")),
+                    "restartable": callable(restart),
+                })
             elif path == "/api/operators":
                 self._json({
                     "contracts": operator_store.list_statuses(),
@@ -832,6 +998,23 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
         def do_POST(self):
             url = urlparse(self.path)
             path = url.path
+            if path == "/api/server/restart":
+                ok, _payload = self._read_json_post()
+                if not ok:
+                    return
+                restart = getattr(self.server, "request_restart", None)
+                if not callable(restart):
+                    return self._json({"error": "dashboard restart is unavailable"}, 503)
+                self._json({
+                    "restarting": True,
+                    "instance_id": str(getattr(self.server, "instance_id", "")),
+                }, 202)
+                threading.Thread(
+                    target=restart,
+                    name="orchestra-ui-restart",
+                    daemon=True,
+                ).start()
+                return
             if path.startswith("/api/operator-decisions/") and path.endswith("/answer"):
                 ok, payload = self._read_json_post()
                 if not ok:
@@ -932,13 +1115,39 @@ def tailscale_warning(bind_host: str) -> str:
     """The exact one-line warning orchestra prints when Tailscale is the
     bind mode. Returned (not printed) so tests can assert on it without
     spinning up a real server against a non-routable interface. The string is
-    explicit that Tailnet viewers can read dashboard data and stop active runs,
-    so operators do not mistake the POST stop action for a passive view."""
+    explicit that Tailnet viewers can read dashboard data, stop active runs,
+    and restart the dashboard, so operators do not mistake its controls for a
+    passive view."""
     return (
         "[orchestra] Tailnet access is enabled. Members permitted by "
         "your Tailscale ACLs can view this Orchestra dashboard and stop "
-        "active runs from your Tailnet."
+        "active runs or restart the dashboard from your Tailnet."
     )
+
+
+def _exec_dashboard_restart(*, port: int, host: str | None,
+                            tailscale_mode: bool) -> None:
+    """Replace only the dashboard process, pinning its current listener URL.
+
+    Worker supervisors are separate detached processes, so ``exec`` reloads
+    Orchestra's Python code without interrupting active runs. The restarted
+    process must keep the current port: an implicit launch may have fallen back
+    from 4764, and the browser is polling the existing URL.
+    """
+    command = [
+        sys.executable,
+        "-m",
+        "orchestra_cli",
+        "ui",
+        "--port",
+        str(port),
+        "--no-open",
+    ]
+    if tailscale_mode:
+        command.append("--tailscale")
+    elif host is not None:
+        command += ["--host", host]
+    os.execv(sys.executable, command)
 
 
 def serve(root: Path | None = None, *, port: int | None = None,
@@ -987,25 +1196,32 @@ def serve(root: Path | None = None, *, port: int | None = None,
         pin_port = True
         fallback_used = False
 
-    try:
-        httpd = _DashboardHTTPServer((bind_host, chosen), make_handler(root))
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            raise SystemExit(
-                f"orchestra: port {chosen} is already in use on {bind_host}. "
-                "Pick a free port with --port, or omit --port to let orchestra "
-                "fall back to an OS-chosen free port."
-            ) from exc
-        raise
+    def bind_dashboard(bind_port: int) -> _DashboardHTTPServer:
+        try:
+            return _DashboardHTTPServer(
+                (bind_host, bind_port),
+                make_handler(root),
+            )
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise SystemExit(
+                    f"orchestra: port {bind_port} is already in use on {bind_host}. "
+                    "Pick a free port with --port, or omit --port to let orchestra "
+                    "fall back to an OS-chosen free port."
+                ) from exc
+            raise
 
+    httpd = bind_dashboard(chosen)
     actual_port = httpd.server_address[1]
     url = f"http://{bind_host}:{actual_port}"
     print(f"orchestra ui: {url}  (ctrl-c to stop; ui.html edits apply on browser refresh)")
     if plan.tailscale:
         print(tailscale_warning(bind_host))
     if fallback_used:
-        print(f"[orchestra] Preferred port {DEFAULT_UI_PORT} was occupied on "
-              f"{bind_host}; using {actual_port} instead.")
+        print(f"[orchestra] Preferred port {DEFAULT_UI_PORT} is already owned by "
+              f"another process on {bind_host}; using {actual_port} instead. If that "
+              "process is another Orchestra dashboard, restart it there instead of "
+              "launching a second server.")
     elif pin_port and actual_port != port:
         # Pinned port that wasn't free should have raised already; this
         # guard exists only for paranoia.
@@ -1013,8 +1229,31 @@ def serve(root: Path | None = None, *, port: int | None = None,
 
     if open_browser and bind_host == "127.0.0.1":
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    return actual_port
+    while True:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            return actual_port
+        finally:
+            # Close before either returning from Ctrl-C or binding the same
+            # address again for an in-process restart.
+            httpd.server_close()
+        if not httpd.restart_requested.is_set():
+            return actual_port
+        try:
+            _exec_dashboard_restart(
+                port=actual_port,
+                host=host,
+                tailscale_mode=tailscale_mode,
+            )
+        except OSError as exc:
+            # Keep the dashboard reachable if the interpreter replacement
+            # itself fails. This fallback cannot reload Python code, so say so
+            # explicitly instead of claiming a successful restart.
+            print(f"[orchestra] Could not reload the dashboard process: {exc}. "
+                  "Rebinding the existing process.")
+            httpd = bind_dashboard(actual_port)
+            continue
+        # ``execv`` does not return. A test double may, in which case stop the
+        # old serve loop rather than binding a second listener.
+        return actual_port
