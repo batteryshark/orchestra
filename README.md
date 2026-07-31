@@ -76,6 +76,7 @@ orchestra dispatch --to kimi --allow-question --as codex "implement the risky mi
 orchestra status
 orchestra wait
 orchestra inbox codex --unread --mark-read
+orchestra interrupt 7 "The parser is length-prefixed, not delimiter-based" --as codex
 orchestra resume 7 "good; now cover malformed input"
 orchestra queue 8 "afterward, update the compatibility test" --as codex
 orchestra recall 42 --as codex
@@ -89,6 +90,19 @@ Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion 
 Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
 
 Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
+
+An unattended Claude tool denial uses the same bounded question lifecycle automatically. Orchestra records the rejected tool request, asks the run's requester for guidance, and resumes the saved session with the answer. If nobody answers, it retries without the denied request using a safer non-destructive alternative. A second denial terminates with an actionable summary instead of repeatedly pausing. Claude stream interruptions are also identified explicitly rather than being collapsed into a generic exit-143 failure.
+
+Every supervised worker also has `orchestra consult "<question>"` for ordinary,
+correctable uncertainty. Consultation is non-blocking: Orchestra addresses the run's recorded
+requester, the worker continues on its documented assumption, and the requester can inject
+guidance with `orchestra interrupt RUN "..."`. A child consultation is routed directly to its
+exact active lead run at a safe action boundary; Orchestra never guesses among runs that happen
+to share a profile. Consultations without an active supervised lead remain durable requester
+inbox messages. `orchestra wait` returns early when one of its target runs consults, so an
+interactive orchestrator can answer promptly and then resume waiting. For a contained Operator
+run, the consultation is recorded for controller/owner review; revised instructions and retries
+remain controller-owned rather than bypassing the approved authority contract.
 
 `orchestra send AGENT "message"` uses the same safe-boundary delivery when that profile has one active run. It binds the message to the recipient's run, stops after a completed action, and resumes the same session with the text injected into its prompt. If several active runs share the profile, pass `--run`; Orchestra refuses to guess. With no active run, the message remains profile-wide mail for the next run to claim.
 
@@ -335,6 +349,8 @@ conflicting display option.
 Discovery separates configured intent from live evidence. It verifies that backend executables exist, checks Codex and Claude authentication, and reads OpenCode's configured provider/model catalog. Dispatch refuses profiles proven unavailable before creating a run. If a CLI does not expose a trustworthy model catalog—or a bounded probe fails—the profile is labeled `unknown` and dispatch continues with an explicit warning instead of guessing. OpenCode profiles with an explicit model are rejected when that provider/model is absent from `opencode models`.
 
 The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables the max-thinking variant for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
+
+Ordinary supervised OpenCode profiles disable OpenCode's native `task` and plugin team-delegation tools per process. OpenCode 1.18.3 can leave an unattended native child session blocked forever on a permission request even when its parent was launched with `--auto`; Orchestra's own `orchestra spawn` child runs remain available and observable. The explicit `ensemble = true` profile keeps its team tools. A profile may deliberately restore native delegation with `opencode_native_subagents = true`, accepting the backend-specific permission behavior.
 
 ### Optional OpenCode Ensemble integration
 

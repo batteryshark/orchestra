@@ -830,7 +830,7 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                 deliveries = list(con.execute(
                     "SELECT id, sender, recipient, body, kind, created_at, read_at, "
                     "delivery_offset, delivered_at, recalled_at, recalled_by FROM messages "
-                    "WHERE run_id=? AND (kind IN ('queued','interrupt','checkin') "
+                    "WHERE run_id=? AND (kind IN ('queued','interrupt','checkin','consult') "
                     "OR body LIKE '[INTERRUPT]%') ORDER BY id",
                     (run_id,),
                 )) if r else []
@@ -883,6 +883,17 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                                   if item.get("kind") == "delivery"}
                 for message in deliveries:
                     if message["id"] in serialized_ids:
+                        continue
+                    if message["kind"] == "consult":
+                        items.append({
+                            "kind": "consult",
+                            "message_id": message["id"],
+                            "sender": _fmt(message["sender"], 120),
+                            "recipient": _fmt(message["recipient"], 120),
+                            "body": _fmt(message["body"], MAX_INPUT),
+                            "created_at": _fmt(message["created_at"], 80),
+                            "phase": "routed" if message["read_at"] else "sent",
+                        })
                         continue
                     delivery = message["kind"] if message["kind"] in ("queued", "checkin") \
                         else "interrupt"

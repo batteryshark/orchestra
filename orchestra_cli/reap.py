@@ -112,6 +112,16 @@ def reap_orphans(con, root: Path | None = None, *,
         session_ref, last_text = (runners.parse_log(log_path) if log_path
                                   else (None, None))
         status = outcome or "failed"
+        terminal_failure = (
+            runners.claude_terminal_failure(log_path)
+            if log_path and run["backend"] == "claude" else None
+        )
+        terminal_text = (
+            runners.claude_terminal_failure_text(terminal_failure)
+            if terminal_failure is not None else None
+        )
+        if status == "failed" and terminal_text:
+            last_text = terminal_text
         exit_code = 0 if status == "done" else None
         summary = (last_text or "").strip()[:2000] or None
         con.execute(

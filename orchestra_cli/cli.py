@@ -261,8 +261,7 @@ def cmd_send(args):
     print(f"sent {sender} -> {args.to}")
 
 
-def _worker_message(args, *, handoff: bool) -> None:
-    root = paths.find_root()
+def _supervised_worker_run(con, *, action: str):
     raw_run_id = os.environ.get("ORCHESTRA_RUN_ID")
     identity = os.environ.get("ORCHESTRA_SELF")
     try:
@@ -271,23 +270,30 @@ def _worker_message(args, *, handoff: bool) -> None:
         run_id = None
     if run_id is None or not identity:
         raise SystemExit(
-            f"orchestra: {'handoff' if handoff else 'report'} is worker-only and requires "
-            "a supervised run"
+            f"orchestra: {action} is worker-only and requires a supervised run"
         )
+    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not run:
+        raise SystemExit(f"orchestra: supervised run {run_id} not found")
+    if run["agent"] != identity:
+        raise SystemExit(
+            f"orchestra: supervised identity mismatch for run {run_id}"
+        )
+    return run
 
+
+def _worker_message(args, *, handoff: bool) -> None:
+    root = paths.find_root()
     body = " ".join(args.message).strip()
     if not body:
         raise SystemExit(f"orchestra: empty {'handoff' if handoff else 'report'}")
 
     con = db.connect(root)
     try:
-        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-        if not run:
-            raise SystemExit(f"orchestra: supervised run {run_id} not found")
-        if run["agent"] != identity:
-            raise SystemExit(
-                f"orchestra: supervised identity mismatch for run {run_id}"
-            )
+        run = _supervised_worker_run(
+            con, action="handoff" if handoff else "report"
+        )
+        run_id = int(run["id"])
         prefix = "HANDOFF" if handoff else "REPORT"
         text = f"{prefix} run {run_id}: {body}"
         con.execute(
@@ -307,6 +313,105 @@ def cmd_report(args):
 
 def cmd_handoff(args):
     _worker_message(args, handoff=True)
+
+
+def cmd_consult(args):
+    """Ask the recorded requester for advice without pausing the worker."""
+    root = paths.find_root()
+    cfg = config.load(root)
+    question = " ".join(args.question).strip()
+    if not question:
+        raise SystemExit("orchestra: consultation question must not be empty")
+    if len(question) > 4000:
+        raise SystemExit("orchestra: consultation question is limited to 4000 characters")
+
+    con = db.connect(root)
+    routed_lead_id = None
+    consultation_id = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        run = _supervised_worker_run(con, action="consult")
+        run_id = int(run["id"])
+        requester = run["requested_by"]
+        created_at = db.now()
+        if run["containment_mode"]:
+            body = (
+                f"CONSULT run {run_id} ({run['agent']}; worker is continuing): {question}\n"
+                "This is a contained Operator run. The consultation is recorded for its "
+                "controller and owner; the controller owns any revised instructions or retry."
+            )
+        else:
+            body = (
+                f"CONSULT run {run_id} ({run['agent']}; worker is continuing): {question}\n"
+                f"Guide the active run with `orchestra interrupt {run_id} "
+                f"\"<guidance>\" --as {requester}`; if it already finished, use "
+                f"`orchestra resume {run_id} \"<guidance>\" --as {requester}`."
+            )
+        inserted = con.execute(
+            "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, "
+            "created_at) VALUES(?,?,?,?,?,'consult',?)",
+            (
+                run["agent"],
+                requester,
+                body,
+                run["work_item"],
+                run_id,
+                created_at,
+            ),
+        )
+        consultation_id = int(inserted.lastrowid)
+
+        # Spawned children retain an exact edge to the supervised lead that
+        # requested them. Route the advisory there immediately when its
+        # supervisor supports safe delivery; never guess from a profile name.
+        lead = None
+        if run["lead_run"] is not None:
+            lead = con.execute(
+                "SELECT * FROM runs WHERE id=? AND status NOT IN "
+                "('done','failed','timeout','killed')",
+                (run["lead_run"],),
+            ).fetchone()
+        lead_profile = (
+            cfg.get("agents", {}).get(lead["agent"], {})
+            if lead is not None else {}
+        )
+        if (
+            lead is not None
+            and lead["agent"] == requester
+            and int(lead["supervisor_protocol"] or 0) >= 1
+            and not lead_profile.get("ensemble")
+        ):
+            con.execute(
+                "UPDATE messages SET read_at=? WHERE id=?",
+                (created_at, consultation_id),
+            )
+            _record_interrupt(
+                con,
+                lead,
+                sender=run["agent"],
+                body=body,
+                immediate=False,
+            )
+            routed_lead_id = int(lead["id"])
+        else:
+            con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+    if routed_lead_id is not None:
+        print(
+            f"consultation #{consultation_id} routed to requester on lead run "
+            f"{routed_lead_id}; run {run_id} keeps working"
+        )
+    else:
+        print(
+            f"consultation #{consultation_id} sent to {requester}; run {run_id} "
+            "keeps working"
+        )
 
 
 def cmd_broadcast(args):
@@ -757,6 +862,8 @@ def cmd_logs(args):
 def cmd_wait(args):
     import time
     root = paths.find_root()
+    cfg = config.load(root)
+    requester = _identity(args, cfg)
     con = db.connect(root)
     reap.reap_orphans(con, root)
     if args.run_ids:
@@ -766,6 +873,7 @@ def cmd_wait(args):
             "SELECT id FROM runs WHERE status NOT IN ('done','failed','timeout','killed')")}
     if not targets:
         print("no active runs")
+        con.close()
         return
     print(f"waiting on runs: {sorted(targets)}")
     deadline = time.time() + args.timeout if args.timeout else None
@@ -773,7 +881,34 @@ def cmd_wait(args):
     while pending:
         if deadline and time.time() > deadline:
             print(f"timeout; still pending: {sorted(pending)}")
+            con.close()
             sys.exit(2)
+        consultation_query = (
+            "SELECT * FROM messages WHERE kind='consult' AND recipient=? "
+            f"AND read_at IS NULL AND run_id IN ({','.join(map(str, pending))}) "
+            "ORDER BY id"
+        )
+        consultations = list(con.execute(consultation_query, (requester,)))
+        if consultations:
+            # Claim after acquiring the write lock so two orchestrators waiting
+            # under the same identity cannot both believe they received it.
+            con.execute("BEGIN IMMEDIATE")
+            consultations = list(con.execute(consultation_query, (requester,)))
+            read_at = db.now()
+            if consultations:
+                con.execute(
+                    f"UPDATE messages SET read_at=? WHERE id IN "
+                    f"({','.join(str(row['id']) for row in consultations)}) "
+                    "AND read_at IS NULL",
+                    (read_at,),
+                )
+            con.execute("COMMIT")
+        if consultations:
+            print("guidance requested; workers are still running:")
+            for message in consultations:
+                print(f"\n[{message['id']}] {message['body']}")
+            con.close()
+            return
         rows = con.execute(
             f"SELECT id, agent, status, exit_code FROM runs WHERE id IN "
             f"({','.join(map(str, pending))}) AND status IN ('done','failed','timeout','killed')").fetchall()
@@ -782,6 +917,7 @@ def cmd_wait(args):
                   + (f" exit {r['exit_code']}" if r["exit_code"] not in (None, 0) else ""))
             pending.discard(r["id"])
             if args.any:
+                con.close()
                 return
         if pending:
             time.sleep(2)
@@ -790,6 +926,7 @@ def cmd_wait(args):
             for item in reap.reap_orphans(con, root):
                 print(f"reconciled: {item['note']}", file=sys.stderr)
     print("all runs finished — check your inbox: `orchestra inbox <you> --unread --mark-read`")
+    con.close()
 
 
 def _question_run_id(args) -> int:
@@ -2003,6 +2140,13 @@ def main():
     s.set_defaults(fn=cmd_report)
 
     s = sub.add_parser(
+        "consult",
+        help="ask this worker's requester for advisory guidance without pausing",
+    )
+    s.add_argument("question", nargs="+")
+    s.set_defaults(fn=cmd_consult)
+
+    s = sub.add_parser(
         "handoff",
         help="send this supervised run's final handoff to its requester",
     )
@@ -2086,11 +2230,14 @@ def main():
     s.add_argument("--pretty", action="store_true", help="extract readable text from JSONL")
     s.set_defaults(fn=cmd_logs)
 
-    s = sub.add_parser("wait", help="block until runs finish (default: all active)")
+    s = sub.add_parser(
+        "wait",
+        help="block until runs finish or a worker requests advisory guidance",
+    )
     s.add_argument("run_ids", nargs="*", type=int)
     s.add_argument("--any", action="store_true", help="return after the first completion")
     s.add_argument("--timeout", type=int, default=0)
-    ident(s)  # accepted for consistency; wait is identity-agnostic
+    ident(s)
     s.set_defaults(fn=cmd_wait)
 
     s = sub.add_parser("host", help="manage the persistent opencode host (used by ensemble runs)")

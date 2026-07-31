@@ -115,6 +115,12 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
 Use `interrupt` when the exact run is already known or `send` when the recipient profile is
 unambiguous. Use `queue` for work that should begin only after the current run finishes.
 
+Workers can use `orchestra consult "<question>"` for correctable uncertainty. It derives the
+recorded requester from the supervised run, sends the question without pausing the worker, and
+routes a child consultation directly to its exact active lead when possible. The worker keeps
+moving on a documented assumption; answer or correct it with
+`orchestra interrupt <run> "<guidance>"`.
+
 Default workers do not block for clarification. For ambiguity where a wrong assumption risks
 destructive or substantially wasted work, dispatch with `--allow-question`. The worker must
 supply a recommended fallback; Orchestra resumes with the answer or applies that fallback when

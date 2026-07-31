@@ -4,7 +4,51 @@ import tomllib
 import unittest
 
 from orchestra_cli import config
-from orchestra_cli.runners import build_cmd, claude_rate_limit_text, parse_log
+from orchestra_cli.runners import (
+    apply_backend_env,
+    build_cmd,
+    claude_rate_limit_text,
+    claude_terminal_failure,
+    claude_terminal_failure_text,
+    parse_log,
+)
+
+
+class OpenCodeEnvironmentTests(unittest.TestCase):
+    def test_ordinary_worker_disables_all_delegation_tools_per_process(self) -> None:
+        source = {
+            "KEEP": "yes",
+            "OPENCODE_CONFIG_CONTENT": json.dumps({
+                "provider": {"local": {"name": "Local"}},
+                "permission": {"read": "allow", "task": "allow"},
+            }),
+        }
+
+        updated = apply_backend_env({"backend": "opencode"}, source)
+
+        content = json.loads(updated["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(updated["KEEP"], "yes")
+        self.assertEqual(content["provider"], {"local": {"name": "Local"}})
+        self.assertEqual(content["permission"]["read"], "allow")
+        self.assertEqual(content["permission"]["task"], "deny")
+        self.assertEqual(content["permission"]["team_spawn"], "deny")
+        self.assertIsNot(updated, source)
+
+    def test_explicit_ensemble_and_native_subagent_profiles_keep_delegation(self) -> None:
+        env = {"OPENCODE_CONFIG_CONTENT": '{"permission":{"task":"allow"}}'}
+
+        self.assertIs(apply_backend_env(
+            {"backend": "opencode", "ensemble": True}, env
+        ), env)
+        self.assertIs(apply_backend_env(
+            {"backend": "opencode", "opencode_native_subagents": True}, env
+        ), env)
+
+    def test_invalid_config_content_fails_before_launch(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "must be a JSON object"):
+            apply_backend_env(
+                {"backend": "opencode"}, {"OPENCODE_CONFIG_CONTENT": "[1,2]"}
+            )
 
 
 class CodexCommandTests(unittest.TestCase):
@@ -193,6 +237,69 @@ class ClaudeRateLimitTests(unittest.TestCase):
         self.assertEqual(session, "session-1")
         self.assertIn("5-hour usage limit", last_text)
         self.assertNotIn("monthly spend", last_text)
+
+
+class ClaudeTerminalFailureTests(unittest.TestCase):
+    def test_extracts_rejected_tool_from_aborted_tools_result(self) -> None:
+        events = [
+            {
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Bash",
+                    "input": {
+                        "description": "Stop test process",
+                        "command": "pkill -f test-process",
+                    },
+                }]},
+            },
+            {
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "is_error": True,
+                    "content": "The tool use was rejected. STOP and wait.",
+                }]},
+            },
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "terminal_reason": "aborted_tools",
+                "result": None,
+            },
+        ]
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as log:
+            log.write("\n".join(json.dumps(event) for event in events))
+            log.flush()
+
+            failure = claude_terminal_failure(log.name)
+
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.reason, "aborted_tools")
+        self.assertTrue(failure.tool_rejected)
+        self.assertEqual(failure.tool_name, "Bash")
+        self.assertEqual(failure.tool_description, "Stop test process")
+        self.assertEqual(failure.tool_command, "pkill -f test-process")
+        self.assertIn("Operator guidance is required", claude_terminal_failure_text(failure))
+
+    def test_describes_aborted_streaming_as_external_interruption(self) -> None:
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as log:
+            log.write(json.dumps({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "terminal_reason": "aborted_streaming",
+                "result": None,
+            }))
+            log.flush()
+
+            failure = claude_terminal_failure(log.name)
+
+        self.assertIsNotNone(failure)
+        self.assertIn("without an Orchestra stop", claude_terminal_failure_text(failure))
 
 
 if __name__ == "__main__":

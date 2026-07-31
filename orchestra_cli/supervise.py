@@ -348,11 +348,15 @@ def _insert_checkin_message(con, run, run_id: int) -> dict:
     }
 
 
-def _write_json_event(log, event: dict) -> int:
+def _json_event_bytes(event: dict) -> bytes:
     payload = dict(event)
     event_type = payload.pop("type", "orchestra.delivery")
-    log.write((json.dumps({"type": event_type, **payload},
-                          ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+    return (json.dumps({"type": event_type, **payload},
+                       ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+
+def _write_json_event(log, event: dict) -> int:
+    log.write(_json_event_bytes(event))
     log.flush()
     return os.fstat(log.fileno()).st_size
 
@@ -495,6 +499,58 @@ def _resume_delivery_prompt(events: list[dict]) -> str:
     )
 
 
+def _pause_for_rejected_tool(con, run, failure: runners.ClaudeTerminalFailure) -> bool:
+    """Turn one unattended Claude tool denial into a bounded operator question."""
+    if (failure.reason != "aborted_tools" or not failure.tool_rejected
+            or not run["session_ref"]):
+        return False
+    if run["containment_mode"]:
+        # Contained runs may only be retried by their controller; do not create
+        # a side-channel that bypasses that authority boundary.
+        return False
+    if con.execute("SELECT 1 FROM questions WHERE run_id=?", (run["id"],)).fetchone():
+        return False
+
+    tool = failure.tool_name or "tool"
+    if failure.tool_description:
+        tool += f" ({failure.tool_description})"
+    command = (failure.tool_command or "").strip()
+    command_detail = ""
+    if command:
+        bounded = command[:1200] + ("…" if len(command) > 1200 else "")
+        command_detail = f"\n\nRejected request:\n{bounded}"
+    question = (
+        f"Claude's {tool} request was denied and the unattended session stopped. "
+        f"How should it proceed?{command_detail}"
+    )
+    recommended = (
+        "Continue without the denied request. Use a safer non-destructive alternative and "
+        "document any verification limitation."
+    )
+    wait_seconds = int(run["question_wait_seconds"])
+    asked_at, deadline_at = db.now(), db.after(wait_seconds)
+    con.execute(
+        "INSERT INTO questions(run_id, sender, recipient, question, recommended_default, "
+        "asked_at, deadline_at) VALUES(?,?,?,?,?,?,?)",
+        (run["id"], run["agent"], run["requested_by"], question, recommended,
+         asked_at, deadline_at),
+    )
+    body = (
+        f"[QUESTION run {run['id']}] {question}\n"
+        f"Recommended default: {recommended}\n"
+        f"Auto-resumes with that default in {wait_seconds} seconds.\n"
+        f"Answer: `orchestra answer {run['id']} \"<answer>\" --as {run['requested_by']}`"
+    )
+    con.execute(
+        "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, created_at) "
+        "VALUES(?,?,?,?,?, 'question', ?)",
+        (run["agent"], run["requested_by"], body, run["work_item"], run["id"], asked_at),
+    )
+    con.execute("UPDATE runs SET status='waiting_input' WHERE id=?", (run["id"],))
+    con.commit()
+    return True
+
+
 def _mark_pending_delivered(con, run_id: int) -> list[dict]:
     rows = list(con.execute(
         "SELECT id, sender, recipient, body, kind, created_at FROM messages "
@@ -604,6 +660,10 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
         except OSError:
             last_log_size = 0
         last_progress_at = started
+        # Delivery markers share the JSONL file with backend stdout. Account
+        # for their exact bytes without treating supervisor activity as proof
+        # that a silent worker is still making progress.
+        ignored_log_growth = 0
         while True:
             try:
                 exit_code = proc.wait(timeout=max(0.01, min(CONTROL_POLL_INTERVAL,
@@ -726,6 +786,7 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
                             _wait_after_term(proc)
                             return "usage_limit", None
                         checkin_event = _insert_checkin_message(con, latest_run, run_id)
+                        ignored_log_growth += len(_json_event_bytes(checkin_event))
                         delivery_offset = _write_json_event(log, checkin_event)
                         con.execute(
                             "UPDATE messages SET delivery_offset=? WHERE id=?",
@@ -738,8 +799,12 @@ def _run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, *,
             except OSError:
                 sz = last_log_size
             if sz > last_log_size:
+                growth = sz - last_log_size
                 last_log_size = sz
-                last_progress_at = now
+                ignored = min(growth, ignored_log_growth)
+                ignored_log_growth -= ignored
+                if growth > ignored:
+                    last_progress_at = now
             if stall_timeout and (now - last_progress_at) >= stall_timeout:
                 con.execute(
                     "UPDATE runs SET summary=? WHERE id=?",
@@ -838,6 +903,7 @@ def supervise(root: Path, run_id: int) -> int:
         env = config.apply_env_passthrough(
             cfg, dict(os.environ, ORCHESTRA_SELF=run["agent"], ORCHESTRA_ROOT=str(root),
                       ORCHESTRA_RUN_ID=str(run_id)))
+        env = runners.apply_backend_env(agent, env)
         outcome, exit_code = _run_proc(con, run, cmd, run["workdir"], env,
                                        run["log_path"], run_id, deadline,
                                        agent=agent,
@@ -849,6 +915,19 @@ def supervise(root: Path, run_id: int) -> int:
                                        poll_interval=PROC_POLL_INTERVAL)
         delivery_events = []
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+
+        terminal_failure = (
+            runners.claude_terminal_failure(run["log_path"])
+            if (agent["backend"] == "claude" and outcome == "exit"
+                and exit_code not in (None, 0))
+            else None
+        )
+        if (
+            terminal_failure is not None
+            and run["status"] == "running"
+            and _pause_for_rejected_tool(con, run, terminal_failure)
+        ):
+            run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
 
         if outcome == "waiting_input" or run["status"] == "waiting_input":
             if not run["session_ref"]:
@@ -998,6 +1077,16 @@ def supervise(root: Path, run_id: int) -> int:
     )
 
     session_ref, last_text = runners.parse_log(run["log_path"])
+    terminal_failure = (
+        runners.claude_terminal_failure(run["log_path"])
+        if agent["backend"] == "claude" else None
+    )
+    terminal_text = (
+        runners.claude_terminal_failure_text(terminal_failure)
+        if terminal_failure is not None else None
+    )
+    if status == "failed" and terminal_text:
+        last_text = terminal_text
     if status == "timeout" and run["summary"] and run["summary"].startswith("Stalled:"):
         last_text = run["summary"]
     if status == "failed" and run["summary"] and "usage limit" in run["summary"].lower():

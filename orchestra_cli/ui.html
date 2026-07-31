@@ -902,6 +902,12 @@ async function stopRun(id){
 
 function itemHtml(it, i){
   if (it.kind === 'text')    return `<div class="titem"><div class="prose">${esc(it.body)}</div></div>`;
+  if (it.kind === 'consult') {
+    const routed = it.phase === 'routed';
+    const title = routed ? 'advisory consultation routed' : 'advisory consultation sent';
+    const at = it.created_at ? ` · ${esc(it.created_at)}` : '';
+    return `<div class="titem delivery consult ${routed?'delivered':'pending'}"><div><span class="event-title">&#128172; ${title}</span><span class="event-route">${esc(it.sender||'runner')} → ${esc(it.recipient||'requester')} · message #${esc(it.message_id||'')}${at}</span></div><div class="event-body">${esc(it.body||'')}</div></div>`;
+  }
   if (it.kind === 'delivery') {
     const mode = ['interrupt','checkin','queued'].includes(it.delivery) ? it.delivery : 'queued';
     const pending = it.phase === 'pending';

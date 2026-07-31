@@ -311,6 +311,154 @@ class SendFileTests(unittest.TestCase):
         self.assertEqual(message["run_id"], run_id)
         self.assertEqual(message["body"], f"REPORT run {run_id}: tests are passing")
 
+    def test_worker_consult_is_non_blocking_and_routes_to_requester(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(
+                ["consult", "Is", "the", "wire", "format", "length-prefixed?"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"sent to codex; run {run_id} keeps working", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["sender"], "glm")
+        self.assertEqual(message["recipient"], "codex")
+        self.assertEqual(message["run_id"], run_id)
+        self.assertEqual(message["kind"], "consult")
+        self.assertIn(f"CONSULT run {run_id}", message["body"])
+        self.assertIn(f"orchestra interrupt {run_id}", message["body"])
+        con = db.connect(self.root)
+        try:
+            status = con.execute(
+                "SELECT status FROM runs WHERE id=?", (run_id,)
+            ).fetchone()["status"]
+        finally:
+            con.close()
+        self.assertEqual(status, "running")
+
+    def test_child_consult_routes_to_exact_active_lead_at_safe_boundary(self) -> None:
+        lead_id = self._insert_active_run(agent="reviewer", slug="steady_otter")
+        child_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "UPDATE runs SET requested_by='reviewer', lead_run=? WHERE id=?",
+                (lead_id, child_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(child_id)},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main(
+                ["consult", "Does", "this", "fixture", "encode", "legacy", "behavior?"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"routed to requester on lead run {lead_id}", stdout)
+        messages = self._messages()
+        self.assertEqual(len(messages), 2)
+        consultation, delivery = messages
+        self.assertEqual(consultation["kind"], "consult")
+        self.assertEqual(consultation["run_id"], child_id)
+        self.assertIsNotNone(consultation["read_at"])
+        self.assertEqual(delivery["kind"], "interrupt")
+        self.assertEqual(delivery["run_id"], lead_id)
+        self.assertEqual(delivery["recipient"], "reviewer")
+        self.assertIsNotNone(delivery["delivery_offset"])
+        self.assertIsNone(delivery["delivered_at"])
+        self.assertIn(f"CONSULT run {child_id}", delivery["body"])
+
+    def test_worker_consult_requires_matching_supervised_identity(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "reviewer", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, _, stderr = self._run_main(["consult", "Which", "schema?"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("supervised identity mismatch", stderr)
+        self.assertEqual(self._messages(), [])
+
+    def test_operator_consult_does_not_suggest_bypassing_controller(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "UPDATE runs SET requested_by='operator:opn-test', "
+                "containment_mode='operator-write' WHERE id=?",
+                (run_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, _, stderr = self._run_main(
+                ["consult", "Which", "approved", "schema", "applies?"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        message = self._messages()[0]
+        self.assertEqual(message["recipient"], "operator:opn-test")
+        self.assertIn("controller owns any revised instructions or retry", message["body"])
+        self.assertNotIn("orchestra interrupt", message["body"])
+        self.assertNotIn("orchestra resume", message["body"])
+
+    def test_wait_returns_early_and_claims_a_target_consultation(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
+                "VALUES('glm','codex',?,?,'consult',?)",
+                (
+                    f"CONSULT run {run_id}: Which schema?",
+                    run_id,
+                    db.now(),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        code, stdout, stderr = self._run_main(
+            ["wait", str(run_id), "--as", "codex", "--timeout", "1"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("guidance requested; workers are still running", stdout)
+        self.assertIn(f"CONSULT run {run_id}: Which schema?", stdout)
+        self.assertIsNotNone(self._messages()[0]["read_at"])
+        con = db.connect(self.root)
+        try:
+            status = con.execute(
+                "SELECT status FROM runs WHERE id=?", (run_id,)
+            ).fetchone()["status"]
+        finally:
+            con.close()
+        self.assertEqual(status, "running")
+
     def test_worker_handoff_derives_route_and_canonical_prefix(self) -> None:
         run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
 
