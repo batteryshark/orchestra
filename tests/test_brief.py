@@ -38,6 +38,8 @@ class BriefTests(unittest.TestCase):
         self.assertIn("commands infer them automatically", text)
         self.assertIn("Batch independent read-only searches", text)
         self.assertIn("overlapping writes sequential", text)
+        self.assertIn('orchestra consult "<question>"', text)
+        self.assertIn("without pausing this run", text)
 
     def test_question_protocol_only_appears_for_opted_in_run(self) -> None:
         default = self._compose()
@@ -100,6 +102,7 @@ class BriefTests(unittest.TestCase):
         self.assertIn("original mission, project instructions", text)
         self.assertIn("Add the two edge cases.", text)
         self.assertIn("orchestra ask", text)
+        self.assertIn("orchestra consult", text)
         self.assertIn("wait is 60 seconds", text)
         self.assertNotIn("work log W-0141", text)
         self.assertNotIn("work move W-0141", text)

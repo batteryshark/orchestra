@@ -1,6 +1,69 @@
 """Backend command builders and output normalization for worker CLIs."""
 
+import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
+
+
+_OPENCODE_DELEGATION_PERMISSIONS = (
+    "task",
+    "team_create",
+    "team_spawn",
+    "team_message",
+    "team_broadcast",
+    "team_tasks_list",
+    "team_tasks_add",
+    "team_tasks_complete",
+    "team_claim",
+    "team_results",
+    "team_shutdown",
+    "team_cleanup",
+    "team_merge",
+    "team_status",
+    "team_view",
+)
+
+
+def apply_backend_env(agent: dict, env: dict[str, str]) -> dict[str, str]:
+    """Apply per-process backend policy without changing the user's global config."""
+    if (
+        agent.get("backend") != "opencode"
+        or agent.get("ensemble")
+        or agent.get("opencode_native_subagents")
+    ):
+        return env
+
+    raw = env.get("OPENCODE_CONFIG_CONTENT", "")
+    try:
+        content = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            "orchestra: OPENCODE_CONFIG_CONTENT must be a JSON object"
+        ) from exc
+    if not isinstance(content, dict):
+        raise SystemExit("orchestra: OPENCODE_CONFIG_CONTENT must be a JSON object")
+    permissions = content.get("permission", {})
+    if not isinstance(permissions, dict):
+        raise SystemExit(
+            "orchestra: OPENCODE_CONFIG_CONTENT.permission must be a JSON object"
+        )
+
+    # OpenCode 1.18.3's `run --auto` approves tools in the primary session but
+    # can leave a native task child blocked forever on its own permission ask.
+    # Ordinary Orchestra workers already provide explicit child-run
+    # orchestration. Disable both native and plugin delegation here so a model
+    # cannot enter that unobservable deadlock. The explicit ensemble profile
+    # and an intentional roster override above retain delegation.
+    content = dict(content)
+    content["permission"] = {
+        **permissions,
+        **{name: "deny" for name in _OPENCODE_DELEGATION_PERMISSIONS},
+    }
+    updated = dict(env)
+    updated["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+        content, ensure_ascii=False, separators=(",", ":")
+    )
+    return updated
 
 
 def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
@@ -85,6 +148,131 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
 # primary reporting channel — this is best-effort fallback/telemetry) -------
 
 SESSION_KEYS = {"sessionID", "session_id", "sessionId", "thread_id", "threadId"}
+
+
+@dataclass(frozen=True)
+class ClaudeTerminalFailure:
+    """Structured reason Claude Code stopped without a successful result."""
+
+    reason: str
+    tool_rejected: bool = False
+    tool_name: str | None = None
+    tool_description: str | None = None
+    tool_command: str | None = None
+
+
+def _claude_tool_uses(event: dict) -> list[dict]:
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [item for item in content if isinstance(item, dict)
+            and item.get("type") == "tool_use"]
+
+
+def _claude_rejected_tool_ids(event: dict) -> list[str]:
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    rejected = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_result":
+            continue
+        content_text = item.get("content")
+        if (item.get("is_error") is True and isinstance(content_text, str)
+                and ("rejected" in content_text.lower()
+                     or "doesn't want to proceed" in content_text.lower())):
+            tool_id = item.get("tool_use_id")
+            if isinstance(tool_id, str):
+                rejected.append(tool_id)
+    return rejected
+
+
+def claude_terminal_failure(log_path: str) -> ClaudeTerminalFailure | None:
+    """Return Claude's last structured terminal failure, if it has one.
+
+    Claude emits a useful ``terminal_reason`` even when its human-readable
+    ``result`` is null. Track the matching rejected tool so the supervisor can
+    ask for actionable guidance instead of reporting a generic exit 143.
+    """
+    import json
+
+    tools: dict[str, dict] = {}
+    rejected: set[str] = set()
+    terminal: ClaudeTerminalFailure | None = None
+    try:
+        with open(log_path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                for tool in _claude_tool_uses(event):
+                    tool_id = tool.get("id")
+                    if isinstance(tool_id, str):
+                        tools[tool_id] = tool
+                rejected.update(_claude_rejected_tool_ids(event))
+                if event.get("type") != "result":
+                    continue
+                reason = event.get("terminal_reason")
+                if not isinstance(reason, str) or not reason:
+                    terminal = None
+                    tools.clear()
+                    rejected.clear()
+                    continue
+                tool = next(
+                    (tools[tool_id] for tool_id in reversed(list(tools))
+                     if tool_id in rejected),
+                    None,
+                )
+                tool_input = tool.get("input") if isinstance(tool, dict) else None
+                terminal = ClaudeTerminalFailure(
+                    reason=reason,
+                    tool_rejected=tool is not None,
+                    tool_name=tool.get("name") if isinstance(tool, dict) else None,
+                    tool_description=(tool_input.get("description")
+                                      if isinstance(tool_input, dict) else None),
+                    tool_command=(tool_input.get("command")
+                                  if isinstance(tool_input, dict) else None),
+                )
+                # One log can contain several resumed Claude invocations. Do
+                # not attribute a later failure to an earlier rejected tool.
+                tools.clear()
+                rejected.clear()
+    except OSError:
+        return None
+    return terminal
+
+
+def claude_terminal_failure_text(failure: ClaudeTerminalFailure) -> str | None:
+    """Render an actionable run summary for known Claude terminal reasons."""
+    if failure.reason == "aborted_tools":
+        if not failure.tool_rejected:
+            return (
+                "Claude reported that it was interrupted while running a tool without an "
+                "Orchestra stop or timeout being recorded. Partial work remains in the run "
+                "worktree; inspect the run log and resume the saved session to continue."
+            )
+        tool = failure.tool_name or "tool"
+        if failure.tool_description:
+            tool += f" ({failure.tool_description})"
+        return (
+            f"Claude stopped because its {tool} request was denied. Operator guidance is "
+            "required before retrying it; resume the saved session with a safe alternative "
+            "or explicit instructions. The rejected request remains available in the run log."
+        )
+    if failure.reason == "aborted_streaming":
+        return (
+            "Claude reported that its response stream was interrupted without an Orchestra "
+            "stop or timeout being recorded. Partial work remains in the run worktree; resume "
+            "the saved session to continue."
+        )
+    return None
+
 
 _CLAUDE_RATE_LIMIT_LABELS = {
     "five_hour": "5-hour usage limit",

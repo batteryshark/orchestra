@@ -44,6 +44,9 @@ env_passthrough = []
 # model:   backend-specific model id (opencode: provider/model, codex: model name)
 # ensemble = true opts an opencode agent into the optional OpenCode Ensemble
 # integration. See the README for the plugin and roster configuration.
+# opencode_native_subagents = true deliberately restores OpenCode's native
+# task/team tools; ordinary supervised profiles disable them to avoid
+# unattended child-session permission deadlocks.
 # extra_args: appended to the backend CLI invocation
 
 [agents.minimax]

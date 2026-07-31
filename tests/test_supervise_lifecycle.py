@@ -10,7 +10,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from orchestra_cli import cli, db, supervise
+from orchestra_cli import cli, db, runners, supervise
 from orchestra_cli.usage.models import ProviderResult, QuotaWindow
 
 
@@ -253,6 +253,41 @@ class SupervisorStallTimeoutTests(unittest.TestCase):
         self.assertEqual(row["status"], "timeout")
         self.assertIn("Stalled: no worker output", row["summary"])
         self.assertLess(elapsed, 3)
+
+    def test_supervisor_checkin_does_not_reset_worker_stall_clock(self) -> None:
+        self.tmp, root = _project(checkin_interval=0, timeout=10)
+        run_id = _insert_run(root)
+        con = db.connect(root)
+        started = time.monotonic()
+        try:
+            run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            outcome, exit_code = supervise._run_proc(
+                con,
+                run,
+                _sleeping_worker(line={"sessionID": "ses-silent"}, seconds=5),
+                str(root),
+                {},
+                run["log_path"],
+                run_id,
+                time.time() + 3,
+                checkin_interval=0.15,
+                checkin_state={"last_sent_at": time.time()},
+                stall_timeout=0.4,
+                poll_interval=0.01,
+            )
+            checkins = con.execute(
+                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='checkin'",
+                (run_id,),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual((outcome, exit_code), ("timeout", None))
+        self.assertEqual(checkins, 1)
+        # Before the fix, the supervisor-authored check-in counted as worker
+        # output and this took roughly 0.55s (check-in + full stall window).
+        self.assertLess(elapsed, 0.52)
 
     def test_stall_timeout_validation(self) -> None:
         self.assertIsNone(supervise._stall_timeout_seconds(0))
@@ -724,6 +759,176 @@ class BlockingQuestionTests(unittest.TestCase):
                 mock.patch.object(cli.config, "load", return_value=self.cfg), \
                 self.assertRaisesRegex(SystemExit, "not dispatched with --allow-question"):
             cli.cmd_ask(ask)
+
+    def test_rejected_claude_tool_creates_bounded_operator_question(self) -> None:
+        failure = runners.ClaudeTerminalFailure(
+            reason="aborted_tools",
+            tool_rejected=True,
+            tool_name="Bash",
+            tool_description="Stop test process",
+            tool_command="pkill -f test-process",
+        )
+        con = db.connect(self.root)
+        try:
+            run = con.execute("SELECT * FROM runs WHERE id=?", (self.run_id,)).fetchone()
+
+            paused = supervise._pause_for_rejected_tool(con, run, failure)
+
+            updated = con.execute(
+                "SELECT status FROM runs WHERE id=?", (self.run_id,)
+            ).fetchone()
+            question = con.execute(
+                "SELECT * FROM questions WHERE run_id=?", (self.run_id,)
+            ).fetchone()
+            message = con.execute(
+                "SELECT * FROM messages WHERE run_id=? AND kind='question'", (self.run_id,)
+            ).fetchone()
+        finally:
+            con.close()
+
+        self.assertTrue(paused)
+        self.assertEqual(updated["status"], "waiting_input")
+        self.assertIn("Bash (Stop test process)", question["question"])
+        self.assertIn("pkill -f test-process", question["question"])
+        self.assertIn("safer non-destructive alternative", question["recommended_default"])
+        self.assertEqual(question["recipient"], "codex")
+        self.assertIn("orchestra answer", message["body"])
+
+    def test_aborted_tool_without_rejection_does_not_claim_operator_denied_it(self) -> None:
+        failure = runners.ClaudeTerminalFailure(reason="aborted_tools")
+        con = db.connect(self.root)
+        try:
+            run = con.execute("SELECT * FROM runs WHERE id=?", (self.run_id,)).fetchone()
+
+            paused = supervise._pause_for_rejected_tool(con, run, failure)
+
+            question_count = con.execute(
+                "SELECT COUNT(*) FROM questions WHERE run_id=?", (self.run_id,)
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+        self.assertFalse(paused)
+        self.assertEqual(question_count, 0)
+        self.assertIn("interrupted while running a tool",
+                      runners.claude_terminal_failure_text(failure))
+
+    def test_supervisor_resumes_claude_after_rejected_tool_answer(self) -> None:
+        (self.root / ".orchestra" / "config.toml").write_text(
+            "[settings]\n"
+            "timeout = 30\n"
+            "supervisor_checkin_interval = 0\n"
+            "\n[agents.glm]\n"
+            'backend = "claude"\n'
+            'model = "opus"\n'
+        )
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "UPDATE runs SET status='spawning', session_ref=NULL, backend='claude' "
+                "WHERE id=?",
+                (self.run_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        calls: list[tuple[str | None, str]] = []
+        attempt = 0
+
+        def build_cmd(agent, *, workdir, title, prompt, resume_ref=None,
+                      add_dirs=None, attach=None):
+            calls.append((resume_ref, prompt))
+            return [sys.executable, "-c", "pass"]
+
+        def run_proc(con, run, cmd, workdir, env, log_path, run_id, deadline, **kwargs):
+            nonlocal attempt
+            attempt += 1
+            if attempt == 1:
+                events = [
+                    {
+                        "type": "assistant",
+                        "session_id": "ses-denied",
+                        "message": {"content": [{
+                            "type": "tool_use",
+                            "id": "tool-1",
+                            "name": "Bash",
+                            "input": {"description": "Stop test process",
+                                      "command": "pkill -f test-process"},
+                        }]},
+                    },
+                    {
+                        "type": "user",
+                        "session_id": "ses-denied",
+                        "message": {"content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "is_error": True,
+                            "content": "The tool use was rejected. STOP and wait.",
+                        }]},
+                    },
+                    {
+                        "type": "result",
+                        "session_id": "ses-denied",
+                        "is_error": True,
+                        "terminal_reason": "aborted_tools",
+                        "result": None,
+                    },
+                ]
+                with open(log_path, "a") as log:
+                    for event in events:
+                        log.write(json.dumps(event) + "\n")
+                con.execute(
+                    "UPDATE runs SET status='running', session_ref='ses-denied' WHERE id=?",
+                    (run_id,),
+                )
+                con.commit()
+                return "exit", 143
+            with open(log_path, "a") as log:
+                log.write(json.dumps({
+                    "type": "result",
+                    "session_id": "ses-denied",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Finished safely",
+                }) + "\n")
+            return "exit", 0
+
+        def answer_question(con, run):
+            answered_at = db.now()
+            con.execute(
+                "UPDATE questions SET status='answered', answer=?, answered_by=?, "
+                "answered_at=? WHERE run_id=?",
+                ("Do not kill it; inspect the PID only", "codex", answered_at, run["id"]),
+            )
+            con.commit()
+            return con.execute(
+                "SELECT * FROM questions WHERE run_id=?", (run["id"],)
+            ).fetchone(), 0
+
+        with mock.patch.object(supervise.runners, "build_cmd", side_effect=build_cmd), \
+                mock.patch.object(supervise, "_run_proc", side_effect=run_proc), \
+                mock.patch.object(supervise, "_wait_for_question", side_effect=answer_question):
+            rc = supervise.supervise(self.root, self.run_id)
+
+        con = db.connect(self.root)
+        try:
+            run = con.execute(
+                "SELECT status, exit_code, summary FROM runs WHERE id=?", (self.run_id,)
+            ).fetchone()
+            question = con.execute(
+                "SELECT status, answer FROM questions WHERE run_id=?", (self.run_id,)
+            ).fetchone()
+        finally:
+            con.close()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(run["status"], "done")
+        self.assertEqual(run["exit_code"], 0)
+        self.assertEqual(run["summary"], "Finished safely")
+        self.assertEqual(question["status"], "answered")
+        self.assertEqual(calls[1][0], "ses-denied")
+        self.assertIn("Answer to apply: Do not kill it; inspect the PID only", calls[1][1])
 
     def test_unanswered_question_uses_declared_fallback(self) -> None:
         con = db.connect(self.root)

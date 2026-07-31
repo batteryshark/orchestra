@@ -114,6 +114,9 @@ Orchestra exports this process's identity and run ID; commands infer them automa
   `orchestra dispatch` from a supervised run.
 - {progress}
 - Send findings or peer messages with `orchestra note` / `orchestra send`; check `orchestra roster` when needed.
+- When upstream context could prevent likely rework, ask with
+  `orchestra consult "<question>"`. It routes to the requester without pausing this run;
+  keep working on your best documented assumption until guidance arrives.
 - {question}
 - Before stopping, send `orchestra handoff "<files, verification, remaining work>"`.
 - Do not update or move tracker items directly; Orchestra records the run-bound report/handoff,
@@ -142,6 +145,9 @@ session. Apply this follow-up; it overrides earlier instructions only where they
 {instructions.strip()}
 {question}
 
+For non-blocking guidance, use `orchestra consult "<question>"` and keep working on
+your best documented assumption.
+
 Before stopping, send `orchestra handoff "<result, verification, remaining risks>"`."""
 
 
@@ -156,7 +162,8 @@ def compose(*, root: Path, run_id: int, agent: dict, mission: str,
         "Work autonomously and make reasonable assumptions. You have ONE blocking-question "
         "option for unsafe or materially wasteful ambiguity; see Coordination."
         if allow_question else
-        "Work autonomously. If something is unclear, make a reasonable documented assumption."
+        "Work autonomously. Seek advisory guidance when it can prevent likely rework, but keep "
+        "moving on a reasonable documented assumption."
     )
     location = f"Project and working directory: `{workdir}`."
     if str(root) != workdir:

@@ -392,6 +392,13 @@ class DetailSerializationTests(unittest.TestCase):
              "2026-07-18T22:01:45Z", "codex"),
         )
         con.execute(
+            "INSERT INTO messages(sender, recipient, body, run_id, kind, created_at) "
+            "VALUES(?,?,?,?, 'consult', ?)",
+            ("minimax", "codex",
+             "CONSULT run 1 (minimax; worker is continuing): Is this legacy behavior?",
+             1, "2026-07-18T22:01:45Z"),
+        )
+        con.execute(
             "INSERT INTO questions(run_id,sender,recipient,question,recommended_default,"
             "asked_at,deadline_at) VALUES(?,?,?,?,?,?,?)",
             (1, "minimax", "codex", "Which output format should I preserve?",
@@ -520,6 +527,18 @@ class DetailSerializationTests(unittest.TestCase):
                     "recalled_by": "codex",
                 },
                 {
+                    "kind": "consult",
+                    "message_id": 3,
+                    "sender": "minimax",
+                    "recipient": "codex",
+                    "body": (
+                        "CONSULT run 1 (minimax; worker is continuing): "
+                        "Is this legacy behavior?"
+                    ),
+                    "created_at": "2026-07-18T22:01:45Z",
+                    "phase": "sent",
+                },
+                {
                     "kind": "question",
                     "question_id": 1,
                     "sender": "minimax",
@@ -535,7 +554,7 @@ class DetailSerializationTests(unittest.TestCase):
                 },
                 {
                     "kind": "handoff",
-                    "message_id": 5,
+                    "message_id": 6,
                     "sender": "minimax",
                     "recipient": "codex",
                     "body": "HANDOFF run 1: completed the requested work",
