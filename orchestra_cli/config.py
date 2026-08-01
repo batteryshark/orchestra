@@ -42,6 +42,9 @@ env_passthrough = []
 # distinguishes configured profiles from the backends/models available here.
 # backend: opencode | codex | claude
 # model:   backend-specific model id (opencode: provider/model, codex: model name)
+# effort:  Codex or Claude reasoning effort; OpenCode uses `variant` instead
+# tier:    optional non-negative cost/capability level; tiered children may not
+#          exceed a tiered parent's level (omit either tier to leave unconstrained)
 # ensemble = true opts an opencode agent into the optional OpenCode Ensemble
 # integration. See the README for the plugin and roster configuration.
 # opencode_native_subagents = true deliberately restores OpenCode's native
@@ -70,6 +73,8 @@ backend = "opencode"
 model = "kimi-for-coding/k3"
 role = "flagship Kimi generalist — complex coding, long context, and visual work"
 
+# Kimi K3 currently has one explicit thinking variant: max. Do not create
+# low/medium/high Kimi thinking profiles; `kimi` above has no explicit variant.
 [agents.kimi-max]
 backend = "opencode"
 model = "kimi-for-coding/k3"

@@ -17,6 +17,7 @@ from orchestra_cli import (
     checkpoint,
     config,
     db,
+    dependencies,
     docs,
     ensemble,
     host,
@@ -132,11 +133,15 @@ def cmd_init(args):
 
 def cmd_roster(args):
     cfg = config.load(_maybe_root())
-    print(f"{'agent':<12} {'backend':<9} {'model':<42} role")
+    print(f"{'agent':<12} {'backend':<9} {'tier':<5} {'model':<42} role")
     for name, a in sorted(cfg.get("agents", {}).items()):
         model = a.get("model", "(backend default)")
+        tier = a.get("tier", "-")
         flags = " [ensemble]" if a.get("ensemble") else ""
-        print(f"{name:<12} {a.get('backend', '?'):<9} {model:<42} {a.get('role', '')}{flags}")
+        print(
+            f"{name:<12} {a.get('backend', '?'):<9} {str(tier):<5} "
+            f"{model:<42} {a.get('role', '')}{flags}"
+        )
 
 
 def _maybe_root() -> Path | None:
@@ -316,7 +321,7 @@ def cmd_handoff(args):
 
 
 def cmd_consult(args):
-    """Ask the recorded requester for advice without pausing the worker."""
+    """Ask the recorded requester, optionally pausing with a bounded fallback."""
     root = paths.find_root()
     cfg = config.load(root)
     question = " ".join(args.question).strip()
@@ -324,6 +329,15 @@ def cmd_consult(args):
         raise SystemExit("orchestra: consultation question must not be empty")
     if len(question) > 4000:
         raise SystemExit("orchestra: consultation question is limited to 4000 characters")
+    raw_wait = getattr(args, "wait", None)
+    fallback = (getattr(args, "fallback", None) or "").strip()
+    if raw_wait is None and fallback:
+        raise SystemExit("orchestra: --fallback requires --wait")
+    if raw_wait is not None and not fallback:
+        raise SystemExit("orchestra: --wait requires a non-empty --fallback")
+    if len(fallback) > 4000:
+        raise SystemExit("orchestra: consultation fallback is limited to 4000 characters")
+    wait_seconds = config.question_wait_seconds(raw_wait) if raw_wait is not None else None
 
     con = db.connect(root)
     routed_lead_id = None
@@ -334,7 +348,39 @@ def cmd_consult(args):
         run_id = int(run["id"])
         requester = run["requested_by"]
         created_at = db.now()
-        if run["containment_mode"]:
+        kind = "consult"
+        if wait_seconds is not None:
+            if run["containment_mode"]:
+                raise SystemExit(
+                    "orchestra: contained Operator runs cannot pause through consult; "
+                    "the controller owns revised instructions and retries"
+                )
+            if run["status"] != "running":
+                raise SystemExit(f"orchestra: run {run_id} is {run['status']}, not running")
+            if not run["session_ref"]:
+                raise SystemExit(
+                    f"orchestra: run {run_id}'s session is not resumable yet; "
+                    "continue with the declared fallback"
+                )
+            if con.execute("SELECT 1 FROM questions WHERE run_id=?", (run_id,)).fetchone():
+                raise SystemExit(
+                    f"orchestra: run {run_id} already used its one blocking question"
+                )
+            deadline_at = db.after(wait_seconds)
+            con.execute(
+                "INSERT INTO questions(run_id, sender, recipient, question, "
+                "recommended_default, asked_at, deadline_at) VALUES(?,?,?,?,?,?,?)",
+                (run_id, run["agent"], requester, question, fallback, created_at, deadline_at),
+            )
+            body = (
+                f"[QUESTION run {run_id}] {question}\n"
+                f"Recommended fallback: {fallback}\n"
+                f"Auto-resumes with that fallback in {wait_seconds} seconds.\n"
+                f"Answer: `orchestra answer {run_id} \"<answer>\" --as {requester}`"
+            )
+            kind = "question"
+            con.execute("UPDATE runs SET status='waiting_input' WHERE id=?", (run_id,))
+        elif run["containment_mode"]:
             body = (
                 f"CONSULT run {run_id} ({run['agent']}; worker is continuing): {question}\n"
                 "This is a contained Operator run. The consultation is recorded for its "
@@ -349,13 +395,14 @@ def cmd_consult(args):
             )
         inserted = con.execute(
             "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, "
-            "created_at) VALUES(?,?,?,?,?,'consult',?)",
+            "created_at) VALUES(?,?,?,?,?,?,?)",
             (
                 run["agent"],
                 requester,
                 body,
                 run["work_item"],
                 run_id,
+                kind,
                 created_at,
             ),
         )
@@ -402,7 +449,13 @@ def cmd_consult(args):
     finally:
         con.close()
 
-    if routed_lead_id is not None:
+    if wait_seconds is not None:
+        destination = f"lead run {routed_lead_id}" if routed_lead_id else requester
+        print(
+            f"consultation #{consultation_id} sent to {destination}; run {run_id} paused "
+            f"for up to {wait_seconds} seconds before applying its fallback"
+        )
+    elif routed_lead_id is not None:
         print(
             f"consultation #{consultation_id} routed to requester on lead run "
             f"{routed_lead_id}; run {run_id} keeps working"
@@ -559,6 +612,11 @@ def cmd_dispatch(args):
     question_wait = config.question_wait_seconds(configured_question_wait)
 
     con = db.connect(root)
+    try:
+        after_ids = dependencies.validate(con, list(getattr(args, "after", None) or []))
+    except BaseException:
+        con.close()
+        raise
     if args.team:
         if not con.execute("SELECT 1 FROM teams WHERE name=?", (args.team,)).fetchone():
             con.close()
@@ -598,11 +656,12 @@ def cmd_dispatch(args):
                 cur = con.execute(
                     "INSERT INTO runs(agent, backend, model, title, work_item, team, "
                     "requested_by, workdir, slug, allow_question, question_wait_seconds, "
-                    "status, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+                    "status, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (target, agent["backend"], display_model,
                      args.title or mission[:80],
                      args.work, args.team, requester, str(root), slug,
-                     int(allow_question), question_wait, db.now()))
+                     int(allow_question), question_wait,
+                     "pending" if after_ids else "spawning", db.now()))
                 run_id = cur.lastrowid
                 break
             except sqlite3.IntegrityError as exc:
@@ -616,28 +675,61 @@ def cmd_dispatch(args):
                 f"after repeated collisions — odd, retry dispatch"
             )
         workdir, branch = str(root), None
-        if args.worktree:
-            wt, branch = worktree.create(root, run_id)
-            workdir = str(wt)
-        text = brief.compose(root=root, run_id=run_id, agent=agent, mission=mission,
-                             work_item=args.work, team=args.team, requester=requester,
-                             workdir=workdir, extra_context=args.context,
-                             allow_question=allow_question,
-                             question_wait_seconds=question_wait, slug=slug)
-        bp = paths.briefs_dir(root) / f"run-{run_id}.md"
-        bp.write_text(text)
-        lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
-        lp.touch()
-        con.execute("UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=? WHERE id=?",
-                    (str(bp), str(lp), workdir, branch, run_id))
+        if after_ids:
+            dependencies.enqueue(
+                con,
+                run_id,
+                after_ids,
+                mission=mission,
+                context=args.context,
+                use_worktree=bool(args.worktree),
+            )
+        else:
+            if args.worktree:
+                wt, branch = worktree.create(root, run_id)
+                workdir = str(wt)
+            text = brief.compose(root=root, run_id=run_id, agent=agent, mission=mission,
+                                 work_item=args.work, team=args.team, requester=requester,
+                                 workdir=workdir, extra_context=args.context,
+                                 allow_question=allow_question,
+                                 question_wait_seconds=question_wait, slug=slug)
+            bp = paths.briefs_dir(root) / f"run-{run_id}.md"
+            bp.write_text(text)
+            lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
+            lp.touch()
+            con.execute(
+                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=? WHERE id=?",
+                (str(bp), str(lp), workdir, branch, run_id),
+            )
         con.commit()
         run_ids.append(run_id)
-        _work_log(root, args.work, f"orchestra: dispatched run {run_id} ({slug}) to {target} "
+        disposition = (
+            f"queued after run(s) {', '.join(map(str, after_ids))}"
+            if after_ids else "dispatched"
+        )
+        _work_log(root, args.work, f"orchestra: {disposition} run {run_id} ({slug}) to {target} "
                                    f"({agent['backend']}/{agent.get('model') or 'default'})"
                                    + (f" in worktree branch {branch}" if branch else ""))
         print(f"run {run_id} ({slug}): {target} ({agent['backend']}/{agent.get('model') or 'default'})"
+              + (f" pending-on={','.join(map(str, after_ids))}" if after_ids else "")
               + (f" worktree={workdir}" if branch else ""))
+    if after_ids:
+        dependencies.process_ready(con, root, cfg, _spawn_supervisor)
     con.close()
+    if after_ids:
+        if args.sync:
+            cmd_wait(argparse.Namespace(
+                run_ids=run_ids,
+                timeout=None,
+                any=False,
+                as_=requester,
+            ))
+        else:
+            print(
+                "dependency-aware dispatch recorded. It will launch once every prerequisite "
+                "finishes successfully; cancel it with `orchestra cancel RUN`."
+            )
+        return
     for rid in run_ids:
         if args.sync:
             supervise.supervise(root, rid)
@@ -670,6 +762,7 @@ def cmd_spawn(args):
     con = db.connect(root)
     try:
         parent = child_runs.validate_parent(con, cfg, parent_id, identity)
+        child_runs.validate_tiers(cfg, parent, list(args.to))
         request_id = child_runs.enqueue(
             con, parent, list(args.to), mission,
             title=args.title, context=args.context,
@@ -714,6 +807,8 @@ def cmd_spawn(args):
             f"lead run {parent_id}: {request['error'] or 'unknown broker error'}"
         )
     run_ids = json.loads(request["child_run_ids_json"] or "[]")
+    if request["error"]:
+        print(f"orchestra: warning: {request['error']}", file=sys.stderr)
     for run_id in run_ids:
         print(f"child run {run_id}: spawned for lead run {parent_id}")
     print("Child completions will notify this lead; if it exits first, Orchestra will "
@@ -805,14 +900,19 @@ def cmd_runs(args):
     rows = list(con.execute(q))
     if args.json:
         print(json.dumps([dict(r) for r in rows], indent=2))
+        con.close()
         return
     if not rows:
         print("(no runs)")
+        con.close()
         return
-    print(f"{'id':<4} {'agent':<10} {'status':<8} {'work':<8} {'started':<21} title")
+    print(f"{'id':<4} {'agent':<10} {'status':<18} {'work':<8} {'started':<21} title")
     for r in rows:
-        print(f"{r['id']:<4} {r['agent']:<10} {r['status']:<8} {r['work_item'] or '-':<8} "
+        waiting = dependencies.pending_on(con, r["id"]) if r["status"] == "pending" else []
+        status = f"pending-on-{','.join(map(str, waiting))}" if waiting else r["status"]
+        print(f"{r['id']:<4} {r['agent']:<10} {status:<18} {r['work_item'] or '-':<8} "
               f"{r['started_at']:<21} {(r['title'] or '')[:60]}")
+    con.close()
 
 
 def cmd_run_show(args):
@@ -821,6 +921,7 @@ def cmd_run_show(args):
     reap.reap_orphans(con, root)
     r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
     if not r:
+        con.close()
         raise SystemExit(f"orchestra: no run {args.run_id}")
     for k in r.keys():
         v = r[k]
@@ -828,6 +929,16 @@ def cmd_run_show(args):
             print(f"{k}:\n  " + v.replace("\n", "\n  "))
         else:
             print(f"{k}: {v}")
+    dependency_ids = [
+        row["depends_on_run"] for row in con.execute(
+            "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=? "
+            "ORDER BY depends_on_run",
+            (args.run_id,),
+        )
+    ]
+    if dependency_ids:
+        print("depends_on: " + ", ".join(map(str, dependency_ids)))
+    con.close()
 
 
 def cmd_logs(args):
@@ -1193,6 +1304,20 @@ def _record_interrupt(con, run, *, sender: str, body: str, immediate: bool) -> i
 def cmd_interrupt(args):
     root = paths.find_root()
     cfg = config.load(root)
+    message_file = getattr(args, "message_file", None)
+    if message_file:
+        source = Path(message_file)
+        try:
+            body = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise SystemExit(
+                f"orchestra: cannot read interrupt file '{source}': {exc}"
+            ) from exc
+    else:
+        message = getattr(args, "message", [])
+        body = message if isinstance(message, str) else " ".join(message)
+    if not body.strip():
+        raise SystemExit("orchestra: interrupt message must not be empty")
     con = db.connect(root)
     r = con.execute("SELECT * FROM runs WHERE id=?", (args.run_id,)).fetchone()
     if not r:
@@ -1209,7 +1334,6 @@ def cmd_interrupt(args):
         raise SystemExit(f"orchestra: run {args.run_id}'s session isn't identified yet "
                          "(happens ~10s after spawn) — retry in a moment")
     sender = _identity(args, cfg)
-    body = " ".join(args.message)
     immediate = bool(getattr(args, "now", False))
     if not immediate and int(r["supervisor_protocol"] or 0) < 1:
         con.close()
@@ -1289,7 +1413,9 @@ def cmd_status(args):
         "SELECT * FROM runs WHERE status NOT IN ('done','failed','timeout','killed') ORDER BY id"))
     print(f"## active runs ({len(active)})")
     for r in active:
-        print(f"  run {r['id']}: {r['agent']} [{r['status']}] work:{r['work_item'] or '-'} "
+        waiting = dependencies.pending_on(con, r["id"]) if r["status"] == "pending" else []
+        status = f"pending-on-{','.join(map(str, waiting))}" if waiting else r["status"]
+        print(f"  run {r['id']}: {r['agent']} [{status}] work:{r['work_item'] or '-'} "
               f"since {r['started_at']} — {(r['title'] or '')[:50]}")
     recent = list(con.execute("SELECT * FROM runs WHERE status IN "
                               "('done','failed','timeout','killed') ORDER BY id DESC LIMIT 5"))
@@ -1321,6 +1447,7 @@ def cmd_status(args):
                 print("\n".join("  " + line for line in out.splitlines()[:20]))
         except Exception:
             pass
+    con.close()
 
 
 def cmd_checkpoint(args):
@@ -2141,9 +2268,13 @@ def main():
 
     s = sub.add_parser(
         "consult",
-        help="ask this worker's requester for advisory guidance without pausing",
+        help="ask this worker's requester; optionally pause with a bounded fallback",
     )
     s.add_argument("question", nargs="+")
+    s.add_argument("--wait", type=int, metavar="SECONDS",
+                   help="pause this run for a bounded answer window")
+    s.add_argument("--fallback",
+                   help="required assumption to apply automatically when --wait expires")
     s.set_defaults(fn=cmd_consult)
 
     s = sub.add_parser(
@@ -2178,6 +2309,8 @@ def main():
     s.add_argument("--context", help="extra context appended to the brief")
     s.add_argument("--brief-file", help="read mission text from a file")
     s.add_argument("--worktree", action="store_true", help="isolate in a git worktree (skills auto-synced)")
+    s.add_argument("--after", action="append", type=int, metavar="RUN_ID",
+                   help="launch only after this run succeeds (repeatable)")
     s.add_argument("--sync", action="store_true", help="block until the run finishes")
     s.add_argument("--allow-question", action="store_true",
                    help="allow one genuine blocking question with an automatic fallback")
@@ -2457,11 +2590,18 @@ def main():
     s = sub.add_parser("interrupt", help="guaranteed delivery to a RUNNING worker: "
                                          "deliver at the next safe action boundary")
     s.add_argument("run_id", type=int)
-    s.add_argument("message", nargs="+")
+    interrupt_source = s.add_mutually_exclusive_group(required=True)
+    interrupt_source.add_argument("message", nargs="*", help="message text")
+    interrupt_source.add_argument("--file", dest="message_file", metavar="PATH",
+                                  help="read the complete message from a UTF-8 file")
     s.add_argument("--now", action="store_true",
                    help="stop immediately instead of waiting for a safe boundary")
     ident(s)
     s.set_defaults(fn=cmd_interrupt)
+
+    s = sub.add_parser("cancel", help="cancel a pending or active run")
+    s.add_argument("run_id", type=int)
+    s.set_defaults(fn=cmd_kill)
 
     s = sub.add_parser("kill", help="terminate a running worker")
     s.add_argument("run_id", type=int)

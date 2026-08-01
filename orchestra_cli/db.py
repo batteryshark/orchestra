@@ -105,6 +105,21 @@ CREATE TABLE IF NOT EXISTS spawn_requests (
   created_at TEXT NOT NULL,
   processed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS dispatch_dependencies (
+  run_id INTEGER NOT NULL REFERENCES runs(id),
+  depends_on_run INTEGER NOT NULL REFERENCES runs(id),
+  PRIMARY KEY(run_id, depends_on_run)
+);
+CREATE TABLE IF NOT EXISTS deferred_dispatches (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(id),
+  mission TEXT NOT NULL,
+  context TEXT,
+  use_worktree INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT,
+  created_at TEXT NOT NULL,
+  processed_at TEXT
+);
 CREATE TABLE IF NOT EXISTS feed (
   id INTEGER PRIMARY KEY,
   author TEXT NOT NULL,
@@ -240,6 +255,27 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_spawn_requests_lead_status "
         "ON spawn_requests(lead_run, status)"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS dispatch_dependencies ("
+        "run_id INTEGER NOT NULL REFERENCES runs(id), "
+        "depends_on_run INTEGER NOT NULL REFERENCES runs(id), "
+        "PRIMARY KEY(run_id, depends_on_run))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS deferred_dispatches ("
+        "run_id INTEGER PRIMARY KEY REFERENCES runs(id), mission TEXT NOT NULL, "
+        "context TEXT, use_worktree INTEGER NOT NULL DEFAULT 0, "
+        "status TEXT NOT NULL DEFAULT 'pending', error TEXT, "
+        "created_at TEXT NOT NULL, processed_at TEXT)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dispatch_dependencies_prerequisite "
+        "ON dispatch_dependencies(depends_on_run)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deferred_dispatches_status "
+        "ON deferred_dispatches(status)"
     )
 
 

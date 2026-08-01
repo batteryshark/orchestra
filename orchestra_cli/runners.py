@@ -132,6 +132,11 @@ def build_cmd(agent: dict, *, workdir: str, title: str, prompt: str,
             for arg in extra
         ):
             cmd += ["--thinking-display", "summarized"]
+        if agent.get("effort") and not any(
+            arg == "--effort" or arg.startswith("--effort=")
+            for arg in extra
+        ):
+            cmd += ["--effort", str(agent["effort"])]
         if resume_ref:
             cmd += ["--resume", resume_ref]
         if model:

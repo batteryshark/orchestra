@@ -69,6 +69,19 @@ class ChildPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "non-negative integer"):
             child_runs.limits(self.cfg)
 
+    def test_tiered_parent_cannot_spawn_a_stronger_tier(self) -> None:
+        self.cfg["agents"]["codex"]["tier"] = 2
+        self.cfg["agents"]["minimax"]["tier"] = 3
+        con = db.connect(self.root)
+        try:
+            parent = child_runs.validate_parent(con, self.cfg, self.parent_id, "codex")
+            with self.assertRaisesRegex(SystemExit, "orchestra consult"):
+                child_runs.create(
+                    con, self.root, self.cfg, parent, ["minimax"], "inspect"
+                )
+        finally:
+            con.close()
+
     def test_operator_worker_cannot_spawn_undeclared_child(self) -> None:
         con = db.connect(self.root)
         try:
@@ -257,6 +270,38 @@ class SpawnBrokerTests(unittest.TestCase):
         self.assertEqual(results[0]["status"], "failed")
         self.assertIn("child count limit", request["error"])
         self.assertEqual(lead["status"], "running")
+
+    def test_non_git_project_falls_back_to_shared_workdir_with_warning(self) -> None:
+        con = db.connect(self.root)
+        launched: list[int] = []
+        try:
+            parent = con.execute("SELECT * FROM runs WHERE id=?", (self.lead,)).fetchone()
+            request_id = child_runs.enqueue(con, parent, ["minimax"], "read only")
+            with mock.patch.object(
+                child_runs.worktree,
+                "create",
+                side_effect=AssertionError("non-git fallback must not create a worktree"),
+            ):
+                child_runs.process_pending(
+                    con,
+                    self.root,
+                    self.cfg,
+                    self.lead,
+                    lambda _root, run_id: launched.append(run_id),
+                )
+            request = con.execute(
+                "SELECT * FROM spawn_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            child = con.execute(
+                "SELECT * FROM runs WHERE spawn_request_id=?", (request_id,)
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(request["status"], "accepted")
+        self.assertIn("not a git repository", request["error"])
+        self.assertEqual(child["workdir"], str(self.root))
+        self.assertIsNone(child["branch"])
+        self.assertEqual(launched, [child["id"]])
 
     def test_settled_batch_interrupts_active_lead_exactly_once(self) -> None:
         con = db.connect(self.root)

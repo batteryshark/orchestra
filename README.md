@@ -71,6 +71,7 @@ instruction to migrate its custom doctrine manually into a newly generated templ
 
 ```sh
 orchestra dispatch --to glm --as codex "implement the parser and add tests"
+orchestra dispatch --to minimax --after 7 --as codex "review run 7's output"
 orchestra dispatch --to glm --to minimax --as codex "review this independently"
 orchestra dispatch --to kimi --allow-question --as codex "implement the risky migration"
 orchestra status
@@ -81,13 +82,22 @@ orchestra resume 7 "good; now cover malformed input"
 orchestra queue 8 "afterward, update the compatibility test" --as codex
 orchestra recall 42 --as codex
 orchestra interrupt 8 "stop—the schema changed" --as codex
+orchestra interrupt 8 --file correction.md --as codex
 orchestra interrupt 8 "stop immediately" --now --as codex
+orchestra cancel 9
 orchestra logs 7 --pretty
 ```
 
 Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion events are then logged to that item, and the worker brief asks the agent to record progress and verification evidence there.
 
 Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
+
+Use repeatable `--after RUN_ID` options when a run consumes another run's output. Orchestra
+records the dispatch as `pending`, shows its unresolved prerequisites as `pending-on-N`, and
+launches it exactly once after every prerequisite finishes successfully. A failed, timed-out,
+or cancelled prerequisite declines the dependent dispatch without starting its worker. Pending
+dispatches are cancellable with `orchestra cancel RUN`; worktree setup is deferred until launch
+so it starts from the post-prerequisite repository state.
 
 Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
 
@@ -104,9 +114,15 @@ interactive orchestrator can answer promptly and then resume waiting. For a cont
 run, the consultation is recorded for controller/owner review; revised instructions and retries
 remain controller-owned rather than bypassing the approved authority contract.
 
+For ambiguity where continuing would be unsafe or materially wasteful, a supervised worker can
+use `orchestra consult "<question>" --wait SECONDS --fallback "<safe assumption>"`. This uses
+the same bounded pause/resume lifecycle as an opted-in dispatch question, but is also available
+to spawned children. Blocking remains explicit: ordinary `consult` stays non-blocking, the
+fallback is mandatory, and each run gets at most one blocking question.
+
 `orchestra send AGENT "message"` uses the same safe-boundary delivery when that profile has one active run. It binds the message to the recipient's run, stops after a completed action, and resumes the same session with the text injected into its prompt. If several active runs share the profile, pass `--run`; Orchestra refuses to guess. With no active run, the message remains profile-wide mail for the next run to claim.
 
-`orchestra interrupt` is the explicitly run-addressed form. It waits for the next completed action boundary reported by the active backend before stopping and resuming the worker, so routine redirection does not terminate a tool during a file write. OpenCode step finishes, Codex completed tool items, and Claude tool results are recognized. Use `--now` only when stopping immediately is more important than preserving the current tool operation. If the worker exits before another boundary, Orchestra resumes the same session immediately with the pending message. Periodic supervisor check-ins use the same safe path.
+`orchestra interrupt` is the explicitly run-addressed form. It waits for the next completed action boundary reported by the active backend before stopping and resuming the worker, so routine redirection does not terminate a tool during a file write. OpenCode step finishes, Codex completed tool items, and Claude tool results are recognized. Use `--file PATH` for complete multiline UTF-8 corrections without shell quoting, and `--now` only when stopping immediately is more important than preserving the current tool operation. If the worker exits before another boundary, Orchestra resumes the same session immediately with the pending message. Periodic supervisor check-ins use the same safe path.
 
 `orchestra queue` prints the queued message ID, which also appears in run details. Recall an obsolete follow-up with `orchestra recall MESSAGE_ID --as SENDER` before the current run finishes. Recall and auto-delivery are atomic: once the follow-up has been claimed for session resume, Orchestra refuses to recall it.
 
@@ -339,6 +355,36 @@ Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.o
 
 Roster entries are reusable launch profiles, not singleton workers or capacity slots. Each profile chooses a backend (`opencode`, `codex`, or `claude`), model, reasoning configuration, role, and optional arguments; every dispatch creates a distinct run, so several independent runs may use the same profile concurrently. Choose a wave by task fit and current `orchestra usage` headroom rather than trying to keep exactly one of each profile active. Profiles can share a provider quota, and usage data is advisory, so routing still requires judgment about model strengths, weaknesses, risk, and project concurrency limits. Session references are recorded so `orchestra resume` continues the same worker context rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
 
+Roster entries may also set an integer `tier`. When both a parent and proposed child have tiers,
+`orchestra spawn` refuses a child above the parent's tier and directs the worker to consult its
+requester instead. If either tier is omitted, spawning remains unconstrained for backward
+compatibility.
+
+### Suggested role and effort mapping
+
+The following is a cost-aware starting point for explicit per-role profiles,
+not a routing guarantee or a quality-floor downgrade. Keep independent review
+separate from implementation and adjust the roster from measured results on
+your own workloads.
+
+| Role | Claude Code | Codex | Kimi K3 |
+|---|---|---|---|
+| Architect | `claude-opus-5` / `high` | `gpt-5.6-sol` / `xhigh` | `kimi-for-coding/k3` / `max` |
+| Scout | `claude-opus-5` / `low` | `gpt-5.6-luna` / `max` | — |
+| Implementer | `claude-opus-5` / `medium` | `gpt-5.6-terra` / `max` | `kimi-for-coding/k3` / `max` |
+| Specialist | `claude-opus-5` / `high` | `gpt-5.6-sol` / `max` | `kimi-for-coding/k3` / `max` |
+| Reviewer | `claude-opus-5` / `high` | `gpt-5.6-sol` / `xhigh` | `kimi-for-coding/k3` / `max` |
+| Review downgrade | `claude-opus-5` / `medium` | `gpt-5.6-sol` / `high` | — |
+
+Set `effort` on Codex or Claude roster entries. OpenCode providers use
+`variant` instead. Kimi K3 is a useful max-thinking alternative for complex
+architecture, implementation, specialist, or review work when task fit and
+provider headroom favor it, but it does not have low, medium, or high thinking
+variants. Use `kimi-max` for its sole explicit thinking level; the plain
+`kimi` profile selects base K3 without an explicit thinking variant. That
+makes Kimi a poor semantic match for the cost-down scout or review-downgrade
+lanes even when it is otherwise capable of the task.
+
 Claude workers request summarized thinking, partial-message streaming, and
 forwarded subagent text so the dashboard can show reasoning summaries and live
 activity alongside tool calls. Claude does not expose raw chain-of-thought. A
@@ -348,7 +394,28 @@ conflicting display option.
 
 Discovery separates configured intent from live evidence. It verifies that backend executables exist, checks Codex and Claude authentication, and reads OpenCode's configured provider/model catalog. Dispatch refuses profiles proven unavailable before creating a run. If a CLI does not expose a trustworthy model catalog—or a bounded probe fails—the profile is labeled `unknown` and dispatch continues with an explicit warning instead of guessing. OpenCode profiles with an explicit model are rejected when that provider/model is absent from `opencode models`.
 
-The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables the max-thinking variant for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
+The default roster includes `kimi` and `kimi-max`, both backed by OpenCode's `kimi-for-coding/k3` model. The first is the flagship generalist for complex coding, long-context, and visual work; `kimi-max` enables Kimi's only explicit thinking variant, `max`, for hard design and integration work. Override or remove those entries in the normal global or project roster config if a Kimi Code plan is not connected.
+
+### Optional Ponytail efficiency layer
+
+[Ponytail](https://github.com/DietrichGebert/ponytail) is an optional
+agent-instruction plugin that pushes workers to reuse existing code, standard
+library features, native platform features, and installed dependencies before
+adding new code. Its [published agentic benchmark](https://github.com/DietrichGebert/ponytail/blob/main/benchmarks/results/2026-06-18-agentic.md)
+reports a 54% mean reduction in added lines, 20% lower cost, and 27% lower
+elapsed time across 12 feature tasks, with the largest gains on frontend
+over-build traps. Treat those results as promising project-authored evidence
+rather than a universal expectation: the study used Claude Code with Haiku
+4.5, four runs per task and arm, and did not test this recommended
+multi-provider roster.
+
+Ponytail installs independently into each backend used by ordinary Orchestra
+workers. Follow its upstream instructions for Claude Code, Codex, or add
+`"@dietrichgebert/ponytail"` to OpenCode's `plugin` list. Orchestra does not
+install or require it. Live contained Operator runs deliberately pass Codex
+`--ignore-user-config` and disable hooks, so a user-level Ponytail plugin is
+not active inside that boundary; changing that would require a separate,
+explicit containment design.
 
 Ordinary supervised OpenCode profiles disable OpenCode's native `task` and plugin team-delegation tools per process. OpenCode 1.18.3 can leave an unattended native child session blocked forever on a permission request even when its parent was launched with `--auto`; Orchestra's own `orchestra spawn` child runs remain available and observable. The explicit `ensemble = true` profile keeps its team tools. A profile may deliberately restore native delegation with `opencode_native_subagents = true`, accepting the backend-specific permission behavior.
 
@@ -382,8 +449,9 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
   Child ownership is distinct from backend session follow-ups, works across OpenCode, Codex,
   and Claude runners, and is shown hierarchically in the dashboard. Spawn requests are brokered
   by the lead's outer supervisor, so worktree creation and child CLI startup do not inherit the
-  lead worker's backend sandbox. Children use isolated git worktrees by default; Orchestra
-  reports their branches and never auto-merges them. A settled batch safely interrupts an active
+  lead worker's backend sandbox. Children use isolated git worktrees by default; in a non-Git
+  project Orchestra warns and falls back to the lead's shared workdir instead of dropping the
+  delegation. Orchestra reports isolated branches and never auto-merges them. A settled batch safely interrupts an active
   lead at an action boundary or resumes a completed lead exactly once. Defaults are deliberately
   bounded by `settings.child_max_depth`, `child_max_per_run`, and `child_max_active` (1, 3, and
   3). Stopping a lead cascades to its active descendants. Supervised workers cannot call

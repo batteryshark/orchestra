@@ -20,7 +20,17 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra_cli import brief, child_runs, config, containment, db, host, paths, runners
+from orchestra_cli import (
+    brief,
+    child_runs,
+    config,
+    containment,
+    db,
+    dependencies,
+    host,
+    paths,
+    runners,
+)
 from orchestra_cli.usage import DEFAULT_COLLECTORS, infer_from_agent
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
@@ -865,6 +875,7 @@ def supervise(root: Path, run_id: int) -> int:
                 ),
             )
             con.commit()
+            dependencies.process_ready(con, root, cfg, spawn_supervisor)
             con.close()
             return 1
     timeout = int(agent.get("timeout") or cfg["settings"].get(
@@ -1185,5 +1196,6 @@ def supervise(root: Path, run_id: int) -> int:
         spawn_supervisor(root, followup_id)
     if child_wakeup_id:
         spawn_supervisor(root, child_wakeup_id)
+    dependencies.process_ready(con, root, cfg, spawn_supervisor)
     con.close()
     return 0 if status == "done" else 1

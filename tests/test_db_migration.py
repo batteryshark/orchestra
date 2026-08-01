@@ -105,6 +105,13 @@ class MigrationTests(unittest.TestCase):
             }
             self.assertIn("targets_json", spawn_columns)
             self.assertIn("notified_at", spawn_columns)
+            tables = {
+                row["name"] for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertIn("dispatch_dependencies", tables)
+            self.assertIn("deferred_dispatches", tables)
         finally:
             con.close()
 

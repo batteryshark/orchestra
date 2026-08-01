@@ -152,6 +152,55 @@ class DispatchQuotaHookTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "requires --allow-question"):
             self._run_dispatch(args)
 
+    def test_after_records_a_visible_pending_dispatch_without_launching(self) -> None:
+        con = db.connect(self.root)
+        try:
+            prerequisite = con.execute(
+                "INSERT INTO runs(agent,backend,title,requested_by,workdir,status,started_at) "
+                "VALUES('minimax','opencode','producer','codex',?,'running',?)",
+                (str(self.root), db.now()),
+            ).lastrowid
+            con.commit()
+        finally:
+            con.close()
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.after = [prerequisite]
+
+        stdout, _ = self._run_dispatch(args)
+
+        con = db.connect(self.root)
+        try:
+            consumer = con.execute(
+                "SELECT * FROM runs WHERE id!=? ORDER BY id DESC LIMIT 1",
+                (prerequisite,),
+            ).fetchone()
+            edge = con.execute(
+                "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
+                (consumer["id"],),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(consumer["status"], "pending")
+        self.assertIsNone(consumer["brief_path"])
+        self.assertEqual(edge["depends_on_run"], prerequisite)
+        self.assertIn(f"pending-on={prerequisite}", stdout)
+        status_output = io.StringIO()
+        with contextlib.redirect_stdout(status_output):
+            cli.cmd_status(Namespace())
+        self.assertIn(f"[pending-on-{prerequisite}]", status_output.getvalue())
+
+    def test_after_rejects_unknown_prerequisite_before_creating_run(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.after = [999]
+        with self.assertRaisesRegex(SystemExit, "unknown run"):
+            self._run_dispatch(args)
+        con = db.connect(self.root)
+        try:
+            count = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(count, 0)
+
     def test_default_on_emits_warning_before_run_insert(self) -> None:
         critical = ProviderResult(
             id="minimax", name="MiniMax", status="ok", plan="Token Plan",

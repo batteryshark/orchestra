@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from orchestra_cli import db, runners
@@ -62,6 +63,18 @@ def _log_quiet_for(log_path: str | None, seconds: float) -> bool:
     return (time.time() - mtime) >= seconds
 
 
+def _row_old_for(started_at: str | None, seconds: float) -> bool:
+    if not started_at:
+        return False
+    try:
+        started = datetime.strptime(
+            started_at, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - started) >= seconds
+
+
 def is_orphan(run, *, grace_seconds: int = DEFAULT_GRACE_SECONDS) -> bool:
     """Has this non-terminal run lost its supervisor?
 
@@ -76,6 +89,8 @@ def is_orphan(run, *, grace_seconds: int = DEFAULT_GRACE_SECONDS) -> bool:
     """
     if run["status"] in db.RUN_TERMINAL:
         return False
+    if run["status"] == "pending":
+        return False
     supervisor_pid = run["supervisor_pid"] if "supervisor_pid" in run.keys() else None
     if supervisor_pid:
         return not _alive(supervisor_pid)
@@ -85,6 +100,8 @@ def is_orphan(run, *, grace_seconds: int = DEFAULT_GRACE_SECONDS) -> bool:
     # is no agent pid to have died and no log to have gone quiet. Require the
     # row itself to be old enough instead.
     if not run["pid"]:
+        if not run["log_path"]:
+            return _row_old_for(run["started_at"], grace_seconds)
         return _log_quiet_for(run["log_path"], grace_seconds)
     return _log_quiet_for(run["log_path"], grace_seconds)
 
@@ -160,6 +177,11 @@ def reap_orphans(con, root: Path | None = None, *,
             (f"lead supervisor died before accepting this spawn request", db.now(),
              run["id"]),
         )
+        con.execute(
+            "UPDATE deferred_dispatches SET status='failed', error=?, processed_at=? "
+            "WHERE run_id=? AND status='processing'",
+            ("dispatch supervisor died before recording the result", db.now(), run["id"]),
+        )
         reaped.append({"id": run["id"], "agent": run["agent"], "status": status,
                        "work_item": run["work_item"], "note": note})
     if reaped:
@@ -167,8 +189,9 @@ def reap_orphans(con, root: Path | None = None, *,
     # The tracker gets the same entry the normal completion path writes, so a
     # reconciled run is not silently missing from its work item's history.
     if reaped and root is not None:
-        from orchestra_cli import supervise
+        from orchestra_cli import config, dependencies, supervise
         for item in reaped:
             if item["work_item"]:
                 supervise._work_log(root, item["work_item"], item["note"] + ".")
+        dependencies.process_ready(con, root, config.load(root), supervise.spawn_supervisor)
     return reaped

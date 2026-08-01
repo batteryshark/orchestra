@@ -82,6 +82,8 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
    asynchronous dispatches for independent work. The same roster profile may back several
    concurrent runs; repeat `--to` only when intentionally asking multiple runs for independent
    treatments of the same brief. Those targets may use the same profile or different profiles.
+   Use repeatable `--after <run-id>` options for consumers that must wait for producers; pending
+   dispatches are visible and cancellable, and do not fire when a prerequisite fails.
    Use `--worktree` when edits need isolation. Inside a supervised worker, use
    `orchestra spawn` instead of `orchestra dispatch`; the outer supervisor brokers child setup
    and launch so it does not inherit the worker backend's sandbox.
@@ -104,8 +106,8 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
   `orchestra send <agent> --file handoff.md`.
 - `orchestra interrupt <run> "message"` is the normal in-flight correction. It waits for a
   completed action boundary, stops the worker, injects the correction, and resumes the same
-  session. Use `--now` only when immediate termination is safer than letting the current tool
-  finish.
+  session. For long corrections use `orchestra interrupt <run> --file correction.md`. Use
+  `--now` only when immediate termination is safer than letting the current tool finish.
 - `orchestra queue <run> "message"` schedules a non-urgent continuation after the current run.
 - `orchestra recall <message-id> --as <sender>` withdraws your queued continuation before
   auto-delivery claims it. Queue output includes the message ID.
@@ -120,6 +122,11 @@ recorded requester from the supervised run, sends the question without pausing t
 routes a child consultation directly to its exact active lead when possible. The worker keeps
 moving on a documented assumption; answer or correct it with
 `orchestra interrupt <run> "<guidance>"`.
+
+When continuing would be unsafe or materially wasteful, any supervised worker can instead use
+`orchestra consult "<question>" --wait <seconds> --fallback "<safe assumption>"`. Orchestra
+pauses the run, routes the question to its requester (including its exact active lead), and
+resumes with the answer or recorded fallback when the bounded wait expires.
 
 Default workers do not block for clarification. For ambiguity where a wrong assumption risks
 destructive or substantially wasted work, dispatch with `--allow-question`. The worker must
@@ -199,6 +206,8 @@ Do not spend a heavy tier on grunt work merely because it is available, and do n
 weak tier to a task whose primary difficulty is judgment rather than typing. When multiple runs
 share one profile identity, prefer run-addressed controls such as `interrupt`, `queue`, and
 `resume`; a bare `send` refuses ambiguous active delivery instead of guessing which run owns it.
+Roster profiles may set an integer `tier`; when both profiles are tiered, a child cannot exceed
+its parent's tier and must consult the requester for a stronger decomposition instead.
 
 ## Rules of engagement
 
@@ -256,11 +265,13 @@ orchestra discover kimi
 orchestra usage
 orchestra status
 orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
+orchestra dispatch --to <agent> --after <run-id> "consume its output" --as <you>
 orchestra dispatch --to <agent> --to <reviewer> --as <you> "independent treatments"
 orchestra runs --active
 orchestra wait
 orchestra inbox <you> --unread --mark-read
 orchestra interrupt 7 "stop—the schema changed" --as <you>
+orchestra interrupt 7 --file correction.md --as <you>
 orchestra queue 7 "after this step, also update the compatibility test" --as <you>
 orchestra recall 42 --as <you>
 orchestra resume 7 "address the review findings and rerun the gate"
@@ -270,6 +281,7 @@ orchestra logs 7 --pretty
 orchestra checkpoint --as <you> --work W-0001 --objective "..." --next "..."
 orchestra takeover --from <you> --as <successor>
 orchestra kill 7
+orchestra cancel 8
 ```
 <!-- orchestra:managed:end -->
 

@@ -118,6 +118,27 @@ class SendFileTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(self._messages()[0]["body"], "inline handoff")
 
+    def test_interrupt_reads_multiline_utf8_message_from_file(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+        body = "Correct `support` handling.\n\nPreserve café fixtures exactly.\n"
+        source = self.root / "interrupt.md"
+        source.write_text(body, encoding="utf-8")
+
+        code, stdout, stderr = self._run_main([
+            "interrupt",
+            str(run_id),
+            "--file",
+            str(source),
+            "--as",
+            "codex",
+        ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("interrupt scheduled", stdout)
+        message = self._messages()[0]
+        self.assertEqual(message["body"], f"[INTERRUPT] {body}")
+
     def test_supervised_run_identity_and_run_id_are_inferred(self) -> None:
         with mock.patch.dict(
             os.environ,
@@ -379,6 +400,39 @@ class SendFileTests(unittest.TestCase):
         self.assertIsNotNone(delivery["delivery_offset"])
         self.assertIsNone(delivery["delivered_at"])
         self.assertIn(f"CONSULT run {child_id}", delivery["body"])
+
+    def test_consult_can_pause_with_a_bounded_fallback_without_dispatch_opt_in(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, stdout, stderr = self._run_main([
+                "consult",
+                "Which schema should I apply?",
+                "--wait",
+                "60",
+                "--fallback",
+                "Use schema v1",
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(f"run {run_id} paused for up to 60 seconds", stdout)
+        con = db.connect(self.root)
+        try:
+            run = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            question = con.execute(
+                "SELECT * FROM questions WHERE run_id=?", (run_id,)
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(run["status"], "waiting_input")
+        self.assertEqual(question["recommended_default"], "Use schema v1")
+        self.assertEqual(question["status"], "waiting")
+        self.assertEqual(self._messages()[0]["kind"], "question")
 
     def test_worker_consult_requires_matching_supervised_identity(self) -> None:
         run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")

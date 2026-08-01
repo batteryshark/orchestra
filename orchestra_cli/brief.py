@@ -117,6 +117,9 @@ Orchestra exports this process's identity and run ID; commands infer them automa
 - When upstream context could prevent likely rework, ask with
   `orchestra consult "<question>"`. It routes to the requester without pausing this run;
   keep working on your best documented assumption until guidance arrives.
+- If continuing would be unsafe or materially wasteful, pause once with
+  `orchestra consult "<question>" --wait <seconds> --fallback "<safe assumption>"`.
+  Orchestra resumes with the answer or applies that fallback when the bounded wait expires.
 - {question}
 - Before stopping, send `orchestra handoff "<files, verification, remaining work>"`.
 - Do not update or move tracker items directly; Orchestra records the run-bound report/handoff,

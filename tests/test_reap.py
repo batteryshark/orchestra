@@ -185,6 +185,22 @@ class LegacyRowReapTests(unittest.TestCase):
 
         self.assertEqual(reap.reap_orphans(self.con, grace_seconds=600), [])
 
+    def test_stale_spawning_row_without_log_is_reaped(self):
+        run_id = _insert(self.con, status="spawning", log_path=None)
+        self.con.execute(
+            "UPDATE runs SET started_at='2000-01-01T00:00:00Z' WHERE id=?",
+            (run_id,),
+        )
+        self.con.commit()
+
+        reaped = reap.reap_orphans(self.con, grace_seconds=600)
+
+        self.assertEqual([item["id"] for item in reaped], [run_id])
+        status = self.con.execute(
+            "SELECT status FROM runs WHERE id=?", (run_id,)
+        ).fetchone()["status"]
+        self.assertEqual(status, "failed")
+
 
 class MigrationTests(unittest.TestCase):
     def test_supervisor_pid_is_added_to_a_preexisting_database(self):

@@ -6,7 +6,7 @@ import signal
 import sqlite3
 from dataclasses import dataclass
 
-from orchestra_cli import db
+from orchestra_cli import db, dependencies
 
 
 @dataclass(frozen=True)
@@ -109,11 +109,19 @@ def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
                 f"WHERE id IN ({','.join('?' for _ in ids)})",
                 (db.now(), *ids),
             )
+        cancelled_ids = [run_id, *(int(r["id"]) for r in descendants)]
+        con.execute(
+            f"UPDATE deferred_dispatches SET status='cancelled', processed_at=? "
+            f"WHERE run_id IN ({','.join('?' for _ in cancelled_ids)}) "
+            "AND status IN ('pending','processing')",
+            (db.now(), *cancelled_ids),
+        )
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
 
+    dependencies.decline_failed(con)
     signal_sent, reason = _signal_process_group(pid)
     for child in descendants:
         _signal_process_group(_safe_pid(child["pid"]))

@@ -163,6 +163,33 @@ class ClaudeCommandTests(unittest.TestCase):
         self.assertNotIn("--thinking-display", cmd)
         self.assertNotIn("summarized", cmd)
 
+    def test_profile_effort_is_forwarded(self):
+        cmd = build_cmd(
+            {**self.agent, "effort": "medium"},
+            workdir="/workspace/project",
+            title="run-1",
+            prompt="do the work",
+        )
+
+        effort = cmd.index("--effort")
+        self.assertEqual(cmd[effort + 1], "medium")
+
+    def test_explicit_effort_override_is_preserved(self):
+        cmd = build_cmd(
+            {
+                **self.agent,
+                "effort": "medium",
+                "extra_args": ["--effort=max"],
+            },
+            workdir="/workspace/project",
+            title="run-1",
+            prompt="do the work",
+        )
+
+        self.assertIn("--effort=max", cmd)
+        self.assertNotIn("--effort", cmd)
+        self.assertNotIn("medium", cmd)
+
     def test_resume_keeps_prompt_as_print_value(self):
         cmd = build_cmd(
             self.agent,

@@ -25,6 +25,29 @@ def limits(cfg: dict) -> tuple[int, int, int]:
     )
 
 
+def _tier(agent: dict, name: str) -> int | None:
+    value = agent.get("tier")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"orchestra: agent '{name}' tier must be a non-negative integer")
+    return value
+
+
+def validate_tiers(cfg: dict, parent: sqlite3.Row, targets: list[str]) -> None:
+    """Prevent a tiered parent from escalating to a stronger tiered child."""
+    parent_agent = config.agent_cfg(cfg, parent["agent"])
+    parent_tier = _tier(parent_agent, parent["agent"])
+    for target in targets:
+        target_tier = _tier(config.agent_cfg(cfg, target), target)
+        if parent_tier is not None and target_tier is not None and target_tier > parent_tier:
+            raise SystemExit(
+                f"orchestra: target '{target}' tier {target_tier} exceeds parent "
+                f"'{parent['agent']}' tier {parent_tier}; use `orchestra consult` to ask "
+                "the requester for a stronger decomposition instead"
+            )
+
+
 def validate_parent(con: sqlite3.Connection, cfg: dict, run_id: int,
                     identity: str | None) -> sqlite3.Row:
     parent = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -56,6 +79,7 @@ def create(con: sqlite3.Connection, root: Path, cfg: dict, parent: sqlite3.Row,
     if not targets:
         raise SystemExit("orchestra: spawn needs at least one --to target")
     _, max_total, max_active = limits(cfg)
+    validate_tiers(cfg, parent, targets)
     agents = [(name, config.agent_cfg(cfg, name)) for name in targets]
     prepared: list[tuple[str, dict, str | None]] = []
     for target, agent in agents:
@@ -194,10 +218,18 @@ def process_pending(con: sqlite3.Connection, root: Path, cfg: dict, lead_run: in
             ).fetchone()
             if not parent or parent["status"] != "running":
                 raise RuntimeError(f"lead run {lead_run} is no longer running")
+            fallback_shared = not bool(request["shared_workdir"]) and not (
+                root / ".git"
+            ).exists()
+            warning = (
+                "project is not a git repository; using the lead's shared workdir "
+                "instead of an isolated child worktree"
+                if fallback_shared else None
+            )
             child_ids = create(
                 con, root, cfg, parent, targets, request["mission"],
                 title=request["title"], context=request["context"],
-                shared_workdir=bool(request["shared_workdir"]),
+                shared_workdir=bool(request["shared_workdir"]) or fallback_shared,
                 spawn_request_id=int(request["id"]),
             )
             for child_id in child_ids:
@@ -211,14 +243,15 @@ def process_pending(con: sqlite3.Connection, root: Path, cfg: dict, lead_run: in
                     )
             con.execute(
                 "UPDATE spawn_requests SET status='accepted', child_run_ids_json=?, "
-                "processed_at=? WHERE id=?",
-                (json.dumps(child_ids), db.now(), request["id"]),
+                "error=?, processed_at=? WHERE id=?",
+                (json.dumps(child_ids), warning, db.now(), request["id"]),
             )
             con.commit()
             results.append({
                 "id": int(request["id"]),
                 "status": "accepted",
                 "child_run_ids": child_ids,
+                "warning": warning,
             })
         except (Exception, SystemExit) as exc:
             error = str(exc)[:1000] or exc.__class__.__name__
