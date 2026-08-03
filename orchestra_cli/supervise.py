@@ -17,19 +17,23 @@ import subprocess
 import sys
 import tempfile
 import time
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 
 from orchestra_cli import (
     brief,
+    capabilities,
     child_runs,
     config,
     containment,
     db,
     dependencies,
     host,
+    incidents,
     paths,
     runners,
+    worktree,
 )
 from orchestra_cli.usage import DEFAULT_COLLECTORS, infer_from_agent
 
@@ -61,6 +65,60 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+def _checkpoint_commit(run: dict, terminal_status: str) -> str | None:
+    """Persist one writer's Git delta when ownership is unambiguous."""
+    if not int(run.get("writes_tree", 1)):
+        return None
+    workdir = Path(run["workdir"])
+    if not (workdir / ".git").exists():
+        return None
+    dirty = worktree.status(workdir)
+    if dirty and not run.get("branch"):
+        raise RuntimeError(
+            "shared-tree writer left uncommitted changes; commit them before handoff "
+            "or dispatch with --worktree for automatic checkpointing"
+        )
+    if dirty:
+        pathspec = ["."]
+        for name in worktree.untracked_context_paths(workdir):
+            pathspec.append(f":(exclude){name}")
+            pathspec.append(f":(exclude){name}/**")
+        added = subprocess.run(
+            ["git", "-C", str(workdir), "add", "-A", "--", *pathspec],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if added.returncode != 0:
+            raise RuntimeError(f"automatic checkpoint staging failed: {added.stderr.strip()}")
+        staged = subprocess.run(
+            ["git", "-C", str(workdir), "diff", "--cached", "--quiet"],
+            timeout=60,
+        )
+        if staged.returncode not in (0, 1):
+            raise RuntimeError("cannot inspect staged checkpoint changes")
+        if staged.returncode == 1:
+            committed = subprocess.run(
+                [
+                    "git", "-C", str(workdir),
+                    "-c", "user.name=Orchestra",
+                    "-c", "user.email=orchestra@localhost",
+                    "-c", "commit.gpgSign=false",
+                    "commit", "--no-verify", "-m",
+                    f"orchestra: checkpoint run {run['id']} ({terminal_status})",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if committed.returncode != 0:
+                raise RuntimeError(
+                    f"automatic checkpoint commit failed: {committed.stderr.strip()}"
+                )
+    head = worktree.head(workdir)
+    return head if head != run.get("base_commit") else None
+
+
 def create_followup(con, root: Path, parent: dict, requester: str, text: str,
                     title: str | None = None, *, commit: bool = True) -> int:
     """New run row that resumes parent's session with `text` as the prompt."""
@@ -71,18 +129,48 @@ def create_followup(con, root: Path, parent: dict, requester: str, text: str,
         )
     allow_question = int(bool(parent.get("allow_question", 0)))
     question_wait = int(parent.get("question_wait_seconds") or 1800)
+    writes_tree = int(parent.get("writes_tree", 1))
+    if writes_tree and not parent.get("branch"):
+        conflicts = dependencies.shared_writer_conflicts(
+            con, exclude_run_ids=[int(parent["id"])]
+        )
+        if conflicts:
+            raise RuntimeError(
+                "cannot resume a shared-tree writer while run(s) are active: "
+                + ", ".join(map(str, conflicts))
+            )
+    base_commit = None
+    if (root / ".git").exists():
+        base_commit = worktree.head(Path(parent["workdir"]))
     cur = con.execute(
         "INSERT INTO runs(agent, backend, model, title, work_item, team, requested_by, "
         "workdir, branch, parent_run, lead_run, child_depth, session_ref, allow_question, "
-        "question_wait_seconds, status, started_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+        "question_wait_seconds, verification_required, verification_status, "
+        "required_capabilities_json, writes_tree, base_commit, status, started_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
         (parent["agent"], parent["backend"], parent["model"],
          title or f"continuation of run {parent['id']}", parent["work_item"], parent["team"],
          requester, parent["workdir"], parent["branch"], parent["id"],
          parent.get("lead_run"), parent.get("child_depth", 0), parent["session_ref"],
-         allow_question, question_wait, db.now()))
+         allow_question, question_wait,
+         int(parent.get("verification_required", 0)),
+         "pending" if parent.get("verification_required", 0) else "not_required",
+         parent.get("required_capabilities_json", "[]"),
+         writes_tree, base_commit,
+         db.now()))
     run_id = cur.lastrowid
+    if parent.get("status") == "killed":
+        con.execute(
+            "UPDATE dispatch_dependencies SET depends_on_run=? "
+            "WHERE depends_on_run=? AND kind=? AND run_id IN ("
+            "SELECT run_id FROM deferred_dispatches WHERE status='pending')",
+            (run_id, parent["id"], dependencies.REQUIRES_SUCCESS),
+        )
     bp = paths.briefs_dir(root) / f"run-{run_id}.md"
+    try:
+        required_capabilities = json.loads(parent.get("required_capabilities_json") or "[]")
+    except (TypeError, ValueError):
+        required_capabilities = []
     bp.write_text(brief.compose_continuation(
         run_id=run_id,
         parent_run=parent["id"],
@@ -91,6 +179,9 @@ def create_followup(con, root: Path, parent: dict, requester: str, text: str,
         work_item=parent.get("work_item"),
         allow_question=bool(allow_question),
         question_wait_seconds=question_wait,
+        require_verification=bool(parent.get("verification_required", 0)),
+        required_capabilities=required_capabilities,
+        writes_tree=bool(writes_tree),
     ))
     lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
     lp.touch()
@@ -339,8 +430,11 @@ def _usage_limit_text(log_path: str, *, max_bytes: int = 262144) -> str | None:
 def _insert_checkin_message(con, run, run_id: int) -> dict:
     created_at = db.now()
     body = (
-        f"PROGRESS CHECK-IN run {run_id}: send a short update with "
-        "`orchestra report \"<progress>\"`, then continue the original mission."
+        f"PROGRESS CHECK-IN run {run_id}: report all six items with "
+        "`orchestra report \"<update>\"`, then continue the original mission:\n"
+        "1. current hypothesis; 2. new evidence since the last checkpoint; "
+        "3. cheapest untried falsification; 4. acceptance evidence status; "
+        "5. environment blocker (or none); 6. next bounded step."
     )
     cur = con.execute(
         "INSERT INTO messages(sender, recipient, body, work_item, run_id, kind, created_at) "
@@ -878,6 +972,50 @@ def supervise(root: Path, run_id: int) -> int:
             dependencies.process_ready(con, root, cfg, spawn_supervisor)
             con.close()
             return 1
+    try:
+        required_capabilities = json.loads(run["required_capabilities_json"] or "[]")
+    except (TypeError, ValueError):
+        required_capabilities = None
+    if not isinstance(required_capabilities, list) or any(
+        not isinstance(item, str) or not item.strip() for item in required_capabilities
+    ):
+        capability_error = "Stored environment capability requirements are malformed"
+    else:
+        backend = agent["backend"]
+        sandbox = (
+            agent.get("sandbox", "workspace-write")
+            if backend == "codex"
+            else "orchestra-unrestricted"
+        )
+        check = capabilities.check_requirements(
+            root,
+            host_identity=socket.gethostname(),
+            backend=backend,
+            profile=run["agent"],
+            sandbox_mode=str(sandbox),
+            capabilities=required_capabilities,
+        )
+        capability_error = None
+        if not check.satisfied:
+            detail = "; ".join(
+                f"{state}={','.join(sorted(getattr(check, state)))}"
+                for state in ("unsupported", "unknown", "missing", "expired")
+                if getattr(check, state)
+            )
+            capability_error = (
+                "Required environment capabilities lack fresh positive evidence "
+                f"for this launch ({detail})"
+            )
+    if capability_error:
+        con.execute(
+            "UPDATE runs SET status='failed', exit_code=1, finished_at=?, summary=? "
+            "WHERE id=?",
+            (db.now(), capability_error, run_id),
+        )
+        con.commit()
+        dependencies.process_ready(con, root, cfg, spawn_supervisor)
+        con.close()
+        return 1
     timeout = int(agent.get("timeout") or cfg["settings"].get(
         "timeout", config.DEFAULT_RUN_TIMEOUT_SECONDS
     ))
@@ -1118,10 +1256,52 @@ def supervise(root: Path, run_id: int) -> int:
     if handoff_body:
         last_text = handoff_body
     summary = (last_text or "").strip()[:2000] or None
+    checkpoint_commit = None
+    try:
+        checkpoint_commit = _checkpoint_commit(dict(run), status)
+    except RuntimeError as exc:
+        checkpoint_error = str(exc)
+        if status != "killed":
+            status = "failed"
+            exit_code = exit_code or 1
+        summary = (
+            f"{summary}\n\nCheckpoint error: {checkpoint_error}"
+            if summary else f"Checkpoint error: {checkpoint_error}"
+        )[:2000]
+        incidents.record_incident(
+            con,
+            fingerprint=(
+                "git:uncommitted-shared-tree"
+                if checkpoint_error.startswith("shared-tree writer left uncommitted")
+                else "git:checkpoint-commit-failed"
+            ),
+            scope=str(root),
+            title="Run changes were not durably committed",
+            evidence=f"run {run_id}: {checkpoint_error}",
+            run_id=run_id,
+            work_item=run["work_item"],
+            remediation="Commit shared-tree changes before handoff or use an isolated worktree.",
+        )
+    # A handoff can arrive while an ensemble lead is waiting for its final
+    # message, after the run row above was last read.  Read this narrow state
+    # immediately before finalization so a real --verified outcome is never
+    # overwritten by the default pending -> unverified conversion.
+    verification = con.execute(
+        "SELECT verification_required, verification_status FROM runs WHERE id=?", (run_id,)
+    ).fetchone()
+    verification_required = int(verification["verification_required"] or 0)
+    verification_status = verification["verification_status"]
+    verification_missing = False
+    if verification_required and verification_status == "pending":
+        # A process exit only says the worker stopped.  A required acceptance
+        # outcome must be explicitly reported rather than inferred from exit 0.
+        verification_status = "unverified"
+        verification_missing = True
     con.execute(
         "UPDATE runs SET status=?, exit_code=?, session_ref=COALESCE(?, session_ref), "
-        "summary=?, finished_at=? WHERE id=?",
-        (status, exit_code, session_ref, summary, db.now(), run_id))
+        "summary=?, verification_status=?, checkpoint_commit=?, finished_at=? WHERE id=?",
+        (status, exit_code, session_ref, summary, verification_status,
+         checkpoint_commit, db.now(), run_id))
     # queued follow-ups: deliver by resuming the session in a fresh run
     followup_id = None
     ref_final = session_ref or run["session_ref"]
@@ -1162,6 +1342,12 @@ def supervise(root: Path, run_id: int) -> int:
             f"{chr(10) + 'Last output: ' + summary[:800] if summary else ''}\n"
             f"Details: `orchestra run show {run_id}` · logs: `orchestra logs {run_id}`"
             + (f" · resume: `orchestra resume {run_id} \"...\"`" if ref_final else "")
+            + (f"\nVerification: required but no outcome was reported; marked unverified."
+               if verification_missing else "")
+            + (f"\nVerification: {verification_status}."
+               if verification_status not in ("not_required", "pending") and not verification_missing
+               else "")
+            + (f"\nCheckpoint commit: {checkpoint_commit}." if checkpoint_commit else "")
             + (f"\nQueued follow-up auto-dispatched as run {followup_id}." if followup_id else ""))
     con.execute("INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
                 "VALUES('orchestra', ?, ?, ?, ?, ?)",

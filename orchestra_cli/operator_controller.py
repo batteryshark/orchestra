@@ -655,6 +655,7 @@ def _dispatch_review(
         availability_report=report,
         capacity={},
         reviewer_profile=work["selected_profile"],
+        containment_mode="operator-read",
         path=path,
     )
     if not route.profile:
@@ -1194,6 +1195,7 @@ def _dispatch_ready(
             availability_report=report,
             capacity=capacity,
             active_by_profile=active_profiles,
+            containment_mode="operator-write",
             path=path,
         )
         if not route.profile:

@@ -2126,6 +2126,7 @@ def _insert_initial_work(
                 "goal_key": goal["id"],
                 "scope": {"include": include, "exclude": exclude},
                 "read_dependencies": goal.get("read_dependencies", []),
+                "required_capabilities": goal.get("required_capabilities", []),
                 "quality_gates": contract["quality"]["gates"],
             }),
             "[]",

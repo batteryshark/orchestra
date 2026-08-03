@@ -106,6 +106,7 @@ class MultiProjectContainmentTests(unittest.TestCase):
                 "depends_on": [],
                 "requires_review": False,
                 "read_dependencies": [],
+                "required_capabilities": ["cocoa-window"],
             },
             {
                 "id": "G2",
@@ -115,6 +116,7 @@ class MultiProjectContainmentTests(unittest.TestCase):
                 "depends_on": ["G1"],
                 "requires_review": True,
                 "read_dependencies": [PROJECT_A],
+                "required_capabilities": ["coreaudio-output"],
             },
         ]
         return contract
@@ -129,6 +131,7 @@ class MultiProjectContainmentTests(unittest.TestCase):
                 "depends_on",
                 "requires_review",
                 "read_dependencies",
+                "required_capabilities",
             ):
                 goal.pop(key)
         contract["quality"]["verification"] = [
@@ -174,6 +177,10 @@ class MultiProjectContainmentTests(unittest.TestCase):
         self.assertFalse(operator_runtime.dependencies_satisfied(work[1], path=self.db))
         self.assertTrue(work[1]["requires_review"])
         self.assertEqual(work[1]["requirements"]["read_dependencies"], [PROJECT_A])
+        self.assertEqual(work[0]["requirements"]["required_capabilities"], ["cocoa-window"])
+        self.assertEqual(
+            work[1]["requirements"]["required_capabilities"], ["coreaudio-output"]
+        )
 
     def test_dirty_live_integration_checkout_starts_queued_for_retry(self) -> None:
         contract = self.multiproject_contract()

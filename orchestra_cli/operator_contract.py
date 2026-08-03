@@ -245,6 +245,7 @@ def template(
                 "depends_on": [],
                 "requires_review": False,
                 "read_dependencies": [],
+                "required_capabilities": [],
             }],
             "non_goals": list(non_goals or []),
         },
@@ -641,6 +642,11 @@ class _Validator:
                     "requires_review",
                     "read_dependencies",
                 }
+                # This was added to v2 after the first v2 contracts were
+                # stored.  Treat its absence as no environment requirement so
+                # those approved contracts remain valid.
+                if isinstance(raw, dict) and "required_capabilities" in raw:
+                    goal_keys.add("required_capabilities")
             goal = self.obj(raw, path, goal_keys)
             goal_id = self.text(goal.get("id"), f"{path}.id", max_chars=32)
             if goal_id is not None and not _GOAL_ID.fullmatch(goal_id):
@@ -691,6 +697,12 @@ class _Validator:
                             f"{path}.read_dependencies[{dep_index}]",
                             "must be a registered project id",
                         )
+                if "required_capabilities" in goal:
+                    self.text_list(
+                        goal.get("required_capabilities"),
+                        f"{path}.required_capabilities",
+                        max_chars=128,
+                    )
         self.text_list(data.get("non_goals"), "$.intent.non_goals", max_chars=2048)
 
     def _scope(self, value: Any) -> None:

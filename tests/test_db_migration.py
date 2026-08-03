@@ -80,6 +80,13 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(row["allow_question"], 0)
             self.assertEqual(row["question_wait_seconds"], 1800)
             self.assertEqual(row["supervisor_protocol"], 0)
+            self.assertEqual(row["verification_required"], 0)
+            self.assertEqual(row["verification_status"], "not_required")
+            self.assertIsNone(row["environment_blocker"])
+            self.assertEqual(row["required_capabilities_json"], "[]")
+            self.assertEqual(row["writes_tree"], 1)
+            self.assertIsNone(row["base_commit"])
+            self.assertIsNone(row["checkpoint_commit"])
             self.assertIn("spawn_request_id", row.keys())
             self.assertIn("child_wakeup_message", row.keys())
             message_cols = {
@@ -112,6 +119,13 @@ class MigrationTests(unittest.TestCase):
             }
             self.assertIn("dispatch_dependencies", tables)
             self.assertIn("deferred_dispatches", tables)
+            deferred_columns = {
+                row["name"] for row in con.execute(
+                    "PRAGMA table_info(deferred_dispatches)"
+                )
+            }
+            self.assertIn("work_snapshot", deferred_columns)
+            self.assertIn("required_capabilities_json", deferred_columns)
         finally:
             con.close()
 

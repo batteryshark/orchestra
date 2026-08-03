@@ -84,20 +84,49 @@ orchestra recall 42 --as codex
 orchestra interrupt 8 "stop—the schema changed" --as codex
 orchestra interrupt 8 --file correction.md --as codex
 orchestra interrupt 8 "stop immediately" --now --as codex
+orchestra cancel 9 --dry-run
 orchestra cancel 9
 orchestra logs 7 --pretty
 ```
 
-Attach a run to a slash-work item with `--work W-0003`. Dispatch and completion events are then logged to that item, and the worker brief asks the agent to record progress and verification evidence there.
+Attach a run to a slash-work item with `--work W-0003`. Orchestra resolves that item from the
+integration checkout before it creates a run and embeds the resulting immutable snapshot in the
+worker brief. The worker's isolated checkout does not need a current copy of generated tracker
+files, and a missing item fails dispatch immediately instead of producing a blind worker.
 
 Use `--worktree` to give a worker an isolated Git worktree on an `orchestra/run-N` branch. Orchestra carries the project's agent instructions and skill folders into that worktree so delegated tools retain their context.
 
 Use repeatable `--after RUN_ID` options when a run consumes another run's output. Orchestra
 records the dispatch as `pending`, shows its unresolved prerequisites as `pending-on-N`, and
-launches it exactly once after every prerequisite finishes successfully. A failed, timed-out,
-or cancelled prerequisite declines the dependent dispatch without starting its worker. Pending
-dispatches are cancellable with `orchestra cancel RUN`; worktree setup is deferred until launch
-so it starts from the post-prerequisite repository state.
+launches it exactly once after every prerequisite finishes successfully. A failed or timed-out
+prerequisite declines the dependent dispatch. Cancelling a producer instead holds its success
+dependents as `held-on-N`; resuming that producer automatically rebinds them to the continuation.
+Pending dispatches are cancellable with `orchestra cancel RUN`; worktree setup is deferred until
+launch so it starts from the post-prerequisite repository state.
+
+Use `--wait-for RUN_ID` for cleanup, reporting, or observation that should launch after a
+prerequisite reaches any terminal state. This differs deliberately from `--after`, which requires
+success and declines its dependent after failure or timeout. `orchestra cancel RUN
+--dry-run` shows the success-dependent runs that would be declined and the wait-only runs that
+would become launchable, plus success dependents that would be held, before anything is changed.
+
+Write runs use the shared integration tree by default, but Orchestra admits only one shared-tree
+writer at a time and requires that tree to be clean first. Use `--worktree` for parallel edits.
+Use `--read-only` for analysis or review that cannot modify files; read-only runs may safely share
+a prerequisite or execute alongside a writer. This declaration is included in the worker brief.
+
+Git persistence is enforced at run completion. A shared-tree write run must commit its changes
+before handoff; leftover dirty changes fail the run instead of silently accumulating all day.
+An isolated Orchestra worktree is safer and more automatic: the supervisor commits any remaining
+delta as `orchestra: checkpoint run N (...)`, records the resulting hash as `checkpoint_commit`,
+and excludes untracked agent-context folders copied into the worktree.
+
+For work whose acceptance depends on running the product, dispatch with `--require-verification`
+and have the worker end with exactly one of `orchestra handoff --verified`, `--unverified`, or
+`--blocked-environment CAPABILITY`. Execution can finish while verification remains unsuccessful;
+Orchestra records those as separate facts. A required-verification run that exits without an
+explicit outcome becomes unverified rather than inheriting a false success from a clean process
+exit, and success dependencies do not launch from it.
 
 Workers remain fully autonomous by default. For a mission where a wrong assumption could be destructive or waste substantial work, `--allow-question` grants that run one blocking question. The worker must provide a recommended fallback; Orchestra stops its model process, pauses the execution timeout, sends the question to the dispatcher's inbox, and resumes the same session after `orchestra answer RUN "..."`. If nobody answers, the declared fallback is applied automatically after 30 minutes. Override that bounded window per dispatch with `--question-wait SECONDS` or globally with `settings.question_wait_timeout`.
 
@@ -355,6 +384,43 @@ Global configuration lives at `~/.config/orchestra/config.toml`; a project's `.o
 
 Roster entries are reusable launch profiles, not singleton workers or capacity slots. Each profile chooses a backend (`opencode`, `codex`, or `claude`), model, reasoning configuration, role, and optional arguments; every dispatch creates a distinct run, so several independent runs may use the same profile concurrently. Choose a wave by task fit and current `orchestra usage` headroom rather than trying to keep exactly one of each profile active. Profiles can share a provider quota, and usage data is advisory, so routing still requires judgment about model strengths, weaknesses, risk, and project concurrency limits. Session references are recorded so `orchestra resume` continues the same worker context rather than starting over. Environment passthrough is opt-in through `env_passthrough`; Orchestra does not ship with private credential names enabled.
 
+Codex profiles default to `sandbox = "workspace-write"`. Keep that default for ordinary work. A
+trusted project may override a specific profile with a broader Codex sandbox when a required host
+capability cannot work otherwise, but the override is project policy—not a model property—and
+should be paired with a fresh capability probe. Orchestra does not apply the Codex sandbox flag to
+OpenCode or Claude workers. Consequently, an `XCreateWindow`, CoreAudio, network, or device result
+is evidence only for its exact host/backend/profile/sandbox lane.
+
+Record and inspect that evidence directly:
+
+```sh
+orchestra capability record window-server --profile codex --state unsupported \
+  --evidence "XCreateWindow failed in workspace-write"
+orchestra capability check window-server --profile claude
+orchestra capability list --fresh
+orchestra dispatch --to claude --requires-capability window-server "run the GUI smoke test"
+```
+
+Observations expire by default, and `supported`, `unsupported`, `unknown`, `missing`, and `expired`
+remain distinct. Capability-sensitive dispatch requires fresh positive evidence; it does not guess
+that silence means support. The Operator contract can also attach `required_capabilities` to a
+goal, so live routing waits for evidence or selects a proven lane rather than repeatedly assigning
+work to a blind runner.
+
+Recurring operational failures have a project-local incident ledger:
+
+```sh
+orchestra incident record --fingerprint environment:window-server \
+  --scope host/backend/profile/sandbox --title "GUI verification unavailable" \
+  --evidence "run 68 failed at XCreateWindow" --run 68 --lost-seconds 7200
+orchestra incident list --state open
+orchestra incident state 1 resolved --resolution-evidence "probe P passed twice"
+```
+
+The fingerprint and scope deduplicate recurrences while retaining each evidence record and total
+estimated lost time. A new recurrence reopens a mitigated or resolved incident. Operators should
+review open incidents before dispatch waves and resolve them only with proof of the mitigation.
+
 Roster entries may also set an integer `tier`. When both a parent and proposed child have tiers,
 `orchestra spawn` refuses a child above the parent's tier and directs the worker to consult its
 requester instead. If either tier is omitted, spawning remains unconstrained for backward
@@ -448,8 +514,11 @@ After restarting OpenCode, run `orchestra doctor`, then dispatch with `orchestra
 - Supervised workers can create native child runs with `orchestra spawn --to AGENT "mission"`.
   Child ownership is distinct from backend session follow-ups, works across OpenCode, Codex,
   and Claude runners, and is shown hierarchically in the dashboard. Spawn requests are brokered
-  by the lead's outer supervisor, so worktree creation and child CLI startup do not inherit the
-  lead worker's backend sandbox. Children use isolated git worktrees by default; in a non-Git
+  by the lead's outer supervisor. Workers run `orchestra spawn` normally without host escalation:
+  the command only records a local request, so worktree creation and child CLI startup do not
+  inherit the lead worker's backend sandbox. Configured roster profiles are approved destinations
+  for the minimum project context needed by a bounded child mission; unrelated repository content
+  and secrets remain out of scope. Children use isolated git worktrees by default; in a non-Git
   project Orchestra warns and falls back to the lead's shared workdir instead of dropping the
   delegation. Orchestra reports isolated branches and never auto-merges them. A settled batch safely interrupts an active
   lead at an action boundary or resumes a completed lead exactly once. Defaults are deliberately

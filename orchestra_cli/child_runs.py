@@ -144,24 +144,29 @@ def create(con: sqlite3.Connection, root: Path, cfg: dict, parent: sqlite3.Row,
     try:
         for run_id, (_, agent, _) in zip(run_ids, prepared):
             child = con.execute("SELECT slug FROM runs WHERE id=?", (run_id,)).fetchone()
-            child_workdir, branch = str(parent["workdir"] if shared_workdir else root), None
+            child_workdir, branch, base_commit = (
+                str(parent["workdir"] if shared_workdir else root), None, None
+            )
             if not shared_workdir:
                 start_point = parent["branch"] or None
                 wt, branch = worktree.create(root, run_id, start_point=start_point)
                 child_workdir = str(wt)
+                base_commit = worktree.head(wt)
             text = brief.compose(
                 root=root, run_id=run_id, agent=agent, mission=mission,
                 work_item=parent["work_item"], team=parent["team"],
                 requester=parent["agent"], workdir=child_workdir,
                 extra_context=context, lead_run=parent["id"], slug=child["slug"],
+                require_work_snapshot=bool(parent["work_item"]),
             )
             bp = paths.briefs_dir(root) / f"run-{run_id}.md"
             bp.write_text(text)
             lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
             lp.touch()
             con.execute(
-                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=? WHERE id=?",
-                (str(bp), str(lp), child_workdir, branch, run_id),
+                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
+                "base_commit=? WHERE id=?",
+                (str(bp), str(lp), child_workdir, branch, base_commit, run_id),
             )
             con.commit()
     except BaseException as exc:

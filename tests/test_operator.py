@@ -53,6 +53,19 @@ class ContractValidationTests(unittest.TestCase):
         self.assertEqual(first.canonical_bytes, second.canonical_bytes)
         self.assertEqual(first.sha256, second.sha256)
         self.assertEqual(len(first.sha256), 64)
+        self.assertEqual(
+            first.data["intent"]["goals"][0]["required_capabilities"], []
+        )
+
+    def test_goal_capabilities_must_be_a_unique_string_list(self) -> None:
+        data = _contract()
+        data["intent"]["goals"][0]["required_capabilities"] = [
+            "cocoa-window", "cocoa-window"
+        ]
+        with self.assertRaisesRegex(
+            operator_contract.ContractError, "must not contain duplicate values"
+        ):
+            operator_contract.validate_contract(data)
 
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaisesRegex(operator_contract.ContractError, "duplicate key"):

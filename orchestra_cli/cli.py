@@ -3,15 +3,18 @@ import json
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from orchestra_cli import (
     availability,
     brief,
+    capabilities,
     cancel,
     child_runs,
     checkpoint,
@@ -21,6 +24,7 @@ from orchestra_cli import (
     docs,
     ensemble,
     host,
+    incidents,
     names,
     operator_controller,
     operator_contract,
@@ -293,20 +297,70 @@ def _worker_message(args, *, handoff: bool) -> None:
     if not body:
         raise SystemExit(f"orchestra: empty {'handoff' if handoff else 'report'}")
 
+    verification_status = getattr(args, "verification_status", None) if handoff else None
+    environment_blocker = getattr(args, "blocked_environment", None) if handoff else None
+    if environment_blocker:
+        verification_status = "blocked_environment"
+
     con = db.connect(root)
     try:
+        con.execute("BEGIN IMMEDIATE")
         run = _supervised_worker_run(
             con, action="handoff" if handoff else "report"
         )
         run_id = int(run["id"])
         prefix = "HANDOFF" if handoff else "REPORT"
         text = f"{prefix} run {run_id}: {body}"
+        if verification_status:
+            con.execute(
+                "UPDATE runs SET verification_status=?, environment_blocker=? WHERE id=?",
+                (verification_status, environment_blocker, run_id),
+            )
+        if environment_blocker:
+            cfg = config.load(root)
+            backend, sandbox = _capability_lane(cfg, run["agent"])
+            host_identity = socket.gethostname()
+            evidence = (
+                f"Run {run_id} reported that {environment_blocker} was unavailable: {body}"
+            )
+            capabilities.record_observation_in_connection(
+                con,
+                host_identity=host_identity,
+                backend=backend,
+                profile=run["agent"],
+                sandbox_mode=sandbox,
+                capability=environment_blocker,
+                state="unsupported",
+                evidence=evidence,
+                probe="worker handoff",
+            )
+            incidents.record_incident(
+                con,
+                fingerprint=f"environment-blocked:{environment_blocker}",
+                scope=(
+                    f"host={host_identity};backend={backend};profile={run['agent']};"
+                    f"sandbox={sandbox}"
+                ),
+                title=f"Environment capability unavailable: {environment_blocker}",
+                evidence=evidence,
+                run_id=run_id,
+                work_item=run["work_item"],
+                estimated_lost_seconds=_run_elapsed_seconds(run["started_at"]),
+                remediation=(
+                    "Route verification to a profile with fresh supported evidence, "
+                    "or change the approved sandbox policy and re-probe."
+                ),
+            )
         con.execute(
             "INSERT INTO messages(sender, recipient, body, work_item, run_id, created_at) "
             "VALUES(?,?,?,?,?,?)",
             (run["agent"], run["requested_by"], text, run["work_item"], run_id, db.now()),
         )
         con.commit()
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
     finally:
         con.close()
     print(f"{prefix.lower()} sent for run {run_id} -> {run['requested_by']}")
@@ -318,6 +372,19 @@ def cmd_report(args):
 
 def cmd_handoff(args):
     _worker_message(args, handoff=True)
+
+
+def _run_elapsed_seconds(started_at: str | None) -> int:
+    """Best-effort measured elapsed time for an incident occurrence."""
+    if not started_at:
+        return 0
+    try:
+        started = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return 0
+    return max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
 
 
 def cmd_consult(args):
@@ -583,8 +650,45 @@ def cmd_dispatch(args):
         mission = Path(args.brief_file).read_text()
     if not mission.strip():
         raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
+    work_snapshot_text = None
+    if args.work:
+        # Resolve before creating any run rows. A brief that names an invisible
+        # tracker item is not durable context, especially in an isolated worktree.
+        work_snapshot_text = brief.work_snapshot(root, args.work, required=True)
 
     target_agents = [(target, config.agent_cfg(cfg, target)) for target in args.to]
+    writes_tree = not bool(getattr(args, "read_only", False))
+    if writes_tree and not args.worktree and len(target_agents) > 1:
+        raise SystemExit(
+            "orchestra: multiple shared-tree writers cannot be dispatched together; "
+            "use --worktree for isolated edits or --read-only for independent analysis"
+        )
+    required_capabilities = list(
+        dict.fromkeys(getattr(args, "requires_capability", None) or [])
+    )
+    for target, agent in target_agents:
+        if not required_capabilities:
+            break
+        backend, sandbox = _capability_lane(cfg, target)
+        check = capabilities.check_requirements(
+            root,
+            host_identity=socket.gethostname(),
+            backend=backend,
+            profile=target,
+            sandbox_mode=sandbox,
+            capabilities=required_capabilities,
+        )
+        if not check.satisfied:
+            failures = "; ".join(
+                f"{name}={','.join(sorted(getattr(check, name))) or '-'}"
+                for name in ("unsupported", "unknown", "missing", "expired")
+                if getattr(check, name)
+            )
+            raise SystemExit(
+                f"orchestra: profile '{target}' lacks fresh evidence for required "
+                f"environment capabilities ({failures}). Record a probe with "
+                "`orchestra capability record`, or choose a proven profile."
+            )
     _availability_report, unavailable, availability_warnings = \
         availability.check_profiles(cfg, target_agents)
     if unavailable:
@@ -610,10 +714,21 @@ def cmd_dispatch(args):
             "question_wait_timeout", config.DEFAULT_QUESTION_WAIT_SECONDS
         )
     question_wait = config.question_wait_seconds(configured_question_wait)
+    verification_required = bool(getattr(args, "require_verification", False))
+    verification_status = "pending" if verification_required else "not_required"
 
     con = db.connect(root)
     try:
         after_ids = dependencies.validate(con, list(getattr(args, "after", None) or []))
+        wait_for_ids = dependencies.validate(
+            con, list(getattr(args, "wait_for", None) or [])
+        )
+        overlap = set(after_ids) & set(wait_for_ids)
+        if overlap:
+            raise SystemExit(
+                "orchestra: the same prerequisite cannot be both --after and --wait-for: "
+                + ", ".join(map(str, sorted(overlap)))
+            )
     except BaseException:
         con.close()
         raise
@@ -636,6 +751,27 @@ def cmd_dispatch(args):
 
     run_ids = []
     for target, agent in target_agents:
+        base_commit = None
+        if writes_tree and not args.worktree:
+            conflicts = dependencies.shared_writer_conflicts(
+                con, exclude_run_ids=[*after_ids, *wait_for_ids]
+            )
+            if conflicts:
+                con.close()
+                raise SystemExit(
+                    "orchestra: shared-tree writer collision with active/pending run(s) "
+                    + ", ".join(map(str, conflicts))
+                    + ". Use --worktree for isolated edits or --read-only when this "
+                    "dispatch cannot modify the tree."
+                )
+            if not (after_ids or wait_for_ids) and (root / ".git").exists():
+                if worktree.status(root):
+                    con.close()
+                    raise SystemExit(
+                        "orchestra: the integration tree is dirty; commit/stash it, use "
+                        "--worktree for isolated edits, or --read-only for analysis"
+                    )
+                base_commit = worktree.head(root)
         display_model = agent.get("model")
         if agent["backend"] == "codex":
             dm, de = config.codex_defaults()
@@ -656,12 +792,17 @@ def cmd_dispatch(args):
                 cur = con.execute(
                     "INSERT INTO runs(agent, backend, model, title, work_item, team, "
                     "requested_by, workdir, slug, allow_question, question_wait_seconds, "
-                    "status, started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "verification_required, verification_status, required_capabilities_json, "
+                    "writes_tree, base_commit, status, started_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (target, agent["backend"], display_model,
                      args.title or mission[:80],
                      args.work, args.team, requester, str(root), slug,
                      int(allow_question), question_wait,
-                     "pending" if after_ids else "spawning", db.now()))
+                     int(verification_required), verification_status,
+                     json.dumps(required_capabilities),
+                     int(writes_tree), base_commit,
+                     "pending" if after_ids or wait_for_ids else "spawning", db.now()))
                 run_id = cur.lastrowid
                 break
             except sqlite3.IntegrityError as exc:
@@ -674,49 +815,87 @@ def cmd_dispatch(args):
                 f"orchestra: could not mint a unique run slug for {target} "
                 f"after repeated collisions — odd, retry dispatch"
             )
-        workdir, branch = str(root), None
-        if after_ids:
-            dependencies.enqueue(
+        if writes_tree and not args.worktree:
+            conflicts = dependencies.shared_writer_conflicts(
                 con,
-                run_id,
-                after_ids,
-                mission=mission,
-                context=args.context,
-                use_worktree=bool(args.worktree),
+                exclude_run_ids=[run_id, *after_ids, *wait_for_ids],
             )
+            if conflicts:
+                con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+                con.commit()
+                con.close()
+                raise SystemExit(
+                    "orchestra: shared-tree writer collision with active/pending run(s) "
+                    + ", ".join(map(str, conflicts))
+                    + ". Use --worktree for isolated edits or --read-only when this "
+                    "dispatch cannot modify the tree."
+                )
+        workdir, branch = str(root), None
+        if after_ids or wait_for_ids:
+            try:
+                dependencies.enqueue(
+                    con,
+                    run_id,
+                    after_ids,
+                    mission=mission,
+                    context=args.context,
+                    use_worktree=bool(args.worktree),
+                    wait_for_ids=wait_for_ids,
+                    work_snapshot=work_snapshot_text,
+                    required_capabilities=required_capabilities,
+                    writes_tree=not bool(getattr(args, "read_only", False)),
+                )
+            except dependencies.SharedWriterConflict as exc:
+                con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+                con.commit()
+                con.close()
+                raise SystemExit(
+                    "orchestra: pending shared-tree writer collision with run(s) "
+                    + ", ".join(map(str, exc.run_ids))
+                    + ". Use --worktree for isolated edits or --read-only when this "
+                    "dispatch cannot modify the tree."
+                ) from exc
         else:
             if args.worktree:
                 wt, branch = worktree.create(root, run_id)
                 workdir = str(wt)
+                base_commit = worktree.head(wt)
             text = brief.compose(root=root, run_id=run_id, agent=agent, mission=mission,
                                  work_item=args.work, team=args.team, requester=requester,
                                  workdir=workdir, extra_context=args.context,
                                  allow_question=allow_question,
-                                 question_wait_seconds=question_wait, slug=slug)
+                                 question_wait_seconds=question_wait, slug=slug,
+                                 work_snapshot_text=work_snapshot_text,
+                                 required_capabilities=required_capabilities,
+                                 require_verification=verification_required,
+                                 writes_tree=writes_tree)
             bp = paths.briefs_dir(root) / f"run-{run_id}.md"
             bp.write_text(text)
             lp = paths.logs_dir(root) / f"run-{run_id}.jsonl"
             lp.touch()
             con.execute(
-                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=? WHERE id=?",
-                (str(bp), str(lp), workdir, branch, run_id),
+                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
+                "base_commit=? WHERE id=?",
+                (str(bp), str(lp), workdir, branch, base_commit, run_id),
             )
         con.commit()
         run_ids.append(run_id)
         disposition = (
-            f"queued after run(s) {', '.join(map(str, after_ids))}"
-            if after_ids else "dispatched"
+            "queued for prerequisite run(s) "
+            + ", ".join(map(str, [*after_ids, *wait_for_ids]))
+            if after_ids or wait_for_ids else "dispatched"
         )
         _work_log(root, args.work, f"orchestra: {disposition} run {run_id} ({slug}) to {target} "
                                    f"({agent['backend']}/{agent.get('model') or 'default'})"
                                    + (f" in worktree branch {branch}" if branch else ""))
         print(f"run {run_id} ({slug}): {target} ({agent['backend']}/{agent.get('model') or 'default'})"
               + (f" pending-on={','.join(map(str, after_ids))}" if after_ids else "")
+              + (f" wait-for={','.join(map(str, wait_for_ids))}" if wait_for_ids else "")
               + (f" worktree={workdir}" if branch else ""))
-    if after_ids:
+    if after_ids or wait_for_ids:
         dependencies.process_ready(con, root, cfg, _spawn_supervisor)
     con.close()
-    if after_ids:
+    if after_ids or wait_for_ids:
         if args.sync:
             cmd_wait(argparse.Namespace(
                 run_ids=run_ids,
@@ -727,7 +906,8 @@ def cmd_dispatch(args):
         else:
             print(
                 "dependency-aware dispatch recorded. It will launch once every prerequisite "
-                "finishes successfully; cancel it with `orchestra cancel RUN`."
+                "meets its declared edge condition (`--after` requires success; `--wait-for` "
+                "requires only a terminal outcome). Cancel it with `orchestra cancel RUN`."
             )
         return
     for rid in run_ids:
@@ -890,6 +1070,13 @@ def cmd_reply(args):
         _spawn_supervisor(root, run_id)
 
 
+def _run_status_label(run: sqlite3.Row) -> str:
+    status = str(run["status"])
+    if status in db.RUN_TERMINAL and int(run["verification_required"] or 0):
+        return f"{status}/{run['verification_status']}"
+    return status
+
+
 def cmd_runs(args):
     root = paths.find_root()
     con = db.connect(root)
@@ -909,7 +1096,12 @@ def cmd_runs(args):
     print(f"{'id':<4} {'agent':<10} {'status':<18} {'work':<8} {'started':<21} title")
     for r in rows:
         waiting = dependencies.pending_on(con, r["id"]) if r["status"] == "pending" else []
-        status = f"pending-on-{','.join(map(str, waiting))}" if waiting else r["status"]
+        held = dependencies.held_on(con, r["id"]) if r["status"] == "pending" else []
+        status = (
+            f"held-on-{','.join(map(str, held))}" if held
+            else f"pending-on-{','.join(map(str, waiting))}" if waiting
+            else _run_status_label(r)
+        )
         print(f"{r['id']:<4} {r['agent']:<10} {status:<18} {r['work_item'] or '-':<8} "
               f"{r['started_at']:<21} {(r['title'] or '')[:60]}")
     con.close()
@@ -1354,20 +1546,53 @@ def cmd_interrupt(args):
 
 def cmd_kill(args):
     root = paths.find_root()
+    cfg = config.load(root)
     con = db.connect(root)
-    result = cancel.stop_run(con, args.run_id)
-    if not result:
-        raise SystemExit(f"orchestra: no run {args.run_id}")
-    if not result.stopped:
-        print(f"run {args.run_id} already {result.status}")
-        return
-    if result.signal_sent:
-        print(f"sent SIGTERM to run {args.run_id} (pgid {result.pid})")
-    else:
-        print(f"run {args.run_id} marked killed ({result.reason})")
-    if result.descendant_ids:
-        print(f"also stopped {len(result.descendant_ids)} active child run(s): "
-              + ", ".join(map(str, result.descendant_ids)))
+    try:
+        if getattr(args, "dry_run", False):
+            preview = cancel.preview_stop(con, args.run_id)
+            if preview is None:
+                raise SystemExit(f"orchestra: no run {args.run_id}")
+            print(f"would stop run {args.run_id} (currently {preview['status']})")
+            if preview["descendant_ids"]:
+                print("would also stop active child run(s): "
+                      + ", ".join(map(str, preview["descendant_ids"])))
+            print("would decline success-dependent run(s): "
+                  + (", ".join(map(str, preview["declined_run_ids"])) or "none"))
+            print("would hold success-dependent run(s): "
+                  + (", ".join(map(str, preview["held_run_ids"])) or "none"))
+            print("would release wait-only run(s): "
+                  + (", ".join(map(str, preview["unblocked_run_ids"])) or "none"))
+            return
+
+        result = cancel.stop_run(con, args.run_id)
+        if not result:
+            raise SystemExit(f"orchestra: no run {args.run_id}")
+        if not result.stopped:
+            print(f"run {args.run_id} already {result.status}")
+            return
+        if result.signal_sent:
+            print(f"sent SIGTERM to run {args.run_id} (pgid {result.pid})")
+        else:
+            print(f"run {args.run_id} marked killed ({result.reason})")
+        if result.descendant_ids:
+            print(f"also stopped {len(result.descendant_ids)} active child run(s): "
+                  + ", ".join(map(str, result.descendant_ids)))
+        if result.declined_run_ids:
+            print("declined success-dependent run(s): "
+                  + ", ".join(map(str, result.declined_run_ids)))
+        if result.held_run_ids:
+            print("held success-dependent run(s): "
+                  + ", ".join(map(str, result.held_run_ids))
+                  + " (resume the cancelled producer to rebind them)")
+        if result.unblocked_run_ids:
+            print("released wait-only run(s): "
+                  + ", ".join(map(str, result.unblocked_run_ids)))
+        # stop_run changes dependency readiness synchronously. Reconcile here
+        # instead of relying on a supervisor that may not exist for a pending run.
+        dependencies.process_ready(con, root, cfg, _spawn_supervisor)
+    finally:
+        con.close()
 
 
 def cmd_note(args):
@@ -1381,6 +1606,167 @@ def cmd_note(args):
     con.commit()
     _work_log(root, args.work, f"[{author}] {args.body}")
     print("noted")
+
+
+def _capability_lane(cfg: dict, profile: str) -> tuple[str, str]:
+    agent = config.agent_cfg(cfg, profile)
+    backend = agent["backend"]
+    # `sandbox` is a Codex exec flag. Orchestra does not wrap OpenCode or
+    # Claude in it, even if an irrelevant key appears in a merged roster.
+    sandbox = (
+        agent.get("sandbox", "workspace-write")
+        if backend == "codex"
+        else "orchestra-unrestricted"
+    )
+    return backend, str(sandbox)
+
+
+def cmd_capability_record(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    backend, sandbox = _capability_lane(cfg, args.profile)
+    ttl = None if args.permanent else timedelta(seconds=args.ttl_seconds)
+    observation = capabilities.record_observation(
+        root,
+        host_identity=args.host or socket.gethostname(),
+        backend=backend,
+        profile=args.profile,
+        sandbox_mode=sandbox,
+        capability=args.capability,
+        state=args.state,
+        evidence=args.evidence,
+        probe=args.probe,
+        ttl=ttl,
+    )
+    print(
+        f"{observation.profile}/{observation.sandbox_mode} "
+        f"{observation.capability}={observation.state}"
+    )
+
+
+def cmd_capability_check(args):
+    root = paths.find_root()
+    cfg = config.load(root)
+    backend, sandbox = _capability_lane(cfg, args.profile)
+    result = capabilities.check_requirements(
+        root,
+        host_identity=args.host or socket.gethostname(),
+        backend=backend,
+        profile=args.profile,
+        sandbox_mode=sandbox,
+        capabilities=args.capabilities,
+    )
+    payload = {
+        "satisfied": result.satisfied,
+        **{
+            name: sorted(getattr(result, name))
+            for name in ("supported", "unsupported", "unknown", "missing", "expired")
+        },
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if not result.satisfied:
+        raise SystemExit(1)
+
+
+def cmd_capability_list(args):
+    root = paths.find_root()
+    rows = capabilities.list_observations(
+        root,
+        host_identity=args.host,
+        backend=args.backend,
+        profile=args.profile,
+        sandbox_mode=args.sandbox,
+        capability=args.capability,
+        include_expired=not args.fresh,
+    )
+    if args.json:
+        print(json.dumps([
+            {
+                "host_identity": row.host_identity,
+                "backend": row.backend,
+                "profile": row.profile,
+                "sandbox_mode": row.sandbox_mode,
+                "capability": row.capability,
+                "state": row.state,
+                "evidence": row.evidence,
+                "probe": row.probe,
+                "observed_at": row.observed_at.isoformat(),
+                "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+            }
+            for row in rows
+        ], indent=2, sort_keys=True))
+        return
+    if not rows:
+        print("no capability observations")
+        return
+    for row in rows:
+        expiry = row.expires_at.isoformat() if row.expires_at else "permanent"
+        print(
+            f"{row.host_identity} {row.profile}/{row.sandbox_mode} "
+            f"{row.capability}={row.state} observed={row.observed_at.isoformat()} "
+            f"expires={expiry} — {row.evidence}"
+        )
+
+
+def cmd_incident_record(args):
+    root = paths.find_root()
+    con = db.connect(root)
+    try:
+        incident = incidents.record_incident(
+            con,
+            fingerprint=args.fingerprint,
+            scope=args.scope,
+            title=args.title,
+            evidence=args.evidence,
+            run_id=args.run,
+            work_item=args.work,
+            estimated_lost_seconds=args.lost_seconds,
+            remediation=args.remediation,
+        )
+        con.commit()
+    finally:
+        con.close()
+    print(f"incident {incident['id']} {incident['state']} occurrences={incident['occurrence_count']}")
+
+
+def cmd_incident_list(args):
+    root = paths.find_root()
+    con = db.connect(root)
+    try:
+        rows = incidents.list_incidents(
+            con, state=args.state, scope=args.scope, fingerprint=args.fingerprint
+        )
+    finally:
+        con.close()
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    if not rows:
+        print("no systemic incidents")
+        return
+    for row in rows:
+        print(
+            f"{row['id']} [{row['state']}] {row['title']} "
+            f"occurrences={row['occurrence_count']} lost={row['estimated_lost_seconds']}s "
+            f"scope={row['scope']}"
+        )
+
+
+def cmd_incident_state(args):
+    root = paths.find_root()
+    con = db.connect(root)
+    try:
+        incident = incidents.set_incident_state(
+            con,
+            args.incident_id,
+            args.state,
+            remediation=args.remediation,
+            resolution_evidence=args.resolution_evidence,
+        )
+        con.commit()
+    finally:
+        con.close()
+    print(f"incident {incident['id']} -> {incident['state']}")
 
 
 def cmd_feed(args):
@@ -1414,7 +1800,12 @@ def cmd_status(args):
     print(f"## active runs ({len(active)})")
     for r in active:
         waiting = dependencies.pending_on(con, r["id"]) if r["status"] == "pending" else []
-        status = f"pending-on-{','.join(map(str, waiting))}" if waiting else r["status"]
+        held = dependencies.held_on(con, r["id"]) if r["status"] == "pending" else []
+        status = (
+            f"held-on-{','.join(map(str, held))}" if held
+            else f"pending-on-{','.join(map(str, waiting))}" if waiting
+            else _run_status_label(r)
+        )
         print(f"  run {r['id']}: {r['agent']} [{status}] work:{r['work_item'] or '-'} "
               f"since {r['started_at']} — {(r['title'] or '')[:50]}")
     recent = list(con.execute("SELECT * FROM runs WHERE status IN "
@@ -1422,7 +1813,16 @@ def cmd_status(args):
     if recent:
         print("## recent finished")
         for r in recent[::-1]:
-            print(f"  run {r['id']}: {r['agent']} -> {r['status']} — {(r['title'] or '')[:50]}")
+            print(f"  run {r['id']}: {r['agent']} -> {_run_status_label(r)} — "
+                  f"{(r['title'] or '')[:50]}")
+    open_incidents = incidents.list_incidents(con, state="open")
+    print(f"## open systemic incidents ({len(open_incidents)})")
+    for incident in open_incidents[:10]:
+        print(f"  {incident['id']}: {incident['title']} "
+              f"({incident['occurrence_count']} occurrence(s), "
+              f"{incident['estimated_lost_seconds']}s estimated lost)")
+    if not open_incidents:
+        print("  (none)")
     unread = list(con.execute("SELECT recipient, COUNT(*) n FROM messages WHERE read_at IS NULL "
                               "GROUP BY recipient ORDER BY n DESC"))
     print("## unread inboxes")
@@ -2282,6 +2682,26 @@ def main():
         help="send this supervised run's final handoff to its requester",
     )
     s.add_argument("message", nargs="+")
+    handoff_verification = s.add_mutually_exclusive_group()
+    handoff_verification.add_argument(
+        "--verified",
+        action="store_const",
+        dest="verification_status",
+        const="verified",
+        help="record that the required acceptance evidence passed",
+    )
+    handoff_verification.add_argument(
+        "--unverified",
+        action="store_const",
+        dest="verification_status",
+        const="unverified",
+        help="record that the work was not verified",
+    )
+    handoff_verification.add_argument(
+        "--blocked-environment",
+        metavar="CAPABILITY",
+        help="record an unavailable environment capability and raise an incident",
+    )
     s.set_defaults(fn=cmd_handoff)
 
     s = sub.add_parser("broadcast", help="message every member of a team")
@@ -2311,6 +2731,22 @@ def main():
     s.add_argument("--worktree", action="store_true", help="isolate in a git worktree (skills auto-synced)")
     s.add_argument("--after", action="append", type=int, metavar="RUN_ID",
                    help="launch only after this run succeeds (repeatable)")
+    s.add_argument("--wait-for", action="append", type=int, metavar="RUN_ID",
+                   help="launch after this run settles, regardless of outcome (repeatable)")
+    s.add_argument("--read-only", action="store_true",
+                   help="declare no tree writes; permits safe shared dependency fan-out")
+    s.add_argument(
+        "--requires-capability",
+        action="append",
+        dest="requires_capability",
+        metavar="NAME",
+        help="require fresh positive evidence for this environment capability (repeatable)",
+    )
+    s.add_argument(
+        "--require-verification",
+        action="store_true",
+        help="a successful process exit is not accepted until a handoff records verification",
+    )
     s.add_argument("--sync", action="store_true", help="block until the run finishes")
     s.add_argument("--allow-question", action="store_true",
                    help="allow one genuine blocking question with an automatic fallback")
@@ -2601,10 +3037,14 @@ def main():
 
     s = sub.add_parser("cancel", help="cancel a pending or active run")
     s.add_argument("run_id", type=int)
+    s.add_argument("--dry-run", action="store_true",
+                   help="show child and dependency impact without changing state")
     s.set_defaults(fn=cmd_kill)
 
     s = sub.add_parser("kill", help="terminate a running worker")
     s.add_argument("run_id", type=int)
+    s.add_argument("--dry-run", action="store_true",
+                   help="show child and dependency impact without changing state")
     s.set_defaults(fn=cmd_kill)
 
     s = sub.add_parser("note", help="log a finding to the shared feed")
@@ -2614,6 +3054,70 @@ def main():
     s.add_argument("--run", type=int)
     ident(s)
     s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser(
+        "capability",
+        help="record and inspect evidence about a worker launch environment",
+    )
+    capability_sub = s.add_subparsers(dest="capability_action", required=True)
+    capability_record = capability_sub.add_parser("record", help="record one probe result")
+    capability_record.add_argument("capability")
+    capability_record.add_argument("--profile", required=True)
+    capability_record.add_argument(
+        "--state", required=True, choices=sorted(capabilities.CAPABILITY_STATES)
+    )
+    capability_record.add_argument("--evidence", required=True)
+    capability_record.add_argument("--probe")
+    capability_record.add_argument("--host")
+    expiry = capability_record.add_mutually_exclusive_group()
+    expiry.add_argument("--ttl-seconds", type=int, default=7 * 24 * 60 * 60)
+    expiry.add_argument("--permanent", action="store_true")
+    capability_record.set_defaults(fn=cmd_capability_record)
+
+    capability_check = capability_sub.add_parser(
+        "check", help="check fresh evidence for one profile"
+    )
+    capability_check.add_argument("capabilities", nargs="+")
+    capability_check.add_argument("--profile", required=True)
+    capability_check.add_argument("--host")
+    capability_check.set_defaults(fn=cmd_capability_check)
+
+    capability_list = capability_sub.add_parser("list", help="list recorded observations")
+    capability_list.add_argument("--host")
+    capability_list.add_argument("--backend")
+    capability_list.add_argument("--profile")
+    capability_list.add_argument("--sandbox")
+    capability_list.add_argument("--capability")
+    capability_list.add_argument("--fresh", action="store_true")
+    capability_list.add_argument("--json", action="store_true")
+    capability_list.set_defaults(fn=cmd_capability_list)
+
+    s = sub.add_parser("incident", help="manage recurring systemic issues")
+    incident_sub = s.add_subparsers(dest="incident_action", required=True)
+    incident_record = incident_sub.add_parser("record", help="record an occurrence")
+    incident_record.add_argument("--fingerprint", required=True)
+    incident_record.add_argument("--scope", required=True)
+    incident_record.add_argument("--title", required=True)
+    incident_record.add_argument("--evidence", required=True)
+    incident_record.add_argument("--run", type=int)
+    incident_record.add_argument("--work")
+    incident_record.add_argument("--lost-seconds", type=int, default=0)
+    incident_record.add_argument("--remediation")
+    incident_record.set_defaults(fn=cmd_incident_record)
+
+    incident_list = incident_sub.add_parser("list", help="list systemic incidents")
+    incident_list.add_argument("--state", choices=sorted(incidents.INCIDENT_STATES))
+    incident_list.add_argument("--scope")
+    incident_list.add_argument("--fingerprint")
+    incident_list.add_argument("--json", action="store_true")
+    incident_list.set_defaults(fn=cmd_incident_list)
+
+    incident_state = incident_sub.add_parser("state", help="change incident state")
+    incident_state.add_argument("incident_id", type=int)
+    incident_state.add_argument("state", choices=sorted(incidents.INCIDENT_STATES))
+    incident_state.add_argument("--remediation")
+    incident_state.add_argument("--resolution-evidence")
+    incident_state.set_defaults(fn=cmd_incident_state)
 
     s = sub.add_parser("feed", help="show the shared findings feed")
     s.add_argument("--limit", type=int, default=25)

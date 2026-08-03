@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -26,6 +27,72 @@ class CommandPreviewTests(unittest.TestCase):
             "claude -p <prompt> --output-format stream-json --verbose ...",
         )
         self.assertNotIn("secret", preview)
+
+
+class CheckpointCommitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        (self.root / "tracked.txt").write_text("base\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "tracked.txt"], check=True)
+        subprocess.run([
+            "git", "-C", str(self.root),
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-q", "-m", "base",
+        ], check=True)
+        self.base = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_isolated_worktree_changes_are_checkpointed(self) -> None:
+        isolated = self.root / "isolated"
+        subprocess.run([
+            "git", "-C", str(self.root), "worktree", "add", "-q", "-b", "run-7",
+            str(isolated),
+        ], check=True)
+        (isolated / "tracked.txt").write_text("changed\n")
+        (isolated / "new.txt").write_text("new\n")
+        (isolated / ".agents").mkdir()
+        (isolated / ".agents" / "local.md").write_text("copied context\n")
+
+        checkpoint = supervise._checkpoint_commit({
+            "id": 7,
+            "workdir": str(isolated),
+            "branch": "run-7",
+            "writes_tree": 1,
+            "base_commit": self.base,
+        }, "done")
+
+        names = subprocess.run(
+            ["git", "-C", str(isolated), "show", "--pretty=", "--name-only", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        self.assertNotEqual(checkpoint, self.base)
+        self.assertEqual(set(names), {"new.txt", "tracked.txt"})
+        self.assertTrue((isolated / ".agents" / "local.md").exists())
+
+    def test_shared_tree_dirty_output_is_not_auto_committed(self) -> None:
+        (self.root / "tracked.txt").write_text("uncommitted\n")
+        with self.assertRaisesRegex(RuntimeError, "shared-tree writer left uncommitted"):
+            supervise._checkpoint_commit({
+                "id": 8,
+                "workdir": str(self.root),
+                "branch": None,
+                "writes_tree": 1,
+                "base_commit": self.base,
+            }, "done")
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip(),
+            self.base,
+        )
 
 
 def _project(*, checkin_interval: int = 0, timeout: int = 30) -> tuple[tempfile.TemporaryDirectory, Path]:
@@ -70,6 +137,119 @@ def _sleeping_worker(*, line: dict | None = None, seconds: int = 60) -> list[str
         code += f"print(json.dumps({line!r}), flush=True);"
     code += f"time.sleep({seconds})"
     return [sys.executable, "-c", code]
+
+
+class VerificationOutcomeTests(unittest.TestCase):
+    def test_supervisor_rechecks_capabilities_before_continuation_launch(self) -> None:
+        tmp, root = _project(checkin_interval=0)
+        try:
+            run_id = _insert_run(root)
+            con = db.connect(root)
+            try:
+                con.execute(
+                    "UPDATE runs SET required_capabilities_json='[\"window-server\"]' "
+                    "WHERE id=?",
+                    (run_id,),
+                )
+                con.commit()
+            finally:
+                con.close()
+            with mock.patch.object(
+                supervise.runners, "build_cmd",
+                side_effect=AssertionError("worker must not launch without fresh evidence"),
+            ):
+                self.assertEqual(supervise.supervise(root, run_id), 1)
+            con = db.connect(root)
+            try:
+                run = con.execute(
+                    "SELECT status, summary FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+            finally:
+                con.close()
+            self.assertEqual(run["status"], "failed")
+            self.assertIn("missing=window-server", run["summary"])
+        finally:
+            tmp.cleanup()
+
+    def test_required_run_without_handoff_outcome_finishes_unverified(self) -> None:
+        tmp, root = _project(checkin_interval=0)
+        try:
+            run_id = _insert_run(root)
+            con = db.connect(root)
+            try:
+                con.execute(
+                    "UPDATE runs SET verification_required=1, verification_status='pending' "
+                    "WHERE id=?",
+                    (run_id,),
+                )
+                con.commit()
+            finally:
+                con.close()
+            with mock.patch.object(
+                supervise.runners, "build_cmd", return_value=[sys.executable, "-c", "pass"]
+            ):
+                self.assertEqual(supervise.supervise(root, run_id), 0)
+            con = db.connect(root)
+            try:
+                run = con.execute(
+                    "SELECT status, verification_status FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+                message = con.execute(
+                    "SELECT body FROM messages WHERE recipient='codex' AND run_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+            finally:
+                con.close()
+            self.assertEqual(run["status"], "done")
+            self.assertEqual(run["verification_status"], "unverified")
+            self.assertIn("marked unverified", message["body"])
+        finally:
+            tmp.cleanup()
+
+    def test_late_verified_handoff_is_not_overwritten_at_finalization(self) -> None:
+        tmp, root = _project(checkin_interval=0)
+        try:
+            run_id = _insert_run(root)
+            con = db.connect(root)
+            try:
+                con.execute(
+                    "UPDATE runs SET verification_required=1, verification_status='pending' "
+                    "WHERE id=?",
+                    (run_id,),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            def parse_log(_path: str) -> tuple[None, str]:
+                # This models a handoff recorded after supervise refreshed its
+                # run row, but before it writes the terminal outcome.
+                handoff_con = db.connect(root)
+                try:
+                    handoff_con.execute(
+                        "UPDATE runs SET verification_status='verified' WHERE id=?",
+                        (run_id,),
+                    )
+                    handoff_con.commit()
+                finally:
+                    handoff_con.close()
+                return None, "verified handoff"
+
+            with mock.patch.object(
+                supervise.runners, "build_cmd", return_value=[sys.executable, "-c", "pass"]
+            ), mock.patch.object(supervise.runners, "parse_log", side_effect=parse_log):
+                self.assertEqual(supervise.supervise(root, run_id), 0)
+            con = db.connect(root)
+            try:
+                status = con.execute(
+                    "SELECT verification_status FROM runs WHERE id=?", (run_id,)
+                ).fetchone()["verification_status"]
+            finally:
+                con.close()
+            self.assertEqual(status, "verified")
+        finally:
+            tmp.cleanup()
 
 
 class SupervisorUsageLimitTests(unittest.TestCase):
@@ -358,6 +538,15 @@ class SupervisorCheckinTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([c[0] for c in calls], [None, "ses-checkin"])
         self.assertIn("PROGRESS CHECK-IN", calls[1][1])
+        for checkpoint in (
+            "current hypothesis",
+            "new evidence",
+            "cheapest untried falsification",
+            "acceptance evidence status",
+            "environment blocker",
+            "next bounded step",
+        ):
+            self.assertIn(checkpoint, calls[1][1])
         self.assertIn("No inbox lookup is needed", calls[1][1])
         self.assertNotIn("orchestra inbox", calls[1][1])
         con = db.connect(root)

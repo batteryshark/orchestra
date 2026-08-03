@@ -743,8 +743,11 @@ function elapsed(start, end){
 function statusLabel(status){
   return status === 'killed' ? 'stopped by user' : status === 'waiting_input' ? 'waiting for answer' : status;
 }
-function statusChip(status){
-  return `<span class="chip s-${esc(status)}">${esc(statusLabel(status))}</span>`;
+function statusChip(status, verificationStatus=null, displayStatus=null){
+  const label = displayStatus || (verificationStatus
+    ? `${statusLabel(status)}/${verificationStatus}`
+    : statusLabel(status));
+  return `<span class="chip s-${esc(status)}">${esc(label)}</span>`;
 }
 function canStopRun(r){
   return r && !TERMINAL.has(r.status);
@@ -812,7 +815,7 @@ function renderRuns(){
         ${r.parent_run?`<span class="mono muted" title="continues run #${r.parent_run}">&#8618; #${r.parent_run}</span>`:''}
         ${r.lead_run?`<span class="mono muted" title="child of run #${r.lead_run}">↳ #${r.lead_run}</span>`:''}
         <b>${esc(r.agent)}</b>
-        ${statusChip(r.status)}
+        ${statusChip(r.status, r.verification_required ? r.verification_status : null, r.display_status)}
         <span class="mono muted" style="margin-left:auto" data-start="${esc(r.started_at)}"
           ${r.finished_at?`data-end="${esc(r.finished_at)}"`:''}></span></div>
       <div class="task-description" title="${esc(r.title||'No task description recorded')}">${esc(r.title||'No task description recorded')}</div>
@@ -968,7 +971,7 @@ async function refreshTranscript(force){
   const lineage = continuationLineage(r);
   const head = `<span class="mono">#${r.id}</span> ${r.slug?`<span class="mono muted" title="memorable run name">${esc(r.slug)}</span>`:''}
     <b>${esc(r.agent)}</b>
-    ${statusChip(r.status)}
+    ${statusChip(r.status, r.verification_required ? r.verification_status : null)}
     <span class="mono muted" title="configured backend">${esc(r.backend||'')}</span>
     ${r.model?`<span class="mono muted" title="configured model">${esc(r.model)}</span>`:''}
     ${r.work_item?`<span class="mono">${esc(r.work_item)}</span>`:''}

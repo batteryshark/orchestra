@@ -5,13 +5,20 @@ import hashlib
 import json
 import math
 import secrets
+import socket
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from orchestra_cli import availability, config, operator_runtime, operator_store
+from orchestra_cli import (
+    availability,
+    capabilities,
+    config,
+    operator_runtime,
+    operator_store,
+)
 from orchestra_cli.usage import infer_provider
 
 ROSTER_SCHEMA_TAG = "orchestra.roster-policy/v1"
@@ -278,6 +285,11 @@ def bootstrap_policy(cfg: Mapping[str, Any]) -> RosterPolicy:
         profiles.append({
             "name": name,
             "backend": backend,
+            "sandbox": str(
+                raw.get("sandbox", "workspace-write")
+                if backend == "codex"
+                else "orchestra-unrestricted"
+            ),
             "model": model,
             "role": role,
             "tier": tier,
@@ -361,12 +373,17 @@ def validate_policy(data: Any, *, source: str = "<memory>") -> RosterPolicy:
     }
     for index, profile in enumerate(profiles[:256]):
         path = f"profiles[{index}]"
-        if not isinstance(profile, dict) or set(profile) != expected_profile_keys:
+        allowed_profile_keys = expected_profile_keys | {"sandbox"}
+        if not isinstance(profile, dict) or not (
+            expected_profile_keys <= set(profile) <= allowed_profile_keys
+        ):
             errors.append(f"{path} has an unexpected shape")
             continue
         name = profile.get("name")
         _bounded_string(name, f"{path}.name", errors)
         _bounded_string(profile.get("backend"), f"{path}.backend", errors)
+        if "sandbox" in profile:
+            _bounded_string(profile.get("sandbox"), f"{path}.sandbox", errors)
         if profile.get("model") is not None:
             _bounded_string(profile.get("model"), f"{path}.model", errors)
         _bounded_string(profile.get("role"), f"{path}.role", errors, maximum=4096)
@@ -678,10 +695,14 @@ def route(
     capacity: Mapping[str, Mapping[str, Any]],
     active_by_profile: Mapping[str, int] | None = None,
     reviewer_profile: str | None = None,
+    containment_mode: str | None = None,
     structural_only: bool = False,
     path: Path | None = None,
 ) -> Route:
     active_by_profile = active_by_profile or {}
+    required_capabilities = work.get("requirements", {}).get(
+        "required_capabilities", []
+    )
     discovered = {
         row.get("name"): row
         for row in availability_report.get("roster") or []
@@ -728,6 +749,36 @@ def route(
                 reasons.append("reviewer must differ from implementer")
         if _contraindicated(profile, work):
             reasons.append("task matches an explicit contraindication")
+        if not structural_only and required_capabilities:
+            backend, sandbox_mode = _capability_lane(
+                profile, operation, containment_mode
+            )
+            check = capabilities.check_requirements(
+                Path(work["root"]),
+                host_identity=socket.gethostname(),
+                backend=backend,
+                profile=name,
+                sandbox_mode=sandbox_mode,
+                capabilities=required_capabilities,
+            )
+            if check.unsupported:
+                reasons.append(
+                    "environment capability is unsupported: "
+                    + ", ".join(sorted(check.unsupported))
+                )
+            unavailable = {
+                state: sorted(getattr(check, state))
+                for state in ("unknown", "missing", "expired")
+                if getattr(check, state)
+            }
+            if unavailable:
+                detail = ", ".join(
+                    f"{state}={','.join(values)}"
+                    for state, values in unavailable.items()
+                )
+                reasons.append(
+                    "environment capability evidence unavailable: " + detail
+                )
         pools = profile["pools"]
         pool_rows = [capacity.get(pool_id, {}) for pool_id in pools]
         pool_limits = {
@@ -783,6 +834,7 @@ def route(
         "launch evidence proves unavailable",
         "health state is quarantined",
         "health state is unavailable",
+        "environment capability evidence unavailable",
     )
     transient_candidates = [
         row for row in candidates
@@ -825,6 +877,7 @@ def route(
                     "minimum_tier": work["minimum_tier"],
                     "actuation_mode": work["actuation_mode"],
                     "risk": work["risk"],
+                    "required_capabilities": required_capabilities,
                 }),
                 _json(candidates),
                 _json(capacity),
@@ -1445,6 +1498,28 @@ def _model_family(profile: Mapping[str, Any]) -> str:
     if backend == "codex":
         return "openai"
     return model.split("/", 1)[0] if "/" in model else backend
+
+
+def _capability_lane(
+    profile: Mapping[str, Any],
+    operation: Mapping[str, Any],
+    containment_mode: str | None,
+) -> tuple[str, str]:
+    """Return the sandbox the selected worker will actually use.
+
+    Live Operator runs always pass through ``containment.apply_profile``.  It
+    pins Codex workers to workspace-write or read-only depending on the
+    contained action, even if the normal roster profile has a broader project
+    setting; capability evidence must match that contained lane, not the
+    ordinary worker lane.
+    """
+    backend = str(profile["backend"])
+    if operation.get("mode") == "live" and backend == "codex":
+        sandbox = "read-only" if containment_mode == "operator-read" else "workspace-write"
+        return backend, sandbox
+    if backend != "codex":
+        return backend, "orchestra-unrestricted"
+    return backend, str(profile.get("sandbox") or "workspace-write")
 
 
 def _infer_tier(name: str, role: str) -> str:

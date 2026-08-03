@@ -40,6 +40,10 @@ class BriefTests(unittest.TestCase):
         self.assertIn("overlapping writes sequential", text)
         self.assertIn('orchestra consult "<question>"', text)
         self.assertIn("without pausing this run", text)
+        self.assertIn("approved destinations for the minimum project context", text)
+        self.assertIn("normally without host escalation", text)
+        self.assertIn("only records a local request", text)
+        self.assertIn("do not include unrelated repository content or secrets", text)
 
     def test_question_protocol_only_appears_for_opted_in_run(self) -> None:
         default = self._compose()
@@ -48,6 +52,14 @@ class BriefTests(unittest.TestCase):
         self.assertNotIn("orchestra ask", default)
         self.assertIn("orchestra ask", opted_in)
         self.assertIn("waits up to 60 seconds", opted_in)
+
+    def test_required_verification_brief_requires_an_explicit_handoff_outcome(self) -> None:
+        text = self._compose(require_verification=True)
+
+        self.assertIn("An exit code is not verification", text)
+        self.assertIn("--verified", text)
+        self.assertIn("--unverified", text)
+        self.assertIn("--blocked-environment <capability>", text)
 
     def test_json_work_snapshot_is_compact_markdown_and_omits_empty_fields(self) -> None:
         payload = {
@@ -69,7 +81,7 @@ class BriefTests(unittest.TestCase):
             "acceptanceCriteria": [{"checked": True, "text": "Seven tests pass"}],
             "log": [{"at": "now", "message": "Created"}],
         }
-        completed = mock.Mock(stdout=json.dumps(payload))
+        completed = mock.Mock(stdout=json.dumps(payload), stderr="", returncode=0)
         with mock.patch.object(brief.shutil, "which", return_value="/bin/work"), \
                 mock.patch.object(brief.subprocess, "run", return_value=completed):
             text = brief.work_snapshot(Path("/project"), "W-0141")
@@ -83,6 +95,36 @@ class BriefTests(unittest.TestCase):
         self.assertNotIn("blockedReason", text)
         self.assertNotIn("completionSummary", text)
         self.assertNotIn("Created", text)
+
+    def test_required_work_snapshot_rejects_missing_cli_or_item(self) -> None:
+        with mock.patch.object(brief.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "needs the `work` CLI"):
+                brief.work_snapshot(Path("/project"), "W-0141", required=True)
+
+        missing = mock.Mock(stdout="", stderr="Task not found", returncode=1)
+        with mock.patch.object(brief.shutil, "which", return_value="/bin/work"), \
+                mock.patch.object(brief.subprocess, "run", return_value=missing):
+            with self.assertRaisesRegex(SystemExit, "Task not found"):
+                brief.work_snapshot(Path("/project"), "W-0141", required=True)
+
+    def test_worker_brief_uses_dispatch_snapshot_not_worktree_tracker(self) -> None:
+        item = mock.Mock(
+            stdout='{"id":"W-0141","title":"Hash trees"}',
+            stderr="",
+            returncode=0,
+        )
+        with mock.patch.object(brief.shutil, "which", return_value="/bin/work"), \
+                mock.patch.object(brief.subprocess, "run", return_value=item):
+            text = self._compose(
+                work_item="W-0141",
+                workdir="/project/.orchestra/worktrees/run-323",
+                require_work_snapshot=True,
+            )
+
+        self.assertIn("immutable snapshot", text)
+        self.assertIn("worker checkout may contain an", text)
+        self.assertIn("older tracker copy", text)
+        self.assertNotIn("Run `work show", text)
 
     def test_non_json_work_output_is_preserved(self) -> None:
         self.assertEqual(brief._render_work_snapshot("already readable"), "already readable")

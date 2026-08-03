@@ -104,7 +104,8 @@ class ChildPolicyTests(unittest.TestCase):
         try:
             parent = child_runs.validate_parent(con, self.cfg, self.parent_id, "codex")
             with mock.patch.object(child_runs.worktree, "create",
-                                   return_value=(fake_wt, "orchestra/run-2")) as create:
+                                   return_value=(fake_wt, "orchestra/run-2")) as create, \
+                    mock.patch.object(child_runs.worktree, "head", return_value="abc123"):
                 ids = child_runs.create(con, self.root, self.cfg, parent, ["minimax"], "inspect")
             row = con.execute("SELECT * FROM runs WHERE id=?", (ids[0],)).fetchone()
         finally:
@@ -201,6 +202,8 @@ class ChildWakeupTests(unittest.TestCase):
                      depth=1, session_ref="child-session")
         con = db.connect(self.root)
         try:
+            con.execute("UPDATE runs SET writes_tree=0 WHERE id=?", (child,))
+            con.commit()
             parent = dict(con.execute("SELECT * FROM runs WHERE id=?", (child,)).fetchone())
             followup = supervise.create_followup(con, self.root, parent, "codex", "continue")
             row = con.execute("SELECT * FROM runs WHERE id=?", (followup,)).fetchone()

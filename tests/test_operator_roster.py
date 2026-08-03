@@ -5,9 +5,12 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from orchestra_cli import (
+    capabilities,
     operator_contract,
     operator_roster,
     operator_runtime,
@@ -123,6 +126,34 @@ class OperatorRosterTests(unittest.TestCase):
             path=self.db_path,
         )
         return version
+
+    def record_capability(
+        self,
+        profile: dict,
+        capability: str,
+        state: capabilities.CapabilityState,
+        *,
+        sandbox_mode: str | None = None,
+        observed_at: datetime | None = None,
+        ttl: timedelta | None = None,
+    ) -> None:
+        capabilities.record_observation(
+            self.project_root,
+            host_identity="operator-test-host",
+            backend=profile["backend"],
+            profile=profile["name"],
+            sandbox_mode=sandbox_mode or profile.get(
+                "sandbox",
+                "workspace-write"
+                if profile["backend"] == "codex"
+                else "orchestra-unrestricted",
+            ),
+            capability=capability,
+            state=state,
+            evidence="dedicated environment probe",
+            observed_at=observed_at,
+            ttl=ttl,
+        )
 
     def test_bootstrap_separates_tiers_modes_disabled_profiles_and_pools(self) -> None:
         profiles = {row["name"]: row for row in self.policy.data["profiles"]}
@@ -280,6 +311,267 @@ class OperatorRosterTests(unittest.TestCase):
         self.assertEqual(route.profile, "codex")
         fable = next(row for row in route.considered if row["profile"] == "fable")
         self.assertIn("explicit contraindication", " ".join(fable["reasons"]))
+
+    def test_router_uses_fresh_capability_evidence_for_the_matching_profile(self) -> None:
+        contract, operation, work = self.start_operation()
+        work = {
+            **work,
+            "requirements": {
+                **work["requirements"],
+                "required_capabilities": ["cocoa-window"],
+            },
+        }
+        kimi = next(
+            profile for profile in self.policy.data["profiles"]
+            if profile["name"] == "kimi"
+        )
+        self.record_capability(kimi, "cocoa-window", "supported")
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            route = operator_roster.route(
+                operation,
+                work,
+                contract,
+                self.policy,
+                availability_report={"roster": [{"name": "kimi", "state": "available"}]},
+                capacity={},
+                path=self.db_path,
+            )
+        self.assertEqual(route.profile, "kimi")
+
+    def test_router_treats_unsupported_capability_as_policy_blocker(self) -> None:
+        contract, operation, work = self.start_operation()
+        work = {
+            **work,
+            "requirements": {
+                **work["requirements"],
+                "required_capabilities": ["cocoa-window"],
+            },
+        }
+        for profile in self.policy.data["profiles"]:
+            self.record_capability(profile, "cocoa-window", "unsupported")
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            route = operator_roster.route(
+                operation,
+                work,
+                contract,
+                self.policy,
+                availability_report={"roster": []},
+                capacity={},
+                path=self.db_path,
+            )
+        self.assertIsNone(route.profile)
+        self.assertEqual(route.blocker, "policy")
+        kimi = next(row for row in route.considered if row["profile"] == "kimi")
+        self.assertIn("is unsupported", " ".join(kimi["reasons"]))
+
+    def test_router_waits_for_missing_or_expired_capability_evidence(self) -> None:
+        contract, operation, work = self.start_operation()
+        work = {
+            **work,
+            "requirements": {
+                **work["requirements"],
+                "required_capabilities": ["cocoa-window"],
+            },
+        }
+        structural = operator_roster.route(
+            operation,
+            work,
+            contract,
+            self.policy,
+            availability_report={"roster": []},
+            capacity={},
+            structural_only=True,
+            path=self.db_path,
+        )
+        self.assertIsNotNone(structural.profile)
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            missing = operator_roster.route(
+                operation,
+                work,
+                contract,
+                self.policy,
+                availability_report={"roster": []},
+                capacity={},
+                path=self.db_path,
+            )
+        self.assertEqual(missing.blocker, "transient")
+        kimi = next(row for row in missing.considered if row["profile"] == "kimi")
+        self.assertIn("missing=cocoa-window", " ".join(kimi["reasons"]))
+
+        kimi_profile = next(
+            profile for profile in self.policy.data["profiles"]
+            if profile["name"] == "kimi"
+        )
+        self.record_capability(
+            kimi_profile,
+            "cocoa-window",
+            "supported",
+            observed_at=datetime(2020, 1, 1, tzinfo=UTC),
+            ttl=timedelta(minutes=1),
+        )
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            expired = operator_roster.route(
+                operation,
+                work,
+                contract,
+                self.policy,
+                availability_report={"roster": []},
+                capacity={},
+                path=self.db_path,
+            )
+        self.assertEqual(expired.blocker, "transient")
+        kimi = next(row for row in expired.considered if row["profile"] == "kimi")
+        self.assertIn("expired=cocoa-window", " ".join(kimi["reasons"]))
+
+    def test_router_does_not_reuse_evidence_from_a_different_sandbox_lane(self) -> None:
+        cfg = _config()
+        cfg["agents"]["codex-terra"]["sandbox"] = "danger-full-access"
+        policy = operator_roster.bootstrap_policy(cfg)
+        contract, operation, work = self.start_operation()
+        contract = {
+            **contract,
+            "routing": {
+                **contract["routing"],
+                "forbidden_profiles": [
+                    profile["name"]
+                    for profile in policy.data["profiles"]
+                    if profile["name"] != "codex-terra"
+                ],
+            },
+        }
+        work = {
+            **work,
+            "requirements": {
+                **work["requirements"],
+                "required_capabilities": ["cocoa-window"],
+            },
+        }
+        codex_terra = next(
+            profile for profile in policy.data["profiles"]
+            if profile["name"] == "codex-terra"
+        )
+        self.record_capability(
+            codex_terra,
+            "cocoa-window",
+            "supported",
+            sandbox_mode="workspace-write",
+        )
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            wrong_lane = operator_roster.route(
+                operation,
+                work,
+                contract,
+                policy,
+                availability_report={"roster": [{"name": "codex-terra", "state": "available"}]},
+                capacity={},
+                path=self.db_path,
+            )
+        self.assertEqual(wrong_lane.blocker, "transient")
+
+        self.record_capability(codex_terra, "cocoa-window", "supported")
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            matched_lane = operator_roster.route(
+                operation,
+                work,
+                contract,
+                policy,
+                availability_report={"roster": [{"name": "codex-terra", "state": "available"}]},
+                capacity={},
+                path=self.db_path,
+            )
+        self.assertEqual(matched_lane.profile, "codex-terra")
+
+    def test_live_router_uses_the_contained_read_or_write_sandbox_lane(self) -> None:
+        cfg = _config()
+        cfg["agents"]["codex-terra"]["sandbox"] = "danger-full-access"
+        policy = operator_roster.bootstrap_policy(cfg)
+        contract, operation, work = self.start_operation()
+        contract = {
+            **contract,
+            "routing": {
+                **contract["routing"],
+                "forbidden_profiles": [
+                    profile["name"]
+                    for profile in policy.data["profiles"]
+                    if profile["name"] != "codex-terra"
+                ],
+            },
+        }
+        operation = {**operation, "mode": "live"}
+        codex_terra = next(
+            profile for profile in policy.data["profiles"]
+            if profile["name"] == "codex-terra"
+        )
+        self.record_capability(
+            codex_terra,
+            "cocoa-window",
+            "supported",
+            sandbox_mode="workspace-write",
+        )
+        write_work = {
+            **work,
+            "requirements": {
+                **work["requirements"],
+                "required_capabilities": ["cocoa-window"],
+            },
+        }
+        self.record_capability(
+            codex_terra,
+            "coreaudio-output",
+            "supported",
+            sandbox_mode="read-only",
+        )
+        read_work = {
+            **work,
+            "requirements": {
+                **work["requirements"],
+                "required_capabilities": ["coreaudio-output"],
+            },
+        }
+        with mock.patch(
+            "orchestra_cli.operator_roster.socket.gethostname",
+            return_value="operator-test-host",
+        ):
+            write_route = operator_roster.route(
+                operation,
+                write_work,
+                contract,
+                policy,
+                availability_report={"roster": [{"name": "codex-terra", "state": "available"}]},
+                capacity={},
+                containment_mode="operator-write",
+                path=self.db_path,
+            )
+            read_route = operator_roster.route(
+                operation,
+                read_work,
+                contract,
+                policy,
+                availability_report={"roster": [{"name": "codex-terra", "state": "available"}]},
+                capacity={},
+                containment_mode="operator-read",
+                path=self.db_path,
+            )
+        self.assertEqual(write_route.profile, "codex-terra")
+        self.assertEqual(read_route.profile, "codex-terra")
 
     def test_capacity_reservations_are_atomic_and_preserve_heavy_reserve(self) -> None:
         _, operation, work = self.start_operation()

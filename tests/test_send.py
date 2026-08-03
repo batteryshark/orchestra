@@ -532,6 +532,91 @@ class SendFileTests(unittest.TestCase):
         self.assertEqual(message["run_id"], run_id)
         self.assertEqual(message["body"], f"HANDOFF run {run_id}: implemented and verified")
 
+    def test_worker_handoff_records_verified_outcome(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="bright_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, _, stderr = self._run_main(
+                ["handoff", "acceptance", "passed", "--verified"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        con = db.connect(self.root)
+        try:
+            row = con.execute(
+                "SELECT verification_status, environment_blocker FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(row["verification_status"], "verified")
+        self.assertIsNone(row["environment_blocker"])
+
+    def test_environment_blocker_handoff_records_lane_evidence_and_incident(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="blocked_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, _, stderr = self._run_main([
+                "handoff", "XCreateWindow", "failed", "--blocked-environment", "x11-window",
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        con = db.connect(self.root)
+        try:
+            run = con.execute(
+                "SELECT verification_status, environment_blocker FROM runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            observation = con.execute(
+                "SELECT backend, profile, sandbox_mode, capability, state FROM capability_observations"
+            ).fetchone()
+            incident = con.execute(
+                "SELECT fingerprint, scope, occurrence_count FROM systemic_incidents"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(run["verification_status"], "blocked_environment")
+        self.assertEqual(run["environment_blocker"], "x11-window")
+        self.assertEqual(
+            dict(observation),
+            {
+                "backend": "opencode",
+                "profile": "glm",
+                "sandbox_mode": "orchestra-unrestricted",
+                "capability": "x11-window",
+                "state": "unsupported",
+            },
+        )
+        self.assertEqual(incident["fingerprint"], "environment-blocked:x11-window")
+        self.assertIn("profile=glm", incident["scope"])
+        self.assertEqual(incident["occurrence_count"], 1)
+
+    def test_handoff_outcome_flags_are_mutually_exclusive(self) -> None:
+        run_id = self._insert_active_run(agent="glm", slug="flags_ferret")
+
+        with mock.patch.dict(
+            os.environ,
+            {"ORCHESTRA_SELF": "glm", "ORCHESTRA_RUN_ID": str(run_id)},
+            clear=False,
+        ):
+            code, _, stderr = self._run_main(
+                ["handoff", "done", "--verified", "--unverified"]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed with argument", stderr)
+        self.assertEqual(self._messages(), [])
+
     def test_worker_handoff_rejects_identity_mismatch(self) -> None:
         run_id = self._insert_active_run(agent="glm", slug="chilly_ferret")
 

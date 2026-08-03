@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS runs (
   supervisor_protocol INTEGER NOT NULL DEFAULT 0,
   containment_mode TEXT,
   workspace_limit_bytes INTEGER,
+  verification_required INTEGER NOT NULL DEFAULT 0,
+  verification_status TEXT NOT NULL DEFAULT 'not_required'
+    CHECK(verification_status IN ('not_required', 'pending', 'verified', 'unverified', 'blocked_environment')),
+  environment_blocker TEXT,
+  required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+  writes_tree INTEGER NOT NULL DEFAULT 1,
+  base_commit TEXT,
+  checkpoint_commit TEXT,
   pid INTEGER,
   supervisor_pid INTEGER,
   session_ref TEXT,
@@ -108,6 +116,8 @@ CREATE TABLE IF NOT EXISTS spawn_requests (
 CREATE TABLE IF NOT EXISTS dispatch_dependencies (
   run_id INTEGER NOT NULL REFERENCES runs(id),
   depends_on_run INTEGER NOT NULL REFERENCES runs(id),
+  kind TEXT NOT NULL DEFAULT 'requires_success'
+    CHECK(kind IN ('requires_success', 'wait_for')),
   PRIMARY KEY(run_id, depends_on_run)
 );
 CREATE TABLE IF NOT EXISTS deferred_dispatches (
@@ -115,6 +125,8 @@ CREATE TABLE IF NOT EXISTS deferred_dispatches (
   mission TEXT NOT NULL,
   context TEXT,
   use_worktree INTEGER NOT NULL DEFAULT 0,
+  work_snapshot TEXT,
+  required_capabilities_json TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL DEFAULT 'pending',
   error TEXT,
   created_at TEXT NOT NULL,
@@ -211,6 +223,32 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
     if not _has_column(con, "runs", "workspace_limit_bytes"):
         con.execute("ALTER TABLE runs ADD COLUMN workspace_limit_bytes INTEGER")
 
+    # W-0057: execution completion is distinct from verification.  Existing
+    # completed work was never required to report verification, so it remains
+    # explicitly ``not_required`` rather than being inferred as verified.
+    if not _has_column(con, "runs", "verification_required"):
+        con.execute(
+            "ALTER TABLE runs ADD COLUMN verification_required INTEGER NOT NULL DEFAULT 0"
+        )
+    if not _has_column(con, "runs", "verification_status"):
+        con.execute(
+            "ALTER TABLE runs ADD COLUMN verification_status TEXT NOT NULL "
+            "DEFAULT 'not_required'"
+        )
+    if not _has_column(con, "runs", "environment_blocker"):
+        con.execute("ALTER TABLE runs ADD COLUMN environment_blocker TEXT")
+    if not _has_column(con, "runs", "required_capabilities_json"):
+        con.execute(
+            "ALTER TABLE runs ADD COLUMN required_capabilities_json TEXT NOT NULL "
+            "DEFAULT '[]'"
+        )
+    if not _has_column(con, "runs", "writes_tree"):
+        con.execute("ALTER TABLE runs ADD COLUMN writes_tree INTEGER NOT NULL DEFAULT 1")
+    if not _has_column(con, "runs", "base_commit"):
+        con.execute("ALTER TABLE runs ADD COLUMN base_commit TEXT")
+    if not _has_column(con, "runs", "checkpoint_commit"):
+        con.execute("ALTER TABLE runs ADD COLUMN checkpoint_commit TEXT")
+
     # W-0040: orphan reaping. ``pid`` is the AGENT process; a supervisor that
     # dies between its worker exiting and the completion UPDATE strands the run
     # at 'running' forever, with nothing to notice. Recording the SUPERVISOR's
@@ -260,15 +298,37 @@ def _apply_migrations(con: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS dispatch_dependencies ("
         "run_id INTEGER NOT NULL REFERENCES runs(id), "
         "depends_on_run INTEGER NOT NULL REFERENCES runs(id), "
+        "kind TEXT NOT NULL DEFAULT 'requires_success' "
+        "CHECK(kind IN ('requires_success', 'wait_for')), "
         "PRIMARY KEY(run_id, depends_on_run))"
     )
+    # W-0056: dependency semantics. Existing ``--after`` rows had the
+    # ``requires_success`` behavior, so make that explicit before adding the
+    # less restrictive sequencing-only edge kind.
+    if not _has_column(con, "dispatch_dependencies", "kind"):
+        con.execute(
+            "ALTER TABLE dispatch_dependencies ADD COLUMN kind TEXT NOT NULL "
+            "DEFAULT 'requires_success'"
+        )
     con.execute(
         "CREATE TABLE IF NOT EXISTS deferred_dispatches ("
         "run_id INTEGER PRIMARY KEY REFERENCES runs(id), mission TEXT NOT NULL, "
         "context TEXT, use_worktree INTEGER NOT NULL DEFAULT 0, "
+        "work_snapshot TEXT, required_capabilities_json TEXT NOT NULL DEFAULT '[]', "
         "status TEXT NOT NULL DEFAULT 'pending', error TEXT, "
         "created_at TEXT NOT NULL, processed_at TEXT)"
     )
+    # W-0057: deferred runs must retain the context and admissibility
+    # decision made when they were queued.  Old rows intentionally remain
+    # NULL/[]: a legacy run with a work item will be re-snapshotted strictly
+    # at launch instead of pretending that it has immutable context.
+    if not _has_column(con, "deferred_dispatches", "work_snapshot"):
+        con.execute("ALTER TABLE deferred_dispatches ADD COLUMN work_snapshot TEXT")
+    if not _has_column(con, "deferred_dispatches", "required_capabilities_json"):
+        con.execute(
+            "ALTER TABLE deferred_dispatches ADD COLUMN required_capabilities_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_dispatch_dependencies_prerequisite "
         "ON dispatch_dependencies(depends_on_run)"

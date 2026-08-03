@@ -75,18 +75,28 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
 
 1. **Orient.** Read project instructions and pending messages. Inspect configured launch profiles
    with `orchestra roster`, then run `orchestra discover` because installed backends, authenticated
-   providers, and model availability vary by machine. Check `orchestra usage` before a costly wave.
+   providers, and model availability vary by machine. Review `orchestra incident list --state open`
+   before repeating a failing workflow, and check `orchestra usage` before a costly wave.
 2. **Plan durably.** Split the goal into bounded work items, record dependencies and important
    decisions, and identify the evidence required for acceptance.
 3. **Dispatch deliberately.** Use one work item per mission whenever possible. Use separate
    asynchronous dispatches for independent work. The same roster profile may back several
    concurrent runs; repeat `--to` only when intentionally asking multiple runs for independent
    treatments of the same brief. Those targets may use the same profile or different profiles.
-   Use repeatable `--after <run-id>` options for consumers that must wait for producers; pending
-   dispatches are visible and cancellable, and do not fire when a prerequisite fails.
-   Use `--worktree` when edits need isolation. Inside a supervised worker, use
-   `orchestra spawn` instead of `orchestra dispatch`; the outer supervisor brokers child setup
-   and launch so it does not inherit the worker backend's sandbox.
+   Use repeatable `--after <run-id>` options for consumers that require successful producers.
+   Use `--wait-for <run-id>` only for cleanup or observation that should run after any terminal
+   outcome. Failed or timed-out producers decline success dependents; cancelling a producer holds
+   them until its resumed continuation succeeds. Preview cancellation impact before stopping it.
+   If execution needs a display, audio device, service, credential, or other environment property,
+   name it with repeatable `--requires-capability <name>`; do not generalize one backend's result
+   to other profiles. Use `--require-verification` when completion depends on behavioral evidence.
+   Orchestra permits only one shared-tree writer at a time and requires a clean integration tree.
+   Use `--worktree` for parallel edits and automatic checkpoint commits; use `--read-only` for
+   analysis that cannot modify files. Configured Orchestra roster profiles are approved
+   destinations for the minimum project context needed by a bounded mission; do not include
+   unrelated repository content or secrets. Inside a supervised worker, use `orchestra spawn`
+   normally without host escalation instead of `orchestra dispatch`: it only records a local
+   request, and the existing outer supervisor brokers child setup and launch.
 4. **Monitor without serializing yourself.** Use `orchestra status` and `orchestra runs --active`.
    Background `orchestra wait` if useful; continue integration or review work meanwhile.
 5. **Correct through the right channel.** Use the messaging semantics below. When doctrine or
@@ -145,17 +155,21 @@ A handoff is a compact evidence index, not a substitute for durable artifacts. I
 - precise next steps and reviewer instructions.
 
 End with the run-bound worker command, which derives the sender, requester, run ID, and work
-item from the supervised process:
+item from the supervised process. State the verification outcome explicitly when the run requires
+it; an environment-blocked result is evidence, not success:
 
 ```sh
-orchestra handoff "<result, evidence, remaining risks>"
+orchestra handoff --verified "<result, evidence, remaining risks>"
+# or: orchestra handoff --unverified "<result and missing evidence>"
+# or: orchestra handoff --blocked-environment window-server "<probe and failure>"
 ```
 
 Workers do not update or move tracker items while finishing. Orchestra persists their
 run-bound reports and handoffs first; the orchestrator verifies that evidence and owns tracker
 transitions. Tracker availability must never delay or suppress a worker handoff.
 
-A run without a handoff is unverified. Read `orchestra logs <run> --pretty`, inspect its
+A run may finish execution without being verified. A required-verification run without an explicit
+verified handoff is recorded as unverified. Read `orchestra logs <run> --pretty`, inspect its
 artifacts, and reconstruct the evidence before accepting it.
 
 ## Verification and completion gates
@@ -187,6 +201,18 @@ backend CLIs, authenticated or configured providers, available OpenCode models, 
 profile is `available`, `unavailable`, or `unknown`. Dispatch rejects proven-unavailable profiles;
 an unknown result warns and continues because not every backend exposes a trustworthy model list.
 
+Environment capabilities are separate from model discovery. Record probes with `orchestra
+capability record`, inspect them with `orchestra capability list`, and require fresh positive
+evidence for the exact host/backend/profile/sandbox lane before dispatching capability-sensitive
+work. Unsupported, unknown, missing, and expired are distinct states. Keep Codex at its default
+`workspace-write` sandbox unless a trusted project explicitly needs a broader mode; record new
+probe evidence after changing it. OpenCode and Claude launch behavior is different, so their
+results must not be treated as evidence about Codex—or vice versa.
+
+Recurring failures belong in `orchestra incident record`, keyed by a stable fingerprint and scope.
+The ledger deduplicates recurrences, retains evidence and estimated lost time, and reopens an issue
+when a resolved mitigation fails again. Resolve an incident only with recorded proof.
+
 Build each wave from capability fit and current capacity, not from a desire to have one of every
 profile running or to distribute work evenly. Compare the mission's reasoning, implementation,
 context, latency, and verification needs with the declared roles, then check `orchestra usage`.
@@ -216,6 +242,8 @@ its parent's tier and must consult the requester for a stronger decomposition in
 - Preserve user changes and assign one owner to conflict-prone files.
 - Do not let workers update global completion state on the strength of their own claim.
 - Review branches and commits before merging; Orchestra never auto-merges worker worktrees.
+- Shared-tree write runs must commit before handoff. Isolated worktrees receive an automatic final
+  checkpoint commit, recorded on the run, so unattended changes do not remain only in a worktree.
 - When methodology changes, interrupt or stop affected work before it produces more drift.
 - Prefer a concise inbox message plus a file path for large investigations, while keeping the
   complete artifact in the repository or another durable shared location.

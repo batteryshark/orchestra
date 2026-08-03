@@ -19,6 +19,9 @@ class StopResult:
     reason: str
     pid: int | None = None
     descendant_ids: tuple[int, ...] = ()
+    declined_run_ids: tuple[int, ...] = ()
+    held_run_ids: tuple[int, ...] = ()
+    unblocked_run_ids: tuple[int, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -30,6 +33,9 @@ class StopResult:
             "reason": self.reason,
             "pid": self.pid,
             "descendant_ids": list(self.descendant_ids),
+            "declined_run_ids": list(self.declined_run_ids),
+            "held_run_ids": list(self.held_run_ids),
+            "unblocked_run_ids": list(self.unblocked_run_ids),
         }
 
 
@@ -63,12 +69,39 @@ def _signal_process_group(pid: int | None) -> tuple[bool, str]:
         return False, "permission_denied"
 
 
+def preview_stop(con: sqlite3.Connection, run_id: int) -> dict | None:
+    """Preview the exact dependency impact of stopping a run and active children."""
+    row = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+    if row is None:
+        return None
+    descendants = [
+        int(item["id"])
+        for item in con.execute(
+            "WITH RECURSIVE tree(id) AS ("
+            " SELECT id FROM runs WHERE lead_run=?"
+            " UNION SELECT r.id FROM runs r JOIN tree t ON r.lead_run=t.id"
+            ") SELECT r.id FROM runs r JOIN tree t ON r.id=t.id "
+            "WHERE r.status NOT IN ('done','failed','timeout','killed')",
+            (run_id,),
+        )
+    ]
+    impact = dependencies.cancellation_impact(con, [run_id, *descendants])
+    return {
+        "status": row["status"],
+        "descendant_ids": descendants,
+        **impact,
+    }
+
+
 def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
     """Mark a non-terminal run as user-stopped and signal its worker group.
 
     The persisted terminal state remains ``killed`` for compatibility with
     existing run queries. The row update happens before signaling so stale
     supervisors observe the user's terminal decision instead of racing it.
+    This function deliberately does not launch work: the normal reconciliation
+    paths must call :func:`dependencies.process_ready` afterward to fire any
+    newly-ready ``wait_for`` dispatches.
     """
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -96,6 +129,8 @@ def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
             "WHERE r.status NOT IN ('done','failed','timeout','killed')",
             (run_id,),
         ))
+        cancelled_ids = [run_id, *(int(r["id"]) for r in descendants)]
+        impact = dependencies.cancellation_impact(con, cancelled_ids)
         pid = _safe_pid(row["pid"])
         con.execute(
             "UPDATE runs SET status='killed', finished_at=COALESCE(finished_at, ?) "
@@ -109,7 +144,6 @@ def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
                 f"WHERE id IN ({','.join('?' for _ in ids)})",
                 (db.now(), *ids),
             )
-        cancelled_ids = [run_id, *(int(r["id"]) for r in descendants)]
         con.execute(
             f"UPDATE deferred_dispatches SET status='cancelled', processed_at=? "
             f"WHERE run_id IN ({','.join('?' for _ in cancelled_ids)}) "
@@ -134,4 +168,7 @@ def stop_run(con: sqlite3.Connection, run_id: int) -> StopResult | None:
         reason=reason,
         pid=pid,
         descendant_ids=tuple(int(r["id"]) for r in descendants),
+        declined_run_ids=tuple(impact["declined_run_ids"]),
+        held_run_ids=tuple(impact["held_run_ids"]),
+        unblocked_run_ids=tuple(impact["unblocked_run_ids"]),
     )

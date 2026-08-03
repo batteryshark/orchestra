@@ -39,12 +39,14 @@ from orchestra_cli import (
     cancel,
     config,
     db,
+    dependencies,
     ensemble,
     host,
     operator_runtime,
     operator_store,
     projects,
     runners,
+    supervise,
     tailscale,
 )
 from orchestra_cli.usage import default_service
@@ -788,11 +790,18 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                 if project is None:
                     return
                 con = db.connect(project)
+                runs = []
+                for row in con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 100"):
+                    run = dict(row)
+                    if row["status"] == "pending":
+                        held = dependencies.held_on(con, int(row["id"]))
+                        if held:
+                            run["display_status"] = "held-on-" + ",".join(map(str, held))
+                    runs.append(run)
                 state = {
                     "root": str(project),
                     "project_id": projects.project_id(project),
-                    "runs": [dict(r) for r in con.execute(
-                        "SELECT * FROM runs ORDER BY id DESC LIMIT 100")][::-1],
+                    "runs": runs[::-1],
                     "messages": [dict(r) for r in con.execute(
                         "SELECT * FROM messages ORDER BY id DESC LIMIT 150")][::-1],
                     "feed": [dict(r) for r in con.execute(
@@ -1065,6 +1074,10 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                 con = db.connect(project)
                 try:
                     result = cancel.stop_run(con, run_id)
+                    if result and result.stopped:
+                        dependencies.process_ready(
+                            con, project, config.load(project), supervise.spawn_supervisor
+                        )
                 finally:
                     con.close()
                 if not result:

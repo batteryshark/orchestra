@@ -43,6 +43,11 @@ env_passthrough = []
 # backend: opencode | codex | claude
 # model:   backend-specific model id (opencode: provider/model, codex: model name)
 # effort:  Codex or Claude reasoning effort; OpenCode uses `variant` instead
+# sandbox: Codex execution sandbox (default: workspace-write). Set a broader
+#          mode only in a trusted project override when a required capability
+#          has been proven unavailable in the default lane. OpenCode and Claude
+#          are not wrapped in Orchestra's Codex sandbox, so capability evidence
+#          is recorded per backend/profile/sandbox rather than generalized.
 # tier:    optional non-negative cost/capability level; tiered children may not
 #          exceed a tiered parent's level (omit either tier to leave unconstrained)
 # ensemble = true opts an opencode agent into the optional OpenCode Ensemble

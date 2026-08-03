@@ -5,10 +5,13 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from orchestra_cli import cancel, db, paths, supervise
+from orchestra_cli import cancel, cli, config, db, dependencies, paths, supervise
 
 
 def _make_project() -> tuple[tempfile.TemporaryDirectory, Path]:
@@ -32,6 +35,26 @@ def _insert_run(root: Path, *, status: str = "running", pid: int | None = None) 
         )
         con.commit()
         return int(cur.lastrowid)
+    finally:
+        con.close()
+
+
+def _defer(root: Path, prerequisite: int, *, kind: str) -> int:
+    run_id = _insert_run(root, status="pending")
+    con = db.connect(root)
+    try:
+        dependencies.enqueue(
+            con,
+            run_id,
+            [prerequisite],
+            mission="wait for prerequisite",
+            context=None,
+            use_worktree=False,
+            dependency_kind=kind,
+            writes_tree=False,
+        )
+        con.commit()
+        return run_id
     finally:
         con.close()
 
@@ -116,6 +139,204 @@ class StopRunSemanticsTests(unittest.TestCase):
             self.assertIsNone(cancel.stop_run(con, 999))
         finally:
             con.close()
+
+    def test_cancellation_preview_distinguishes_declines_from_wait_for_release(self) -> None:
+        producer = _insert_run(self.root)
+        declined = _defer(
+            self.root, producer, kind=dependencies.REQUIRES_SUCCESS
+        )
+        transitive_decline = _defer(
+            self.root, declined, kind=dependencies.REQUIRES_SUCCESS
+        )
+        unblocked = _defer(self.root, producer, kind=dependencies.WAIT_FOR)
+        transitive_unblock = _defer(self.root, declined, kind=dependencies.WAIT_FOR)
+        con = db.connect(self.root)
+        try:
+            impact = dependencies.cancellation_impact(con, producer)
+            before = {
+                int(row["id"]): row["status"]
+                for row in con.execute(
+                    "SELECT id, status FROM runs WHERE id IN (?,?,?,?)",
+                    (declined, transitive_decline, unblocked, transitive_unblock),
+                )
+            }
+            result = cancel.stop_run(con, producer)
+            after = {
+                int(row["id"]): row["status"]
+                for row in con.execute(
+                    "SELECT id, status FROM runs WHERE id IN (?,?,?,?)",
+                    (declined, transitive_decline, unblocked, transitive_unblock),
+                )
+            }
+        finally:
+            con.close()
+
+        self.assertEqual(
+            impact,
+            {
+                "declined_run_ids": [],
+                "held_run_ids": [declined],
+                "unblocked_run_ids": [unblocked],
+            },
+        )
+        self.assertEqual(set(before.values()), {"pending"})
+        self.assertEqual(after[declined], "pending")
+        self.assertEqual(after[transitive_decline], "pending")
+        self.assertEqual(after[unblocked], "pending")
+        self.assertEqual(after[transitive_unblock], "pending")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declined_run_ids, ())
+        self.assertEqual(result.held_run_ids, (declined,))
+        self.assertEqual(result.unblocked_run_ids, (unblocked,))
+        self.assertEqual(result.as_dict()["held_run_ids"], [declined])
+
+    def test_terminal_stop_has_no_new_cancellation_impact(self) -> None:
+        producer = _insert_run(self.root, status="done")
+        _defer(self.root, producer, kind=dependencies.REQUIRES_SUCCESS)
+        con = db.connect(self.root)
+        try:
+            result = cancel.stop_run(con, producer)
+        finally:
+            con.close()
+        self.assertIsNotNone(result)
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.declined_run_ids, ())
+        self.assertEqual(result.unblocked_run_ids, ())
+
+    def test_preview_wait_for_with_another_active_prerequisite_is_not_unblocked(self) -> None:
+        cancelled = _insert_run(self.root)
+        still_running = _insert_run(self.root)
+        consumer = _defer(self.root, cancelled, kind=dependencies.WAIT_FOR)
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "INSERT INTO dispatch_dependencies(run_id, depends_on_run, kind) "
+                "VALUES(?,?,?)",
+                (consumer, still_running, dependencies.WAIT_FOR),
+            )
+            con.commit()
+            impact = dependencies.cancellation_impact(con, cancelled)
+            status = con.execute(
+                "SELECT status FROM runs WHERE id=?", (consumer,)
+            ).fetchone()["status"]
+        finally:
+            con.close()
+
+        self.assertEqual(
+            impact,
+            {"declined_run_ids": [], "held_run_ids": [], "unblocked_run_ids": []},
+        )
+        self.assertEqual(status, "pending")
+
+    def test_preview_declines_mixed_wait_for_and_failed_success_edge(self) -> None:
+        cancelled = _insert_run(self.root)
+        already_failed = _insert_run(self.root, status="failed")
+        consumer = _defer(self.root, cancelled, kind=dependencies.WAIT_FOR)
+        con = db.connect(self.root)
+        try:
+            con.execute(
+                "INSERT INTO dispatch_dependencies(run_id, depends_on_run, kind) "
+                "VALUES(?,?,?)",
+                (consumer, already_failed, dependencies.REQUIRES_SUCCESS),
+            )
+            con.commit()
+            impact = dependencies.cancellation_impact(con, cancelled)
+            before = con.execute(
+                "SELECT status FROM runs WHERE id=?", (consumer,)
+            ).fetchone()["status"]
+            result = cancel.stop_run(con, cancelled)
+            after = con.execute(
+                "SELECT status FROM runs WHERE id=?", (consumer,)
+            ).fetchone()["status"]
+        finally:
+            con.close()
+
+        self.assertEqual(
+            impact,
+            {"declined_run_ids": [consumer], "held_run_ids": [], "unblocked_run_ids": []},
+        )
+        self.assertEqual(before, "pending")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.declined_run_ids, (consumer,))
+        self.assertEqual(result.unblocked_run_ids, ())
+        self.assertEqual(after, "failed")
+
+    def test_unknown_cancellation_impact_is_empty_and_read_only(self) -> None:
+        prerequisite = _insert_run(self.root)
+        consumer = _defer(self.root, prerequisite, kind=dependencies.REQUIRES_SUCCESS)
+        con = db.connect(self.root)
+        try:
+            impact = dependencies.cancellation_impact(con, 999)
+            row = con.execute(
+                "SELECT status FROM runs WHERE id=?", (consumer,)
+            ).fetchone()
+            deferred = con.execute(
+                "SELECT status FROM deferred_dispatches WHERE run_id=?", (consumer,)
+            ).fetchone()
+        finally:
+            con.close()
+
+        self.assertEqual(
+            impact,
+            {"declined_run_ids": [], "held_run_ids": [], "unblocked_run_ids": []},
+        )
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(deferred["status"], "pending")
+
+    def test_reconciliation_can_launch_wait_for_after_stop(self) -> None:
+        producer = _insert_run(self.root)
+        consumer = _defer(self.root, producer, kind=dependencies.WAIT_FOR)
+        launched: list[int] = []
+        con = db.connect(self.root)
+        try:
+            result = cancel.stop_run(con, producer)
+            dependencies.process_ready(
+                con,
+                self.root,
+                config.load(self.root),
+                lambda _root, run_id: launched.append(run_id),
+            )
+            status = con.execute(
+                "SELECT status FROM runs WHERE id=?", (consumer,)
+            ).fetchone()["status"]
+        finally:
+            con.close()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.unblocked_run_ids, (consumer,))
+        self.assertEqual(launched, [consumer])
+        self.assertEqual(status, "spawning")
+
+    def test_cli_dry_run_is_read_only_and_real_cancel_releases_wait_for(self) -> None:
+        producer = _insert_run(self.root)
+        consumer = _defer(self.root, producer, kind=dependencies.WAIT_FOR)
+        output = StringIO()
+        with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
+                redirect_stdout(output):
+            cli.cmd_kill(SimpleNamespace(run_id=producer, dry_run=True))
+
+        con = db.connect(self.root)
+        try:
+            self.assertEqual(
+                con.execute("SELECT status FROM runs WHERE id=?", (producer,)).fetchone()[0],
+                "running",
+            )
+            self.assertEqual(
+                con.execute("SELECT status FROM runs WHERE id=?", (consumer,)).fetchone()[0],
+                "pending",
+            )
+        finally:
+            con.close()
+        self.assertIn(f"would release wait-only run(s): {consumer}", output.getvalue())
+
+        launched: list[int] = []
+        with mock.patch.object(cli.paths, "find_root", return_value=self.root), \
+                mock.patch.object(
+                    cli, "_spawn_supervisor",
+                    side_effect=lambda _root, run_id: launched.append(run_id),
+                ), redirect_stdout(StringIO()):
+            cli.cmd_kill(SimpleNamespace(run_id=producer, dry_run=False))
+        self.assertEqual(launched, [consumer])
 
 
 class SupervisorStopRaceTests(unittest.TestCase):

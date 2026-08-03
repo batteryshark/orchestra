@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import socket
 import sys
 import tempfile
 import unittest
@@ -33,7 +34,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from orchestra_cli import cli, db
+from orchestra_cli import capabilities, cli, db
 from orchestra_cli.usage.models import ProviderResult, QuotaWindow
 
 
@@ -87,10 +88,12 @@ class DispatchQuotaHookTests(unittest.TestCase):
             title=None,
             context=None,
             worktree=False,
+            read_only=True,
             sync=False,
             no_quota_warn=no_quota_warn,
             allow_question=False,
             question_wait=None,
+            require_verification=False,
             as_=None,
         )
 
@@ -152,6 +155,22 @@ class DispatchQuotaHookTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "requires --allow-question"):
             self._run_dispatch(args)
 
+    def test_require_verification_is_persisted_with_pending_outcome(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.require_verification = True
+
+        self._run_dispatch(args)
+
+        con = db.connect(self.root)
+        try:
+            run = con.execute(
+                "SELECT verification_required, verification_status FROM runs"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(run["verification_required"], 1)
+        self.assertEqual(run["verification_status"], "pending")
+
     def test_after_records_a_visible_pending_dispatch_without_launching(self) -> None:
         con = db.connect(self.root)
         try:
@@ -200,6 +219,115 @@ class DispatchQuotaHookTests(unittest.TestCase):
         finally:
             con.close()
         self.assertEqual(count, 0)
+
+    def test_second_pending_shared_writer_on_same_parent_is_rejected(self) -> None:
+        con = db.connect(self.root)
+        try:
+            prerequisite = con.execute(
+                "INSERT INTO runs(agent,backend,title,requested_by,workdir,status,started_at) "
+                "VALUES('minimax','opencode','producer','codex',?,'running',?)",
+                (str(self.root), db.now()),
+            ).lastrowid
+            con.commit()
+        finally:
+            con.close()
+        first = self._make_args("minimax", no_quota_warn=True)
+        first.after = [prerequisite]
+        first.read_only = False
+        self._run_dispatch(first)
+
+        second = self._make_args("minimax", no_quota_warn=True)
+        second.after = [prerequisite]
+        second.read_only = False
+        with self.assertRaisesRegex(SystemExit, "shared-tree writer collision"):
+            self._run_dispatch(second)
+
+        second.read_only = True
+        self._run_dispatch(second)
+        con = db.connect(self.root)
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 3)
+        finally:
+            con.close()
+
+    def test_terminal_run_status_keeps_verification_outcome_visible(self) -> None:
+        con = db.connect(self.root)
+        try:
+            run_id = con.execute(
+                "INSERT INTO runs(agent,backend,title,requested_by,workdir,status,"
+                "verification_required,verification_status,started_at) "
+                "VALUES('minimax','opencode','verified run','codex',?,'done',1,"
+                "'unverified',?)",
+                (str(self.root), db.now()),
+            ).lastrowid
+            con.commit()
+            row = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(cli._run_status_label(row), "done/unverified")
+
+    def test_work_snapshot_is_captured_once_before_creating_the_run(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.work = "W-0141"
+        with mock.patch.object(
+            cli.brief, "work_snapshot", return_value="**W-0141** — immutable context"
+        ) as snapshot:
+            self._run_dispatch(args)
+
+        con = db.connect(self.root)
+        try:
+            run = con.execute("SELECT brief_path FROM runs").fetchone()
+        finally:
+            con.close()
+        snapshot.assert_called_once_with(self.root, "W-0141", required=True)
+        self.assertIn("immutable context", Path(run["brief_path"]).read_text())
+
+    def test_missing_work_item_fails_before_creating_a_run(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.work = "W-9999"
+        with mock.patch.object(
+            cli.brief, "work_snapshot", side_effect=SystemExit("missing work item")
+        ):
+            with self.assertRaisesRegex(SystemExit, "missing work item"):
+                self._run_dispatch(args)
+
+        con = db.connect(self.root)
+        try:
+            count = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(count, 0)
+
+    def test_required_capability_needs_fresh_positive_lane_evidence(self) -> None:
+        args = self._make_args("minimax", no_quota_warn=True)
+        args.requires_capability = ["window-server"]
+        with self.assertRaisesRegex(SystemExit, "missing=window-server"):
+            self._run_dispatch(args)
+        con = db.connect(self.root)
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+        finally:
+            con.close()
+
+        capabilities.record_observation(
+            self.root,
+            host_identity=socket.gethostname(),
+            backend="opencode",
+            profile="minimax",
+            sandbox_mode="orchestra-unrestricted",
+            capability="window-server",
+            state="supported",
+            evidence="probe opened and closed a window",
+        )
+        self._run_dispatch(args)
+        con = db.connect(self.root)
+        try:
+            row = con.execute(
+                "SELECT required_capabilities_json FROM runs"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(row["required_capabilities_json"], '["window-server"]')
 
     def test_default_on_emits_warning_before_run_insert(self) -> None:
         critical = ProviderResult(

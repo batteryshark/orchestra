@@ -9,6 +9,44 @@ SKILL_DIRS = [".agents", ".claude", ".codex", ".opencode"]
 DOC_FILES = ["AGENTS.md", "CLAUDE.md", "ORCHESTRA.md"]
 
 
+def head(workdir: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot read worktree HEAD: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def status(workdir: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(workdir), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot read worktree status: {result.stderr.strip()}")
+    return result.stdout
+
+
+def untracked_context_paths(workdir: Path) -> list[str]:
+    """Context copied for agents must not leak into automatic checkpoints."""
+    excluded = []
+    for name in [*SKILL_DIRS, *DOC_FILES]:
+        if not (workdir / name).exists():
+            continue
+        tracked = subprocess.run(
+            ["git", "-C", str(workdir), "ls-files", "--error-unmatch", "--", name],
+            capture_output=True,
+            text=True,
+        )
+        if tracked.returncode != 0:
+            excluded.append(name)
+    return excluded
+
+
 def sync_skills(root: Path, workdir: Path) -> list[str]:
     """Mirror the project's skills folders + agent docs into an isolated workdir.
 
