@@ -49,6 +49,8 @@ orchestra init
 
 Add `--work` if the optional `work` CLI is installed and you want Orchestra to initialize its tracker too. `init` creates a Git repository when needed so isolated worktrees are available, creates local `.orchestra/` state and an orchestrator playbook, and registers the root with the shared dashboard registry.
 
+Project-local non-secret environment values belong in `.orchestra/config.toml` under `[worker_env]`. Orchestra injects them into every backend and expands `{root}` to the integration checkout, so tools in isolated worktrees can consistently reach shared databases or other external assets without per-worker shell exports.
+
 Project discovery walks upward from the current directory, but never crosses a nearer Git repository boundary. If a nested repository has not been initialized for Orchestra, commands stop and direct you to run `orchestra init` there instead of silently using an Orchestra project in a parent directory.
 
 The canonical playbook is a readable, packaged template at
@@ -372,11 +374,13 @@ to control access, as described in [SECURITY.md](SECURITY.md).
 
 ## Provider runway
 
-The dashboard's right-side runway rail keeps the current headroom for configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts visible while you work, and can show Together AI's prepaid USD balance when `TOGETHER_ORG_ID` is available. Select a provider—or the Usage button on narrower screens—to open quota windows and refresh controls without leaving the dashboard. Existing `/runway` bookmarks open this drawer. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
+The dashboard's right-side runway rail keeps the current headroom for configured MiniMax, Moonshot AI (Kimi Code), Claude, Z.AI, and Codex accounts visible while you work, and shows DeepSeek and Together AI prepaid balances. Select a provider—or the Usage button on narrower screens—to open quota windows and refresh controls without leaving the dashboard. Existing `/runway` bookmarks open this drawer. Collection happens server-side and the browser receives only normalized usage state—never API keys, access tokens, or credential-file contents.
 
 The adjacent Runtime view totals worker time and provider-reported processed tokens for the selected project, grouped by roster agent and model. Token counts are derived on demand from Codex, Claude, and OpenCode run-log events; runs whose backend did not report usage remain explicitly unavailable instead of being estimated.
 
 Together credentials are read from OpenCode's `togetherai` connection (or `TOGETHER_API_KEY`). Its organization-level balance also requires the non-secret `TOGETHER_ORG_ID`. The balance is live account data; the adjacent spend value is deliberately labeled with the selected Orchestra project because it sums only Together-backed OpenCode costs recorded in that project's run logs.
+
+DeepSeek credentials are read from OpenCode's `deepseek` connection (or `DEEPSEEK_API_KEY`). Orchestra reads the account's live API credit balance from DeepSeek's authenticated balance endpoint.
 
 `orchestra usage` prints the same state in the terminal. Before dispatch, Orchestra can warn when a target's known coding-plan headroom is at or below 20 percent. The advisory never reroutes a run and fails open if usage is unavailable. Disable it with `quota_warn = false` or `--no-quota-warn`.
 

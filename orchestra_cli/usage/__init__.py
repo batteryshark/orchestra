@@ -1,8 +1,8 @@
 """Native provider-quota subsystem for Orchestra.
 
 This package ported from the standalone ``usage-widget`` prototype keeps
-credential discovery server-side, normalizes coding-plan quotas and Together
-AI's prepaid balance into shared dataclasses, and exposes them through ``UsageService``,
+credential discovery server-side, normalizes coding-plan quotas and prepaid API
+balances into shared dataclasses, and exposes them through ``UsageService``,
 which is cached per-process so callers within the same Orchestra project do
 not trigger extra API calls.
 """

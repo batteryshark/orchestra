@@ -15,6 +15,7 @@ from orchestra_cli.usage.models import ProviderResult, error_result, utc_now_iso
 from orchestra_cli.usage.providers import (
     collect_claude,
     collect_codex,
+    collect_deepseek,
     collect_kimi,
     collect_minimax,
     collect_together,
@@ -37,6 +38,7 @@ DEFAULT_COLLECTORS: tuple[tuple[str, str, Collector], ...] = (
     ("kimi", "Moonshot AI", collect_kimi),
     ("claude", "Claude", collect_claude),
     ("zai", "Z.AI", collect_zai),
+    ("deepseek", "DeepSeek", collect_deepseek),
     ("together", "Together AI", collect_together),
     ("codex", "Codex", collect_codex),
 )

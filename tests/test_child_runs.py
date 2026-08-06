@@ -348,6 +348,9 @@ class SupervisorChildEnvironmentTests(unittest.TestCase):
 
     def test_supervisor_exports_current_run_identity(self) -> None:
         run_id = _run(self.root, agent="minimax")
+        (self.root / ".orchestra" / "config.toml").write_text(
+            '[worker_env]\nPIU_IDA_DB = "{root}/../shared/piu.i64"\n'
+        )
         brief_path = self.root / "brief.md"
         log_path = self.root / "run.jsonl"
         observed = self.root / "observed.txt"
@@ -363,12 +366,16 @@ class SupervisorChildEnvironmentTests(unittest.TestCase):
         code = (
             "import os,pathlib;"
             f"pathlib.Path({str(observed)!r}).write_text("
-            "os.environ['ORCHESTRA_SELF']+'|'+os.environ['ORCHESTRA_RUN_ID'])"
+            "os.environ['ORCHESTRA_SELF']+'|'+os.environ['ORCHESTRA_RUN_ID']+'|'"
+            "+os.environ['PIU_IDA_DB'])"
         )
         with mock.patch.object(supervise.runners, "build_cmd",
                                return_value=[sys.executable, "-c", code]):
             self.assertEqual(supervise.supervise(self.root, run_id), 0)
-        self.assertEqual(observed.read_text(), f"minimax|{run_id}")
+        self.assertEqual(
+            observed.read_text(),
+            f"minimax|{run_id}|{self.root}/../shared/piu.i64",
+        )
 
 
 class ChildCancellationTests(unittest.TestCase):

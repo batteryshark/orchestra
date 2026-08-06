@@ -11,12 +11,14 @@ from orchestra_cli.usage.credentials import opencode_api_key
 from orchestra_cli.usage.providers import (
     ProviderRequestError,
     collect_claude,
+    collect_deepseek,
     collect_kimi,
     collect_together,
     parse_claude,
     parse_claude_usage_screen,
     parse_codex,
     parse_codex_reset_credits,
+    parse_deepseek_balance,
     parse_kimi,
     parse_minimax,
     parse_together_balance,
@@ -134,6 +136,49 @@ class TogetherBalanceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "not_configured")
         self.assertIn("TOGETHER_ORG_ID", result.message)
+
+
+class DeepSeekBalanceTests(unittest.TestCase):
+    def test_parses_usd_balance_from_official_response_shape(self) -> None:
+        balance = parse_deepseek_balance({
+            "is_available": True,
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": "110.00"},
+                {"currency": "USD", "total_balance": "19.987"},
+            ],
+        })
+        self.assertEqual(balance.currency, "USD")
+        self.assertEqual(balance.remaining, 19.99)
+
+    def test_rejects_missing_negative_or_non_numeric_balance(self) -> None:
+        for payload in (
+            {},
+            {"balance_infos": []},
+            {"balance_infos": [{"currency": "USD", "total_balance": "nope"}]},
+            {"balance_infos": [{"currency": "USD", "total_balance": "-1"}]},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ProviderRequestError):
+                parse_deepseek_balance(payload)
+
+    def test_collector_uses_saved_opencode_key_without_serializing_it(self) -> None:
+        with patch("orchestra_cli.usage.providers.opencode_api_key") as credential_reader:
+            credential_reader.return_value.value = "fixture-secret"
+            credential_reader.return_value.source = "OpenCode (deepseek)"
+            calls = []
+
+            def fetcher(url, headers, timeout):
+                calls.append((url, headers, timeout))
+                return {"is_available": True, "balance_infos": [
+                    {"currency": "USD", "total_balance": "12.34"}
+                ]}
+
+            result = collect_deepseek(json_fetcher=fetcher)
+
+        credential_reader.assert_called_once_with(("deepseek",), ("DEEPSEEK_API_KEY",))
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.account_balance.remaining, 12.34)
+        self.assertEqual(calls[0][0], "https://api.deepseek.com/user/balance")
+        self.assertNotIn("fixture-secret", json.dumps(result.to_dict()))
 
 
 class KimiParserTests(unittest.TestCase):

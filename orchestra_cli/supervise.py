@@ -1052,6 +1052,7 @@ def supervise(root: Path, run_id: int) -> int:
         env = config.apply_env_passthrough(
             cfg, dict(os.environ, ORCHESTRA_SELF=run["agent"], ORCHESTRA_ROOT=str(root),
                       ORCHESTRA_RUN_ID=str(run_id)))
+        env = config.apply_worker_env(cfg, env, root)
         env = runners.apply_backend_env(agent, env)
         outcome, exit_code = _run_proc(con, run, cmd, run["workdir"], env,
                                        run["log_path"], run_id, deadline,

@@ -68,6 +68,11 @@ PROJECT_CONFIG_STUB = """\
 [settings]
 # timeout = 36000        # hard cap for runaway workers (10 hours)
 # stall_timeout = 1800   # no worker output before termination; 0 disables
+
+# Non-secret values inherited by every worker. {root} is the integration
+# checkout, including when a worker runs in an isolated worktree.
+[worker_env]
+# TOOL_DATABASE = "{root}/../shared/tool.i64"
 """
 
 STATE_GITIGNORE = """\

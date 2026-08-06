@@ -3,7 +3,8 @@
 Inference uses the actual coding-plan prefixes recorded by OpenCode:
 ``minimax-coding-plan`` / ``minimax-cn-coding-plan`` map to ``minimax``;
 ``kimi-for-coding`` maps to ``kimi``; ``zhipuai-coding-plan`` /
-``zai-coding-plan`` map to ``zai``; ``togetherai`` maps to ``together``. Backend matches
+``zai-coding-plan`` map to ``zai``; ``deepseek`` maps to ``deepseek``;
+``togetherai`` maps to ``together``. Backend matches
 for Claude (``claude``) and Codex (``codex``). Anything else returns ``None``
 (unknown), which the dispatcher treats as fail-open.
 """
@@ -34,6 +35,8 @@ def infer_provider(backend: str | None, model: str | None) -> str | None:
         return "kimi"
     if model.startswith(("zhipuai-coding-plan/", "zai-coding-plan/")):
         return "zai"
+    if model.startswith("deepseek/"):
+        return "deepseek"
     if model.startswith("togetherai/"):
         return "together"
     return None

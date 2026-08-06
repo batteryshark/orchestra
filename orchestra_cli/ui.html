@@ -410,7 +410,7 @@ const runtimeStats = document.getElementById('runtimeStats');
 const runtimeUpdated = document.getElementById('runtimeUpdated');
 const RUNWAY_OPEN_KEY = 'orchestra.runway.open';
 const INSIGHTS_VIEW_KEY = 'orchestra.insights.view';
-const RUNWAY_MONOGRAMS = {minimax:'MM', kimi:'K', claude:'CL', zai:'Z', codex:'CX'};
+const RUNWAY_MONOGRAMS = {minimax:'MM', kimi:'K', claude:'CL', zai:'Z', deepseek:'DS', codex:'CX'};
 let runwayLoading = false, runtimeLoading = false, insightsView = 'usage';
 
 function runwayTone(value){
@@ -497,13 +497,14 @@ function runwayCreditsHtml(credits){
 function runwayMoney(provider){
   const balance = provider && provider.account_balance;
   const remaining = Number(balance && balance.remaining);
-  if (!balance || balance.currency !== 'USD' || !Number.isFinite(remaining)) return null;
+  if (!balance || !['USD','CNY'].includes(balance.currency) || !Number.isFinite(remaining)) return null;
+  const formatted = new Intl.NumberFormat([], {style:'currency', currency:balance.currency}).format(remaining);
   const spent = balance.spent == null ? NaN : Number(balance.spent);
   return {
-    compact: `$${remaining.toFixed(2)}`,
-    title: `$${remaining.toFixed(2)} balance`,
-    html: `<div class="runway-credits"><strong>$${esc(remaining.toFixed(2))}</strong> balance${
-      Number.isFinite(spent) ? ` · $${esc(spent.toFixed(2))} spent${balance.spent_scope ? ` (${esc(balance.spent_scope)})` : ''}` : ''
+    compact: formatted,
+    title: `${formatted} balance`,
+    html: `<div class="runway-credits"><strong>${esc(formatted)}</strong> balance${
+      Number.isFinite(spent) ? ` · ${esc(new Intl.NumberFormat([], {style:'currency', currency:balance.currency}).format(spent))} spent${balance.spent_scope ? ` (${esc(balance.spent_scope)})` : ''}` : ''
     }</div>`
   };
 }

@@ -1,4 +1,4 @@
-"""Native quota collectors for MiniMax, Kimi, Z.AI, Claude, and Codex.
+"""Native quota collectors for MiniMax, Kimi, Z.AI, DeepSeek, Claude, and Codex.
 
 Each `parse_*` function takes the raw provider JSON and returns normalized
 `QuotaWindow` rows. Each `collect_*` function handles credential discovery,
@@ -43,6 +43,7 @@ from orchestra_cli.usage.models import (
 MINIMAX_USAGE_URL = "https://www.minimax.io/v1/token_plan/remains"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 TOGETHER_BALANCE_URL = (
     "https://api.together.ai/api/billing/organizations/{organization_id}/ongoing-balance"
 )
@@ -443,6 +444,71 @@ def parse_together_balance(payload: dict[str, Any]) -> AccountBalance:
     if cents is None or cents < 0:
         raise ProviderRequestError("Together returned no usable prepaid balance")
     return AccountBalance(currency="USD", remaining=round(cents / 100, 2))
+
+
+def parse_deepseek_balance(payload: dict[str, Any]) -> AccountBalance:
+    rows = payload.get("balance_infos")
+    if not isinstance(rows, list):
+        raise ProviderRequestError("DeepSeek returned no usable balance")
+    balances: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("currency") not in ("USD", "CNY"):
+            continue
+        amount = _quota_number(row.get("total_balance"))
+        if amount is not None and amount >= 0:
+            balances[row["currency"]] = amount
+    for currency in ("USD", "CNY"):
+        if currency in balances:
+            return AccountBalance(currency=currency, remaining=round(balances[currency], 2))
+    raise ProviderRequestError("DeepSeek returned no usable balance")
+
+
+def collect_deepseek(*, json_fetcher: JsonFetcher = fetch_json) -> ProviderResult:
+    try:
+        credential = opencode_api_key(("deepseek",), ("DEEPSEEK_API_KEY",))
+    except CredentialMissing:
+        return error_result(
+            "deepseek",
+            "DeepSeek",
+            "not_configured",
+            "Connect DeepSeek in OpenCode or set DEEPSEEK_API_KEY.",
+        )
+    except CredentialError:
+        return error_result(
+            "deepseek", "DeepSeek", "unavailable", "DeepSeek credentials could not be read."
+        )
+
+    try:
+        payload = json_fetcher(
+            DEEPSEEK_BALANCE_URL,
+            {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {credential.value}",
+                "User-Agent": "orchestra-cli/0.1",
+            },
+            HTTP_TIMEOUT_SECONDS,
+        )
+        account_balance = parse_deepseek_balance(payload)
+    except ProviderRequestError as exc:
+        if exc.status_code in (401, 403):
+            return error_result(
+                "deepseek",
+                "DeepSeek",
+                "auth_required",
+                "DeepSeek rejected the saved API key.",
+                source=credential.source,
+            )
+        return error_result(
+            "deepseek", "DeepSeek", "unavailable", str(exc), source=credential.source
+        )
+    return ProviderResult(
+        id="deepseek",
+        name="DeepSeek",
+        status="ok",
+        plan="API credits",
+        account_balance=account_balance,
+        source=credential.source,
+    )
 
 
 def collect_together(*, json_fetcher: JsonFetcher = fetch_json) -> ProviderResult:

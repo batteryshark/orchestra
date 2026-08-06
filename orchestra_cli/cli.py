@@ -24,6 +24,7 @@ from orchestra_cli import (
     docs,
     ensemble,
     host,
+    harness_hooks,
     incidents,
     names,
     operator_controller,
@@ -127,6 +128,10 @@ def cmd_init(args):
         (sd / "config.toml").write_text(docs.PROJECT_CONFIG_STUB)
     gp = config.ensure_global_config()
     db.connect(root).close()
+    try:
+        hook_statuses = harness_hooks.install(root)
+    except RuntimeError as exc:
+        raise SystemExit(f"orchestra: {exc}") from exc
     for doc in ["AGENTS.md", "CLAUDE.md"]:
         p = root / doc
         text = p.read_text(encoding="utf-8") if p.exists() else ""
@@ -146,6 +151,8 @@ def cmd_init(args):
     print(f"  global roster config: {gp}")
     print(f"  playbook: {playbook} ({playbook_status}; "
           "pointers present in AGENTS.md / CLAUDE.md)")
+    print("  harness hooks: " + "; ".join(hook_statuses))
+    print("  note: Codex requires one-time review of new project hooks with `/hooks`")
     if not (root / ".work").is_dir():
         print("  note: no .work workspace here — run `work init .` (or `orchestra init --work`) "
               "so missions can be tracked durably")
@@ -548,6 +555,17 @@ def cmd_consult(args):
             f"consultation #{consultation_id} sent to {requester}; run {run_id} "
             "keeps working"
         )
+
+
+def cmd_hook(args):
+    """Backend lifecycle adapter used by generated project hook files."""
+    try:
+        root = paths.find_root()
+    except SystemExit:
+        print(harness_hooks.render_hook_result(args.backend, None))
+        return
+    prompt = harness_hooks.wait_for_attention(root)
+    print(harness_hooks.render_hook_result(args.backend, prompt))
 
 
 def cmd_broadcast(args):
@@ -2039,9 +2057,10 @@ def _format_account_balance(balance: dict | None) -> str:
         return ""
     remaining = balance.get("remaining")
     currency = balance.get("currency")
-    if not isinstance(remaining, (int, float)) or currency != "USD":
+    if not isinstance(remaining, (int, float)) or currency not in ("USD", "CNY"):
         return ""
-    note = f" · ${remaining:.2f} balance"
+    symbol = "$" if currency == "USD" else "CN¥"
+    note = f" · {symbol}{remaining:.2f} balance"
     spent = balance.get("spent")
     if isinstance(spent, (int, float)):
         scope = balance.get("spent_scope")
@@ -2698,6 +2717,13 @@ def main():
         help="record an unavailable environment capability and raise an incident",
     )
     s.set_defaults(fn=cmd_handoff)
+
+    s = sub.add_parser(
+        "hook",
+        help="wait for Orchestra events and emit a backend lifecycle response",
+    )
+    s.add_argument("--backend", choices=("claude", "codex", "opencode"), required=True)
+    s.set_defaults(fn=cmd_hook)
 
     s = sub.add_parser("broadcast", help="message every member of a team")
     s.add_argument("body")

@@ -34,6 +34,10 @@ child_max_active = 3
 # starts outside the user's interactive shell. Add only names, never values.
 env_passthrough = []
 
+# Non-secret environment values applied to every worker. ``{{root}}`` expands to
+# the integration checkout, even when the worker runs in an isolated worktree.
+[worker_env]
+
 
 # --- roster ---------------------------------------------------------------
 # Each entry is a reusable launch profile, not a singleton worker. Multiple
@@ -137,6 +141,21 @@ def apply_env_passthrough(cfg: dict, env: dict) -> dict:
     return env
 
 
+def apply_worker_env(cfg: dict, env: dict[str, str], root: Path) -> dict[str, str]:
+    """Apply non-secret project values to every worker process."""
+    values = cfg.get("worker_env", {})
+    if not isinstance(values, dict):
+        raise SystemExit("orchestra: [worker_env] must be a TOML table")
+    updated = dict(env)
+    for name, value in values.items():
+        if not isinstance(name, str) or not name or "=" in name or "\0" in name:
+            raise SystemExit(f"orchestra: invalid worker environment name {name!r}")
+        if not isinstance(value, str) or "\0" in value:
+            raise SystemExit(f"orchestra: worker environment value for {name} must be a string")
+        updated[name] = value.replace("{root}", str(root))
+    return updated
+
+
 def codex_defaults() -> tuple[str | None, str | None]:
     """(model, reasoning_effort) from ~/.codex/config.toml, for display."""
     cfg = _load_toml(Path("~/.codex/config.toml").expanduser())
@@ -156,6 +175,10 @@ def load(root: Path | None) -> dict:
     for p in [paths.global_config_path()] + ([paths.project_config_path(root)] if root else []):
         overlay = _load_toml(p)
         cfg.setdefault("settings", {}).update(overlay.get("settings", {}))
+        worker_env = overlay.get("worker_env", {})
+        if not isinstance(worker_env, dict):
+            raise SystemExit(f"orchestra: [worker_env] in {p} must be a TOML table")
+        cfg.setdefault("worker_env", {}).update(worker_env)
         for name, agent in overlay.get("agents", {}).items():
             cfg.setdefault("agents", {}).setdefault(name, {}).update(agent)
     return cfg

@@ -55,6 +55,9 @@ class InferProviderTests(unittest.TestCase):
             "together",
         )
 
+    def test_maps_deepseek_api_models_to_deepseek(self) -> None:
+        self.assertEqual(infer_provider("opencode", "deepseek/deepseek-chat"), "deepseek")
+
     def test_maps_kimi_for_coding_to_kimi(self) -> None:
         self.assertEqual(infer_provider("opencode", "kimi-for-coding/k3"), "kimi")
         self.assertEqual(
