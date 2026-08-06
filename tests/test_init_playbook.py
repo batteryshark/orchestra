@@ -95,6 +95,10 @@ class InitPlaybookTests(unittest.TestCase):
             pointer = (self.root / name).read_text(encoding="utf-8")
             self.assertEqual(pointer.count("<!-- orchestra -->"), 1)
             self.assertIn("read `ORCHESTRA.md`", pointer)
+        self.assertTrue((self.root / ".codex" / "hooks.json").is_file())
+        self.assertTrue((self.root / ".claude" / "settings.json").is_file())
+        self.assertTrue((self.root / ".opencode" / "plugins" / "orchestra.js").is_file())
+        self.assertIn("harness hooks", output)
 
     def test_init_creates_git_repository_ready_for_worktrees(self) -> None:
         self._init()
