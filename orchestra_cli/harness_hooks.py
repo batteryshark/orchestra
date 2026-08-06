@@ -100,8 +100,12 @@ def wait_for_attention(root: Path, *, poll_interval: float = 0.25) -> str | None
 
     con = db.connect(root)
     try:
+        next_reap_at = 0.0
         while True:
-            reap.reap_orphans(con, root)
+            now = time.monotonic()
+            if now >= next_reap_at:
+                reap.reap_orphans(con, root)
+                next_reap_at = now + 5
             messages = _claim_messages(con, recipient)
             if messages:
                 rendered = "\n\n".join(

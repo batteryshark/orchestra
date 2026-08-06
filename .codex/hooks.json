@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "orchestra hook --backend codex",
+            "timeout": 36000,
+            "statusMessage": "Waiting for Orchestra workers"
+          }
+        ]
+      }
+    ]
+  }
+}

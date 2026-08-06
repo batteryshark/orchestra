@@ -98,7 +98,8 @@ orchestra dispatch --to <agent> --work W-0001 --brief-file mission.md --as <you>
    normally without host escalation instead of `orchestra dispatch`: it only records a local
    request, and the existing outer supervisor brokers child setup and launch.
 4. **Monitor without serializing yourself.** Use `orchestra status` and `orchestra runs --active`.
-   Background `orchestra wait` if useful; continue integration or review work meanwhile.
+   Project lifecycle hooks keep Claude, Codex, and OpenCode attached while owned runs are active.
+   Use `orchestra wait` directly when hooks are disabled or from shell automation.
 5. **Correct through the right channel.** Use the messaging semantics below. When doctrine or
    shared assumptions change, redirect every affected in-flight worker.
 6. **Harvest.** Read the orchestrator inbox, findings feed, handoffs, commits, and full logs.
