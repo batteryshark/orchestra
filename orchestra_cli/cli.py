@@ -48,6 +48,7 @@ from orchestra_cli.usage import (
     render_warning_lines,
 )
 from orchestra_cli.usage.spend import with_project_spend
+from orchestra_cli.usage.tokens import token_usage
 
 
 def _identity(args, cfg) -> str:
@@ -103,6 +104,21 @@ def cmd_init(args):
             playbook_status = "refreshed managed section"
     else:
         playbook_status = "preserved existing file"
+
+    if not (root / ".git").exists():
+        try:
+            result = subprocess.run(
+                ["git", "init", "--quiet", str(root)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(f"orchestra: cannot initialize git repository: {exc}") from exc
+        if result.returncode != 0:
+            raise SystemExit(
+                f"orchestra: cannot initialize git repository: {result.stderr.strip()}"
+            )
 
     sd = root / paths.STATE_DIR
     sd.mkdir(exist_ok=True)
@@ -2087,33 +2103,12 @@ def cmd_usage(args):
             continue
         a = agg.setdefault(r["agent"], {"runs": 0, "in": 0, "out": 0, "reason": 0, "cache": 0, "cost": 0.0})
         a["runs"] += 1
-        for line in lp.read_text(errors="replace").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            part = obj.get("part")
-            if isinstance(part, dict) and part.get("type") == "step-finish":  # opencode
-                tk = part.get("tokens") or {}
-                a["in"] += tk.get("input", 0)
-                a["out"] += tk.get("output", 0)
-                a["reason"] += tk.get("reasoning", 0)
-                a["cache"] += (tk.get("cache") or {}).get("read", 0)
-                a["cost"] += part.get("cost") or 0
-            elif obj.get("type") == "turn.completed":  # codex
-                u = obj.get("usage") or {}
-                a["in"] += u.get("input_tokens", 0)
-                a["out"] += u.get("output_tokens", 0)
-                a["cache"] += u.get("cached_input_tokens", 0)
-            elif obj.get("type") == "result":  # claude
-                u = obj.get("usage") or {}
-                a["in"] += u.get("input_tokens", 0)
-                a["out"] += u.get("output_tokens", 0)
-                a["cache"] += u.get("cache_read_input_tokens", 0)
-                a["cost"] += obj.get("total_cost_usd") or 0
+        usage = token_usage(lp)
+        a["in"] += usage["input"]
+        a["out"] += usage["output"]
+        a["reason"] += usage["reasoning"]
+        a["cache"] += usage["cache_read"]
+        a["cost"] += usage["cost"]
     print(f"## worker token burn ({root.name})")
     if not agg:
         print("  (no runs)")

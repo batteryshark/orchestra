@@ -51,6 +51,7 @@ from orchestra_cli import (
 )
 from orchestra_cli.usage import default_service
 from orchestra_cli.usage.spend import with_project_spend
+from orchestra_cli.usage.tokens import token_usage
 
 DEFAULT_UI_PORT = 4764
 
@@ -110,8 +111,8 @@ def summarize_runtime(rows, *, now: datetime | None = None,
     roles = roles or {}
     by_agent: dict[str, dict] = {}
     by_model: dict[tuple[str, str], dict] = {}
-    total_seconds = 0
-    timed_runs = active_runs = 0
+    total_seconds = total_tokens = 0
+    timed_runs = active_runs = tokenized_runs = 0
     rows = list(rows)
 
     for row in rows:
@@ -127,26 +128,40 @@ def summarize_runtime(rows, *, now: datetime | None = None,
         timed_runs += 1
         active_runs += int(active)
 
+        try:
+            usage = token_usage(row["log_path"])
+        except (IndexError, KeyError):
+            usage = token_usage(None)
+        has_usage = usage["events"] > 0
+        total_tokens += usage["total"]
+        tokenized_runs += int(has_usage)
+
         agent = str(row["agent"] or "unknown")
         backend = str(row["backend"] or "unknown")
         model = str(row["model"] or "default")
         agent_item = by_agent.setdefault(agent, {
             "agent": agent, "seconds": 0, "runs": 0, "active_runs": 0,
             "models": set(), "backends": set(), "role": roles.get(agent, ""),
+            "tokens": 0, "tokenized_runs": 0,
         })
         agent_item["seconds"] += seconds
         agent_item["runs"] += 1
         agent_item["active_runs"] += int(active)
+        agent_item["tokens"] += usage["total"]
+        agent_item["tokenized_runs"] += int(has_usage)
         agent_item["models"].add(model)
         agent_item["backends"].add(backend)
 
         model_item = by_model.setdefault((backend, model), {
             "backend": backend, "model": model, "seconds": 0, "runs": 0,
             "active_runs": 0, "agents": set(),
+            "tokens": 0, "tokenized_runs": 0,
         })
         model_item["seconds"] += seconds
         model_item["runs"] += 1
         model_item["active_runs"] += int(active)
+        model_item["tokens"] += usage["total"]
+        model_item["tokenized_runs"] += int(has_usage)
         model_item["agents"].add(agent)
 
     def serialize(items: list[dict], set_fields: tuple[str, ...]) -> list[dict]:
@@ -159,9 +174,11 @@ def summarize_runtime(rows, *, now: datetime | None = None,
     return {
         "generated_at": now.isoformat().replace("+00:00", "Z"),
         "total_seconds": total_seconds,
+        "total_tokens": total_tokens,
         "total_runs": len(rows),
         "timed_runs": timed_runs,
         "active_runs": active_runs,
+        "tokenized_runs": tokenized_runs,
         "ignored_runs": len(rows) - timed_runs,
         "by_agent": serialize(list(by_agent.values()), ("models", "backends")),
         "by_model": serialize(list(by_model.values()), ("agents",)),
@@ -984,7 +1001,7 @@ def make_handler(root: Path | None = None, registry: list[dict] | None = None):
                 con = db.connect(project)
                 try:
                     rows = list(con.execute(
-                        "SELECT agent, backend, model, status, started_at, finished_at "
+                        "SELECT agent, backend, model, status, started_at, finished_at, log_path "
                         "FROM runs ORDER BY id"
                     ))
                 finally:

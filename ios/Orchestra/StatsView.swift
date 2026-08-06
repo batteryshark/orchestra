@@ -13,12 +13,17 @@ struct StatsView: View {
                                 MetricCard(title: "Worker time",
                                            value: OrchestraFormatting.duration(stats.totalSeconds),
                                            systemImage: "clock.arrow.circlepath")
+                                MetricCard(title: "Reported tokens",
+                                           value: OrchestraFormatting.tokens(stats.totalTokens),
+                                           systemImage: "text.word.spacing")
                                 MetricCard(title: "Total runs", value: "\(stats.totalRuns)",
                                            systemImage: "number")
                                 MetricCard(title: "Active now", value: "\(stats.activeRuns)",
                                            systemImage: "waveform", tint: .green)
                                 MetricCard(title: "Timed runs", value: "\(stats.timedRuns)",
                                            systemImage: "stopwatch")
+                                MetricCard(title: "Tokenized runs", value: "\(stats.tokenizedRuns)",
+                                           systemImage: "number.square")
                             }
 
                             runtimeSection("By worker", icon: "person.2") {
@@ -29,6 +34,8 @@ struct StatsView: View {
                                                seconds: agent.seconds,
                                                runs: agent.runs,
                                                activeRuns: agent.activeRuns,
+                                               tokens: agent.tokens,
+                                               tokenizedRuns: agent.tokenizedRuns,
                                                totalSeconds: stats.totalSeconds)
                                 }
                             }
@@ -40,6 +47,8 @@ struct StatsView: View {
                                                seconds: item.seconds,
                                                runs: item.runs,
                                                activeRuns: item.activeRuns,
+                                               tokens: item.tokens,
+                                               tokenizedRuns: item.tokenizedRuns,
                                                totalSeconds: stats.totalSeconds)
                                 }
                             }
@@ -75,6 +84,8 @@ private struct RuntimeRow: View {
     let seconds: Int
     let runs: Int
     let activeRuns: Int
+    let tokens: Int
+    let tokenizedRuns: Int
     let totalSeconds: Int
 
     var body: some View {
@@ -89,6 +100,8 @@ private struct RuntimeRow: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(OrchestraFormatting.duration(seconds)).font(.subheadline.monospacedDigit())
+                    Text(tokenizedRuns > 0 ? "\(OrchestraFormatting.tokens(tokens)) tokens" : "Tokens unavailable")
+                        .font(.caption2).foregroundStyle(.secondary)
                     Text("\(runs) run\(runs == 1 ? "" : "s")\(activeRuns > 0 ? " · \(activeRuns) active" : "")")
                         .font(.caption2).foregroundStyle(.secondary)
                 }

@@ -207,9 +207,11 @@ struct RateLimitResetCredits: Decodable, Sendable {
 struct RuntimeStats: Decodable, Sendable {
     let generatedAt: String
     let totalSeconds: Int
+    let totalTokens: Int
     let totalRuns: Int
     let timedRuns: Int
     let activeRuns: Int
+    let tokenizedRuns: Int
     let ignoredRuns: Int
     let byAgent: [AgentRuntime]
     let byModel: [ModelRuntime]
@@ -220,6 +222,8 @@ struct AgentRuntime: Decodable, Identifiable, Sendable {
     let seconds: Int
     let runs: Int
     let activeRuns: Int
+    let tokens: Int
+    let tokenizedRuns: Int
     let models: [String]
     let backends: [String]
     let role: String
@@ -233,6 +237,8 @@ struct ModelRuntime: Decodable, Identifiable, Sendable {
     let seconds: Int
     let runs: Int
     let activeRuns: Int
+    let tokens: Int
+    let tokenizedRuns: Int
     let agents: [String]
 
     var id: String { "\(backend):\(model)" }
@@ -266,6 +272,10 @@ enum OrchestraFormatting {
         if hours > 0 { return "\(hours)h \(minutes)m" }
         if minutes > 0 { return "\(minutes)m" }
         return "\(seconds)s"
+    }
+
+    static func tokens(_ value: Int) -> String {
+        value.formatted(.number.notation(.compactName).precision(.fractionLength(0...1)))
     }
 
     static func timestamp(_ value: String?) -> String {

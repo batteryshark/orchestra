@@ -18,6 +18,11 @@ def find_root(explicit: str | None = None) -> Path:
     for candidate in [cur, *cur.parents]:
         if (candidate / STATE_DIR).is_dir():
             return candidate
+        if (candidate / ".git").exists():
+            raise SystemExit(
+                f"orchestra: git repository at {candidate} is not initialized for Orchestra.\n"
+                "Run `orchestra init` there first."
+            )
     raise SystemExit(
         "orchestra: no .orchestra/ found in this directory or any parent.\n"
         "Run `orchestra init` at your project root first."

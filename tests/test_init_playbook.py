@@ -8,7 +8,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from orchestra_cli import cli, docs
+from orchestra_cli import cli, docs, paths, worktree
 
 
 class PlaybookTemplateTests(unittest.TestCase):
@@ -95,6 +95,29 @@ class InitPlaybookTests(unittest.TestCase):
             pointer = (self.root / name).read_text(encoding="utf-8")
             self.assertEqual(pointer.count("<!-- orchestra -->"), 1)
             self.assertIn("read `ORCHESTRA.md`", pointer)
+
+    def test_init_creates_git_repository_ready_for_worktrees(self) -> None:
+        self._init()
+
+        isolated, branch = worktree.create(self.root, 1)
+
+        self.assertTrue((self.root / ".git").exists())
+        self.assertEqual(isolated, self.root / ".orchestra" / "worktrees" / "run-1")
+        self.assertEqual(branch, "orchestra/run-1")
+        self.assertTrue((isolated / ".git").is_file())
+
+    def test_nested_git_repository_does_not_adopt_parent_orchestra_root(self) -> None:
+        self._init()
+        nested = self.root / "nested-project"
+        nested.mkdir()
+        (nested / ".git").mkdir()
+        os.chdir(nested)
+
+        with self.assertRaisesRegex(SystemExit, "git repository.*not initialized"):
+            paths.find_root()
+
+        self._init()
+        self.assertEqual(paths.find_root(), nested.resolve())
 
     def test_plain_reinit_preserves_existing_playbook(self) -> None:
         legacy = "# Project-owned playbook without managed markers\n"

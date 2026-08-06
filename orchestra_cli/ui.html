@@ -252,6 +252,7 @@ button:disabled { color:var(--muted); cursor:not-allowed; opacity:.7 }
 .runtime-row-title { font-weight:650 }
 .runtime-row-meta { color:var(--muted); font-size:10px }
 .runtime-row-value { align-self:center; font-family:ui-monospace,monospace; font-weight:700 }
+.runtime-row-value small { display:block; margin-top:3px; color:var(--muted); font-size:9px; text-align:right }
 .runtime-empty { padding:24px 12px; color:var(--muted); text-align:center }
 @media (min-width:1200px) {
   body { padding-right:80px }
@@ -583,6 +584,13 @@ function runtimeValue(seconds, active, generated){
 function runtimeModelLabel(model){
   return (model || 'default').split('/').pop();
 }
+function runtimeTokens(tokens){
+  const value = Math.max(0, Number(tokens) || 0);
+  return new Intl.NumberFormat([], {notation:'compact', maximumFractionDigits:1}).format(value);
+}
+function runtimeTokenValue(item){
+  return Number(item.tokenized_runs) ? `${runtimeTokens(item.tokens)} tokens` : 'tokens unavailable';
+}
 function runtimeRow(item, kind, generated){
   const isAgent = kind === 'agent';
   const title = isAgent ? item.agent : runtimeModelLabel(item.model);
@@ -593,7 +601,7 @@ function runtimeRow(item, kind, generated){
   return `<div class="runtime-row">
     <div><div class="runtime-row-title" title="${esc(item.role||title)}">${esc(title)}</div>
       <div class="runtime-row-meta" title="${esc(models+role)}">${esc(route)} · ${esc(models||'default')} · ${item.runs} run${item.runs===1?'':'s'}${esc(live)}${esc(role)}</div></div>
-    <div class="runtime-row-value">${runtimeValue(item.seconds, item.active_runs, generated)}</div>
+    <div class="runtime-row-value">${runtimeValue(item.seconds, item.active_runs, generated)}<small>${runtimeTokenValue(item)}</small></div>
   </div>`;
 }
 function tickRuntimeStats(){
@@ -613,11 +621,12 @@ function renderRuntimeStats(data){
     </div>
     <div class="runtime-facts">
       <div class="runtime-fact"><strong>${Number(data.timed_runs)||0}</strong><span>timed runs</span></div>
+      <div class="runtime-fact"><strong>${runtimeTokens(data.total_tokens)}</strong><span>reported tokens</span></div>
       <div class="runtime-fact"><strong>${Number(data.active_runs)||0}</strong><span>active now</span></div>
-      <div class="runtime-fact"><strong>${agents.length}</strong><span>roster agents</span></div>
     </div>
     <div class="runtime-section"><h3>By roster agent</h3>${agents.map(x=>runtimeRow(x,'agent',data.generated_at)).join('') || '<div class="runtime-empty">No timed runs yet.</div>'}</div>
     <div class="runtime-section"><h3>By model</h3>${models.map(x=>runtimeRow(x,'model',data.generated_at)).join('') || '<div class="runtime-empty">No model history yet.</div>'}</div>
+    ${Number(data.tokenized_runs)<Number(data.total_runs)?`<div class="runtime-caption">Token counts are available for ${Number(data.tokenized_runs)||0} of ${Number(data.total_runs)||0} runs and update from provider-reported log events.</div>`:''}
     ${ignored?`<div class="runtime-caption">${ignored} historical run${ignored===1?' was':'s were'} omitted because its timestamps were incomplete.</div>`:''}`;
   const generated = new Date(data.generated_at);
   runtimeUpdated.textContent = Number.isFinite(generated.getTime())

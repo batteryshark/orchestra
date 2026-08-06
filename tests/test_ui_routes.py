@@ -214,6 +214,7 @@ class RouteTests(unittest.TestCase):
         self.assertIn('By roster agent', body)
         self.assertIn('By model', body)
         self.assertIn('Concurrent workers count separately.', body)
+        self.assertIn('reported tokens', body)
 
     def test_main_dashboard_has_json_stop_control_wiring(self) -> None:
         status, _headers, body = self.get("/")
@@ -336,15 +337,16 @@ class RuntimeSummaryTests(unittest.TestCase):
         rows = [
             {"agent": "kimi-max", "backend": "opencode", "model": "kimi/k3",
              "status": "done", "started_at": "2026-07-19T00:00:00Z",
-             "finished_at": "2026-07-19T01:00:00Z"},
+             "finished_at": "2026-07-19T01:00:00Z", "log_path": None},
             {"agent": "kimi-max", "backend": "opencode", "model": "kimi/k3-fast",
              "status": "done", "started_at": "2026-07-19T00:00:00Z",
-             "finished_at": "2026-07-19T00:30:00Z"},
+             "finished_at": "2026-07-19T00:30:00Z", "log_path": None},
             {"agent": "opus", "backend": "claude", "model": "opus",
              "status": "running", "started_at": "2026-07-19T00:30:00Z",
-             "finished_at": None},
+             "finished_at": None, "log_path": None},
             {"agent": "legacy", "backend": "opencode", "model": None,
-             "status": "done", "started_at": "not-a-time", "finished_at": None},
+             "status": "done", "started_at": "not-a-time", "finished_at": None,
+             "log_path": None},
         ]
         result = ui.summarize_runtime(
             rows,
@@ -366,6 +368,27 @@ class RuntimeSummaryTests(unittest.TestCase):
             {("opencode", "kimi/k3"), ("opencode", "kimi/k3-fast"),
              ("claude", "opus")},
         )
+
+    def test_adds_reported_tokens_to_agent_and_model_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.jsonl"
+            log.write_text(json.dumps({
+                "type": "turn.completed",
+                "usage": {"input_tokens": 100, "cached_input_tokens": 80,
+                          "output_tokens": 20, "reasoning_output_tokens": 5},
+            }) + "\n")
+            rows = [{
+                "agent": "codex", "backend": "codex", "model": "gpt",
+                "status": "done", "started_at": "2026-07-19T00:00:00Z",
+                "finished_at": "2026-07-19T00:01:00Z", "log_path": str(log),
+            }]
+
+            result = ui.summarize_runtime(rows)
+
+        self.assertEqual(result["total_tokens"], 120)
+        self.assertEqual(result["tokenized_runs"], 1)
+        self.assertEqual(result["by_agent"][0]["tokens"], 120)
+        self.assertEqual(result["by_model"][0]["tokens"], 120)
 
 if __name__ == "__main__":
     unittest.main()
