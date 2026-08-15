@@ -1,0 +1,8 @@
+.maestro/
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.work/
+.firecrawl/
+.test-times.json

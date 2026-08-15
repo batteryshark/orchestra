@@ -1,0 +1,107 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* DromondApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* DromondApp.swift */; };
+		A10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* ContentView.swift */; };
+		A10000000000000000000003 /* RunDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* RunDetailView.swift */; };
+		A10000000000000000000004 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* AppState.swift */; };
+		A10000000000000000000005 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* Models.swift */; };
+		A10000000000000000000006 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* APIClient.swift */; };
+		A10000000000000000000007 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* Keychain.swift */; };
+		A10000000000000000000008 /* SnapshotDecoderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* SnapshotDecoderTests.swift */; };
+		A10000000000000000000009 /* snapshot-v6.json in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* snapshot-v6.json */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A30000000000000000000001 = {isa = PBXContainerItemProxy; containerPortal = A40000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = A50000000000000000000001; remoteInfo = Dromond; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000001 /* DromondApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DromondApp.swift; sourceTree = "<group>"; };
+		A20000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A20000000000000000000003 /* RunDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunDetailView.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* Keychain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Keychain.swift; sourceTree = "<group>"; };
+		A20000000000000000000008 /* SnapshotDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotDecoderTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000009 /* snapshot-v6.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "snapshot-v6.json"; sourceTree = "<group>"; };
+		A2000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A200000000000000000000F0 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		A200000000000000000000F1 /* RunsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunsView.swift; sourceTree = "<group>"; };
+		A200000000000000000000F2 /* FindingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FindingsView.swift; sourceTree = "<group>"; };
+		A200000000000000000000F3 /* RunwayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunwayView.swift; sourceTree = "<group>"; };
+		A200000000000000000000F4 /* ProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilesView.swift; sourceTree = "<group>"; };
+		A200000000000000000000F5 /* HealthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthView.swift; sourceTree = "<group>"; };
+		A2000000000000000000000E /* snapshot-v7.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "snapshot-v7.json"; sourceTree = "<group>"; };
+		A2000000000000000000000D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A2000000000000000000000B /* Dromond.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Dromond.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000000000000000000000C /* DromondTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DromondTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A60000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A60000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A70000000000000000000001 = {isa = PBXGroup; children = (A70000000000000000000002 /* Dromond */, A70000000000000000000003 /* DromondTests */, A70000000000000000000005 /* Products */); sourceTree = "<group>"; };
+		A70000000000000000000002 /* Dromond */ = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000005, A20000000000000000000006, A20000000000000000000007, A2000000000000000000000A, A2000000000000000000000D, A200000000000000000000F0, A200000000000000000000F1, A200000000000000000000F2, A200000000000000000000F3, A200000000000000000000F4, A200000000000000000000F5); path = Dromond; sourceTree = "<group>"; };
+		A70000000000000000000003 /* DromondTests */ = {isa = PBXGroup; children = (A20000000000000000000008, A70000000000000000000004 /* Fixtures */); path = DromondTests; sourceTree = "<group>"; };
+		A70000000000000000000004 /* Fixtures */ = {isa = PBXGroup; children = (A20000000000000000000009, A2000000000000000000000E); path = Fixtures; sourceTree = "<group>"; };
+		A70000000000000000000005 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000B, A2000000000000000000000C); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A50000000000000000000001 /* Dromond */ = {isa = PBXNativeTarget; buildConfigurationList = A80000000000000000000001; buildPhases = (A90000000000000000000001, A60000000000000000000001, A90000000000000000000002); buildRules = (); dependencies = (); name = Dromond; productName = Dromond; productReference = A2000000000000000000000B; productType = "com.apple.product-type.application"; };
+		A50000000000000000000002 /* DromondTests */ = {isa = PBXNativeTarget; buildConfigurationList = A80000000000000000000002; buildPhases = (A90000000000000000000003, A60000000000000000000002, A90000000000000000000004); buildRules = (); dependencies = (A30000000000000000000002); name = DromondTests; productName = DromondTests; productReference = A2000000000000000000000C; productType = "com.apple.product-type.bundle.unit-test"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A40000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {A50000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; A50000000000000000000002 = {CreatedOnToolsVersion = 26.6; TestTargetID = A50000000000000000000001; }; }; }; buildConfigurationList = A80000000000000000000003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A70000000000000000000001; productRefGroup = A70000000000000000000005; projectDirPath = ""; projectRoot = ""; targets = (A50000000000000000000001, A50000000000000000000002); };
+/* End PBXProject section */
+
+		A100000000000000000000F0 = {isa = PBXBuildFile; fileRef = A200000000000000000000F0; };
+		A100000000000000000000F1 = {isa = PBXBuildFile; fileRef = A200000000000000000000F1; };
+		A100000000000000000000F2 = {isa = PBXBuildFile; fileRef = A200000000000000000000F2; };
+		A100000000000000000000F3 = {isa = PBXBuildFile; fileRef = A200000000000000000000F3; };
+		A100000000000000000000F4 = {isa = PBXBuildFile; fileRef = A200000000000000000000F4; };
+		A100000000000000000000F5 = {isa = PBXBuildFile; fileRef = A200000000000000000000F5; };
+		A1000000000000000000000B = {isa = PBXBuildFile; fileRef = A2000000000000000000000E; };
+		A1000000000000000000000A = {isa = PBXBuildFile; fileRef = A2000000000000000000000D; };
+/* Begin PBXResourcesBuildPhase section */
+		A90000000000000000000002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A); runOnlyForDeploymentPostprocessing = 0; };
+		A90000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000009, A1000000000000000000000B); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A90000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007, A100000000000000000000F0, A100000000000000000000F1, A100000000000000000000F2, A100000000000000000000F3, A100000000000000000000F4, A100000000000000000000F5); runOnlyForDeploymentPostprocessing = 0; };
+		A90000000000000000000003 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A30000000000000000000002 = {isa = PBXTargetDependency; target = A50000000000000000000001 /* Dromond */; targetProxy = A30000000000000000000001; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		B10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Dromond/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; }; name = Debug; };
+		B10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Dromond/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; VALIDATE_PRODUCT = YES; }; name = Release; };
+		B10000000000000000000003 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Dromond.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Dromond"; }; name = Debug; };
+		B10000000000000000000004 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Dromond.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Dromond"; }; name = Release; };
+		B10000000000000000000005 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; }; name = Debug; };
+		B10000000000000000000006 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; GCC_C_LANGUAGE_STANDARD = gnu17; SWIFT_COMPILATION_MODE = wholemodule; VALIDATE_PRODUCT = YES; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A80000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000001, B10000000000000000000002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A80000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000003, B10000000000000000000004); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A80000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000005, B10000000000000000000006); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A40000000000000000000001 /* Project object */;
+}

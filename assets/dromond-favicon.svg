@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="32" height="32" role="img" aria-label="Dromond">
+  <title>Dromond</title>
+  <!-- The same idea drawn for 32px, not the mark shrunk: less air, taller
+       hulls, wider gaps. Each hull lands on ~6 device pixels and each gap on
+       ~3, where the mark gives 5 and 2. Corner radius drops with the padding. -->
+  <rect width="512" height="512" rx="96" fill="#161B23"/>
+  <path transform="translate(54,60)" fill="#4FB3C4"
+        d="M0,12 L340,0 C273,48 202,88 115,98 C67,102 18,64 0,12 Z"/>
+  <path transform="translate(94,206)" fill="#61A5E8"
+        d="M0,12 L340,0 C273,48 202,88 115,98 C67,102 18,64 0,12 Z"/>
+  <path transform="translate(54,352)" fill="#4FB3C4"
+        d="M0,12 L340,0 C273,48 202,88 115,98 C67,102 18,64 0,12 Z"/>
+</svg>

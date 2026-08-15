@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 916 168" width="916" height="168" role="img" aria-label="Dromond">
+  <title>Dromond</title>
+  <!-- Mark plus name, for a DARK background. The light-background twin is
+       dromond-wordmark.svg — the two differ only in the stroke colour of
+       the name. A prefers-color-scheme rule was tried and dropped: browsers
+       honour it, rasterisers and several markdown viewers do not, so the file
+       would have rendered invisible ink in exactly the places nobody checks.
+
+       The letters are plain geometry drawn here, one weight, flat terminals.
+       No font is named or needed, so the file renders identically everywhere.
+       If you inline this SVG into HTML, change the .name stroke to
+       currentColor and it will follow the surrounding text colour. -->
+  <g transform="scale(0.328125)">
+    <rect width="512" height="512" rx="112" fill="#161B23"/>
+    <path transform="translate(78,96)" fill="#4FB3C4"
+          d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
+    <path transform="translate(118,214)" fill="#61A5E8"
+          d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
+    <path transform="translate(78,332)" fill="#4FB3C4"
+          d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
+  </g>
+
+  <g class="name" transform="translate(232,34)" fill="none" stroke="#DFE3EA"
+     stroke-width="16" stroke-linecap="butt" stroke-linejoin="round">
+    <path transform="translate(0,0)"   d="M8,0 V100 M8,8 H30 A38,42 0 0 1 30,92 H8"/>
+    <path transform="translate(100,0)" d="M8,0 V100 M8,8 H34 A25,25 0 0 1 34,58 H8 M26,58 L66,96"/>
+    <path transform="translate(200,0)" d="M8,50 A30,42 0 0 1 68,50 A30,42 0 0 1 8,50 Z"/>
+    <path transform="translate(300,0)" d="M8,100 V8 L42,62 L76,8 V100"/>
+    <path transform="translate(408,0)" d="M8,50 A30,42 0 0 1 68,50 A30,42 0 0 1 8,50 Z"/>
+    <path transform="translate(508,0)" d="M8,0 V100 M68,0 V100 M8,8 L68,92"/>
+    <path transform="translate(608,0)" d="M8,0 V100 M8,8 H30 A38,42 0 0 1 30,92 H8"/>
+  </g>
+</svg>

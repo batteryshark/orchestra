@@ -1,0 +1,614 @@
+{
+ "version": 7,
+ "generated_at": "2026-08-14T22:17:54Z",
+ "home": "/Users/example/.dromond",
+ "runs": [
+  {
+   "id": 31,
+   "slug": "gentle_panther",
+   "status": "done",
+   "profile": "ds-flash",
+   "backend": "reasonix",
+   "model": "deepseek/deepseek-v4-flash",
+   "title": "Dromond smoke test",
+   "work_item": null,
+   "project_id": "53efe3c3-6def-4797-8560-3dce073d7d63",
+   "project": "maestro",
+   "workdir": "/Users/example/Projects/demo",
+   "branch": null,
+   "parent_run": null,
+   "requested_by": "human",
+   "started_at": "2026-08-14T22:03:28Z",
+   "finished_at": "2026-08-14T22:03:35Z",
+   "elapsed_seconds": 7.0,
+   "exit_code": 0,
+   "live": false,
+   "blocked_on": [],
+   "summary": "The sentence in README.md (lines 7\u20139) that explains where the name comes from is:\n\n> A dromond was a fast oared galley, and the name comes from the Greek *dromon*, \"runner\" \u2014 one hull that many runner",
+   "base_commit": "dbceab66d826622f9069dea7297bbf7db2ad55fa",
+   "checkpoint_commit": null,
+   "brief_path": "/Users/example/.dromond/briefs/run-31.md",
+   "session_ref": "20260814-220329.215433000-deepseek-v4-flash",
+   "retry_of": null,
+   "tokens_in": 48286,
+   "tokens_out": 353,
+   "tokens_total": 48639,
+   "cost_usd": 0.002556,
+   "billing": "api",
+   "usage_source": "reasonix",
+   "messages": [
+    {
+     "id": 59,
+     "sender": "dromond",
+     "body": "run 31 finished: done\nThe sentence in README.md (lines 7\u20139) that explains where the name comes from is:\n\n> A dromond was a fast oared galley, and the name comes from the Greek *dromon*, \"runner\" \u2014 one hull that many runners drove at once.\n\nNo files were changed and nothing was committed, per the mission.\n\n```json\n{\"findings\": [], \"proposals\": []}\n```",
+     "kind": "completion",
+     "created_at": "2026-08-14T22:03:35Z",
+     "delivered_at": null,
+     "direction": "outbound",
+     "state": "delivered",
+     "undeliverable_reason": null,
+     "pending_boundary": false
+    }
+   ]
+  },
+  {
+   "id": 30,
+   "slug": "bold_shark",
+   "status": "done",
+   "profile": "grok-4-6",
+   "backend": "opencode",
+   "model": "xai/grok-4.6",
+   "title": "Explore DeepSeek Harness (dsh) as a fifth backend",
+   "work_item": "W-0171",
+   "project_id": "53efe3c3-6def-4797-8560-3dce073d7d63",
+   "project": "maestro",
+   "workdir": "/Users/example/.maestro/worktrees/53efe3c3-6def-4797-8560-3dce073d7d63/run-30",
+   "branch": "maestro/run-30",
+   "parent_run": null,
+   "requested_by": "work",
+   "started_at": "2026-08-14T20:14:06Z",
+   "finished_at": "2026-08-14T20:24:52Z",
+   "elapsed_seconds": 646.0,
+   "exit_code": 0,
+   "live": false,
+   "blocked_on": [],
+   "summary": "Hold dsh. Do not add a fifth backend.\n\nWrote `docs/investigations/W-0171-deepseek-harness.md`. Commit `95f95fc`.\nHeadless has no resume and no stdout JSONL. ACP is a demo bin. Keep DeepSeek on Reasoni",
+   "base_commit": "0b37e8859500c89b93b3dd6504eb4e1300a032df",
+   "checkpoint_commit": "95f95fc26baf43bb936fdadfe416afb2df7e43ac",
+   "brief_path": "/Users/example/.maestro/briefs/run-30.md",
+   "session_ref": "ses_ffe16e735ffeJbSmaft1ypaxGV",
+   "retry_of": null,
+   "tokens_in": 2680704,
+   "tokens_out": 9750,
+   "tokens_total": 2698287,
+   "cost_usd": 1.707738,
+   "billing": "plan",
+   "usage_source": "opencode",
+   "messages": [
+    {
+     "id": 57,
+     "sender": "maestro",
+     "body": "run 30 could not land `maestro/run-30` on `main` \u2014 escalated at rebase.\n\n- reason: rebase onto main conflicted; resolve by hand\n- conflicted files: `.work/tasks/W-0171.md`\n- files changed (0): none\n- checks: none declared\n- branch `maestro/run-30` is kept; retry by hand with `maestro merge maestro/run-30`\n- decision card: 01a001f2-e6c3-7e92-8258-df11497c4025",
+     "kind": "merge",
+     "created_at": "2026-08-14T20:24:51Z",
+     "delivered_at": null,
+     "direction": "outbound",
+     "state": "delivered",
+     "undeliverable_reason": null,
+     "pending_boundary": false
+    },
+    {
+     "id": 58,
+     "sender": "maestro",
+     "body": "run 30 finished: done\nHold dsh. Do not add a fifth backend.\n\nWrote `docs/investigations/W-0171-deepseek-harness.md`. Commit `95f95fc`.\nHeadless has no resume and no stdout JSONL. ACP is a demo bin. Keep DeepSeek on Reasonix.\nReopen when a tagged non-rc release ships `--resume` plus stream-json.\n\n```json\n{\"findings\": [], \"proposals\": [{\"title\": \"Reopen dsh after a tagged non-rc release\", \"why\": \"Headless and ACP still fail resume and stdout JSONL. Reasonix already routes DeepSeek.\"}]}\n```\n\nMerge escalated at rebase: rebase onto main conflicted; resolve by hand. Branch maestro/run-30 kept. Nod card 01a001f2-e6c3-7e92-8258-df11497c4025.",
+     "kind": "completion",
+     "created_at": "2026-08-14T20:24:52Z",
+     "delivered_at": null,
+     "direction": "outbound",
+     "state": "delivered",
+     "undeliverable_reason": null,
+     "pending_boundary": false
+    }
+   ]
+  },
+  {
+   "id": 29,
+   "slug": "ardent_octopus",
+   "status": "done",
+   "profile": "grok-4-6",
+   "backend": "opencode",
+   "model": "xai/grok-4.6",
+   "title": "Create a Settings page on the webui that will let you configure all the non prof",
+   "work_item": "W-0190",
+   "project_id": "53efe3c3-6def-4797-8560-3dce073d7d63",
+   "project": "maestro",
+   "workdir": "/Users/example/.maestro/worktrees/53efe3c3-6def-4797-8560-3dce073d7d63/run-29",
+   "branch": "maestro/run-29",
+   "parent_run": null,
+   "requested_by": "work",
+   "started_at": "2026-08-14T19:37:07Z",
+   "finished_at": "2026-08-14T19:45:08Z",
+   "elapsed_seconds": 481.0,
+   "exit_code": 0,
+   "live": false,
+   "blocked_on": [],
+   "summary": "Open the **settings** tab. Edit the file. Press **save and restart**.\n\n1. Profiles stay on their own tab. That page already has pickers and the enabled set.\n2. Settings is the raw `config.toml` textar",
+   "base_commit": "d9975e3f7de3eebbf26b3fcf78ec414800582a8a",
+   "checkpoint_commit": "d9c1f6480d1ad3eb059132ead9f74a06b04750bb",
+   "brief_path": "/Users/example/.maestro/briefs/run-29.md",
+   "session_ref": "ses_ffe38c334ffe7G2r7t6Sa517XO",
+   "retry_of": null,
+   "tokens_in": 1717540,
+   "tokens_out": 7175,
+   "tokens_total": 1730461,
+   "cost_usd": 1.175006,
+   "billing": "plan",
+   "usage_source": "opencode",
+   "messages": [
+    {
+     "id": 54,
+     "sender": "dashboard",
+     "body": "I will leave it up to your judgment if we should move the profiles tab into a new settings tab as a profiles section or a profiles tab within that page or something.",
+     "kind": "interrupt",
+     "created_at": "2026-08-14T19:40:56Z",
+     "delivered_at": "2026-08-14T19:40:57Z",
+     "direction": "inbound",
+     "state": "answered",
+     "undeliverable_reason": null,
+     "pending_boundary": false
+    },
+    {
+     "id": 55,
+     "sender": "maestro",
+     "body": "run 29 landed `maestro/run-29` on `main`.\n\n- merge commit: `dd661cae4802c366d319bf7735a8fc66227f5e4b`\n- files changed (5): `dromond/config.py`, `dromond/dashboard.html`, `dromond/http.py`, `tests/test_config.py`, `tests/test_http.py`\n- checks: tests ok\n- branch: deleted\n- checkout: /Users/example/Projects/demo now holds the merged content; uncommitted work kept\n- revert: `git -C /Users/example/Projects/demo revert -m 1 dd661cae4802c366d319bf7735a8fc66227f5e4b`",
+     "kind": "merge",
+     "created_at": "2026-08-14T19:45:07Z",
+     "delivered_at": null,
+     "direction": "outbound",
+     "state": "delivered",
+     "undeliverable_reason": null,
+     "pending_boundary": false
+    },
+    {
+     "id": 56,
+     "sender": "maestro",
+     "body": "run 29 finished: done\nOpen the **settings** tab. Edit the file. Press **save and restart**.\n\n1. Profiles stay on their own tab. That page already has pickers and the enabled set.\n2. Settings is the raw `config.toml` textarea. Nesting profiles inside it adds UI for no gain.\n3. `GET`/`POST /api/config` reads and writes the file. Bad TOML is refused. `restart: true` restarts the daemon.\n\nVerified: `tests.test_http` config tests, `config.check`, dashboard file test, and `tests.test_auth` all passed.\n\nSkipped: a per-key settings form. Add that when the textarea is not enough.\n\n```json\n{\"findings\": [{\"claim\": \"CLI profile-edit tests fail inside a Maestro run because they inherit MAESTRO_RUN_TOKEN and are treated as an agent.\", \"where\": \"tests/test_profile_edit.py:CliParityTests; dromond/cli.py:_authority\", \"confi",
+     "kind": "completion",
+     "created_at": "2026-08-14T19:45:08Z",
+     "delivered_at": null,
+     "direction": "outbound",
+     "state": "delivered",
+     "undeliverable_reason": null,
+     "pending_boundary": false
+    }
+   ]
+  }
+ ],
+ "live_runs": 0,
+ "projects": [
+  {
+   "project_id": "53efe3c3-6def-4797-8560-3dce073d7d63",
+   "name": "maestro",
+   "runs": 25,
+   "live": 0
+  },
+  {
+   "project_id": "9cfb4307-c19f-4819-98b5-e182bf5f366d",
+   "name": "work-management/project-manager-thing",
+   "runs": 6,
+   "live": 0
+  }
+ ],
+ "dispatch": {
+  "paused": false,
+  "since": null
+ },
+ "profiles": [
+  {
+   "name": "ds-flash",
+   "backend": "reasonix",
+   "model": "deepseek/deepseek-v4-flash",
+   "effort": "high",
+   "role": "workhorse; needs a well-scoped task",
+   "variant": null,
+   "tier": 1,
+   "tier_name": "workhorse",
+   "priority": 10,
+   "spawn_profiles": [],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "grok-4-6",
+   "backend": "opencode",
+   "model": "xai/grok-4.6",
+   "effort": null,
+   "role": "complex work; cheap for its capability",
+   "variant": null,
+   "tier": 2,
+   "tier_name": "generalist",
+   "priority": 10,
+   "spawn_profiles": [],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "opus-high",
+   "backend": "claude",
+   "model": "claude-opus-5",
+   "effort": "high",
+   "role": "the most complex work",
+   "variant": null,
+   "tier": 3,
+   "tier_name": "heavy",
+   "priority": 10,
+   "spawn_profiles": [
+    "sol-medium",
+    "opus-medium",
+    "luna-max",
+    "ds-flash"
+   ],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "ds-pro",
+   "backend": "reasonix",
+   "model": "deepseek/deepseek-v4-pro",
+   "effort": "max",
+   "role": "complex work",
+   "variant": null,
+   "tier": 2,
+   "tier_name": "generalist",
+   "priority": 20,
+   "spawn_profiles": [
+    "ds-flash"
+   ],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "fable-high",
+   "backend": "claude",
+   "model": "claude-fable-5",
+   "effort": "high",
+   "role": "the most complex work",
+   "variant": null,
+   "tier": 3,
+   "tier_name": "heavy",
+   "priority": 20,
+   "spawn_profiles": [
+    "sol-medium",
+    "opus-medium",
+    "luna-max",
+    "ds-flash"
+   ],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "luna-max",
+   "backend": "codex",
+   "model": "gpt-5.6-luna",
+   "effort": "max",
+   "role": "workhorse; needs a well-scoped task",
+   "variant": null,
+   "tier": 1,
+   "tier_name": "workhorse",
+   "priority": 20,
+   "spawn_profiles": [],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "kimi-k3",
+   "backend": "opencode",
+   "model": "kimi-for-coding/k3",
+   "effort": null,
+   "role": "complex work; reasoning is the model's own default",
+   "variant": null,
+   "tier": 2,
+   "tier_name": "generalist",
+   "priority": 30,
+   "spawn_profiles": [],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "sol-medium",
+   "backend": "codex",
+   "model": "gpt-5.6-sol",
+   "effort": "medium",
+   "role": "complex work",
+   "variant": null,
+   "tier": 2,
+   "tier_name": "generalist",
+   "priority": 40,
+   "spawn_profiles": [
+    "luna-max",
+    "ds-flash"
+   ],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "opus-medium",
+   "backend": "claude",
+   "model": "claude-opus-5",
+   "effort": "medium",
+   "role": "complex work",
+   "variant": null,
+   "tier": 2,
+   "tier_name": "generalist",
+   "priority": 50,
+   "spawn_profiles": [
+    "luna-max",
+    "ds-flash"
+   ],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  },
+  {
+   "name": "sol-high",
+   "backend": "codex",
+   "model": "gpt-5.6-sol",
+   "effort": "high",
+   "role": "complex work",
+   "variant": null,
+   "tier": 2,
+   "tier_name": "generalist",
+   "priority": 60,
+   "spawn_profiles": [
+    "sol-medium",
+    "luna-max",
+    "ds-flash"
+   ],
+   "note": null,
+   "note_at": null,
+   "note_age": null
+  }
+ ],
+ "runway": [
+  {
+   "provider": "claude",
+   "kind": "plan",
+   "remaining": 83.0,
+   "unit": "percent",
+   "resets_in": "in 4d 0h 42m",
+   "windows": [
+    {
+     "label": "5h",
+     "remaining": 88.0,
+     "unit": "percent",
+     "resets_at": "2026-08-13T00:19:59Z",
+     "stale": true,
+     "stale_reason": null,
+     "resets_in": "now",
+     "pace": "holding steady"
+    },
+    {
+     "label": "weekly",
+     "remaining": 83.0,
+     "unit": "percent",
+     "resets_at": "2026-08-18T22:59:59Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 4d 0h 42m",
+     "pace": "holding steady"
+    }
+   ],
+   "credits": null,
+   "reason": null,
+   "known": true
+  },
+  {
+   "provider": "codex",
+   "kind": "plan",
+   "remaining": 59.0,
+   "unit": "percent",
+   "resets_in": "in 5d 5h 18m",
+   "windows": [
+    {
+     "label": "weekly",
+     "remaining": 59.0,
+     "unit": "percent",
+     "resets_at": "2026-08-20T03:36:00Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 5d 5h 18m",
+     "pace": "using 6% an hour"
+    }
+   ],
+   "credits": "0 banked resets",
+   "reason": null,
+   "known": true
+  },
+  {
+   "provider": "deepseek",
+   "kind": "api",
+   "remaining": 10.1,
+   "unit": "USD",
+   "resets_in": "-",
+   "windows": [],
+   "credits": null,
+   "reason": null,
+   "known": true
+  },
+  {
+   "provider": "kimi",
+   "kind": "plan",
+   "remaining": 0.0,
+   "unit": "percent",
+   "resets_in": "in 1d 2h 13m",
+   "windows": [
+    {
+     "label": "5h",
+     "remaining": 100.0,
+     "unit": "percent",
+     "resets_at": "2026-08-15T02:31:11Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 4h 13m",
+     "pace": null
+    },
+    {
+     "label": "weekly",
+     "remaining": 0.0,
+     "unit": "percent",
+     "resets_at": "2026-08-16T00:31:11Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 1d 2h 13m",
+     "pace": "holding steady"
+    }
+   ],
+   "credits": null,
+   "reason": null,
+   "known": true
+  },
+  {
+   "provider": "minimax",
+   "kind": "plan",
+   "remaining": 99.0,
+   "unit": "percent",
+   "resets_in": "in 2d 1h 42m",
+   "windows": [
+    {
+     "label": "240m",
+     "remaining": 100.0,
+     "unit": "percent",
+     "resets_at": "2026-08-15T00:00:00Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 1h 42m",
+     "pace": "holding steady"
+    },
+    {
+     "label": "weekly",
+     "remaining": 99.0,
+     "unit": "percent",
+     "resets_at": "2026-08-17T00:00:00Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 2d 1h 42m",
+     "pace": "holding steady"
+    }
+   ],
+   "credits": null,
+   "reason": null,
+   "known": true
+  },
+  {
+   "provider": "xai",
+   "kind": "plan",
+   "remaining": 79.0,
+   "unit": "percent",
+   "resets_in": "in 6d 2h 19m",
+   "windows": [
+    {
+     "label": "weekly",
+     "remaining": 79.0,
+     "unit": "percent",
+     "resets_at": "2026-08-21T00:37:32Z",
+     "stale": false,
+     "stale_reason": null,
+     "resets_in": "in 6d 2h 19m",
+     "pace": "holding steady"
+    }
+   ],
+   "credits": "1 banked reset credit \u00b7 soonest expires 2026-09-12",
+   "reason": null,
+   "known": true
+  }
+ ],
+ "statistics": {
+  "runs_total": 31,
+  "runs_active": 0,
+  "plan_runs": 25,
+  "by_status": {
+   "failed": 4,
+   "done": 27
+  },
+  "worker_seconds": 14694.0,
+  "tokens_total": 109768890,
+  "cost_usd": 0.056259,
+  "by_profile": [
+   {
+    "profile": "codex",
+    "runs": 3,
+    "active": 0,
+    "seconds": 468.0,
+    "tokens": null,
+    "cost": null,
+    "billing": "plan"
+   },
+   {
+    "profile": "ds-flash",
+    "runs": 4,
+    "active": 0,
+    "seconds": 1683.0,
+    "tokens": 9024886,
+    "cost": 0.056259,
+    "billing": "api"
+   },
+   {
+    "profile": "grok-4-6",
+    "runs": 2,
+    "active": 0,
+    "seconds": 1127.0,
+    "tokens": 4428748,
+    "cost": null,
+    "billing": "plan"
+   },
+   {
+    "profile": "reasonix",
+    "runs": 2,
+    "active": 0,
+    "seconds": 51.0,
+    "tokens": null,
+    "cost": null,
+    "billing": "api"
+   },
+   {
+    "profile": "sol-medium",
+    "runs": 20,
+    "active": 0,
+    "seconds": 11365.0,
+    "tokens": 96315256,
+    "cost": null,
+    "billing": "plan"
+   }
+  ]
+ },
+ "findings": [],
+ "proposals": [],
+ "daemon": {
+  "pid": 44513,
+  "last_sweep_at": "2026-08-14T22:17:15Z",
+  "outcome": "ok",
+  "claimed": [],
+  "actions": 0,
+  "released": 0,
+  "reaped": 0,
+  "error": null,
+  "last_error": null,
+  "last_error_at": null,
+  "started_at": "2026-08-14T02:21:18Z",
+  "observer": {
+   "enabled": true,
+   "profile": "opus-medium",
+   "problem": null,
+   "first_look": 300,
+   "interval": 1800
+  }
+ }
+}

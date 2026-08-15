@@ -1,0 +1,1839 @@
+<!doctype html>
+<!-- Dromond control panel (DESIGN §3, rebuilt for W-0178). One hand-written
+     file: no build step, no CDN, no external font, no framework.
+
+     Five views, one concern each, reached by the tabs: RUNS (master-detail,
+     the default), PROFILES, SETTINGS, RUNWAY, HEALTH. The selected run's detail has a
+     second tab strip of its own (W-0180) — trace, thread, brief, facts,
+     summary, merge, findings — under a header that never scrolls.
+
+     Every view OWNS THE VIEWPORT (W-0186): the page itself does not scroll,
+     each view fills the height under the header, and the scrolling happens
+     inside the panes — the run list in its column, the detail in its own.
+     Nothing sits under a view any more, so nothing may leave dead space.
+
+     A PROJECT PICKER in the header (W-0186) offers the projects the runs
+     themselves name. It filters the run list and, in the profiles view, adds
+     the ENABLED column (W-0187): profiles are global presets and always
+     editable here, and what a project chooses is WHICH of them it may staff
+     a run with. Runway and daemon health are the machine's, so they stay
+     global. STATISTICS is a popup on the runs page rather than a card on
+     health, and follows the picker.
+
+     Everything it knows comes from
+     GET /api/snapshot on a 4s poll, except the two live streams: the
+     selected run's normalized trace (GET /api/runs/<id>/stream) and the
+     daemon's own log (GET /api/log/stream), both SSE. EventSource cannot set
+     headers, so those two ride the same-origin cookie the key form parks. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dromond</title>
+<!-- The favicon is the 32px variant inlined as a data URI: the page
+     makes no external request, and that rule does not bend for a
+     16px icon. assets/dromond-favicon.svg is the source of truth. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%3E%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%2296%22%20fill%3D%22%23161B23%22%2F%3E%3Cpath%20transform%3D%22translate%2854%2C60%29%22%20fill%3D%22%234FB3C4%22%20d%3D%22M0%2C12%20L340%2C0%20C273%2C48%20202%2C88%20115%2C98%20C67%2C102%2018%2C64%200%2C12%20Z%22%2F%3E%3Cpath%20transform%3D%22translate%2894%2C206%29%22%20fill%3D%22%2361A5E8%22%20d%3D%22M0%2C12%20L340%2C0%20C273%2C48%20202%2C88%20115%2C98%20C67%2C102%2018%2C64%200%2C12%20Z%22%2F%3E%3Cpath%20transform%3D%22translate%2854%2C352%29%22%20fill%3D%22%234FB3C4%22%20d%3D%22M0%2C12%20L340%2C0%20C273%2C48%20202%2C88%20115%2C98%20C67%2C102%2018%2C64%200%2C12%20Z%22%2F%3E%3C%2Fsvg%3E">
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f25; --line: #2c313a; --text: #dfe3ea;
+    --dim: #8b93a3; --ok: #6fbf73; --warn: #d9a441; --bad: #d96a6a;
+    --live: #61a5e8; --think: #a98be0; --tool: #4fb3c4; --sel: #232a35;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  /* The whole page is ONE column that owns the viewport: header, banners,
+     then main taking every remaining pixel. Nothing below main, so a short
+     list must not leave dead space — each view scrolls INSIDE itself
+     (#runlist, #pbody, .card > .pad) and the page itself never scrolls. */
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         display: flex; flex-direction: column; min-height: 0;
+         font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .dim { color: var(--dim); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .prose { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+           padding: .7rem 1rem; border-bottom: 1px solid var(--line);
+           flex: 0 0 auto; }
+  h1 { font-size: .95rem; margin: 0; letter-spacing: .1em; text-transform: uppercase; }
+  /* The mark drops its background tile here: the header is already its
+     ground, and a second dark square inside a dark bar reads as a hole. */
+  .mark { width: 1.35rem; height: 1.35rem; flex: none; }
+  .live { font-size: 1.5rem; font-weight: 700; color: var(--live); line-height: 1; }
+  .live small { font-size: .7rem; color: var(--dim); font-weight: 400; }
+  nav { display: flex; gap: .3rem; margin-left: auto; }
+  nav button.tab { border-radius: 6px 6px 0 0; }
+  nav button.tab.on { color: var(--live); border-color: var(--live); background: var(--sel); }
+
+  /* --- the project picker (W-0186), where the snapshot stamp used to be ---
+     Orchestra's #projBtn / #projMenu, read for its shape and rebuilt in this
+     file's own el()/kv() idiom — every option here is a built node. */
+  .proj { position: relative; }
+  #projbtn { display: flex; align-items: center; gap: .45rem; font-size: 12.5px;
+             padding: .3rem .6rem; max-width: 22rem; }
+  .proj-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+              background: var(--live); }
+  .proj-dot.all { background: var(--dim); }
+  #projlabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #projmenu { position: absolute; z-index: 20; top: calc(100% + .3rem); left: 0;
+              min-width: 100%; max-width: 26rem; max-height: 60vh; overflow-y: auto;
+              background: var(--panel); border: 1px solid var(--line);
+              border-radius: 8px; padding: .25rem;
+              box-shadow: 0 8px 24px rgba(0, 0, 0, .5); }
+  .proj-opt { display: block; width: 100%; text-align: left; border: 0;
+              background: none; border-radius: 6px; padding: .35rem .5rem; }
+  .proj-opt:hover:enabled { background: var(--sel); }
+  .proj-opt[aria-selected="true"] { color: var(--live); }
+  .proj-opt .po-name { display: block; font-size: 12.5px; font-weight: 600; }
+  .proj-opt .po-meta { display: block; font-size: 10.5px; color: var(--dim); }
+
+  /* --- the statistics popup (W-0186) ---
+     Statistics left the health view: health is the daemon's pulse, and
+     numbers about runs belong to the runs page. <dialog> is the platform's
+     own modal — Esc, the backdrop and focus trapping come with it. */
+  #statsdlg { width: min(56rem, 92vw); max-height: 86vh; padding: 0;
+              background: var(--panel); color: var(--text);
+              border: 1px solid var(--line); border-radius: 8px;
+              overflow: hidden; }
+  #statsdlg::backdrop { background: rgba(0, 0, 0, .55); }
+  #statsdlg .card { border: 0; border-radius: 0; max-height: 86vh; }
+
+  button { font: inherit; font-size: 12px; color: var(--text); background: #262b33;
+           border: 1px solid var(--line); border-radius: 6px;
+           padding: .2rem .6rem; cursor: pointer; }
+  button:hover:enabled { background: #323945; }
+  button:disabled { color: var(--dim); cursor: not-allowed; opacity: .6; }
+  button.pause { border-color: var(--warn); color: var(--warn); }
+  button.resume { border-color: var(--ok); color: var(--ok); }
+  button.danger { border-color: var(--bad); color: var(--bad); }
+  input, select, textarea {
+          font: inherit; font-size: 13px; padding: .3rem; background: #0f1114;
+          color: var(--text); border: 1px solid var(--line); border-radius: 4px; }
+  input:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
+
+  #banner { padding: .4rem 1rem; background: #3a2a2a; color: #ffd7d7;
+            border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+  #banner:empty { display: none; }
+  #paused { padding: .4rem 1rem; background: #3a3324; color: #ffe9b8;
+            border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+  .keyform { padding: 2rem; display: grid; gap: .6rem; max-width: 32rem; }
+
+  /* main owns the leftover height; the visible view fills it whole. */
+  main { flex: 1; min-height: 0; padding: 1rem; overflow: hidden;
+         display: flex; flex-direction: column; }
+  .view { flex: 1; min-height: 0; }
+  .vstack { display: flex; flex-direction: column; gap: 1rem; }
+  .grow { flex: 1; min-height: 0; }
+  /* A card is a column: its header is fixed, its body is what scrolls. */
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 8px; overflow: hidden; min-width: 0;
+          display: flex; flex-direction: column; min-height: 0; }
+  .card > h2 { font-size: .72rem; text-transform: uppercase; letter-spacing: .1em;
+               color: var(--dim); margin: 0; padding: .55rem .8rem;
+               border-bottom: 1px solid var(--line); flex: 0 0 auto;
+               display: flex; align-items: center; gap: .5rem; }
+  .card > h2 .spacer { flex: 1; }
+  .card > .pad { padding: .7rem .8rem; flex: 1; min-height: 0;
+                 overflow-y: auto; display: flex; flex-direction: column; }
+
+  /* --- runs: master-detail (Orchestra's .cols) --- */
+  .cols { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 1rem; }
+  /* Two side-by-side scrollers need real height to be worth anything. Below
+     the breakpoint the columns stack, so the page scrolls instead. */
+  @media (max-width: 980px) {
+    .cols { grid-template-columns: 1fr; }
+    main { overflow-y: auto; }
+    #view-runs { flex: 0 0 auto; }
+    #runlist, #pbody { max-height: 60vh; }
+  }
+  #runlist { flex: 1; min-height: 0; overflow-y: auto; }
+  .runitem { padding: .5rem .8rem; border-bottom: 1px solid var(--line);
+             cursor: pointer; border-left: 3px solid transparent; }
+  .runitem:hover { background: var(--sel); }
+  .runitem.sel { background: var(--sel); border-left-color: var(--live); }
+  /* lineage, exactly as the run row records it: a spawned child, or the one
+     automatic retry of an earlier attempt. */
+  .runitem.child { border-left-color: #3d6ea8; }
+  .runitem.continuation { border-left-color: #4b8a5a; }
+  .runitem.sel.child, .runitem.sel.continuation { border-left-color: var(--live); }
+  .runitem .top { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; }
+  .runitem .title { margin-top: .25rem; font-size: 12.5px; font-weight: 600;
+                    overflow: hidden; display: -webkit-box; line-clamp: 2;
+                    -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+                    overflow-wrap: anywhere; }
+  .runitem .meta { font-size: 11px; color: var(--dim); margin-top: .2rem;
+                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* an unknown status still shows as a chip, never as invisible text */
+  .chip { display: inline-block; padding: 0 .5rem; border-radius: 99px;
+          font-size: 11px; font-weight: 600; color: #10131a;
+          background: var(--dim); }
+  .c-running, .c-interrupt { background: var(--live); }
+  .c-spawning { background: var(--warn); }
+  .c-done { background: var(--ok); }
+  .c-failed, .c-timeout { background: var(--bad); }
+  .c-killed { background: var(--dim); }
+  .c-blocked { background: #6b5ea8; color: #eee; }
+
+  /* The detail header and its tab strip sit outside #pbody, which is the only
+     thing that scrolls — so name, status, tabs and stop never scroll away. */
+  #phead { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+           padding: .5rem .8rem; border-bottom: 1px solid var(--line); }
+  #phead, #ptabs { flex: 0 0 auto; }
+  .run-actions { display: grid;
+                 grid-template-columns: minmax(12rem, 1fr) auto;
+                 gap: .5rem; align-items: end; }
+  .run-actions textarea { width: 100%; min-height: 4.5rem; max-height: 12rem;
+                          resize: vertical; }
+  .run-actions > button { justify-self: end; }
+  @media (max-width: 560px) {
+    .run-actions { grid-template-columns: 1fr; }
+  }
+  #ptabs { display: flex; gap: .3rem; flex-wrap: wrap;
+           padding: .4rem .8rem; border-bottom: 1px solid var(--line); }
+  #ptabs .stop-run { margin-left: auto; }
+  #ptabs button.on { color: var(--live); border-color: var(--live);
+                     background: var(--sel); }
+  #pbody { flex: 1; min-height: 0; overflow-y: auto; padding: .7rem .8rem; }
+  .block { margin-bottom: 1rem; }
+  .block > h3 { font-size: .68rem; text-transform: uppercase; letter-spacing: .09em;
+                color: var(--dim); margin: 0 0 .4rem; font-weight: 700; }
+  table.kv { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+  table.kv th { text-align: left; color: var(--dim); font-weight: 500;
+                padding: .15rem .8rem .15rem 0; white-space: nowrap;
+                vertical-align: top; width: 9rem; }
+  table.kv td { padding: .15rem 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  table.grid { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  table.grid th, table.grid td { text-align: left; padding: .25rem .6rem .25rem 0;
+        border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.grid th { color: var(--dim); font-weight: 500; white-space: nowrap; }
+  table.grid td.grow { width: 100%; overflow-wrap: anywhere; }
+
+  /* --- the trace ---
+     Every line of a run's thread starts in the same 1.5rem gutter: a glyph
+     says WHAT it is, the indent keeps the eye on one left edge. Colour is
+     spent only on the three things that are not the agent talking to itself
+     — thinking, tools, and conversation aimed AT the run. Ordinary assistant
+     output gets no glyph and no gutter, so it reads as the answer. */
+  .g { flex: 0 0 1.5rem; text-align: left; font-style: normal;
+       font-size: 12.5px; line-height: 1.4; }
+  .titem { margin: 0 0 .5rem; }
+  .titem.evt { display: flex; align-items: baseline; gap: 0; }
+  .titem.evt > .body { min-width: 0; flex: 1; }
+  .titem.evt .label { font-size: 11.5px; text-transform: uppercase;
+                      letter-spacing: .05em; font-weight: 600; }
+  .titem.meta { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+  .titem.injection .label { color: var(--live); }
+  .titem.permission .label { color: var(--warn); }
+  details { border: 1px solid var(--line); border-radius: 6px; margin: .3rem 0;
+            background: #171a20; }
+  details > summary { cursor: pointer; padding: .25rem .6rem; font-size: 12.5px;
+                      user-select: none; display: flex; align-items: baseline;
+                      gap: .35rem; }
+  details > summary .name { overflow-wrap: anywhere; }
+  details[open] > summary { border-bottom: 1px solid var(--line); }
+  details .inner { padding: .4rem .6rem .4rem 2.1rem; max-height: 26rem;
+                   overflow: auto; }
+  details pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+                font-family: var(--mono); font-size: 12px; }
+  details.think > summary { color: var(--think); }
+  details.tool > summary { color: var(--tool); }
+  details.tool > summary .name { color: var(--text); }
+  .msg { border-left: 3px solid var(--line); padding: .3rem .6rem; margin: .4rem 0; }
+  .msg.inbound { border-left-color: var(--live); }
+  .msg.outbound { border-left-color: var(--ok); }
+  .diff { clear: both; margin: 0; border: 1px solid var(--line); border-radius: 6px;
+          background: #111318; overflow: auto; font: 12px/1.45 var(--mono); }
+  .diff-line { display: block; min-height: 1.45em; padding: 0 .6rem;
+               white-space: pre; width: max-content; min-width: 100%; }
+  .diff-add { background: rgba(111, 191, 115, .13); color: #a9d9ad; }
+  .diff-del { background: rgba(217, 106, 106, .13); color: #e5a0a0; }
+  .diff-meta { color: var(--live); }
+  .msg .head { font-size: 11.5px; color: var(--dim); display: flex; gap: .4rem;
+               flex-wrap: wrap; align-items: baseline; }
+  .msg .head .g { flex-basis: 1.1rem; }
+  .msg .head .label { color: var(--text); font-weight: 600;
+                      text-transform: uppercase; letter-spacing: .05em; }
+  .msg > :not(.head) { margin-left: 1.5rem; }
+  .badge { border: 1px solid var(--line); border-radius: 99px; padding: 0 .45rem;
+           font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; }
+  .b-queued { color: var(--warn); border-color: var(--warn); }
+  .b-delivered { color: var(--live); border-color: var(--live); }
+  .b-answered { color: var(--ok); border-color: var(--ok); }
+  .b-undeliverable { color: var(--bad); border-color: var(--bad); }
+
+  /* --- runway: ONE collapsible card per provider, its windows inside --- */
+  .track { height: 5px; margin-top: .35rem; border-radius: 99px;
+           background: #2a2f39; overflow: hidden; }
+  .fill { height: 100%; background: var(--ok); }
+  .fill.watch { background: var(--warn); }
+  .fill.critical { background: var(--bad); }
+  #runway { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+            gap: .6rem; align-items: start; }
+  details.rw { margin: 0; background: var(--panel); }
+  details.rw > summary { display: flex; align-items: center; gap: .6rem;
+                         min-height: 3.2rem; padding: .5rem .7rem; }
+  .rwname { min-width: 0; flex: 1; }
+  .rwname strong { display: block; font-size: 13px; }
+  .rwname span { display: block; color: var(--dim); font-size: 10.5px; }
+  .rwvalue { font-size: 15px; font-weight: 700; color: var(--ok); }
+  .rwvalue.watch { color: var(--warn); }
+  .rwvalue.critical { color: var(--bad); }
+  .rwvalue.unknown { color: var(--dim); font-size: 12px; font-weight: 400; }
+  .rwbody { padding: .5rem .7rem .6rem; }
+  .rwq { margin: 0 0 .7rem; }
+  .rwq:last-child { margin-bottom: 0; }
+  .rwqhead { display: flex; justify-content: space-between; gap: .5rem;
+             font-size: 11.5px; }
+  .rwmeta { margin-top: .25rem; color: var(--dim); font-size: 10.5px; }
+  .rwmeta.warn { color: var(--warn); }
+  .rwbal { margin: 0 0 .6rem; padding: .45rem .55rem; border-radius: 6px;
+           background: #1f242c; color: var(--dim); font-size: 11.5px; }
+  .rwbal strong { color: var(--text); font-size: 15px; }
+  #runwaystamp { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+  /* --- profiles editor (W-0173) --- */
+  #editor { display: grid; gap: .45rem; margin-top: .7rem;
+            border-top: 1px solid var(--line); padding-top: .7rem; }
+  #editor label { display: grid; grid-template-columns: 9rem minmax(0, 28rem);
+                  gap: .5rem; align-items: center; }
+  #editor .hint { color: var(--dim); font-size: .8rem; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+  .checklist { display: flex; flex-wrap: wrap; gap: .1rem .8rem;
+               border: 1px solid var(--line); border-radius: 4px; padding: .3rem; }
+  .checklist label { display: inline-flex !important; gap: .3rem;
+                     grid-template-columns: none !important; }
+  /* The enabled column (W-0187): one checkbox per profile, only when a
+     project is picked. The whole cell is the hit target. */
+  .enabledbox { display: flex; align-items: center; justify-content: center;
+                cursor: pointer; }
+  .enabledbox input { cursor: pointer; }
+  .noteedit { display: flex; gap: .4rem; align-items: baseline; }
+  .noteedit .dim { white-space: nowrap; font-size: .8rem; }
+  button.glyph { font-size: 1rem; line-height: 1; padding: .15rem .45rem; }
+  /* The log tail is its own scroller (the stream pins it to the bottom), so
+     it takes the height its card is given rather than a fixed slice of the
+     viewport. */
+  #logtail { flex: 1; min-height: 0; overflow-y: auto; font-family: var(--mono);
+             font-size: 11.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* Raw config (W-0190): the file is the form. */
+  #cfgtext { flex: 1; min-height: 0; width: 100%; resize: none;
+             font-family: var(--mono); font-size: 12px; line-height: 1.45; }
+</style>
+</head>
+<body>
+<div id="banner"></div>
+<div id="paused" hidden></div>
+<header>
+  <svg class="mark" viewBox="0 0 512 512" role="img" aria-label="Dromond"><path transform="translate(78,96)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/><path transform="translate(118,214)" fill="#61A5E8" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/><path transform="translate(78,332)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/></svg>
+  <h1>dromond</h1>
+  <div class="live"><span id="livecount">–</span> <small>live</small></div>
+  <!-- The project picker stands where the snapshot stamp used to (W-0186).
+       Its options are the projects the snapshot's runs name and no others,
+       plus "all projects"; the stamp itself moved into the statistics
+       popup, which is the one place a version number is worth reading. -->
+  <div class="proj" id="projsel" hidden>
+    <button id="projbtn" type="button" aria-haspopup="listbox"
+            aria-expanded="false" aria-controls="projmenu">
+      <span class="proj-dot all" id="projdot" aria-hidden="true"></span>
+      <span id="projlabel">all projects</span>
+      <span class="dim" aria-hidden="true">▾</span>
+    </button>
+    <div id="projmenu" role="listbox" aria-label="projects with runs" hidden></div>
+  </div>
+  <nav id="tabs">
+    <button class="tab on" data-view="runs">runs</button>
+    <button class="tab" data-view="profiles">profiles</button>
+    <button class="tab" data-view="settings">settings</button>
+    <button class="tab" data-view="runway">runway</button>
+    <button class="tab" data-view="health">health</button>
+  </nav>
+</header>
+
+<main id="views" hidden>
+  <!-- ================= RUNS ================= -->
+  <section class="view cols" id="view-runs">
+    <div class="card">
+      <h2>runs <span class="dim" id="runcount"></span>
+        <span class="spacer"></span>
+        <button id="statsbtn" style="text-transform:none;letter-spacing:0"
+                >statistics</button></h2>
+      <div id="runlist"></div>
+    </div>
+    <div class="card">
+      <div id="phead"><span class="dim">select a run</span></div>
+      <div id="ptabs" hidden></div>
+      <div id="pbody"></div>
+    </div>
+  </section>
+
+  <!-- ================= PROFILES ================= -->
+  <section class="view vstack" id="view-profiles" hidden>
+    <div class="card grow">
+      <h2>profiles</h2>
+      <div class="pad">
+        <div class="row" style="margin-bottom:.6rem">
+          <button id="addprofile">+ profile</button>
+          <span class="dim" id="discovery"></span>
+          <span class="dim" id="profscope"></span>
+        </div>
+        <div id="profiles"></div>
+        <div id="editor" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SETTINGS =================
+       The whole config file in a textarea (W-0190). Profiles stay on their
+       own tab; this is everything else, including them, as written. -->
+  <section class="view vstack" id="view-settings" hidden>
+    <div class="card grow">
+      <h2>config.toml <span class="dim" id="cfgpath"></span>
+        <span class="spacer"></span>
+        <span class="dim" id="cfgmsg"></span>
+        <button id="cfgsave" style="text-transform:none;letter-spacing:0"
+                >save and restart</button>
+      </h2>
+      <div class="pad" style="overflow:hidden">
+        <textarea id="cfgtext" class="mono" spellcheck="false"
+                  aria-label="config.toml"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= RUNWAY ================= -->
+  <section class="view vstack" id="view-runway" hidden>
+    <div class="card grow">
+      <h2>provider runway
+        <span class="dim" id="runwaystamp"></span>
+        <span class="spacer"></span>
+        <button id="runwayrefresh" style="text-transform:none;
+                letter-spacing:0">refresh</button>
+      </h2>
+      <div class="pad">
+        <div id="runway"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= HEALTH =================
+       The daemon's pulse and nothing else: statistics moved to the runs page
+       (W-0186). Health is the sweeper's own state plus the controls that
+       drive it, so the log takes every pixel the top card does not. -->
+  <section class="view vstack" id="view-health" hidden>
+    <div class="card" style="flex:0 0 auto">
+      <h2>daemon health</h2>
+      <div class="pad" style="overflow:visible">
+        <div id="daemon"></div>
+        <div class="row" style="margin-top:.7rem">
+          <button id="sweep">sweep now</button>
+          <button id="pause" class="pause">pause dispatch</button>
+          <button id="restart" title="Picks up code changes. In-flight runs keep running — a supervisor is its own process.">restart service</button>
+        </div>
+      </div>
+    </div>
+    <div class="card grow">
+      <h2>daemon log <span class="dim" id="logstate"></span></h2>
+      <div class="pad" style="overflow:hidden">
+        <div id="logtail" class="dim">connecting…</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- The statistics popup, opened from the runs page. It reads the selected
+     project's numbers when one is picked, and every run's otherwise. -->
+<dialog id="statsdlg" aria-labelledby="statstitle">
+  <div class="card">
+    <h2 id="statstitle">statistics <span class="dim" id="statsscope"
+          style="text-transform:none;letter-spacing:0"></span>
+      <span class="spacer"></span>
+      <button id="statsclose" style="text-transform:none;letter-spacing:0"
+              >close</button></h2>
+    <div class="pad" id="stats"></div>
+  </div>
+</dialog>
+
+<form class="keyform" id="keyform" hidden>
+  <p>Paste the shared secret (the <code>key</code> in
+     <code>~/.config/dromond/config.toml</code>).</p>
+  <input type="password" id="keyinput" autocomplete="off" placeholder="X-Dromond-Key">
+  <button type="submit">unlock</button>
+</form>
+
+<script>
+"use strict";
+const POLL_MS = 4000;
+const $ = (id) => document.getElementById(id);
+
+// --- credential -------------------------------------------------------------
+// The header is what the API demands. The cookie exists because EventSource
+// cannot set headers, so the two SSE routes ride it on a same-origin GET.
+function readKey() {
+  const m = document.cookie.match(/(?:^|;\s*)dromond_key=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : (localStorage.getItem("dromond_key") || "");
+}
+function saveKey(k) {
+  localStorage.setItem("dromond_key", k);
+  document.cookie = "dromond_key=" + encodeURIComponent(k) +
+                    "; Path=/; Max-Age=31536000; SameSite=Strict";
+}
+let KEY = readKey();
+
+async function api(path, opts) {
+  const o = Object.assign({headers: {}}, opts || {});
+  o.headers["X-Dromond-Key"] = KEY;
+  if (o.body) o.headers["Content-Type"] = "application/json";
+  const res = await fetch(path, o);
+  const text = await res.text();
+  if (!res.ok) throw new Error(res.status + " " + text.trim());
+  return text ? JSON.parse(text) : {};
+}
+function fail(e) { $("banner").textContent = String((e && e.message) || e); }
+async function act(path, opts) {
+  try { await api(path, opts); await refresh(); } catch (e) { fail(e); }
+}
+
+// --- tiny DOM helpers -------------------------------------------------------
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function kv(rows) {
+  const t = el("table", "kv"), tb = el("tbody");
+  rows.forEach(([label, value]) => {
+    if (value === undefined) return;
+    const tr = el("tr");
+    tr.append(el("th", null, label));
+    const td = el("td");
+    if (value instanceof Node) td.appendChild(value);
+    else td.textContent = value === null || value === "" ? "–" : String(value);
+    tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  return t;
+}
+function table(headers, rows) {
+  const t = el("table", "grid"), thead = el("thead"), tr = el("tr");
+  headers.forEach((h) => tr.appendChild(el("th", null, h)));
+  thead.appendChild(tr); t.appendChild(thead);
+  const tb = el("tbody");
+  rows.forEach((cells) => {
+    const r = el("tr");
+    cells.forEach((c) => {
+      const td = el("td");
+      if (c instanceof Node) td.appendChild(c);
+      else if (c && c.node) { td.appendChild(c.node); td.className = c.cls || ""; }
+      else td.textContent = (c === null || c === undefined) ? "–" : String(c);
+      r.appendChild(td);
+    });
+    tb.appendChild(r);
+  });
+  t.appendChild(tb);
+  return t;
+}
+function block(title, node) {
+  const b = el("div", "block");
+  b.append(el("h3", null, title), node);
+  return b;
+}
+function dur(s) {
+  if (s === null || s === undefined) return "–";
+  if (s < 90) return Math.round(s) + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  return (s / 3600).toFixed(1) + "h";
+}
+function num(n) {
+  return (n === null || n === undefined) ? "–" : n.toLocaleString();
+}
+function money(n) {
+  return (n === null || n === undefined) ? "–" : "$" + Number(n).toFixed(4);
+}
+// Every stamp the snapshot carries is "%Y-%m-%dT%H:%M:%SZ".
+function ageSeconds(stamp) {
+  const t = Date.parse(stamp || "");
+  return isNaN(t) ? null : Math.max(0, (Date.now() - t) / 1000);
+}
+function ago(stamp) {
+  const s = ageSeconds(stamp);
+  return s === null ? "–" : dur(s) + " ago";
+}
+function statusChip(run) {
+  const blocked = run.blocked_on && run.blocked_on.length;
+  const label = blocked ? "blocked on " + run.blocked_on.join(",") : run.status;
+  return el("span", "chip " + (blocked ? "c-blocked" : "c-" + run.status), label);
+}
+
+// --- views ------------------------------------------------------------------
+let VIEW = "runs";
+function showView(name) {
+  VIEW = name;
+  ["runs", "profiles", "settings", "runway", "health"].forEach((v) => {
+    $("view-" + v).hidden = v !== name;
+  });
+  document.querySelectorAll("#tabs .tab").forEach((b) => {
+    b.classList.toggle("on", b.dataset.view === name);
+  });
+  // Neither stream runs behind a view nobody is looking at.
+  if (name === "health") openLog(); else closeLog();
+  if (name === "runway") refreshRunway();  // opening the view is a request
+  if (name === "settings") loadConfig();
+  syncTrace();
+}
+document.querySelectorAll("#tabs .tab").forEach((b) => {
+  b.onclick = () => showView(b.dataset.view);
+});
+
+// --- the project picker (W-0186) --------------------------------------------
+// It offers EXACTLY the projects the snapshot's runs name, plus "all
+// projects" — not every project on the machine, because a project you have
+// never kicked a run off from would filter the board to nothing.
+//
+// Picking one filters the runs list and turns on the ENABLED column in the
+// profiles view (W-0187). Profiles themselves are GLOBAL presets and stay
+// editable whatever is picked; `/api/project` answers with the project's
+// enabled set (null = every profile), and the checkbox POSTs it back.
+// Runway and daemon health stay global: a provider's quota and the
+// sweeper's pulse belong to the machine.
+//
+// The choice lives for as long as the page is open. Nothing is persisted —
+// a reload starts on the whole board, which is the honest default.
+let PROJECT = null;      // a project_id, or null for "all projects"
+let SCOPE = null;        // /api/project: {enabled_profiles, statistics}
+let SCOPE_WAIT = false;
+
+function projectName(id) {
+  const p = ((SNAP && SNAP.projects) || []).find((x) => x.project_id === id);
+  return (p && (p.name || p.project_id)) || id;
+}
+
+function visibleRuns(s) {
+  return PROJECT === null ? s.runs
+       : s.runs.filter((r) => r.project_id === PROJECT);
+}
+
+function renderProjects(s) {
+  const projects = s.projects || [];
+  $("projsel").hidden = !projects.length;
+  // The selected project's last run aged out of the snapshot window, so it
+  // is no longer something to switch to. Fall back rather than show a board
+  // filtered to nothing by a name that is not in the menu.
+  if (PROJECT !== null && !projects.some((p) => p.project_id === PROJECT)) {
+    PROJECT = null;
+    SCOPE = null;
+  }
+  const cur = projects.find((p) => p.project_id === PROJECT);
+  $("projlabel").textContent = cur ? (cur.name || cur.project_id) : "all projects";
+  $("projdot").className = "proj-dot" + (cur ? "" : " all");
+  const total = projects.reduce((n, p) => n + p.runs, 0);
+  $("projmenu").replaceChildren(
+    projectOption(null, "all projects", total + " runs"),
+    ...projects.map((p) => projectOption(p.project_id, p.name || p.project_id,
+                                         p.runs + " runs · " + p.live + " live")));
+}
+
+function projectOption(id, name, meta) {
+  const b = el("button", "proj-opt");
+  b.type = "button";
+  b.setAttribute("role", "option");
+  b.setAttribute("aria-selected", PROJECT === id ? "true" : "false");
+  b.append(el("span", "po-name", name), el("span", "po-meta", meta));
+  b.onclick = () => { openProjectMenu(false); setProject(id); };
+  return b;
+}
+
+function openProjectMenu(open) {
+  const menu = $("projmenu");
+  const next = open === undefined ? menu.hidden : open;
+  menu.hidden = !next;
+  $("projbtn").setAttribute("aria-expanded", next ? "true" : "false");
+}
+
+function setProject(id) {
+  if (PROJECT === id) return;
+  PROJECT = id;
+  SCOPE = null;
+  // A run of some other project is off the board now, so it cannot stay
+  // selected — and its trace must not keep streaming behind the filter.
+  if (SELECTED !== null && SNAP &&
+      !visibleRuns(SNAP).some((r) => r.id === SELECTED)) {
+    SELECTED = null;
+    syncTrace();
+  }
+  if (SNAP) render(SNAP);
+}
+
+// One route for both project-scoped reads, re-fetched on the poll rather
+// than cached: statistics are a running total over the whole runs table, and
+// a stale total is worse than one more scan of a local SQLite file. The
+// in-flight guard is what keeps it to one request per tick.
+function loadScope() {
+  if (PROJECT === null || SCOPE_WAIT) return;
+  SCOPE_WAIT = true;
+  const want = PROJECT;
+  api("/api/project?id=" + encodeURIComponent(want)).then((d) => {
+    if (PROJECT !== want) return;   // switched again while this was in flight
+    SCOPE = d;
+    if (SNAP) render(SNAP);
+  }).catch(fail).finally(() => { SCOPE_WAIT = false; });
+}
+
+$("projbtn").onclick = (e) => { e.stopPropagation(); openProjectMenu(); };
+document.addEventListener("click", (e) => {
+  const sel = $("projsel");
+  if (!sel.hidden && !sel.contains(e.target)) openProjectMenu(false);
+});
+
+// --- runs: the list ---------------------------------------------------------
+let SNAP = null, SELECTED = null;
+const INSTRUCTION_DRAFTS = new Map();
+
+function selectRun(id) {
+  if (SELECTED === id) return;
+  SELECTED = id;
+  syncTrace();
+  if (SNAP) { renderRunList(SNAP); renderDetail(SNAP); }
+}
+
+function renderRunList(s) {
+  const box = $("runlist");
+  const runs = visibleRuns(s);
+  $("runcount").textContent = runs.length ? "(" + runs.length + ")" : "";
+  if (!runs.length) {
+    box.replaceChildren(el("div", "runitem dim", PROJECT === null
+      ? "no runs yet — `dromond run`"
+      : "no runs for " + projectName(PROJECT) + " in the snapshot window"));
+    return;
+  }
+  const ids = new Set(runs.map((r) => r.id));
+  box.replaceChildren(...runs.map((r) => {
+    const lineage = (r.retry_of && ids.has(r.retry_of)) ? " continuation"
+                  : (r.parent_run && ids.has(r.parent_run)) ? " child" : "";
+    const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
+    const top = el("div", "top");
+    top.append(el("span", "mono", "#" + r.id));
+    if (r.slug) top.append(el("span", "mono dim", r.slug));
+    top.append(statusChip(r));
+    const when = el("span", "mono dim", dur(r.elapsed_seconds));
+    when.style.marginLeft = "auto";
+    top.append(when);
+    item.append(top);
+    item.append(el("div", "title", r.title || "(no title recorded)"));
+    item.append(el("div", "meta", [
+      r.profile, r.backend, r.work_item, r.project,
+      r.retry_of ? "retry of #" + r.retry_of : "",
+      r.parent_run ? "child of #" + r.parent_run : "",
+    ].filter(Boolean).join(" · ")));
+    item.onclick = () => selectRun(r.id);
+    return item;
+  }));
+}
+
+// --- runs: the detail pane --------------------------------------------------
+function instructionPane(r) {
+  const box = el("form", "run-actions");
+  const area = el("textarea");
+  area.rows = 3;
+  area.placeholder = "Correction or instruction for run #" + r.id;
+  area.setAttribute("aria-label", "instruction for run #" + r.id);
+  area.value = INSTRUCTION_DRAFTS.get(r.id) || "";
+  const send = el("button", null, "send instruction");
+  send.type = "submit";
+  send.disabled = !r.session_ref || !area.value.trim();
+  send.title = r.session_ref ? "send at the run's next safe action boundary"
+                             : "available once the run's session starts";
+  area.oninput = () => {
+    INSTRUCTION_DRAFTS.set(r.id, area.value);
+    send.disabled = !r.session_ref || !area.value.trim();
+  };
+  box.append(area, send);
+  box.onsubmit = async (e) => {
+    e.preventDefault();
+    const text = area.value.trim();
+    if (!text || !r.session_ref) return;
+    send.disabled = true;
+    try {
+      await api("/api/runs/" + r.id + "/tell",
+                {method: "POST", body: JSON.stringify({text: text})});
+      INSTRUCTION_DRAFTS.delete(r.id);
+      area.value = "";
+      await refresh();
+    } catch (err) { fail(err); }
+    finally { send.disabled = !r.session_ref || !area.value.trim(); }
+  };
+  return box;
+}
+
+function messageItem(m) {
+  const item = el("div", "msg " + m.direction);
+  const head = el("div", "head");
+  head.append(el("i", "g", msgGlyph(m)));
+  head.append(el("span", "label", m.kind || "message"));
+  head.append(el("span", null, m.direction === "inbound" ? "→ " + m.sender
+                                                         : "← " + m.sender));
+  head.append(el("span", "badge b-" + m.state, m.state));
+  if (m.pending_boundary)
+    head.append(el("span", "dim", "waiting for a safe action boundary"));
+  head.append(el("span", "dim mono", m.created_at || ""));
+  item.append(head);
+  if (m.undeliverable_reason)
+    item.append(el("div", "bad", m.undeliverable_reason));
+  item.append(el("div", "prose", m.body || ""));
+  return item;
+}
+
+function forRun(rows, runId) {
+  // Findings and proposals have no tables yet (http._recent returns []), so
+  // this filters whatever shape does appear rather than assuming one.
+  return (rows || []).filter((row) => Number(row.run_id || row.run) === runId);
+}
+
+function recordTable(rows) {
+  const keys = Object.keys(rows[0]);
+  return table(keys, rows.map((r) => keys.map((k) => {
+    const v = r[k];
+    return (v === null || v === undefined) ? null
+         : (typeof v === "object") ? JSON.stringify(v) : String(v);
+  })));
+}
+
+// A brief is written once at dispatch and never changes, so it is fetched
+// once per run and kept — the 4s poll re-renders this pane constantly, and
+// re-reading the file on every tick is what the route exists to avoid.
+// A failed read caches nothing, so the next re-render tries again.
+const BRIEFS = new Map();
+const BRIEF_WAIT = new Set();
+function loadBrief(id) {
+  if (BRIEF_WAIT.has(id)) return;
+  BRIEF_WAIT.add(id);
+  api("/api/runs/" + id + "/brief").then((b) => {
+    BRIEFS.set(id, b);
+    if (SNAP && SELECTED === id && runTab() === "brief") renderDetail(SNAP);
+  }).catch(fail).finally(() => BRIEF_WAIT.delete(id));
+}
+
+// Diffs are also read only when their tab opens. A completed run is immutable;
+// refresh makes the committed view of an active run an explicit choice.
+const DIFFS = new Map();
+const DIFF_WAIT = new Set();
+function loadDiff(id, refresh) {
+  if (DIFF_WAIT.has(id)) return;
+  if (refresh) DIFFS.delete(id);
+  DIFF_WAIT.add(id);
+  api("/api/runs/" + id + "/diff").then((d) => {
+    DIFFS.set(id, d);
+    if (SNAP && SELECTED === id && runTab() === "merge") renderDetail(SNAP);
+  }).catch(fail).finally(() => DIFF_WAIT.delete(id));
+}
+
+function renderDiff(text) {
+  const pre = el("pre", "diff");
+  pre.append(...text.split("\n").map((line) => {
+    let cls = "diff-line";
+    if (line.startsWith("diff ") || line.startsWith("index ") ||
+        line.startsWith("@@") || line.startsWith("---") || line.startsWith("+++")) {
+      cls += " diff-meta";
+    } else if (line.startsWith("+")) cls += " diff-add";
+    else if (line.startsWith("-")) cls += " diff-del";
+    return el("span", cls, line);
+  }));
+  return pre;
+}
+
+// --- runs: the detail tabs (W-0180) -----------------------------------------
+// One tab at a time, because a run is opened to watch its trace and read its
+// thread, and everything else used to be a long scroll away. The strip lives
+// beside the header, outside the scrolling body; trace is the default.
+const TABS = [
+  ["trace", "trace"],
+  ["messages", "inbox / outbox"],
+  ["instruction", "send instruction"],
+  ["brief", "brief"],
+  ["facts", "facts"],
+  ["summary", "summary"],
+  ["merge", "merge"],
+  ["findings", "findings"],
+];
+// Remembered per run for as long as the page is open: come back to a run and
+// it is on the tab you left it on. Nothing is persisted across a reload.
+const RUN_TAB = new Map();
+
+function runTab() {
+  const key = RUN_TAB.get(SELECTED);
+  return PANES[key] ? key : "trace";
+}
+function setRunTab(key) {
+  if (SELECTED === null || runTab() === key) return;
+  RUN_TAB.set(SELECTED, key);
+  syncTrace();
+  if (SNAP) renderDetail(SNAP);
+  $("pbody").scrollTop = 0;
+}
+function renderTabs(run) {
+  const strip = $("ptabs");
+  strip.hidden = !run;
+  if (!run) return strip.replaceChildren();
+  const active = runTab();
+  strip.replaceChildren(...TABS.filter(([key]) => run.live || key !== "instruction")
+    .map(([key, label]) => {
+    const b = el("button", key === active ? "on" : null, label);
+    b.onclick = () => setRunTab(key);
+    return b;
+  }));
+  if (run.live) {
+    const stop = el("button", "danger stop-run", "stop run");
+    stop.onclick = () => {
+      if (confirm("stop run #" + run.id + "?"))
+        act("/api/runs/" + run.id + "/stop", {method: "POST"});
+    };
+    strip.append(stop);
+  }
+}
+
+// One builder per tab. Every one of them renders with empty data: a tab with
+// nothing in it says so, and a tab that cannot apply says why.
+const PANES = {
+  trace: tracePane,
+
+  messages: (s, r) => {
+    const thread = (r.messages || []).filter((m) => m.kind !== "merge");
+    return thread.length ? wrap(thread.map(messageItem))
+      : el("p", "dim",
+           "no messages — nothing was told to this run and it asked nothing");
+  },
+
+  instruction: (s, r) => instructionPane(r),
+
+  // The whole brief, read off disk by /api/runs/<id>/brief when this tab is
+  // opened. It is not in the snapshot: that carries every run every 4s.
+  brief: (s, r) => {
+    const box = el("div");
+    const b = BRIEFS.get(r.id);
+    if (b === undefined) {
+      loadBrief(r.id);
+      box.append(el("p", "dim", "reading the brief file…"));
+      return box;
+    }
+    if (b.text) box.append(el("div", "prose", b.text));
+    else box.append(el("div", "prose", r.title || "(no title recorded)"),
+                    el("p", "dim", b.message || "no brief file"));
+    if (b.path) box.append(el("p", "dim mono", b.path));
+    return box;
+  },
+
+  facts: (s, r) => kv([
+    ["profile", r.profile],
+    ["harness", r.backend + (r.model ? " · " + r.model : "")],
+    ["project", r.project || r.project_id],
+    ["work item", r.work_item],
+    ["branch", r.branch],
+    ["base commit", r.base_commit],
+    ["checkpoint", r.checkpoint_commit],
+    ["workdir", r.workdir],
+    ["brief file", r.brief_path],
+    ["session", r.session_ref],
+    ["requested by", r.requested_by],
+    ["lineage", lineageNode(s, r)],
+    ["started", r.started_at],
+    ["finished", r.finished_at],
+    ["elapsed", dur(r.elapsed_seconds)],
+    ["exit code", r.exit_code],
+    ["tokens", r.tokens_total === null && r.tokens_in === null
+        ? "not captured"
+        : num(r.tokens_total) + " (in " + num(r.tokens_in) +
+          " / out " + num(r.tokens_out) + ")"],
+    // A plan-backed run has no price: OpenCode's cost 0 on subscription data
+    // is not free work, and a bare dash says nothing (W-0179).
+    ["cost", r.billing === "plan" ? "plan"
+             : r.cost_usd === null ? "not captured" : money(r.cost_usd)],
+    ["usage from", r.usage_source],
+  ]),
+
+  summary: (s, r) => r.summary
+    ? el("div", "prose", r.summary)
+    : el("p", "dim", r.live
+        ? "no summary yet — a run writes one when it finishes"
+        : "this run finished without writing a summary"),
+
+  // The merge report is written into the run's own thread as a message of
+  // kind `merge` (merge._thread), so it needs no second source.
+  merge: (s, r) => {
+    const box = el("div");
+    const merges = (r.messages || []).filter((m) => m.kind === "merge");
+    box.append(block("report", merges.length ? wrap(merges.map(messageItem))
+      : el("p", "dim", r.branch ? "nothing landed yet"
+                                : "no branch — this run worked in the shared tree")));
+    const changes = el("div");
+    const d = DIFFS.get(r.id);
+    if (d !== undefined && r.branch) {
+      const refresh = el("button", null, "refresh");
+      refresh.style.cssText = "float:right;margin-bottom:.4rem";
+      refresh.onclick = () => loadDiff(r.id, true);
+      changes.append(refresh);
+    }
+    if (d === undefined) {
+      loadDiff(r.id);
+      changes.append(el("p", "dim", "reading committed changes…"));
+    } else if (d.text) {
+      changes.append(renderDiff(d.text));
+      if (d.truncated) changes.append(el("p", "warn", "diff truncated at 250 KB"));
+    } else {
+      changes.append(el("p", "dim", d.message || "no committed changes"));
+    }
+    box.append(block("changes", changes));
+    return box;
+  },
+
+  // Proposals are folded in here: both are things a run filed for a human.
+  findings: (s, r) => {
+    const box = el("div");
+    const findings = forRun(s.findings, r.id);
+    box.append(block("findings", findings.length ? recordTable(findings)
+      : el("p", "dim", "none filed by this run")));
+    const proposals = forRun(s.proposals, r.id);
+    box.append(block("proposals", proposals.length ? recordTable(proposals)
+      : el("p", "dim", "none filed by this run")));
+    return box;
+  },
+};
+
+function tracePane() {
+  const pane = el("div", "block");
+  // No title: the tab strip above already names this pane.
+  const h3 = el("h3", null, "stream ");
+  const state = el("span", "dim");
+  state.id = "tracestate";
+  state.textContent = TRACE_STATE;
+  const follow = el("label", "dim");
+  follow.style.cssText = "float:right;font-weight:400;text-transform:none";
+  const cb = el("input"); cb.type = "checkbox"; cb.id = "followcb"; cb.checked = FOLLOW;
+  cb.onchange = () => { FOLLOW = cb.checked; };
+  follow.append(cb, el("span", null, " follow tail"));
+  h3.append(state, follow);
+  pane.append(h3, TRACE_BOX);
+  return pane;
+}
+
+function renderDetail(s) {
+  const r = s.runs.find((x) => x.id === SELECTED);
+  const head = $("phead"), body = $("pbody");
+  if (!r) {
+    head.replaceChildren(el("span", "dim",
+      SELECTED === null ? "select a run" : "run #" + SELECTED +
+      " is no longer in the snapshot window"));
+    renderTabs(null);
+    body.replaceChildren();
+    closeTrace();
+    return;
+  }
+  head.replaceChildren();
+  head.append(el("span", "mono", "#" + r.id));
+  if (r.slug) head.append(el("span", "mono dim", r.slug));
+  head.append(statusChip(r));
+  if (r.work_item) head.append(el("span", "mono", r.work_item));
+  // A run can finish while its instruction tab is open. Return to trace;
+  // a dead tab is worse than moving to the run's final output.
+  if (!r.live && runTab() === "instruction") RUN_TAB.delete(r.id);
+  renderTabs(r);
+  const pane = runTab();
+  // A snapshot lands every four seconds. Do not replace the composer while
+  // the human is typing; the next poll after focus leaves may rebuild it.
+  if (pane !== "instruction" || !body.contains(document.activeElement))
+    body.replaceChildren(PANES[pane](s, r));
+}
+
+function wrap(nodes) {
+  const box = el("div");
+  nodes.forEach((n) => box.appendChild(n));
+  return box;
+}
+
+function lineageNode(s, r) {
+  const box = el("span");
+  const link = (label, id) => {
+    if (!s.runs.some((x) => x.id === id)) return el("span", null, label + " (aged out)");
+    const b = el("button", null, label);
+    b.onclick = () => selectRun(id);
+    return b;
+  };
+  if (r.parent_run) box.append(link("child of #" + r.parent_run, r.parent_run), " ");
+  if (r.retry_of) box.append(link("retry of #" + r.retry_of, r.retry_of), " ");
+  const kids = s.runs.filter((x) => x.parent_run === r.id || x.retry_of === r.id);
+  kids.forEach((k) => box.append(link("→ #" + k.id, k.id), " "));
+  if (!box.childNodes.length) box.append(el("span", null, "–"));
+  return box;
+}
+
+// --- the trace stream (SSE) -------------------------------------------------
+// The trace pane is owned by the stream, never by the 4s poll: the box node is
+// kept across re-renders so appended events and open <details> survive.
+const TRACE_BOX = el("div");
+let TRACE = null, TRACE_RUN = null, TRACE_STATE = "", FOLLOW = true;
+
+function setTraceState(text) {
+  TRACE_STATE = text;
+  const node = $("tracestate");
+  if (node) node.textContent = text;
+}
+
+// The one place that decides whether a stream should exist: only the selected
+// run, only while its trace tab is the visible one. Nothing is left connected
+// behind a hidden tab. TRACE_RUN is the run the box holds, so a stream that
+// ended on its own is not reopened by the next call.
+function syncTrace() {
+  const want = (VIEW === "runs" && SELECTED !== null && runTab() === "trace")
+             ? SELECTED : null;
+  if (want === TRACE_RUN) return;
+  closeTrace();
+  if (want !== null) openTrace(want);
+}
+
+function openTrace(runId) {
+  TRACE_RUN = runId;
+  TRACE_BOX.replaceChildren(el("p", "dim", "connecting…"));
+  setTraceState("· live");
+  let empty = true;
+  const src = new EventSource("/api/runs/" + runId + "/stream");
+  TRACE = src;
+  src.addEventListener("trace", (e) => {
+    if (empty) { TRACE_BOX.replaceChildren(); empty = false; }
+    let row;
+    try { row = JSON.parse(e.data); } catch (err) { return; }
+    TRACE_BOX.appendChild(traceItem(row));
+    if (FOLLOW) $("pbody").scrollTop = $("pbody").scrollHeight;
+  });
+  src.addEventListener("end", () => {
+    if (empty) TRACE_BOX.replaceChildren(
+      el("p", "dim", "no events — this run wrote nothing the parsers recognised"));
+    setTraceState("· ended");
+    src.close();
+    if (TRACE === src) TRACE = null;
+  });
+  // EventSource reconnects by itself with Last-Event-ID; say so rather than
+  // offering a reconnect button that duplicates what the browser already does.
+  src.onerror = () => { if (TRACE === src) setTraceState("· reconnecting…"); };
+  src.onopen = () => {
+    if (TRACE !== src) return;
+    setTraceState("· live");
+    if (empty) TRACE_BOX.replaceChildren(el("p", "dim",
+      "no events yet — nothing the parsers recognise has been written"));
+  };
+}
+
+function closeTrace() {
+  if (TRACE) { TRACE.close(); TRACE = null; }
+  TRACE_RUN = null;
+  setTraceState("");
+}
+
+// One glyph per normalized event kind (traces.KINDS). A kind with no entry
+// here would render as an unlabelled line, so tests/test_traces.py asserts
+// this object covers every kind — adding a kind to the parser without adding
+// it here fails the suite. `assistant_text` is deliberately BLANK: the run's
+// answer is the one thing that should carry no decoration.
+const GLYPH = {
+  assistant_text: "",
+  reasoning: "\u{1F9E0}",          // brain — the agent thinking to itself
+  tool_call: "\u{1F527}",          // wrench — it reached for a tool
+  tool_result: "\u{1F9FE}",        // receipt — what the tool handed back
+  permission_request: "\u{1F510}", // lock — it is asking to be allowed
+  human_injection: "\u{1F4E5}",    // inbox — a human put this INTO the run
+  lifecycle: "⚙",             // gear — the harness, not the agent
+};
+const UNKNOWN_GLYPH = "•";    // bullet — a kind this build does not know
+// About 6–8 wrapped lines in the trace pane: useful at a glance without
+// letting longer reasoning blocks take over the feed.
+const SHORT_REASONING_CHARS = 512;
+
+// Messages are conversation WITH the run, so they are glyphed by what the
+// message is, not by which way it travelled (the arrow already says that).
+const MSG_GLYPH = {
+  interrupt: "\u{1F6A8}",  // siren — a tell waiting for a safe boundary
+  tell: "\u{1F4E5}",
+  ask: "❓",           // question — the run is blocked on an answer
+  answer: "\u{1F4AC}",     // speech — the human answered it
+  merge: "\u{1F500}",
+};
+function msgGlyph(m) {
+  return MSG_GLYPH[m.kind] || (m.direction === "inbound" ? "\u{1F4E5}"
+                                                         : "\u{1F4E4}");
+}
+
+function collapsible(cls, glyph, name, verb, payload, row, open = false) {
+  const d = el("details", cls);
+  d.open = open;
+  const s = el("summary");
+  s.append(el("i", "g", glyph), el("span", "name", name));
+  if (verb) s.append(el("span", "dim", "· " + verb));
+  s.append(el("span", "dim", "· " + row.payload_len + " chars" +
+                             (row.truncated ? ", truncated at 2KB" : "")));
+  const inner = el("div", "inner");
+  inner.appendChild(el("pre", null, payload));
+  d.append(s, inner);
+  return d;
+}
+
+// A glyph in the gutter, a label, then the text — for the kinds that are not
+// collapsed. Same 1.5rem indent as `collapsible`, so the whole trace lines up.
+function eventItem(cls, glyph, label, note, payload) {
+  const item = el("div", "titem evt " + cls);
+  const body = el("div", "body");
+  const head = el("div");
+  head.append(el("span", "label", label));
+  if (note) head.append(el("span", "dim", " · " + note));
+  body.append(head);
+  if (payload) body.append(el("div", "prose", payload));
+  item.append(el("i", "g", glyph), body);
+  return item;
+}
+
+function traceItem(row) {
+  const payload = row.payload || "";
+  const name = row.name || "";
+  if (row.kind === "assistant_text")
+    return el("div", "titem prose", payload);
+  if (row.kind === "reasoning")
+    return collapsible("think", GLYPH.reasoning, "thinking", name, payload, row,
+                       row.payload_len <= SHORT_REASONING_CHARS);
+  if (row.kind === "tool_call")
+    return collapsible("tool", GLYPH.tool_call, name || "tool", "call", payload, row);
+  if (row.kind === "tool_result")
+    return collapsible("tool", GLYPH.tool_result, name || "tool", "result", payload, row);
+  if (row.kind === "permission_request")
+    return eventItem("permission", GLYPH.permission_request,
+                     "permission requested", name || "?", payload);
+  if (row.kind === "human_injection")
+    return eventItem("injection", GLYPH.human_injection,
+                     "put into the session", name, payload);
+  if (row.kind === "lifecycle")
+    return eventItem("meta", GLYPH.lifecycle, name || "lifecycle", "",
+                     payload.slice(0, 300));
+  return eventItem("meta", UNKNOWN_GLYPH, name || row.kind, row.kind,
+                   payload.slice(0, 300));
+}
+
+// --- the daemon log stream (SSE) --------------------------------------------
+let LOG = null;
+const LOG_IDLE = "nothing written yet — the daemon logs a line per sweep";
+function openLog() {
+  if (LOG) return;
+  $("logtail").replaceChildren(el("p", "dim", LOG_IDLE));
+  $("logstate").textContent = "· live";
+  const src = new EventSource("/api/log/stream");
+  LOG = src;
+  let empty = true;
+  src.addEventListener("daemon", (e) => {
+    let row;
+    try { row = JSON.parse(e.data); } catch (err) { return; }
+    const box = $("logtail");
+    if (empty) { box.replaceChildren(); empty = false; }
+    const line = el("div", row.file.includes("err") ? "bad" : null,
+                    row.file + "  " + row.line);
+    box.appendChild(line);
+    while (box.childElementCount > 500) box.removeChild(box.firstChild);
+    box.scrollTop = box.scrollHeight;
+  });
+  src.onerror = () => { if (LOG === src) $("logstate").textContent = "· reconnecting…"; };
+  src.onopen = () => { if (LOG === src) $("logstate").textContent = "· live"; };
+}
+function closeLog() {
+  if (!LOG) return;
+  LOG.close();
+  LOG = null;
+  $("logstate").textContent = "· paused (open this view to stream)";
+}
+
+// --- profiles (W-0173) ------------------------------------------------------
+// The model and effort controls are pickers fed by `/api/profiles/options`
+// (what the harnesses themselves report), never free text — except for
+// claude, which publishes no model listing. OpenCode has no --effort flag at
+// all, so the effort control disables itself there instead of quietly
+// accepting a value the launch would drop.
+const BACKENDS = ["opencode", "codex", "claude", "reasonix"];
+let OPTIONS = null, PROFILES = [], EDITING = null, DRAFT = {};
+
+async function loadOptions(refreshNow) {
+  try {
+    OPTIONS = await api("/api/profiles/options" + (refreshNow ? "?refresh=1" : ""));
+    const broken = BACKENDS.filter((b) => OPTIONS[b] && OPTIONS[b].error &&
+                                          !(OPTIONS[b].models || []).length);
+    $("discovery").textContent = broken.length
+      ? "discovery: no models from " + broken.join(", ")
+      : "discovery ok";
+  } catch (e) {
+    OPTIONS = OPTIONS || {};  // do not retry forever behind a dead route
+    $("discovery").textContent = "discovery unavailable";
+  }
+}
+
+// Discovery costs three subprocesses, so it is fetched the first time an
+// editor opens, never on every poll.
+function openEditor(name) {
+  EDITING = name;
+  DRAFT = null;
+  if (OPTIONS) return drawEditor();
+  loadOptions(false).then(drawEditor);
+}
+
+// The note is READ here and written in the editor. It was an inline input,
+// which left a human asking whether the list was editable at all; one place
+// to type a thing is the answer to that question.
+function noteCell(p) {
+  const box = el("span", "noteedit");
+  box.append(el("span", null, p.note || "–"),
+             el("span", "dim", p.note ? (p.note_age || "") : ""));
+  return box;
+}
+
+function tierCell(p) {
+  return p.tier ? p.tier + " " + (p.tier_name || "") : "–";
+}
+
+// The ENABLED SET (W-0187). `SCOPE.enabled_profiles` is null when the project
+// has never said, and null means every profile — so the checkboxes read as
+// all-on, and unticking the first one is what materialises the list.
+function enabledNames() {
+  if (!SCOPE || SCOPE.enabled_profiles === null ||
+      SCOPE.enabled_profiles === undefined) return null;
+  return SCOPE.enabled_profiles;
+}
+
+function isEnabled(name) {
+  const list = enabledNames();
+  return list === null || list.indexOf(name) >= 0;
+}
+
+// Optimistic: the box moves now and the 4s poll confirms it. A refused write
+// puts the banner up and the next poll snaps the box back to the truth.
+async function toggleEnabled(name, on) {
+  const project = PROJECT;
+  const list = enabledNames();
+  const next = (list === null ? PROFILES.map((p) => p.name) : list.slice())
+                 .filter((n) => n !== name);
+  if (on) next.push(name);
+  if (SCOPE) SCOPE.enabled_profiles = next;
+  try {
+    const res = await api("/api/project", {method: "POST", body: JSON.stringify(
+      {project_id: project, enabled_profiles: next})});
+    if (res.error) return fail(new Error(res.error));
+  } catch (e) { fail(e); }
+  // Nothing to re-fetch by hand: loadScope runs on the poll and the server's
+  // answer replaces the optimistic list a tick later, refused or not.
+}
+
+function enabledCell(name) {
+  const l = el("label", "enabledbox"), cb = el("input");
+  cb.type = "checkbox";
+  cb.checked = isEnabled(name);
+  cb.disabled = !SCOPE;   // the enabled set has not landed yet
+  cb.setAttribute("aria-label", "staff " + name + " in " + projectName(PROJECT));
+  cb.onchange = () => toggleEnabled(name, cb.checked);
+  l.appendChild(cb);
+  return l;
+}
+
+function renderProfiles(s) {
+  // Already in routing order: the server sorts by priority, then name.
+  // Profiles are GLOBAL presets (W-0187), so this is the same list whatever
+  // the picker says, and it is editable whatever the picker says. What a
+  // project picks is which of them it may STAFF — the enabled column.
+  const scoped = PROJECT !== null;
+  PROFILES = s.profiles;
+  const none = scoped && (enabledNames() || ["x"]).length === 0;
+  $("profscope").textContent = !scoped ? ""
+    : none ? "· " + projectName(PROJECT) + " enables NO profile — nothing can "
+             + "be staffed for it until one is ticked"
+    : "· enabled = " + projectName(PROJECT) + " may staff it; the profiles "
+      + "themselves are global";
+  $("profscope").className = none ? "warn" : "dim";
+  // The 4s poll must not steal focus from the control a human is on.
+  if ($("profiles").contains(document.activeElement)) return;
+  if (!PROFILES.length) {
+    $("profiles").replaceChildren(el("p", "dim", "no profiles yet — add one"));
+    return;
+  }
+  const head = ["name", "harness", "model", "effort", "pri", "tier",
+                "may spawn", "note", ""];
+  if (scoped) head.unshift("on");
+  $("profiles").replaceChildren(table(head,
+    PROFILES.map((p) => {
+      const row = [
+        p.name, p.backend, p.model || "(default)", p.effort,
+        p.priority, tierCell(p),
+        (p.spawn_profiles || []).join(", ") || "–",
+        {node: noteCell(p), cls: "grow"},
+        editButton(p.name),
+      ];
+      if (scoped) row.unshift({node: enabledCell(p.name)});
+      return row;
+    })));
+}
+
+function editButton(name) {
+  const b = el("button", "glyph", "✎");   // pencil
+  b.title = "edit " + name;
+  b.setAttribute("aria-label", "edit " + name);
+  b.onclick = () => openEditor(name);
+  return b;
+}
+
+function opts(backend) {
+  return (OPTIONS && OPTIONS[backend]) || {models: [], supports_effort: true};
+}
+
+function drawEditor() {
+  const box = $("editor");
+  const existing = PROFILES.find((p) => p.name === EDITING) || {};
+  if (DRAFT === null) DRAFT = Object.assign({backend: "opencode"}, existing);
+  const o = opts(DRAFT.backend);
+  const models = o.models || [];
+  box.hidden = false;
+  box.replaceChildren();
+
+  const add = (text, node, hint) => {
+    const l = el("label"); l.append(el("span", null, text), node); box.append(l);
+    if (hint) box.append(el("div", "hint", hint));
+  };
+  const input = (key, type) => {
+    const i = el("input");
+    i.type = type || "text";
+    i.value = DRAFT[key] === null || DRAFT[key] === undefined ? "" : DRAFT[key];
+    i.oninput = () => { DRAFT[key] = i.value; };
+    return i;
+  };
+  const select = (key, choices, blank) => {
+    const s = el("select");
+    (blank === false ? choices : [""].concat(choices)).forEach((c) => {
+      const op = el("option", null, c === "" ? "— pick —" : c);
+      op.value = c;
+      if (String(DRAFT[key] || "") === c) op.selected = true;
+      s.appendChild(op);
+    });
+    s.onchange = () => { DRAFT[key] = s.value; drawEditor(); };
+    return s;
+  };
+
+  const nameIn = input("name");
+  nameIn.disabled = !!EDITING;
+  add("name", nameIn);
+  add("harness", select("backend", BACKENDS, false));
+
+  // model and effort share one line: they are one decision, and the effort a
+  // model declares only means anything next to the model it came from.
+  const pair = el("div", "row");
+  let modelNode, modelHint = "";
+  if (o.free_model) {
+    modelNode = input("model");
+    modelHint = o.error || "";
+  } else if (models.length) {
+    modelNode = select("model", models.map((m) => m.id));
+    modelHint = models.length + " reported by discovery";
+  } else {
+    modelNode = input("model");
+  }
+  pair.append(modelNode);
+
+  // An effort control appears ONLY where an effort exists to set: a select
+  // when the model declares its list, a typed box where the harness takes
+  // any effort (claude). A harness that declares none gets no control —
+  // there is nothing to choose, so nothing is drawn.
+  const picked = models.find((m) => m.id === DRAFT.model);
+  const efforts = (picked && picked.efforts) || [];
+  let effortHint = modelHint;
+  if (o.supports_effort === false) {
+    DRAFT.effort = "";
+    effortHint = modelHint || o.effort_note || "";
+  } else if (efforts.length) {
+    pair.append(el("span", "dim", "effort"), select("effort", efforts));
+  } else if (o.free_effort) {
+    pair.append(el("span", "dim", "effort"), input("effort"));
+  } else {
+    DRAFT.effort = "";
+  }
+  add("model / effort", pair, effortHint);
+
+  if (DRAFT.backend === "opencode") add("variant", input("variant"));
+
+  // Routing metadata a planner reads (W-0181).
+  add("tier", select("tier", ["1", "2", "3"]),
+      "1 workhorse — a well-defined bounded task · 2 generalist · " +
+      "3 heavy — the frontier model, for the hardest thinking");
+  add("priority", input("priority", "number"),
+      "0–99, like a linux process nice value: LOWER is more preferred. " +
+      "Orders profiles of the same tier against each other. Default 50.");
+
+  const list = el("div", "checklist");
+  PROFILES.filter((p) => p.name !== EDITING).forEach((p) => {
+    const l = el("label"), cb = el("input");
+    cb.type = "checkbox";
+    cb.checked = (DRAFT.spawn_profiles || []).indexOf(p.name) >= 0;
+    cb.onchange = () => {
+      const have = (DRAFT.spawn_profiles || []).filter((n) => n !== p.name);
+      if (cb.checked) have.push(p.name);
+      DRAFT.spawn_profiles = have;
+    };
+    l.append(cb, el("span", null, p.name));
+    list.appendChild(l);
+  });
+  if (!list.childElementCount) list.appendChild(el("span", "dim", "no other profiles"));
+  add("may spawn", list, "a delegation allowlist can only name profiles that exist");
+  add("note", input("note"),
+      "the headroom note, authoritative over measured runway. This is the " +
+      "only place it is typed; the list shows it.");
+
+  const row = el("div", "row");
+  const save = el("button", null, EDITING ? "save" : "create");
+  save.onclick = () => {
+    const name = (EDITING || DRAFT.name || "").trim();
+    if (!name) return fail(new Error("a profile needs a name"));
+    const body = {};
+    ["backend", "model", "effort", "variant", "tier", "priority",
+     "note"].forEach((k) => {
+      if (DRAFT[k] !== undefined) body[k] = DRAFT[k];
+    });
+    body.spawn_profiles = DRAFT.spawn_profiles || [];
+    saveProfile(name, body);
+  };
+  const cancel = el("button", null, "cancel");
+  cancel.onclick = () => { EDITING = null; DRAFT = {}; $("editor").hidden = true; };
+  row.append(save, cancel);
+  if (EDITING) {
+    const rm = el("button", "danger", "remove");
+    rm.onclick = () => {
+      if (confirm("remove profile " + EDITING + "?"))
+        saveProfile(EDITING, null, true);
+    };
+    row.append(rm);
+  }
+  const rediscover = el("button", null, "re-run discovery");
+  rediscover.onclick = async () => { await loadOptions(true); drawEditor(); };
+  row.append(rediscover);
+  box.append(row);
+}
+
+async function saveProfile(name, profile, remove) {
+  try {
+    const res = await api("/api/profiles/" + encodeURIComponent(name),
+      {method: "POST",
+       body: JSON.stringify(remove ? {delete: true} : {profile: profile})});
+    if (res.error) return fail(new Error(res.error));
+    if (!res.applied) return fail(new Error(
+      "needs a human decision: " + (res.needs || []).join(", ")));
+    EDITING = null; DRAFT = {}; $("editor").hidden = true;
+    await refresh();
+  } catch (e) { fail(e); }
+}
+
+// --- runway -----------------------------------------------------------------
+// ONE card per provider, its windows inside it: Claude's 5-hour and weekly
+// limits are two windows of one plan, not two providers.
+const CURRENCY = /^[A-Z]{3}$/;
+const RUNWAY_MS = 300000;
+// Which providers the reader collapsed, so the 4s poll cannot re-open them.
+const RUNWAY_SHUT = new Set();
+
+function tone(percent) {
+  return percent === null ? "" : percent <= 15 ? "critical"
+       : percent <= 35 ? "watch" : "";
+}
+function pct(n) {
+  return n === null || n === undefined ? "–" : Math.round(n) + "%";
+}
+function balanceOf(r) {
+  // Only an api provider is billed per token, and only it has money to show.
+  return (r.kind !== "plan" && r.known && CURRENCY.test(r.unit || ""))
+    ? new Intl.NumberFormat([], {style: "currency", currency: r.unit})
+        .format(r.remaining)
+    : null;
+}
+
+function renderRunway(list) {
+  const box = $("runway");
+  if (!list.length) {
+    box.replaceChildren(el("p", "dim", "no polls yet — press refresh"));
+    return;
+  }
+  box.replaceChildren(...list.map(runwayCard));
+}
+
+function runwayCard(r) {
+  const money = balanceOf(r);
+  const card = el("details", "rw");
+  card.open = !RUNWAY_SHUT.has(r.provider);
+  card.ontoggle = () => {
+    if (card.open) RUNWAY_SHUT.delete(r.provider);
+    else RUNWAY_SHUT.add(r.provider);
+  };
+  const sum = el("summary");
+  const name = el("span", "rwname");
+  name.append(el("strong", null, r.provider),
+              el("span", null, r.kind === "plan" ? "coding plan"
+                                                 : "pay per token"));
+  const headroom = r.windows.length ? Math.min(...r.windows.map((w) => w.remaining))
+                                    : null;
+  sum.append(name, money
+    ? el("span", "rwvalue", money)
+    : el("span", "rwvalue " + (r.known && headroom !== null
+                               ? tone(Math.round(headroom)) : "unknown"),
+         r.known && headroom !== null ? pct(headroom) : "unknown"));
+  const body = el("div", "rwbody");
+  card.append(sum, body);
+
+  // One block for everything a provider banks: DeepSeek's dollar balance,
+  // Codex's and Grok's banked usage resets. Money is formatted here because
+  // only the browser knows the reader's locale; everything else arrives as a
+  // phrase its own adapter wrote.
+  if (money || r.credits) {
+    const bal = el("div", "rwbal");
+    if (money) bal.append(el("strong", null, money),
+                          document.createTextNode(" balance"));
+    else bal.append(r.credits);
+    body.append(bal);
+  }
+  r.windows.forEach((w) => body.append(runwayWindow(w)));
+  if (!r.windows.length && !money && !r.credits)
+    body.append(el("div", "rwmeta", r.reason || "no reading"));
+  return card;
+}
+
+function runwayWindow(w) {
+  const percent = Math.round(w.remaining);
+  const shade = tone(percent);
+  const q = el("div", "rwq"), head = el("div", "rwqhead");
+  head.append(el("span", null, w.label), el("b", null, pct(w.remaining)));
+  const track = el("div", "track"), fill = el("div", "fill " + shade);
+  fill.style.width = Math.max(0, Math.min(100, percent)) + "%";
+  if (w.stale) fill.style.opacity = ".35";
+  track.append(fill);
+  // The daemon polls on its own schedule, so a number reads as current unless
+  // something is broken. A stale window dims its bar; nothing is narrated.
+  const meta = el("div", "rwmeta",
+       [w.resets_in ? "resets " + w.resets_in : null, w.pace]
+         .filter(Boolean).join(" · "));
+  q.append(head, track, meta);
+  return q;
+}
+
+// The refresh route POLLS the providers with ?refresh=1; the 4s snapshot only
+// replays whatever the last poll stored.
+let runwayBusy = false;
+async function refreshRunway() {
+  if (runwayBusy) return;
+  runwayBusy = true;
+  $("runwayrefresh").disabled = true;
+  $("runwayrefresh").textContent = "refreshing…";
+  try {
+    const data = await api("/api/runway?refresh=1", {cache: "no-store"});
+    renderRunway(data.runway);
+    $("runwaystamp").textContent = "· checked " +
+      new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  } catch (e) {
+    fail(e);
+  } finally {
+    runwayBusy = false;
+    $("runwayrefresh").disabled = false;
+    $("runwayrefresh").textContent = "refresh";
+  }
+}
+
+// --- statistics (W-0186) ----------------------------------------------------
+// A popup on the RUNS page, not a card on health: health is the daemon's own
+// pulse, and totals about runs belong beside the runs. The numbers are over
+// the WHOLE runs table, not the snapshot's 30-run window, and they follow the
+// project picker — SCOPE.statistics is the same computation over that
+// project's runs alone.
+function renderStats(s) {
+  const st = (SCOPE && SCOPE.statistics) || s.statistics;
+  $("statsscope").textContent = PROJECT === null
+    ? "· every run"
+    : "· " + projectName(PROJECT) + (SCOPE ? "" : " (loading…)");
+  const head = kv([
+    ["runs", st.runs_total + " total · " + st.runs_active + " active"],
+    ["worker time", dur(st.worker_seconds)],
+    ["tokens", num(st.tokens_total)],
+    ["cost", money(st.cost_usd) + (st.plan_runs
+        ? "   (" + st.plan_runs + " plan runs unpriced)" : "")],
+    ["by status", Object.keys(st.by_status).sort()
+        .map((k) => k + " " + st.by_status[k]).join("   ") || "–"],
+    // What the header stamp used to say. A payload version and a generation
+    // time are worth one line where someone goes looking for numbers, not a
+    // permanent chip in the chrome (W-0186).
+    ["snapshot", "v" + s.version + " · " + s.generated_at],
+  ]);
+  const per = st.by_profile.length
+    ? table(["profile", "runs", "active", "time", "tokens", "cost"],
+        st.by_profile.map((p) => [p.profile, p.runs, p.active, dur(p.seconds),
+                                  num(p.tokens),
+                                  p.billing === "plan" ? "plan"
+                                  : p.cost === null ? "–" : money(p.cost)]))
+    : el("p", "dim", "no runs recorded yet");
+  $("stats").replaceChildren(head, block("per profile", per));
+}
+
+// No CLI commands here: the daemon writes this, and the buttons below drive
+// it. Naming a command a button already performs is noise (W-0183).
+// W-0189: the observer row comes FIRST and is rendered even before the first
+// sweep. A health view that reads "ok" while nothing is watching any run for
+// spin is the exact failure this row exists to make impossible.
+function observerRow(o) {
+  if (!o) return ["spin observer", el("span", "dim", "unknown")];
+  if (!o.enabled) {
+    return ["spin observer", el("span", "bad",
+      "DISABLED — nothing is watching runs · " + (o.problem || ""))];
+  }
+  return ["spin observer", el("span", "ok", o.profile + " · first look after " +
+                              Math.round((o.first_look || 0) / 60) + "m, then hourly")];
+}
+
+function renderDaemon(d) {
+  d = d || {};
+  if (!d.last_sweep_at) {
+    $("daemon").replaceChildren(kv([observerRow(d.observer)]), el("p", "dim",
+      "no sweep reported yet — the daemon records one every tick"));
+    return;
+  }
+  $("daemon").replaceChildren(kv([
+    observerRow(d.observer),
+    ["last sweep", (d.last_sweep_at || "never") +
+                   (d.last_sweep_at ? "  (" + ago(d.last_sweep_at) + ")" : "")],
+    ["outcome", el("span", d.outcome === "ok" ? "ok"
+                         : d.outcome === "paused" ? "warn" : "bad",
+                   d.outcome || "unknown")],
+    ["claimed", (d.claimed && d.claimed.length) ? d.claimed.join(", ") : "none"],
+    ["actions", d.actions],
+    ["released / reaped", (d.released || 0) + " / " + (d.reaped || 0)],
+    ["error", el("span", d.error ? "bad" : "dim", d.error || "none")],
+    ["last error", el("span", "dim", d.last_error
+        ? d.last_error + " (" + d.last_error_at + ")" : "none")],
+    ["pid", d.pid],
+    ["up since", d.started_at],
+  ]));
+}
+
+// --- the poll ---------------------------------------------------------------
+let paused = false;
+function render(s) {
+  SNAP = s;
+  $("banner").textContent = "";
+  $("livecount").textContent = s.live_runs;
+  paused = s.dispatch.paused;
+  $("paused").hidden = !paused;
+  $("paused").textContent = "dispatch is PAUSED since " + (s.dispatch.since || "?") +
+                            " — running work continues, nothing new starts";
+  $("pause").textContent = paused ? "resume dispatch" : "pause dispatch";
+  $("pause").className = paused ? "resume" : "pause";
+  // The picker runs first: it can fall back to "all projects" when the
+  // selected one ages out, and everything below reads that decision.
+  renderProjects(s);
+  loadScope();
+  // A first load lands on the newest run ON THE BOARD, so the detail pane is
+  // never empty when there is something to show.
+  const shown = visibleRuns(s);
+  if (SELECTED === null && shown.length) selectRun(shown[0].id);
+  renderRunList(s);
+  renderDetail(s);
+  renderProfiles(s);
+  renderRunway(s.runway);
+  renderStats(s);
+  renderDaemon(s.daemon || {});
+}
+
+async function refresh() {
+  const s = await api("/api/snapshot");
+  $("views").hidden = false;
+  $("keyform").hidden = true;
+  render(s);
+}
+
+// --- raw config (W-0190) ----------------------------------------------------
+// The file is the form. Dirty means "do not clobber what they are typing"
+// if they leave the tab and come back.
+let CONFIG_DIRTY = false;
+async function loadConfig(force) {
+  if (!force && (CONFIG_DIRTY || $("cfgtext") === document.activeElement)) return;
+  try {
+    const d = await api("/api/config");
+    $("cfgtext").value = d.text;
+    $("cfgpath").textContent = d.path || "";
+    $("cfgmsg").textContent = "";
+    CONFIG_DIRTY = false;
+  } catch (e) { fail(e); }
+}
+$("cfgtext").oninput = () => { CONFIG_DIRTY = true; };
+$("cfgsave").onclick = async () => {
+  const b = $("cfgsave");
+  b.disabled = true;
+  $("cfgmsg").textContent = "saving…";
+  try {
+    const res = await api("/api/config", {method: "POST",
+      body: JSON.stringify({text: $("cfgtext").value, restart: true})});
+    CONFIG_DIRTY = false;
+    $("cfgmsg").textContent = res.restarting ? "saved — restarting…" : "saved";
+  } catch (e) {
+    fail(e);
+    $("cfgmsg").textContent = "not saved";
+  }
+  setTimeout(() => { b.disabled = false; }, 6000);
+};
+
+$("addprofile").onclick = () => openEditor("");
+$("runwayrefresh").onclick = () => refreshRunway();
+// <dialog> is the platform's own modal: Esc, the backdrop and the focus trap
+// come with it, so this is the whole popup.
+$("statsbtn").onclick = () => $("statsdlg").showModal();
+$("statsclose").onclick = () => $("statsdlg").close();
+$("sweep").onclick = () => act("/api/sweep", {method: "POST"});
+$("pause").onclick = () => act("/api/dispatch/" + (paused ? "resume" : "pause"),
+                               {method: "POST"});
+// The daemon re-execs, so the page it served goes away for a moment. Say so
+// rather than letting the next poll look like a crash.
+$("restart").onclick = () => {
+  const b = $("restart");
+  b.disabled = true;
+  b.textContent = "restarting…";
+  act("/api/restart", {method: "POST"});
+  setTimeout(() => { b.disabled = false; b.textContent = "restart service"; }, 6000);
+};
+$("keyform").onsubmit = (e) => {
+  e.preventDefault();
+  KEY = $("keyinput").value.trim();
+  saveKey(KEY);
+  tick();
+};
+
+async function tick() {
+  try {
+    await refresh();
+  } catch (e) {
+    fail(e);
+    if (String(e.message || e).startsWith("401")) {
+      $("views").hidden = true;
+      $("keyform").hidden = false;
+      closeTrace();
+      closeLog();
+    }
+  }
+}
+
+// A first visit arrives as /?key=…; the server parked it in a cookie, so
+// drop it from the address bar before anyone screenshots the URL.
+if (location.search.includes("key=")) {
+  saveKey(readKey());
+  history.replaceState(null, "", location.pathname);
+}
+if (KEY) saveKey(KEY);
+showView("runs");
+tick();
+setInterval(tick, POLL_MS);
+// Nothing else polls the providers on a timer, so this is what keeps the
+// stored numbers current for the conductor as well as for the view.
+setInterval(refreshRunway, RUNWAY_MS);
+</script>
+</body>
+</html>

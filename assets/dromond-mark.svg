@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Dromond">
+  <title>Dromond</title>
+  <!-- Three hulls in echelon, the middle one leading: many hulls, one
+       direction, one shore. The tile is its own ground, so the mark never
+       depends on the page behind it and reads on light and dark alike.
+       Three colours, no text, no strokes, nothing thinner than the hulls. -->
+  <rect width="512" height="512" rx="112" fill="#161B23"/>
+  <path transform="translate(78,96)" fill="#4FB3C4"
+        d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
+  <path transform="translate(118,214)" fill="#61A5E8"
+        d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
+  <path transform="translate(78,332)" fill="#4FB3C4"
+        d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
+</svg>

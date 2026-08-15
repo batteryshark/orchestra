@@ -1,0 +1,64 @@
+{
+  "version": 6,
+  "generated_at": "2026-08-14T17:45:00Z",
+  "home": "/Users/example/.maestro",
+  "runs": [
+    {
+      "id": 16,
+      "slug": "joyful_octopus",
+      "status": "running",
+      "profile": "sol-medium",
+      "backend": "codex",
+      "model": "gpt-5.6-sol",
+      "title": "Maestro iOS app — trace viewer",
+      "work_item": "W-0141",
+      "project_id": "53efe3c3-6def-4797-8560-3dce073d7d63",
+      "project": "maestro",
+      "workdir": "/Users/example/.maestro/worktrees/run-16",
+      "branch": "maestro/run-16",
+      "parent_run": null,
+      "requested_by": "work",
+      "started_at": "2026-08-14T17:40:00Z",
+      "finished_at": null,
+      "elapsed_seconds": 300.0,
+      "exit_code": null,
+      "live": true,
+      "blocked_on": [],
+      "summary": "Building the trace viewer.",
+      "base_commit": "c898694",
+      "checkpoint_commit": null,
+      "brief_path": "/Users/example/.maestro/runs/16/brief.md",
+      "session_ref": "example-session",
+      "retry_of": null,
+      "tokens_in": 1200,
+      "tokens_out": 300,
+      "tokens_total": 1500,
+      "cost_usd": null,
+      "billing": "plan",
+      "usage_source": "codex",
+      "messages": []
+    }
+  ],
+  "live_runs": 1,
+  "projects": [
+    {"project_id": "53efe3c3-6def-4797-8560-3dce073d7d63", "name": "maestro", "runs": 1, "live": 1}
+  ],
+  "dispatch": {"paused": false, "since": null},
+  "profiles": [
+    {"name": "sol-medium", "backend": "codex", "model": "gpt-5.6-sol", "effort": "medium", "role": "work", "variant": null, "priority": 0, "note": null, "note_at": null, "note_age": null, "runway": null}
+  ],
+  "runway": [],
+  "statistics": {
+    "runs_total": 1,
+    "runs_active": 1,
+    "plan_runs": 1,
+    "by_status": {"running": 1},
+    "worker_seconds": 300.0,
+    "tokens_total": 1500,
+    "cost_usd": null,
+    "by_profile": [{"profile": "sol-medium", "runs": 1, "active": 1, "seconds": 300.0, "tokens": 1500, "cost": null, "billing": "plan"}]
+  },
+  "findings": [],
+  "proposals": [],
+  "daemon": {"last_sweep_at": "2026-08-14T17:44:59Z", "outcome": "ok", "claimed": [], "released": 0, "error": null, "last_error": null}
+}
