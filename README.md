@@ -137,6 +137,40 @@ uv run dromond check 7            # stall, loop, and an out-of-band observer tur
 uv run dromond kill 7
 ```
 
+## Install it as a command
+
+`uv run dromond` works from a clone. To have `dromond` on your path everywhere,
+while still editing the code:
+
+```
+uv tool install --editable .
+```
+
+The tool runs from the working tree, so a code change takes effect the next
+time the command starts — there is no reinstall step. Restart the daemon to
+pick one up:
+
+```
+dromond service restart
+```
+
+Under launchd that kickstarts the agent. With a daemon you started by hand,
+there is no supervisor to restart anything, so it says what is running and
+leaves it to you.
+
+### Teach an agent to drive it
+
+`skills/dromond/` is a skill for Claude Code and anything that reads the same
+format. Symlink it so it tracks the repository:
+
+```
+ln -sfn "$PWD/skills/dromond" ~/.claude/skills/dromond
+```
+
+It covers registering a project, dispatching, watching a trace, sending a
+correction, and landing a branch, and it says plainly that dispatch returning
+means a run *started* rather than succeeded.
+
 ## Where things live
 
 | What | Where |

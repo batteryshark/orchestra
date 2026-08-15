@@ -9,6 +9,7 @@ The mapping is cached in the central database: an offline CLI still
 resolves, and only a miss costs a refresh.
 """
 import os
+import uuid
 from pathlib import Path
 
 from dromond import paths, work_client
@@ -70,6 +71,60 @@ def remember(con, workspace_root: str, entries: list) -> int:
             count += 1
     con.commit()
     return count
+
+
+def adopt(con, root: Path, name: str | None = None) -> "Project":
+    """Register a project Dromond owns itself, with no Work behind it.
+
+    Work is the system of record when it is there, and ``remember`` caches its
+    list. But the projects table was the ONLY way to address a directory, and
+    the only writer was Work — so without it ``dispatch`` could not resolve
+    anything and the tool did not run standalone at all.
+
+    A locally adopted project is the same row with ``work_id`` NULL. Nothing
+    downstream cares: a run resolves by path and carries ``project_id``, and
+    writeback is skipped for a run with no Work item anyway. ``remember`` only
+    ever inserts or replaces the paths Work names, so a later refresh cannot
+    delete this row — and if Work is ever told about the same directory, its
+    entry replaces this one, which is the right precedence.
+    """
+    from dromond import db  # local: db imports paths, not project
+
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"dromond: {root} is not a directory")
+    existing = _row(con.execute(
+        "SELECT * FROM projects WHERE path=?", (str(root),)).fetchone())
+    if existing is not None:
+        return existing
+    con.execute(
+        "INSERT INTO projects(path, project_id, work_id, name, refreshed_at) "
+        "VALUES(?,?,NULL,?,?)",
+        (str(root), str(uuid.uuid4()), name or root.name, db.now()))
+    con.commit()
+    return _row(con.execute(
+        "SELECT * FROM projects WHERE path=?", (str(root),)).fetchone())
+
+
+def forget(con, root: Path) -> bool:
+    """Drop a locally adopted project. Refuses one that came from Work, since
+    the next refresh would put it back and the removal would look broken."""
+    root = Path(root).expanduser().resolve()
+    row = con.execute("SELECT work_id FROM projects WHERE path=?",
+                      (str(root),)).fetchone()
+    if row is None:
+        return False
+    if row["work_id"]:
+        raise SystemExit(
+            f"dromond: {root} comes from Work; remove it there, not here")
+    con.execute("DELETE FROM projects WHERE path=?", (str(root),))
+    con.commit()
+    return True
+
+
+def all_projects(con) -> list:
+    return [_row(r) for r in con.execute(
+        "SELECT * FROM projects ORDER BY path")]
 
 
 def refresh(con, cfg: dict) -> int:

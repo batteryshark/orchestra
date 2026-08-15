@@ -7,6 +7,7 @@ import os
 import plistlib
 import signal
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -165,6 +166,38 @@ def _free_pid() -> int:
         except OSError:
             return pid
     raise unittest.SkipTest("no free pid found")
+
+
+class ServiceRestartTests(unittest.TestCase):
+    """`dromond service restart` is the deploy step for an editable install:
+    the code is read from the working tree, so restarting is all that ships."""
+
+    def test_restart_kickstarts_a_loaded_agent(self) -> None:
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(service, "is_loaded", return_value=True), \
+             mock.patch.object(service, "_launchctl", side_effect=fake):
+            self.assertEqual(0, service.restart())
+        self.assertEqual("kickstart", calls[0][0])
+        self.assertIn("-k", calls[0])
+
+    def test_restart_reports_a_bare_daemon_rather_than_pretending(self) -> None:
+        # Nothing supervises a foreground daemon, so there is nothing to
+        # restart; saying so beats a success message that changed nothing.
+        with mock.patch.object(service, "is_loaded", return_value=False), \
+             mock.patch("subprocess.run",
+                        return_value=subprocess.CompletedProcess([], 0, "4242\n", "")):
+            self.assertEqual(1, service.restart())
+
+    def test_restart_says_so_when_nothing_runs(self) -> None:
+        with mock.patch.object(service, "is_loaded", return_value=False), \
+             mock.patch("subprocess.run",
+                        return_value=subprocess.CompletedProcess([], 1, "", "")):
+            self.assertEqual(1, service.restart())
 
 
 if __name__ == "__main__":

@@ -825,6 +825,8 @@ def cmd_service(args):
         sys.exit(service.install(start=args.start))
     if args.action == "uninstall":
         sys.exit(service.uninstall())
+    if args.action == "restart":
+        sys.exit(service.restart())
     sys.exit(service.status())
 
 
@@ -956,6 +958,35 @@ def cmd_prune(args):
     if any(wt["kept"] and not wt.get("live") for wt in kept) and not args.force:
         print("prune: pass --force to remove those and discard what they hold "
               "(a live run's worktree is never removed)")
+
+
+def cmd_project(args):
+    """Address a directory without Work. DESIGN §2: state is central, so this
+    writes a row in ~/.dromond, never a marker file in the project."""
+    con = db.connect()
+    try:
+        if args.action == "list":
+            rows = project.all_projects(con)
+            if not rows:
+                print("no projects. `dromond project add .` registers this one.")
+                return
+            width = max(len(str(r.path)) for r in rows)
+            for r in rows:
+                source = "work" if r.work_id else "local"
+                print(f"{str(r.path):<{width}}  {source:<5}  {r.name or ''}")
+            return
+        if args.action == "forget":
+            target = Path(args.path or ".").expanduser().resolve()
+            print(f"forgot {target}" if project.forget(con, target)
+                  else f"dromond: {target} was not registered")
+            return
+        adopted = project.adopt(con, Path(args.path or "."), args.name)
+        print(f"{adopted.path}\n  project id: {adopted.project_id}"
+              f"\n  name:       {adopted.name}")
+        print("\nDispatch into it with:\n"
+              f"  dromond dispatch --to <profile> \"<mission>\"")
+    finally:
+        con.close()
 
 
 def cmd_traces(args):
@@ -1257,7 +1288,7 @@ def main():
     s.set_defaults(fn=cmd_daemon)
 
     s = sub.add_parser("service", help="manage the launchd LaunchAgent for the daemon")
-    s.add_argument("action", choices=("install", "uninstall", "status"))
+    s.add_argument("action", choices=("install", "uninstall", "status", "restart"))
     s.add_argument("--start", action="store_true",
                    help="also load and start it now (install only)")
     s.set_defaults(fn=cmd_service)
@@ -1267,6 +1298,19 @@ def main():
     s.add_argument("path", nargs="?", help="directory to search upward from")
     s.add_argument("--project-id", help="Work projectId to stamp on the copied runs")
     s.set_defaults(fn=cmd_migrate)
+
+    s = sub.add_parser("project", help="register a directory Dromond may "
+                                       "dispatch into, without Work")
+    s.set_defaults(fn=cmd_project, action="add", path=None, name=None)
+    psub = s.add_subparsers(dest="action")
+    pa = psub.add_parser("add", help="adopt a directory as a project")
+    pa.add_argument("path", nargs="?", help="default: the current directory")
+    pa.add_argument("--name", help="default: the directory's own name")
+    pl = psub.add_parser("list", help="every project, from Work or adopted here")
+    pl.set_defaults(path=None, name=None)
+    pf = psub.add_parser("forget", help="drop a locally adopted project")
+    pf.add_argument("path", nargs="?", help="default: the current directory")
+    pf.set_defaults(name=None)
 
     s = sub.add_parser("traces", help="run traces: raw-log retention and "
                                       "a run's inbox/outbox (DESIGN §7)")

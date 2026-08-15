@@ -221,5 +221,77 @@ class CliSurfaceTests(unittest.TestCase):
         self.assertIn(DEMO_ID, text)
 
 
+class AdoptTests(unittest.TestCase):
+    """Standalone use. The projects table was written only by Work, so without
+    it `dispatch` could not resolve any directory and the tool did not run on
+    its own at all."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.env = mock.patch.dict(os.environ, {"DROMOND_HOME": str(self.root / "home")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.con = db.connect()
+        self.addCleanup(self.con.close)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+
+    def test_an_adopted_directory_resolves(self) -> None:
+        adopted = project.adopt(self.con, self.repo)
+        self.assertEqual(self.repo, Path(adopted.path))
+        self.assertIsNone(adopted.work_id)
+        self.assertTrue(adopted.project_id)
+        found = project.resolve(self.con, {}, str(self.repo))
+        self.assertEqual(adopted.project_id, found.project_id)
+
+    def test_adopting_twice_is_the_same_project(self) -> None:
+        first = project.adopt(self.con, self.repo)
+        again = project.adopt(self.con, self.repo, name="renamed")
+        self.assertEqual(first.project_id, again.project_id)
+        self.assertEqual(1, len(project.all_projects(self.con)))
+
+    def test_a_work_refresh_does_not_delete_an_adopted_project(self) -> None:
+        adopted = project.adopt(self.con, self.repo)
+        other = self.root / "from-work"
+        other.mkdir()
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "w-1", "id": 7, "name": "theirs",
+                           "path": "from-work"}])
+        paths = {str(p.path) for p in project.all_projects(self.con)}
+        self.assertIn(str(self.repo), paths)
+        self.assertEqual(adopted.project_id,
+                         project.resolve(self.con, {}, str(self.repo)).project_id)
+
+    def test_work_wins_when_it_names_the_same_directory(self) -> None:
+        project.adopt(self.con, self.repo)
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "w-1", "id": 7, "name": "theirs",
+                           "path": "repo"}])
+        found = project.resolve(self.con, {}, str(self.repo))
+        self.assertEqual("w-1", found.project_id)
+        # work_id is a TEXT column, so an integer id round-trips as a string.
+        self.assertEqual("7", str(found.work_id))
+
+    def test_forget_drops_a_local_project_but_refuses_one_from_work(self) -> None:
+        project.adopt(self.con, self.repo)
+        self.assertTrue(project.forget(self.con, self.repo))
+        self.assertEqual([], project.all_projects(self.con))
+        self.assertFalse(project.forget(self.con, self.repo))
+
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "w-1", "id": 7, "name": "theirs",
+                           "path": "repo"}])
+        with self.assertRaises(SystemExit):
+            project.forget(self.con, self.repo)
+
+    def test_a_file_is_not_a_project(self) -> None:
+        f = self.root / "a.txt"
+        f.write_text("x")
+        with self.assertRaises(SystemExit):
+            project.adopt(self.con, f)
+
+
 if __name__ == "__main__":
     unittest.main()

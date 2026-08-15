@@ -104,6 +104,38 @@ def uninstall() -> int:
     return 0
 
 
+def restart() -> int:
+    """Restart the daemon so a code change takes effect.
+
+    The dashboard's restart button re-execs the running process; this is the
+    same intent from a terminal, and the two differ in what they can do. Under
+    launchd, ``kickstart -k`` kills and relaunches, which picks up a changed
+    plist as well as changed code. Without launchd there is no supervisor to
+    restart anything, so the honest answer is to say what is running and let
+    the operator stop it.
+    """
+    if not is_loaded():
+        running = subprocess.run(["pgrep", "-f", "dromond daemon"],
+                                 capture_output=True, text=True)
+        pids = running.stdout.split()
+        if pids:
+            print("dromond service: not managed by launchd; a daemon is "
+                  f"running as pid {', '.join(pids)}.")
+            print("  stop it and start it again, or `dromond service install "
+                  "--start` to have launchd own it")
+            return 1
+        print("dromond service: nothing is running. "
+              "`dromond daemon` or `dromond service install --start`")
+        return 1
+    res = _launchctl("kickstart", "-k", _service_target())
+    if res.returncode != 0:
+        print(f"dromond service: launchctl kickstart failed: "
+              f"{(res.stderr or res.stdout).strip()}")
+        return 1
+    print(f"dromond service: restarted {_service_target()}")
+    return 0
+
+
 def status() -> int:
     p = plist_path()
     print(f"dromond service: {LABEL}")
