@@ -42,6 +42,8 @@ import functools
 import selectors
 import shutil
 import subprocess
+import pty
+import select
 import json
 import os
 import re
@@ -461,9 +463,14 @@ def parse_kimi(data: dict) -> Runway:
 
     ``usage`` is a SECOND window, not a summary of the first (W-0184): on a
     Kimi For Coding plan ``limits[]`` carries only the 5-hour burst window,
-    and the plan-wide quota the owner actually runs out of lives in ``usage``
-    — as USED rather than remaining, and with its own reset. Reporting only
-    ``limits`` hid a window that was already at zero (owner, 2026-08-14).
+    and the plan-wide quota the owner actually runs out of lives in ``usage``,
+    with its own reset. Reporting only ``limits`` hid a window that was
+    already at zero (owner, 2026-08-14).
+
+    ``usage`` states REMAINING beside its limit, the same shape ``limits[]``
+    uses. Reading it as ``used`` and subtracting raised KeyError on every real
+    payload, so the weekly window silently vanished and kimi showed a 5-hour
+    window alone. ``used`` is still honoured if it ever appears.
 
     ponytail: ``usage`` states no duration, so its length is assumed weekly —
     what the plan sells and what the owner calls it. If Kimi ever puts a
@@ -483,10 +490,12 @@ def parse_kimi(data: dict) -> Runway:
                                    _iso(detail.get("resetTime"))))
     usage = (data or {}).get("usage") or {}
     if not any(w["label"] == "weekly" for w in windows):
-        try:
-            left = _number(usage["limit"]) - _number(usage["used"])
-        except (KeyError, TypeError, ValueError):
-            left = None
+        left = usage.get("remaining")
+        if left is None and usage.get("used") is not None:
+            try:
+                left = _number(usage["limit"]) - _number(usage["used"])
+            except (KeyError, TypeError, ValueError):
+                left = None
         percent = None if left is None else _percent(left, usage.get("limit"))
         if percent is not None:  # 0% is a reading, and the one that matters
             windows.append(make_window("weekly", percent,
@@ -899,12 +908,175 @@ def parse_claude(data: dict, now_ms: float | None = None) -> Runway:
                         raw=_scrub({"as_of_age_h": round(age_h, 1)}))
 
 
+CLAUDE_SCREEN_TIMEOUT = 20.0
+# Below this the cache is fresh enough to trust and the screen read is skipped.
+CLAUDE_CACHE_FRESH_H = 1.0
+
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_CLAUDE_ROWS = {"Current session": "five_hour",
+                "Current week (all models)": "seven_day"}
+
+
+def parse_claude_screen(output) -> dict:
+    """Percent USED per window from Claude Code's screen-reader /usage view.
+
+    Claude Code shows current values WITHOUT writing them to
+    cachedUsageUtilization, so the file can say 17% while /usage says 53%.
+    Only the named quota rows are read; the surrounding terminal UI and the
+    account diagnostics below it are not.
+    """
+    text = (bytes(output).decode("utf-8", errors="replace")
+            if isinstance(output, (bytes, bytearray)) else output)
+    lines = []
+    for line in text.replace("\r", "\n").splitlines():
+        line = _ANSI.sub("", line)
+        line = re.sub(r"\x1b(?:[()][0-9A-Z]|.)", "", line)
+        lines.append("".join(c for c in line if c >= " " or c == "\t").strip())
+    used = {}
+    for index, line in enumerate(lines):
+        key = next((v for label, v in _CLAUDE_ROWS.items() if label in line), None)
+        if not key:
+            continue
+        for candidate in lines[index + 1:index + 4]:
+            if "used" not in candidate.lower():
+                continue
+            found = re.findall(r"(\d+(?:\.\d+)?)%", candidate)
+            if found:
+                used[key] = float(found[-1])
+                break
+    return used
+
+
+def claude_screen_cwd(state: dict) -> Path | None:
+    """A project Claude Code already trusts; it refuses to start anywhere else."""
+    override = os.environ.get("CLAUDE_USAGE_CWD")
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_dir() else None
+    projects = state.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    for raw, settings in reversed(list(projects.items())):
+        if not isinstance(settings, dict):
+            continue
+        if settings.get("hasTrustDialogAccepted") is True or \
+                settings.get("hasCompletedProjectOnboarding") is True:
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                return path
+    return None
+
+
+def read_claude_screen(state: dict, timeout: float = CLAUDE_SCREEN_TIMEOUT) -> dict:
+    """Drive Claude Code's own /usage view and read the numbers off it.
+
+    A pseudo-terminal in safe mode with the screen reader on, one built-in
+    command, no prompt and no model call -- so it costs nothing but the wait.
+    Returns {} for anything that does not work, and the caller falls back to
+    the cache file.
+    """
+    exe = shutil.which("claude")
+    cwd = claude_screen_cwd(state)
+    if not exe or cwd is None:
+        return {}
+    try:
+        master, slave = pty.openpty()
+    except OSError:
+        return {}
+    env = {**os.environ, "NO_COLOR": "1"}
+    try:
+        proc = subprocess.Popen([exe, "--safe-mode", "--ax-screen-reader"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                cwd=str(cwd), env=env, close_fds=True)
+    except OSError:
+        os.close(master)
+        os.close(slave)
+        return {}
+    os.close(slave)
+    sent, buffer = False, bytearray()
+    started = time.monotonic()
+    try:
+        while time.monotonic() - started < timeout:
+            try:
+                readable, _, _ = select.select([master], [], [], 0.25)
+            except OSError:
+                break
+            if readable:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if len(buffer) < 262144:
+                    buffer.extend(chunk[:262144 - len(buffer)])
+            # It answers once the shell is up; the elapsed check covers a
+            # build whose banner never says so.
+            if not sent and (b"anual mode on" in buffer
+                             or time.monotonic() - started >= 8.0):
+                try:
+                    os.write(master, b"/usage\r")
+                    sent = True
+                except OSError:
+                    break
+            if sent:
+                found = parse_claude_screen(buffer)
+                if "five_hour" in found and "seven_day" in found:
+                    return found
+            if proc.poll() is not None:
+                break
+        return parse_claude_screen(buffer)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        os.close(master)
+
+
 @soft("claude")
-def claude(path: Path | str = CLAUDE_CACHE, now_ms: float | None = None) -> Runway:
+def claude(path: Path | str = CLAUDE_CACHE, now_ms: float | None = None,
+           screen=None) -> Runway:
+    """The cache file for reset times, Claude Code's own /usage for the numbers.
+
+    cachedUsageUtilization is written when Claude Code feels like it -- the
+    owner's sat 86 hours old reading 83% weekly while /usage said 47%. The
+    screen read is skipped while the cache is fresh, because it costs a
+    subprocess and twenty seconds of waiting.
+    """
     p = Path(path).expanduser()
     if not p.is_file():
         return unknown("claude", f"{p} not found")
-    return parse_claude(json.loads(p.read_text(encoding="utf-8")), now_ms)
+    state = json.loads(p.read_text(encoding="utf-8"))
+    cached = parse_claude(state, now_ms)
+    # now_ms is the injectable clock the whole adapter is tested against; the
+    # freshness check has to read the same one or a test pins nothing.
+    age = age_hours(cached.as_of,
+                    now=None if now_ms is None else now_ms / 1000) \
+        if cached.known else None
+    if age is not None and age < CLAUDE_CACHE_FRESH_H:
+        return cached
+
+    used = (screen or read_claude_screen)(state)
+    if not used:
+        return cached  # keep the cache, and its age still rides on the entry
+    windows, cache_windows = [], {w["label"]: w for w in cached.windows}
+    for name, minutes in (("five_hour", 300), ("seven_day", 10080)):
+        if name not in used:
+            continue
+        label = window_label(minutes)
+        # The screen gives percentages, not reset times, so they come from the
+        # cache -- but only if still in the future. A live reading paired with
+        # a reset that already passed would be blanked by as_of_now, throwing
+        # away a number just measured. Better to say when it resets is unknown
+        # than to pretend the reading is.
+        resets = (cache_windows.get(label) or {}).get("resets_at")
+        windows.append(make_window(label, 100 - used[name],
+                                   None if expired(resets) else resets))
+    if not windows:
+        return cached
+    return from_windows("claude", windows, as_of=db.now(),
+                        raw=_scrub({"source": "claude /usage"}))
 
 
 # --- Codex ------------------------------------------------------------------

@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import daemon, db, service
+from dromond import daemon, db, service, runway
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -27,6 +27,14 @@ class DaemonTests(unittest.TestCase):
             "DROMOND_CONFIG": str(self.tmp_path / "global.toml")})
         self.env.start()
         self.con = db.connect()
+
+        # daemon.tick() polls every provider for real, and two adapters now
+        # shell out: Codex to its app server, Claude to a pseudo-terminal
+        # running /usage. A daemon test must not reach the developer's own
+        # tools, wait twenty seconds for one, or read their live quota.
+        self.no_poll = mock.patch.object(runway, "poll_all", return_value=[])
+        self.no_poll.start()
+        self.addCleanup(self.no_poll.stop)
 
     def tearDown(self) -> None:
         self.con.close()

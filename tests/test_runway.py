@@ -1039,5 +1039,77 @@ class CodexLiveTests(unittest.TestCase):
         self.assertIn("no usable session snapshot", r.reason)
 
 
+SCREEN = """\
+ Current session
+   2% used · resets in 2h
+ Current week (all models)
+   53% used · resets Tue
+ Account
+   99% something irrelevant
+"""
+
+
+class ClaudeLiveTests(unittest.TestCase):
+    """cachedUsageUtilization is written when Claude Code feels like it. The
+    owner's sat 86 hours old reading 83% weekly while /usage said 47%, which
+    is the number that decides whether to dispatch."""
+
+    STATE = {"cachedUsageUtilization": {
+        "fetchedAtMs": 1_786_000_000_000,
+        "utilization": {
+            "five_hour": {"utilization": 12,
+                          "resets_at": "2020-01-01T00:00:00Z"},
+            "seven_day": {"utilization": 17,
+                          "resets_at": "2999-01-01T00:00:00Z"}}}}
+
+    def _file(self, tmp, state=None):
+        path = pathlib.Path(tmp) / "claude.json"
+        path.write_text(json.dumps(state if state is not None else self.STATE))
+        return path
+
+    def test_the_screen_beats_a_stale_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 86 * 3600000,
+                              screen=lambda state: runway.parse_claude_screen(SCREEN))
+        by = {w["label"]: w for w in r.windows}
+        self.assertEqual(47.0, by["weekly"]["remaining"])   # not the cache's 83
+        self.assertEqual(98.0, by["5h"]["remaining"])       # not the cache's 88
+
+    def test_a_reset_already_passed_is_dropped_not_kept(self) -> None:
+        # The screen gives percentages, not reset times. Pairing a live number
+        # with a reset that has passed would make as_of_now blank a reading
+        # just taken.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 86 * 3600000,
+                              screen=lambda state: runway.parse_claude_screen(SCREEN))
+        by = {w["label"]: w for w in r.windows}
+        self.assertIsNone(by["5h"]["resets_at"])
+        self.assertEqual(98.0, runway.as_of_now(by["5h"])["remaining"])
+        self.assertEqual("2999-01-01T00:00:00Z", by["weekly"]["resets_at"])
+
+    def test_a_fresh_cache_is_not_worth_a_subprocess(self) -> None:
+        called = []
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 60_000,
+                              screen=lambda state: called.append(1) or {})
+        self.assertEqual([], called)
+        self.assertEqual(83.0, {w["label"]: w for w in r.windows}["weekly"]["remaining"])
+
+    def test_a_screen_that_says_nothing_keeps_the_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 86 * 3600000,
+                              screen=lambda state: {})
+        self.assertTrue(r.known)
+        self.assertEqual(83.0, {w["label"]: w for w in r.windows}["weekly"]["remaining"])
+
+    def test_the_parser_reads_only_the_named_rows(self) -> None:
+        found = runway.parse_claude_screen(SCREEN)
+        self.assertEqual({"five_hour": 2.0, "seven_day": 53.0}, found)
+
+    def test_the_parser_survives_terminal_escapes(self) -> None:
+        noisy = "\x1b[1m Current session\x1b[0m\r\n\x1b[32m   2% used\x1b[0m\r\n"
+        self.assertEqual({"five_hour": 2.0}, runway.parse_claude_screen(noisy))
+
+
 if __name__ == "__main__":
     unittest.main()
