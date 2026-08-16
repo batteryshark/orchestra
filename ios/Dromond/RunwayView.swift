@@ -93,6 +93,11 @@ private struct ProviderCard: View {
                         .padding(.vertical, 4)
                         .background(Color.secondary.opacity(0.14), in: Capsule())
                 }
+                // A figure days old is indistinguishable from a fresh one
+                // unless the age is on screen beside it.
+                if let age = entry.readingAge {
+                    Text(age).font(.caption2).foregroundStyle(.orange)
+                }
                 Spacer()
                 if !entry.known {
                     Text("Not reported")
@@ -120,6 +125,7 @@ private struct ProviderCard: View {
                         GaugeRow(
                             label: window.label,
                             remaining: window.remaining,
+                            staleReason: window.staleReason,
                             unit: window.unit,
                             resetsIn: window.resetsIn
                         )
@@ -151,6 +157,7 @@ private struct ProviderCard: View {
 private struct GaugeRow: View {
     let label: String?
     let remaining: Double?
+    var staleReason: String? = nil
     let unit: String?
     let resetsIn: String?
 
@@ -205,6 +212,11 @@ private struct GaugeRow: View {
             }
             if let resetLabel {
                 Text(resetLabel).font(.caption).foregroundStyle(.secondary)
+            }
+            // Why there is no bar, when the window itself expired rather than
+            // the provider failing to answer.
+            if remaining == nil, let staleReason, !staleReason.isEmpty {
+                Text(staleReason).font(.caption).foregroundStyle(.secondary)
             }
         }
         .accessibilityElement(children: .combine)

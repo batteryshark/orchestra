@@ -79,6 +79,8 @@ from dromond import (auth, config, db, dispatch, paths, profile_edit, profiles,
 # v3 (W-0178): the run rows carry what the dashboard's detail pane shows —
 # base commit, brief path, session, retry lineage, per-run usage, and the
 # run's own message thread with its delivery badges.
+# v8: a runway window whose reset has already passed reports unknown rather
+# than the reading from before it, and each provider carries as_of/age_hours.
 # v4 (W-0182): one runway entry per PROVIDER carrying its windows, no
 # ``limit``, no reading age, and a plain-words ``pace`` per window.
 # v5 (W-0186): ``projects`` — the projects the dashboard's picker offers,
@@ -91,7 +93,7 @@ from dromond import (auth, config, db, dispatch, paths, profile_edit, profiles,
 # v7 (W-0189): ``daemon.observer`` — whether the spin observer can run at
 # all, its profile and its first-look cadence, or the exact fix when it
 # cannot. Health that looks fine while nothing is watching is the bug.
-SNAPSHOT_VERSION = 7
+SNAPSHOT_VERSION = 8
 
 DEFAULT_PORT = 3011
 KEY_ENV = "DROMOND_KEY"
@@ -595,7 +597,7 @@ def _runway(con) -> list[dict]:
     for provider in sorted(history):
         rows = history[provider]
         latest = rows[0]
-        windows = _json_list(latest["windows"])
+        windows = [runway.as_of_now(w) for w in _json_list(latest["windows"])]
         for w in windows:
             w.pop("limit", None)  # written by a build before W-0182
             w["resets_in"] = runway.until_text(w.get("resets_at"))
@@ -610,6 +612,12 @@ def _runway(con) -> list[dict]:
             "credits": runway.credits_text(_json_obj(latest["raw"])),
             "reason": latest["reason"],
             "known": latest["remaining"] is not None,
+            # How old the underlying reading is. Shipped because a provider
+            # Dromond READS rather than polls (Claude's cache file) can be days
+            # behind with nothing broken, and a number with no age on it cannot
+            # be told apart from one taken a second ago.
+            "as_of": latest["as_of"],
+            "age_hours": runway.age_hours(latest["as_of"]),
         })
     return out
 

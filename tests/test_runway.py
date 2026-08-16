@@ -895,5 +895,50 @@ def _iso(epoch_seconds: int) -> str:
     return runway._iso(epoch_seconds)
 
 
+class ExpiredWindowTests(unittest.TestCase):
+    """A window whose reset has passed describes a window that no longer
+    exists. Claude's five-hour window read 88% for two days after it reset,
+    on both the dashboard and the phone, because the reading was merely
+    flagged stale and every surface drew the number anyway."""
+
+    def _window(self, resets_at):
+        return runway.make_window("5h", 88.0, resets_at)
+
+    def test_an_expired_window_reports_unknown_not_the_old_number(self) -> None:
+        past = "2020-01-01T00:00:00Z"
+        current = runway.as_of_now(self._window(past))
+        self.assertIsNone(current["remaining"])
+        self.assertTrue(current["stale"])
+        self.assertIn("reset", current["stale_reason"])
+        self.assertEqual("5h", current["label"])
+
+    def test_a_live_window_is_returned_untouched(self) -> None:
+        future = "2999-01-01T00:00:00Z"
+        window = self._window(future)
+        self.assertEqual(window, runway.as_of_now(window))
+        self.assertEqual(88.0, runway.as_of_now(window)["remaining"])
+
+    def test_a_window_with_no_reset_time_is_not_assumed_expired(self) -> None:
+        window = self._window(None)
+        self.assertEqual(88.0, runway.as_of_now(window)["remaining"])
+
+    def test_the_real_shape_that_caused_this(self) -> None:
+        # ~/.claude.json as it actually stood: read three days ago, with a
+        # five-hour window that reset two days ago and a weekly one that has
+        # not. The weekly figure survives; the five-hour one cannot.
+        fetched = 1786000000000.0
+        data = {"cachedUsageUtilization": {
+            "fetchedAtMs": fetched,
+            "utilization": {
+                "five_hour": {"utilization": 12, "resets_at": "2020-01-01T00:00:00Z"},
+                "seven_day": {"utilization": 17, "resets_at": "2999-01-01T00:00:00Z"}}}}
+        parsed = runway.parse_claude(data, now_ms=fetched + 85 * 3600000)
+        current = [runway.as_of_now(w) for w in parsed.windows]
+        by_label = {w["label"]: w for w in current}
+        self.assertIsNone(by_label["5h"]["remaining"])
+        self.assertEqual(83.0, by_label["weekly"]["remaining"])
+        self.assertIsNotNone(parsed.as_of)
+
+
 if __name__ == "__main__":
     unittest.main()

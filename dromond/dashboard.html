@@ -288,6 +288,8 @@
   .rwq:last-child { margin-bottom: 0; }
   .rwqhead { display: flex; justify-content: space-between; gap: .5rem;
              font-size: 11.5px; }
+  .rwunknown { color: var(--dim); font-weight: 500; }
+  .rwage { color: var(--warn, #d08770); font-size: 11px; }
   .rwmeta { margin-top: .25rem; color: var(--dim); font-size: 10.5px; }
   .rwmeta.warn { color: var(--warn); }
   .rwbal { margin: 0 0 .6rem; padding: .45rem .55rem; border-radius: 6px;
@@ -1562,6 +1564,12 @@ function renderRunway(list) {
   box.replaceChildren(...list.map(runwayCard));
 }
 
+function ageText(hours) {
+  if (hours < 1) return Math.round(hours * 60) + "m";
+  if (hours < 48) return Math.round(hours) + "h";
+  return Math.round(hours / 24) + "d";
+}
+
 function runwayCard(r) {
   const money = balanceOf(r);
   const card = el("details", "rw");
@@ -1575,7 +1583,14 @@ function runwayCard(r) {
   name.append(el("strong", null, r.provider),
               el("span", null, r.kind === "plan" ? "coding plan"
                                                  : "pay per token"));
-  const headroom = r.windows.length ? Math.min(...r.windows.map((w) => w.remaining))
+  // A reading Dromond cannot refresh by polling -- Claude's is a cache file
+  // Claude Code writes -- can be days behind with nothing broken. Say the age
+  // once it is old enough to change what the number means.
+  if (r.age_hours != null && r.age_hours >= 2) {
+    name.append(el("span", "rwage", "read " + ageText(r.age_hours) + " ago"));
+  }
+  const known = r.windows.filter((w) => w.remaining != null);
+  const headroom = known.length ? Math.min(...known.map((w) => w.remaining))
                                     : null;
   sum.append(name, money
     ? el("span", "rwvalue", money)
@@ -1603,16 +1618,22 @@ function runwayCard(r) {
 }
 
 function runwayWindow(w) {
+  const q = el("div", "rwq"), head = el("div", "rwqhead");
+  // A window whose reset has passed has NO current value, and the daemon sends
+  // null for it. Drawing a dimmed bar at the old number said "you have 88%
+  // left" in a quieter voice; it was still saying it. No bar at all is the
+  // same shape an unreported provider gets, which is what this is.
+  if (w.remaining === null || w.remaining === undefined) {
+    head.append(el("span", null, w.label), el("b", "rwunknown", "not known"));
+    q.append(head, el("div", "rwmeta", w.stale_reason || "no reading"));
+    return q;
+  }
   const percent = Math.round(w.remaining);
   const shade = tone(percent);
-  const q = el("div", "rwq"), head = el("div", "rwqhead");
   head.append(el("span", null, w.label), el("b", null, pct(w.remaining)));
   const track = el("div", "track"), fill = el("div", "fill " + shade);
   fill.style.width = Math.max(0, Math.min(100, percent)) + "%";
-  if (w.stale) fill.style.opacity = ".35";
   track.append(fill);
-  // The daemon polls on its own schedule, so a number reads as current unless
-  // something is broken. A stale window dims its bar; nothing is narrated.
   const meta = el("div", "rwmeta",
        [w.resets_in ? "resets " + w.resets_in : null, w.pace]
          .filter(Boolean).join(" · "));

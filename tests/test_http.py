@@ -309,7 +309,15 @@ class SnapshotTests(ServerCase):
         self.assertEqual(entry["kind"], "plan")
         self.assertTrue(entry["known"])
         self.assertEqual([w["label"] for w in entry["windows"]], ["5h", "weekly"])
-        for key in ("limit", "as_of", "polled_at", "trend", "stale"):
+        # `as_of` is shipped now, deliberately reversing an earlier decision to
+        # omit the reading age. That decision assumed a stale reading meant the
+        # daemon had failed to poll -- true for the providers Dromond calls,
+        # false for Claude, whose numbers come from a cache file Claude Code
+        # writes and no amount of polling can refresh. A figure that may be
+        # days old is indistinguishable from a fresh one without it.
+        self.assertIn("as_of", entry)
+        self.assertIn("age_hours", entry)
+        for key in ("limit", "polled_at", "trend", "stale"):
             self.assertNotIn(key, entry, key)
         for w in entry["windows"]:
             self.assertNotIn("limit", w)

@@ -289,6 +289,26 @@ def make_window(label: str, remaining: float, resets_at: str | None) -> dict:
             "stale_reason": None}
 
 
+def as_of_now(window: dict) -> dict:
+    """A window as it stands NOW, which is not always what was measured.
+
+    A window whose reset has already passed says NOTHING about the present. It
+    refilled at that moment and has been drawn down since by an amount nobody
+    measured. Reporting the reading from before the reset is not a stale
+    number, it is a wrong one: Claude's five-hour window read 88% for two days
+    after it had reset, because ~/.claude.json is written by Claude Code and
+    Dromond cannot refresh it by polling harder.
+
+    So an expired window reports unknown, and says why. Every surface already
+    draws unknown as "no bar" rather than an empty one, which is the honest
+    shape: not "you have none left", but "nobody knows".
+    """
+    if not expired(window.get("resets_at")):
+        return window
+    return {**window, "remaining": None, "stale": True,
+            "stale_reason": "reset since this was read"}
+
+
 def from_windows(provider: str, windows: list[dict], as_of: str | None = None,
                  raw: dict | None = None) -> Runway:
     """Scalar fields = the tightest window that has NOT itself reset, since

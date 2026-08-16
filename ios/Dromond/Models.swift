@@ -278,6 +278,16 @@ struct Runway: Decodable, Identifiable, Hashable, Sendable {
     let unit: String?
     let resetsIn: String?
     let windows: [RunwayWindow]
+    /// How old the underlying reading is. Claude's comes from a cache file
+    /// Claude Code writes, so it can be days behind with nothing broken.
+    let ageHours: Double?
+
+    /// Worth saying only once it is old enough to change what the number means.
+    var readingAge: String? {
+        guard let ageHours, ageHours >= 2 else { return nil }
+        if ageHours < 48 { return "read \(Int(ageHours.rounded()))h ago" }
+        return "read \(Int((ageHours / 24).rounded()))d ago"
+    }
     let credits: String?
     let reason: String?
     let known: Bool
@@ -286,6 +296,7 @@ struct Runway: Decodable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case provider, kind, remaining, unit, windows, credits, reason, known
+        case ageHours = "age_hours"
         case resetsIn = "resets_in"
     }
 
@@ -297,6 +308,7 @@ struct Runway: Decodable, Identifiable, Hashable, Sendable {
         unit = try? v.decode(String.self, forKey: .unit)
         resetsIn = try? v.decode(String.self, forKey: .resetsIn)
         windows = (try? v.decode([RunwayWindow].self, forKey: .windows)) ?? []
+        ageHours = try? v.decode(Double.self, forKey: .ageHours)
         credits = try? v.decode(String.self, forKey: .credits)
         reason = try? v.decode(String.self, forKey: .reason)
         known = (try? v.decode(Bool.self, forKey: .known)) ?? false
@@ -317,12 +329,16 @@ struct RunwayWindow: Decodable, Identifiable, Hashable, Sendable {
     let remaining: Double?
     let unit: String?
     let resetsIn: String?
+    /// Why a window has no current value — set when its reset has already
+    /// passed, so the reading describes a window that no longer exists.
+    let staleReason: String?
 
     var id: String { label ?? UUID().uuidString }
 
     enum CodingKeys: String, CodingKey {
         case label, remaining, unit
         case resetsIn = "resets_in"
+        case staleReason = "stale_reason"
     }
 }
 
