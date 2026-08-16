@@ -860,7 +860,7 @@ def cmd_migrate(args):
 def cmd_runway(args):
     """DESIGN §11: poll every provider adapter, store the poll, print it.
     Never fails on a provider — an adapter outage prints as unknown."""
-    results = runway.poll_all()
+    results = runway.poll_all(config.load())
     con = db.connect()
     runway.record(con, results)
     con.close()

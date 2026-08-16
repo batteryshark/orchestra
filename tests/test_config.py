@@ -1,5 +1,6 @@
 import os
 import tempfile
+import pathlib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -232,6 +233,23 @@ class ConfigTests(unittest.TestCase):
         cfg["worker_env"] = {"BAD=NAME": "x"}
         with self.assertRaises(SystemExit):
             config.apply_worker_env(cfg, {}, self.root)
+
+
+def _runway_table_survives_load():
+    pass
+
+
+class RunwayTableTests(unittest.TestCase):
+    """Every table has to be named in config.load to survive it. The same
+    omission once meant a configured [merge] check never ran."""
+
+    def test_the_runway_table_reaches_the_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "config.toml"
+            path.write_text('[runway]\nskip = ["minimax"]\n')
+            with mock.patch.dict(os.environ, {"DROMOND_CONFIG": str(path)}):
+                cfg = config.load()
+        self.assertEqual(["minimax"], cfg["runway"]["skip"])
 
 
 if __name__ == "__main__":

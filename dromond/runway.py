@@ -39,6 +39,9 @@ adapter can put a finished phrase in ``raw["credits"]`` and every surface
 renders it in the one block DeepSeek's balance already used.
 """
 import functools
+import selectors
+import shutil
+import subprocess
 import json
 import os
 import re
@@ -967,8 +970,114 @@ def _codex_credits_text(credits) -> str | None:
     return f"{count} banked reset" + ("" if count == 1 else "s")
 
 
+def parse_codex_live(result: dict) -> Runway:
+    """``account/rateLimits/read`` from the Codex app server: usedPercent per
+    window, right now. The ``rateLimits`` block is the account's own limit;
+    ``rateLimitsByLimitId`` carries per-model ones that are not the account's
+    headroom, so only the former is read."""
+    limits = (result or {}).get("rateLimits")
+    if not isinstance(limits, dict):
+        return unknown("codex", "app server returned no rateLimits")
+    windows = []
+    for slot in ("primary", "secondary"):
+        w = limits.get(slot)
+        if not isinstance(w, dict) or not isinstance(
+                w.get("usedPercent"), (int, float)):
+            continue
+        windows.append(make_window(
+            window_label(w.get("windowDurationMins")),
+            100 - float(w["usedPercent"]),
+            _iso((w.get("resetsAt") or 0) * 1000 if w.get("resetsAt") else None)))
+    if not windows:
+        return unknown("codex", "no usable window in rateLimits")
+    return from_windows("codex", windows, as_of=db.now(), raw=_scrub({
+        "plan_type": limits.get("planType"),
+        "rate_limit_reached_type": limits.get("rateLimitReachedType"),
+        "credits": _codex_credits_text(limits.get("credits")),
+    }))
+
+
+def read_codex_app_server(timeout: float = 20.0) -> dict:
+    """Ask codex-cli for the account's limits over its stdio app server.
+
+    The session files this used to scrape are a RECORD, not a reading: the
+    newest one is as old as the last time Codex happened to write a
+    token_count event. That was 23 hours stale and showed 100% headroom while
+    the account was actually at 11% -- a number that decides whether to
+    dispatch. Asking is the only way to know.
+    """
+    exe = shutil.which("codex")
+    if not exe:
+        raise RuntimeError("codex is not installed")
+    proc = subprocess.Popen([exe, "app-server", "--stdio"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    sel = None
+    try:
+        for message in ({"id": 1, "method": "initialize", "params": {
+                            "clientInfo": {"name": "dromond", "version": "1"},
+                            "capabilities": {"experimentalApi": True}}},
+                        {"method": "initialized"},
+                        {"id": 2, "method": "account/rateLimits/read"}):
+            proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not sel.select(max(0.0, deadline - time.monotonic())):
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("id") != 2:
+                continue
+            if isinstance(message.get("error"), dict):
+                raise RuntimeError("codex refused the quota request")
+            if isinstance(message.get("result"), dict):
+                return message["result"]
+            raise RuntimeError("codex returned an unexpected response")
+        raise RuntimeError("codex quota request timed out")
+    finally:
+        if sel is not None:
+            sel.close()
+        for stream in (proc.stdin, proc.stdout):
+            if stream is not None:
+                stream.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
 @soft("codex")
-def codex(sessions_dir: Path | str = CODEX_SESSIONS) -> Runway:
+def codex(sessions_dir: Path | str = CODEX_SESSIONS, reader=None) -> Runway:
+    """Ask the app server; fall back to the session files it used to scrape.
+
+    The fallback is not equivalent and says so -- it is a recording, and its
+    age rides on the entry -- but a machine without codex-cli on PATH should
+    still see whatever was last written rather than nothing.
+    """
+    try:
+        live = parse_codex_live((reader or read_codex_app_server)())
+        if live.known:
+            return live
+        why = live.reason or "app server gave no reading"
+    except Exception as exc:
+        why = str(exc)
+    fallback = _codex_from_sessions(sessions_dir)
+    if fallback.known:
+        return fallback
+    return unknown("codex", f"{why}; and no usable session snapshot")
+
+
+def _codex_from_sessions(sessions_dir: Path | str = CODEX_SESSIONS) -> Runway:
     d = Path(sessions_dir).expanduser()
     files = sorted(d.glob("**/rollout-*.jsonl"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
@@ -988,14 +1097,36 @@ def codex(sessions_dir: Path | str = CODEX_SESSIONS) -> Runway:
 ADAPTERS = (claude, codex, deepseek, kimi, minimax, xai)
 
 
-def poll_all() -> list[Runway]:
+def skipped(cfg: dict | None) -> set:
+    """Providers the owner has no plan with, from ``[runway] skip``.
+
+    A provider whose subscription has lapsed refuses every request forever, and
+    an adapter cannot tell that apart from an outage — so it reports the
+    provider's own error code, and both surfaces show an orange "Not reported"
+    that reads as a fault. Saying so in config turns a permanent false alarm
+    into a fact, and stops polling something that cannot answer.
+    """
+    names = ((cfg or {}).get("runway") or {}).get("skip") or []
+    return {str(n).strip().lower() for n in names if str(n).strip()}
+
+
+def poll_all(cfg: dict | None = None) -> list[Runway]:
     """Four of the six adapters are network-bound and independent, so they run
     together: polled in series a refresh costs the SUM of the timeouts, which
     is what a human waits behind on the dashboard's refresh button. Every
     adapter is already @soft, so a worker thread cannot raise out of the pool.
+
+    A skipped provider is still REPORTED, as unknown with a reason. Dropping
+    the row entirely would make a lapsed plan look like a provider that never
+    existed, and the owner would have no way to see what they turned off.
     """
-    with ThreadPoolExecutor(max_workers=len(ADAPTERS)) as pool:
-        return list(pool.map(lambda adapter: adapter(), ADAPTERS))
+    off = skipped(cfg)
+    live = [a for a in ADAPTERS if a.__name__ not in off]
+    with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
+        results = list(pool.map(lambda adapter: adapter(), live))
+    results += [unknown(name, "no plan configured (skipped in [runway] skip)")
+                for name in sorted(off) if name in {a.__name__ for a in ADAPTERS}]
+    return sorted(results, key=lambda r: r.provider)
 
 
 def record(con, results) -> None:

@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import time
+import pathlib
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -706,6 +707,12 @@ class ClaudeTests(unittest.TestCase):
         self.assertFalse(runway.claude(self.path.parent / "absent.json").known)
 
 
+def _no_app_server():
+    """Stand in for a machine with no codex-cli, so a test that is about the
+    session files does not reach the real app server."""
+    raise RuntimeError("codex is not installed")
+
+
 class CodexTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -770,10 +777,15 @@ class CodexTests(unittest.TestCase):
         import os
         os.utime(old, (1_780_000_000, 1_780_000_000))
         os.utime(new, (1_790_000_000, 1_790_000_000))
-        self.assertEqual(runway.codex(self.dir.parents[2]).remaining, 75.0)
-        got = runway.codex(Path(self.tmp.name) / "nothing-here")
+        # A reader that refuses forces the session-file path, which is what
+        # these cases are about. Without it the test reaches the real codex
+        # binary on the developer's machine and waits out its timeout.
+        self.assertEqual(
+            runway.codex(self.dir.parents[2], reader=_no_app_server).remaining, 75.0)
+        got = runway.codex(Path(self.tmp.name) / "nothing-here",
+                           reader=_no_app_server)
         self.assertFalse(got.known)
-        self.assertIn("no rollout-", got.reason)
+        self.assertIn("no usable session snapshot", got.reason)
 
     def test_falls_back_past_a_session_with_no_snapshot_yet(self) -> None:
         started = self._rollout("rollout-2026-08-13T11-00-00-ccc.jsonl",
@@ -783,7 +795,7 @@ class CodexTests(unittest.TestCase):
         import os
         os.utime(older, (1_780_000_000, 1_780_000_000))
         os.utime(started, (1_790_000_000, 1_790_000_000))
-        self.assertEqual(runway.codex(self.dir.parents[2]).remaining, 75.0)
+        self.assertEqual(runway.codex(self.dir.parents[2], reader=_no_app_server).remaining, 75.0)
 
     def test_corrupt_lines_and_drifted_shapes_are_unknown(self) -> None:
         cases = {
@@ -938,6 +950,93 @@ class ExpiredWindowTests(unittest.TestCase):
         self.assertIsNone(by_label["5h"]["remaining"])
         self.assertEqual(83.0, by_label["weekly"]["remaining"])
         self.assertIsNotNone(parsed.as_of)
+
+
+class SkipTests(unittest.TestCase):
+    """A lapsed subscription refuses forever, and an adapter cannot tell that
+    apart from an outage -- so it showed an orange 'Not reported' that read as
+    a fault every five minutes."""
+
+    def test_a_skipped_provider_is_reported_not_hidden(self) -> None:
+        results = runway.poll_all({"runway": {"skip": ["minimax"]}})
+        by_name = {r.provider: r for r in results}
+        self.assertIn("minimax", by_name, "a skipped provider still gets a row")
+        self.assertFalse(by_name["minimax"].known)
+        self.assertIn("no plan configured", by_name["minimax"].reason)
+
+    def test_a_skipped_provider_is_not_polled(self) -> None:
+        called = []
+
+        def spy():
+            called.append("minimax")
+            return runway.unknown("minimax", "should not run")
+
+        spy.__name__ = "minimax"
+        with mock.patch.object(runway, "ADAPTERS", (spy,)):
+            runway.poll_all({"runway": {"skip": ["minimax"]}})
+            self.assertEqual([], called)
+            runway.poll_all({})
+            self.assertEqual(["minimax"], called)
+
+    def test_the_skip_list_is_case_and_space_tolerant(self) -> None:
+        self.assertEqual({"minimax"}, runway.skipped({"runway": {"skip": [" MiniMax "]}}))
+        self.assertEqual(set(), runway.skipped({}))
+        self.assertEqual(set(), runway.skipped(None))
+
+
+class CodexLiveTests(unittest.TestCase):
+    """Codex headroom was read from the newest session file, which is a
+    RECORD and not a reading: it showed 100% while the account was at 11%,
+    because the last token_count event was 23 hours old. The app server
+    answers for now."""
+
+    LIVE = {"rateLimits": {"limitId": "codex", "planType": "prolite",
+                           "primary": {"usedPercent": 89,
+                                       "windowDurationMins": 10080,
+                                       "resetsAt": 1787196960},
+                           "secondary": None,
+                           "credits": {"hasCredits": False, "balance": "0"}}}
+
+    def test_used_percent_becomes_remaining(self) -> None:
+        r = runway.parse_codex_live(self.LIVE)
+        self.assertTrue(r.known)
+        self.assertEqual(11.0, r.remaining)
+        self.assertEqual(["weekly"], [w["label"] for w in r.windows])
+        self.assertEqual("0 banked resets", runway.credits_text(r.raw))
+
+    def test_both_windows_when_the_account_has_two(self) -> None:
+        payload = {"rateLimits": {**self.LIVE["rateLimits"],
+                                  "secondary": {"usedPercent": 40,
+                                                "windowDurationMins": 300,
+                                                "resetsAt": 1787196960}}}
+        r = runway.parse_codex_live(payload)
+        self.assertEqual({"weekly", "5h"}, {w["label"] for w in r.windows})
+        # The scalar is the tightest window, which is what dispatch reads.
+        self.assertEqual(11.0, r.remaining)
+
+    def test_a_dead_app_server_falls_back_to_the_session_record(self) -> None:
+        def boom():
+            raise RuntimeError("codex is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp) / "2026" / "08"
+            d.mkdir(parents=True)
+            (d / "rollout-x.jsonl").write_text(json.dumps({
+                "timestamp": "2026-08-15T00:00:00Z",
+                "payload": {"type": "token_count", "rate_limits": {
+                    "primary": {"used_percent": 20, "window_minutes": 10080,
+                                "resets_in_seconds": 3600}}}}) + "\n")
+            r = runway.codex(sessions_dir=tmp, reader=boom)
+        self.assertTrue(r.known, r.reason)
+        self.assertEqual(80.0, r.remaining)
+
+    def test_no_app_server_and_no_record_says_both(self) -> None:
+        def boom():
+            raise RuntimeError("codex is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runway.codex(sessions_dir=tmp, reader=boom)
+        self.assertFalse(r.known)
+        self.assertIn("codex is not installed", r.reason)
+        self.assertIn("no usable session snapshot", r.reason)
 
 
 if __name__ == "__main__":

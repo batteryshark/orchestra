@@ -115,7 +115,7 @@ def _poll_runway(con) -> int:
         except ValueError:
             pass  # unparsable stamp: poll and rewrite it
     try:
-        results = runway.poll_all()
+        results = runway.poll_all(config.load())
         runway.record(con, results)
     except Exception as exc:  # a provider must never end a tick
         print(f"dromond daemon: runway poll failed: {exc}", file=sys.stderr)

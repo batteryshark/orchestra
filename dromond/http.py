@@ -708,7 +708,7 @@ def runway_now(force: bool = False, con=None) -> dict:
     con = db.connect() if own else con
     try:
         if force:
-            runway.record(con, runway.poll_all())
+            runway.record(con, runway.poll_all(config.load()))
         return {"runway": _runway(con), "generated_at": db.now()}
     finally:
         if own:

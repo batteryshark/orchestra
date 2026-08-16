@@ -338,6 +338,10 @@ def load(project_id: str | None = None) -> dict:
         # allowlist (DESIGN §3). `dromond init` writes the table; there is no
         # default, because a default secret is not a secret.
         cfg.setdefault("http", {}).update(overlay.get("http", {}))
+        # [runway] names providers with no active plan. Every table has to be
+        # listed here to survive the load -- the same omission once meant a
+        # configured [merge] check never ran.
+        cfg.setdefault("runway", {}).update(overlay.get("runway", {}))
         worker_env = overlay.get("worker_env", {})
         if not isinstance(worker_env, dict):
             raise SystemExit(f"dromond: [worker_env] in {path} must be a TOML table")

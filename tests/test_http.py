@@ -377,7 +377,7 @@ class SnapshotTests(ServerCase):
         ``?refresh=1`` the route only replays what is stored."""
         polled = []
 
-        def fake_poll():
+        def fake_poll(cfg=None):  # poll_all takes the config now
             polled.append(True)
             return [runway.unknown("xai", "no endpoint"),
                     runway.Runway("codex", remaining=75.0, unit="percent")]
