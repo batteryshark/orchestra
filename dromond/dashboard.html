@@ -1634,9 +1634,10 @@ function runwayWindow(w) {
   const track = el("div", "track"), fill = el("div", "fill " + shade);
   fill.style.width = Math.max(0, Math.min(100, percent)) + "%";
   track.append(fill);
-  const meta = el("div", "rwmeta",
-       [w.resets_in ? "resets " + w.resets_in : null, w.pace]
-         .filter(Boolean).join(" · "));
+  // A per-model window carries no reset time, and until_text renders that as
+  // "-", so the naive check printed a bare "resets -".
+  const resets = w.resets_in && w.resets_in !== "-" ? "resets " + w.resets_in : null;
+  const meta = el("div", "rwmeta", [resets, w.pace].filter(Boolean).join(" · "));
   q.append(head, track, meta);
   return q;
 }
