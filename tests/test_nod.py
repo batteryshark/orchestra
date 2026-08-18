@@ -634,6 +634,41 @@ class AnswersPassTests(ActingTestCase):
         self.assertEqual([a["request_id"] for a in acted], [rid])
         self.assertIsNone(self._row("req_gone")["acted_at"])
 
+    def test_an_acted_card_never_swallows_the_next_escalation(self) -> None:
+        # File -> owner answers Retry -> the pass acts -> the retry escalates
+        # AGAIN. The fresh card must reach the phone: the acted card's dedupe
+        # key must not be reused, or the server swallows the re-file and the
+        # owner never learns the retry failed.
+        first = nod.merge_conflict(self.channels, "conflict", con=self.con,
+                                   run_id=30, title="t")
+        self.nod.resolve(first["request_id"], option_id="retry", kind="custom")
+        nod.act_on_answers(self.con, {})
+        second = nod.merge_conflict(self.channels, "conflict again",
+                                    con=self.con, run_id=30, title="t")
+        self.assertFalse(second["deduped"])
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        self.assertNotEqual(
+            self.nod.requests[first["request_id"]]["dedupe_key"],
+            self.nod.requests[second["request_id"]]["dedupe_key"])
+        # The acted row survived the second filing untouched: still acted.
+        self.assertIsNotNone(self._row(first["request_id"])["acted_at"])
+        # But an open, un-acted escalation still dedupes a re-file.
+        third = nod.merge_conflict(self.channels, "conflict again",
+                                   con=self.con, run_id=30, title="t")
+        self.assertTrue(third["deduped"])
+        self.assertEqual(third["request_id"], second["request_id"])
+
+    def test_a_withdrawn_card_never_swallows_the_next_escalation(self) -> None:
+        # The other route to the same trap: the card was withdrawn because
+        # the merge landed, then a later merge for the same run escalates.
+        first = nod.merge_conflict(self.channels, "conflict", con=self.con,
+                                   run_id=31, title="t")
+        nod.withdraw_merge_cards(self.con, {}, 31, note="landed")
+        second = nod.merge_conflict(self.channels, "conflict again",
+                                    con=self.con, run_id=31, title="t")
+        self.assertFalse(second["deduped"])
+        self.assertNotEqual(first["request_id"], second["request_id"])
+
     def test_non_merge_cards_are_never_acted_on(self) -> None:
         got = nod.blocked_run(self.channels, "q?", title="t", con=self.con,
                               run_id=15)

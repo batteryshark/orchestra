@@ -366,11 +366,25 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
     """File one card on the channel its kind belongs to, and record it.
 
     ``dedupe_key`` defaults to kind + run/item, so a retried run that
-    re-escalates the same thing does not buzz the phone twice.
+    re-escalates the same thing does not buzz the phone twice. For merge
+    cards the default key also carries an attempt counter — how many merge
+    cards for this run were already acted on (answered or withdrawn) — so
+    an acted card never swallows the NEXT escalation: after the owner
+    answers Retry and the retry fails again, the fresh card must reach the
+    phone, and Nod's server-side dedupe must not eat it. An open, un-acted
+    escalation still dedupes exactly as before.
     """
     client = client_for_kind(target, kind)
-    dedupe_key = dedupe_key or ":".join(
-        str(p) for p in ("dromond", kind, run_id, work_item) if p is not None)
+    if dedupe_key is None:
+        dedupe_key = ":".join(
+            str(p) for p in ("dromond", kind, run_id, work_item) if p is not None)
+        if kind == "merge_conflict" and con is not None and run_id is not None:
+            attempt = con.execute(
+                "SELECT COUNT(*) FROM nod_requests WHERE run_id=? AND "
+                "kind='merge_conflict' AND acted_at IS NOT NULL",
+                (run_id,)).fetchone()[0]
+            if attempt:
+                dedupe_key += f":attempt{attempt}"
     created = client.create(title=title, dedupe_key=dedupe_key, options=options,
                             **card)
     if con is not None:
