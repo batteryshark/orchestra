@@ -159,7 +159,13 @@ def tripwires(cfg: dict, workdir: Path, base_sha: str, head_sha: str) -> list[st
     return tripped
 
 
-JUDGE_DIFF_MAX_CHARS = 60_000
+# The judge answers ONE question -- is this the mission's own work -- and the
+# shape of the change answers it: which files, added or deleted, how much. The
+# full contents rarely add anything, and a 60KB diff made a real opus-medium
+# turn blow through its 180s timeout, which lands on escalate and pings the
+# owner anyway. Stat first, then a bounded slice of the diff for texture.
+JUDGE_STAT_MAX_CHARS = 4_000
+JUDGE_DIFF_MAX_CHARS = 8_000
 
 JUDGE_INSTRUCTIONS = """\
 You are Dromond's merge judge. A finished run's branch tripped a mechanical
@@ -172,7 +178,7 @@ Mission:
 Tripwires fired:
 {fired}
 
-The diff (may be truncated):
+The change, as a diffstat and then a truncated diff:
 {diff}
 
 A run sent to delete dead code will delete files; a run sent to refactor one
@@ -392,10 +398,13 @@ def merge_run(root: Path, branch: str, criteria: str = "",
         if result["tripwires"]:
             verdict = {"verdict": "escalate", "rationale": "judging is off"}
             if cfg["judge_tripwires"]:
-                tripped_diff = _out(["diff", base_sha, rebased_sha],
-                                    scratch)[:JUDGE_DIFF_MAX_CHARS]
+                shape = (_out(["diff", "--stat", base_sha, rebased_sha],
+                              scratch)[:JUDGE_STAT_MAX_CHARS]
+                         + "\n\n"
+                         + _out(["diff", base_sha, rebased_sha],
+                                scratch)[:JUDGE_DIFF_MAX_CHARS])
                 verdict = (judge or judge_tripwires)(
-                    settings, mission, result["tripwires"], tripped_diff)
+                    settings, mission, result["tripwires"], shape)
             result["tripwire_verdict"] = verdict
             if verdict["verdict"] != "mission_work":
                 return _escalate(result, "tripwires",
