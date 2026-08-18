@@ -908,13 +908,31 @@ def parse_claude(data: dict, now_ms: float | None = None) -> Runway:
                         raw=_scrub({"as_of_age_h": round(age_h, 1)}))
 
 
-CLAUDE_SCREEN_TIMEOUT = 20.0
+# How often the screen read may run at all. The daemon polls runway every five
+# minutes and the cache is stale most of the time, so without this it spawns a
+# Claude Code process twelve times an hour -- which rate-limits the owner's own
+# /usage view, the per-model breakdown first. Reading it three times an hour is
+# plenty for a weekly number.
+CLAUDE_SCREEN_EVERY_S = 1200.0
+_CLAUDE_LAST: tuple[float, dict] | None = None
+
+CLAUDE_SCREEN_TIMEOUT = 35.0
+# The per-model rows are a SEPARATE async fetch inside /usage and land after
+# the account rows. Returning the moment the account rows parse meant Fable's
+# week was never seen. Keep reading this long after them.
+CLAUDE_SCREEN_GRACE = 10.0
 # Below this the cache is fresh enough to trust and the screen read is skipped.
 CLAUDE_CACHE_FRESH_H = 1.0
 
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CLAUDE_ROWS = {"Current session": "five_hour",
                 "Current week (all models)": "seven_day"}
+# Anthropic meters some models separately, and the row appears only once that
+# model has its own limit -- "Current week (Opus only)", and Fable the same.
+# Matching the SHAPE rather than a list of names means a new one shows up
+# without a code change, which is the only way to keep pace with a screen
+# somebody else designs.
+_CLAUDE_PER_MODEL = re.compile(r"Current week \(([^)]+)\)")
 
 
 def parse_claude_screen(output) -> dict:
@@ -935,6 +953,11 @@ def parse_claude_screen(output) -> dict:
     used = {}
     for index, line in enumerate(lines):
         key = next((v for label, v in _CLAUDE_ROWS.items() if label in line), None)
+        if not key:
+            found = _CLAUDE_PER_MODEL.search(line)
+            # "all models" is the account-wide row and already has a key.
+            if found and found.group(1).strip().lower() != "all models":
+                key = "week:" + found.group(1).strip().lower().replace(" only", "")
         if not key:
             continue
         for candidate in lines[index + 1:index + 4]:
@@ -995,6 +1018,7 @@ def read_claude_screen(state: dict, timeout: float = CLAUDE_SCREEN_TIMEOUT) -> d
     os.close(slave)
     sent, buffer = False, bytearray()
     started = time.monotonic()
+    account_at, retried = None, False
     try:
         while time.monotonic() - started < timeout:
             try:
@@ -1019,7 +1043,20 @@ def read_claude_screen(state: dict, timeout: float = CLAUDE_SCREEN_TIMEOUT) -> d
                     break
             if sent:
                 found = parse_claude_screen(buffer)
-                if "five_hour" in found and "seven_day" in found:
+                # That section can come back rate limited, and offers a retry.
+                if not retried and b"rate limited" in buffer:
+                    try:
+                        os.write(master, b"r")
+                    except OSError:
+                        pass
+                    retried = True
+                have_account = "five_hour" in found and "seven_day" in found
+                if have_account and account_at is None:
+                    account_at = time.monotonic()
+                # Done once a per-model row lands, or once waiting for one has
+                # cost more than it is worth.
+                if have_account and (any(k.startswith("week:") for k in found)
+                                     or time.monotonic() - account_at >= CLAUDE_SCREEN_GRACE):
                     return found
             if proc.poll() is not None:
                 break
@@ -1057,10 +1094,19 @@ def claude(path: Path | str = CLAUDE_CACHE, now_ms: float | None = None,
     if age is not None and age < CLAUDE_CACHE_FRESH_H:
         return cached
 
-    used = (screen or read_claude_screen)(state)
+    global _CLAUDE_LAST
+    if screen is not None:
+        used = screen(state)
+    elif _CLAUDE_LAST and time.monotonic() - _CLAUDE_LAST[0] < CLAUDE_SCREEN_EVERY_S:
+        used = _CLAUDE_LAST[1]  # too soon to ask again; reuse the last answer
+    else:
+        used = read_claude_screen(state)
+        if used:
+            _CLAUDE_LAST = (time.monotonic(), used)
     if not used:
         return cached  # keep the cache, and its age still rides on the entry
     windows, cache_windows = [], {w["label"]: w for w in cached.windows}
+    per_model = [(k, k.split(":", 1)[1]) for k in used if k.startswith("week:")]
     for name, minutes in (("five_hour", 300), ("seven_day", 10080)):
         if name not in used:
             continue
@@ -1075,8 +1121,16 @@ def claude(path: Path | str = CLAUDE_CACHE, now_ms: float | None = None,
                                    None if expired(resets) else resets))
     if not windows:
         return cached
-    return from_windows("claude", windows, as_of=db.now(),
-                        raw=_scrub({"source": "claude /usage"}))
+    # A per-model week is REPORTED but never drives the provider's scalar.
+    # Fable's weekly running out says nothing about Opus, and the scalar is
+    # what dispatch reads as "how much Claude is left".
+    account = from_windows("claude", windows, as_of=db.now(),
+                           raw=_scrub({"source": "claude /usage"}))
+    for key, model in sorted(per_model):
+        account.windows.append({**make_window(f"weekly · {model}",
+                                              100 - used[key], None),
+                                "per_model": True})
+    return account
 
 
 # --- Codex ------------------------------------------------------------------

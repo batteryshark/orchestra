@@ -1102,6 +1102,53 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertTrue(r.known)
         self.assertEqual(83.0, {w["label"]: w for w in r.windows}["weekly"]["remaining"])
 
+    def test_the_screen_read_is_throttled_between_polls(self) -> None:
+        # The daemon polls every five minutes and the cache is stale most of
+        # the time. Spawning Claude Code that often rate-limits the owner's own
+        # /usage view -- the per-model breakdown goes first.
+        runway._CLAUDE_LAST = None
+        calls = []
+
+        def once(state):
+            calls.append(1)
+            return {"five_hour": 5.0, "seven_day": 61.0}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            stale = 1_786_000_000_000 + 86 * 3600000
+            with mock.patch.object(runway, "read_claude_screen", once):
+                first = runway.claude(path, now_ms=stale)
+                second = runway.claude(path, now_ms=stale)
+        self.assertEqual(1, len(calls), "the second poll reused the first answer")
+        self.assertEqual(first.remaining, second.remaining)
+        runway._CLAUDE_LAST = None
+
+    def test_a_per_model_week_is_reported_but_never_the_scalar(self) -> None:
+        # Anthropic meters some models separately. Fable's weekly running out
+        # says nothing about Opus, so it must not become "how much Claude is
+        # left" -- which is the number dispatch reads.
+        screen = ("Current session\n 5% used\n"
+                  "Current week (all models)\n 61% used\n"
+                  "Current week (Fable only)\n 23% used\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 86 * 3600000,
+                              screen=lambda state: runway.parse_claude_screen(screen))
+        by = {w["label"]: w for w in r.windows}
+        self.assertEqual(77.0, by["weekly \u00b7 fable"]["remaining"])
+        self.assertTrue(by["weekly \u00b7 fable"]["per_model"])
+        self.assertEqual(39.0, r.remaining)  # the account week, not Fable's
+
+    def test_an_unknown_per_model_row_needs_no_code_change(self) -> None:
+        # The point of matching the shape: a model Anthropic meters tomorrow
+        # appears without anyone editing a list of names.
+        found = runway.parse_claude_screen(
+            "Current week (Something New only)\n 10% used\n")
+        self.assertEqual({"week:something new": 10.0}, found)
+
+    def test_all_models_is_the_account_row_not_a_per_model_one(self) -> None:
+        found = runway.parse_claude_screen("Current week (all models)\n 61% used\n")
+        self.assertEqual({"seven_day": 61.0}, found)
+
     def test_the_parser_reads_only_the_named_rows(self) -> None:
         found = runway.parse_claude_screen(SCREEN)
         self.assertEqual({"five_hour": 2.0, "seven_day": 53.0}, found)
