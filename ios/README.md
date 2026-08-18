@@ -20,3 +20,22 @@ id is read from the Apple Development certificate in your keychain, so nothing
 about the developer account lives in this repository; `DROMOND_TEAM` overrides
 it. A locked phone installs fine and refuses to launch, which the script
 reports rather than treating as a failure.
+
+## Install on a phone that is somewhere else
+
+```
+./ios/ota.sh
+```
+
+Builds, signs, and publishes the app at `https://<machine>.<tailnet>.ts.net/install/`.
+Open that on the phone and tap Install; iOS fetches it directly. `--off` stops
+serving.
+
+Apple's own wireless install needs mDNS on the local link, which Tailscale does
+not carry, so `deploy.sh` only works on the same network. This goes the other
+way: iOS installs a signed build from any HTTPS URL it trusts, and
+`tailscale serve` provides one with a real certificate. The phone's UDID has to
+be in the development profile already, which the first cabled install does.
+
+It adds a `/install` path to the tailnet serve config and leaves anything
+already served at `/` alone.
