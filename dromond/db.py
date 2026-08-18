@@ -66,15 +66,17 @@ Data-model invariants (DESIGN D4):
   run and Work item it escalated, so a decision can be mirrored into the
   Work thread. ``channel`` is stored because a Nod issuer token is scoped to
   exactly one channel: a later decision/wait/cancel read has to pick the
-  credential for the channel the card was filed to, never guess. Owned by
-  ``nod.py``; carries no issuer token.
+  credential for the channel the card was filed to, never guess.
+  ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
+  the card's decision — stamped exactly once, so an answered card never
+  retriggers on the next tick. Owned by ``nod.py``; carries no issuer token.
 """
 import sqlite3
 from datetime import datetime, timezone
 
 from dromond import paths
 
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -117,6 +119,13 @@ RUNWAY_V12_COLUMNS = (
 MESSAGES_V9_COLUMNS = (
     ("undeliverable_at", "TEXT"),
     ("undeliverable_reason", "TEXT"),
+)
+
+# Schema v14 (the human loop, acting half). ``acted_at`` is the answers
+# pass's once-and-only-once stamp: NULL means the decision has not been
+# acted on yet, anything else means it must never trigger an action again.
+NOD_REQUESTS_V14_COLUMNS = (
+    ("acted_at", "TEXT"),
 )
 
 SCHEMA = """
@@ -305,6 +314,7 @@ CREATE TABLE IF NOT EXISTS nod_requests (
   decision_text TEXT,
   decided_at TEXT,
   mirrored_at TEXT,
+  acted_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nod_requests_run ON nod_requests(run_id);
@@ -385,6 +395,11 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in MESSAGES_V9_COLUMNS:
             if name not in have:
                 con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
+    cards = {r["name"] for r in con.execute("PRAGMA table_info(nod_requests)")}
+    if cards:
+        for name, sql_type in NOD_REQUESTS_V14_COLUMNS:
+            if name not in cards:
+                con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
     con.executescript(SCHEMA)
     con.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",

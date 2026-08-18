@@ -6,7 +6,9 @@ so a test that used the wrong credential would fail rather than pass by
 luck.
 """
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -497,6 +499,226 @@ class CancelTests(NodTestCase):
             self.alerts.cancel(rid)
         self.assertEqual(ctx.exception.status, 403)
         self.assertEqual(self.nod.requests[rid]["status"], "pending")
+
+
+class ActingTestCase(NodTestCase):
+    """Shared plumbing for the acting half: a stub resolver module and a
+    from_cfg patch, so no test depends on the sibling branch's resolver.py
+    or on real Nod configuration."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.resolver = types.ModuleType("dromond.resolver")
+        self.resolver.calls = []
+        stub = self.resolver
+
+        def retry_landing(con, cfg, run_id):
+            stub.calls.append(("retry", run_id))
+            return "landed on retry"
+
+        def dispatch_resolver(con, cfg, run_id, reason):
+            stub.calls.append(("resolver", run_id, reason))
+            return 99
+
+        stub.retry_landing = retry_landing
+        stub.dispatch_resolver = dispatch_resolver
+        # The lazy `from dromond import resolver` binds whichever of these
+        # exists; patch both so the stub wins before and after the merge.
+        import dromond
+        for patcher in (mock.patch.dict(sys.modules,
+                                        {"dromond.resolver": stub}),
+                        mock.patch.object(dromond, "resolver", stub,
+                                          create=True),
+                        mock.patch.object(nod, "from_cfg",
+                                          return_value=self.channels)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _merge_card(self, run_id=7, work_item="W-0201", dedupe_key=None) -> str:
+        got = nod.merge_conflict(
+            self.channels, "conflict detail", con=self.con, run_id=run_id,
+            work_item=work_item, title=f"run {run_id} did not land",
+            dedupe_key=dedupe_key or f"test:{run_id}")
+        return got["request_id"]
+
+    def _row(self, rid):
+        return self.con.execute("SELECT * FROM nod_requests WHERE request_id=?",
+                                (rid,)).fetchone()
+
+
+class AnswersPassTests(ActingTestCase):
+    def test_an_answered_retry_card_acts_once_and_never_again(self) -> None:
+        rid = self._merge_card(run_id=7)
+        self.nod.resolve(rid, option_id="retry", kind="custom")
+        acted = nod.act_on_answers(self.con, {})
+        self.assertEqual(acted, [{"request_id": rid, "action": "retry",
+                                  "outcome": "landed on retry"}])
+        self.assertEqual(self.resolver.calls, [("retry", 7)])
+        row = self._row(rid)
+        self.assertEqual(row["status"], "resolved")
+        self.assertEqual(row["option_id"], "retry")
+        self.assertIsNotNone(row["acted_at"])
+        # The next tick: nothing to do, nothing re-run, no network at all.
+        self.nod.calls.clear()
+        self.assertEqual(nod.act_on_answers(self.con, {}), [])
+        self.assertEqual(self.resolver.calls, [("retry", 7)])
+        self.assertEqual(self.nod.calls, [])
+
+    def test_a_resolver_answer_dispatches_with_the_owners_text(self) -> None:
+        rid = self._merge_card(run_id=8)
+        self.nod.resolve(rid, option_id="resolver", kind="custom",
+                         text="mind the schema migration")
+        acted = nod.act_on_answers(self.con, {})
+        self.assertEqual(acted[0]["action"], "resolver")
+        self.assertEqual(acted[0]["outcome"], "dispatched run 99")
+        self.assertEqual(self.resolver.calls,
+                         [("resolver", 8, "mind the schema migration")])
+
+    def test_leave_acts_without_touching_the_resolver(self) -> None:
+        rid = self._merge_card(run_id=9)
+        self.nod.resolve(rid, option_id="leave", kind="dismiss")
+        acted = nod.act_on_answers(self.con, {})
+        self.assertEqual(acted[0]["action"], "leave")
+        self.assertEqual(self.resolver.calls, [])
+        self.assertIsNotNone(self._row(rid)["acted_at"])
+
+    def test_a_dismissed_card_is_recorded_and_nothing_runs(self) -> None:
+        rid = self._merge_card(run_id=10)
+        self.nod.requests[rid]["status"] = "dismissed"  # swiped away, no option
+        acted = nod.act_on_answers(self.con, {})
+        self.assertEqual(acted[0]["action"], "leave")
+        self.assertEqual(self.resolver.calls, [])
+        self.assertEqual(self._row(rid)["status"], "dismissed")
+        self.assertIsNotNone(self._row(rid)["acted_at"])
+
+    def test_an_unanswered_card_is_untouched_and_not_marked(self) -> None:
+        rid = self._merge_card(run_id=11)
+        self.assertEqual(nod.act_on_answers(self.con, {}), [])
+        row = self._row(rid)
+        self.assertEqual(row["status"], "pending")
+        self.assertIsNone(row["acted_at"])
+        # ...and it is still eligible next tick, once the owner answers.
+        self.nod.resolve(rid, option_id="retry", kind="custom")
+        self.assertEqual(nod.act_on_answers(self.con, {})[0]["action"], "retry")
+
+    def test_no_unacted_rows_means_no_network_and_no_config_load(self) -> None:
+        nod.from_cfg.reset_mock()
+        self.nod.calls.clear()
+        self.assertEqual(nod.act_on_answers(self.con, {}), [])
+        self.assertEqual(self.nod.calls, [])
+        nod.from_cfg.assert_not_called()
+
+    def test_a_card_the_mirror_saw_first_is_still_acted_on(self) -> None:
+        # Another reader (the mirror flow) saved the decision already: the
+        # status is no longer 'pending', but nothing has acted. Act from the
+        # stored columns, with no second decision read.
+        rid = self._merge_card(run_id=12)
+        self.nod.resolve(rid, option_id="retry", kind="custom")
+        nod.save_decision(self.con, rid, self.client.decision(rid))
+        self.nod.calls.clear()
+        acted = nod.act_on_answers(self.con, {})
+        self.assertEqual(acted[0]["action"], "retry")
+        self.assertEqual(self.resolver.calls, [("retry", 12)])
+        self.assertEqual(self.nod.calls, [])
+        # ...and the mirror still sees it: acted, but not yet mirrored.
+        self.assertIn(rid, [r["request_id"] for r in nod.unmirrored(self.con)])
+
+    def test_an_unreadable_card_is_skipped_and_the_rest_still_act(self) -> None:
+        # A row recorded against a channel no token covers cannot be read;
+        # it is a warning, not a reason to skip the cards after it.
+        nod.record(self.con, "req_gone", kind="merge_conflict", channel="chan-gone",
+                   run_id=13)
+        rid = self._merge_card(run_id=14)
+        self.nod.resolve(rid, option_id="retry", kind="custom")
+        acted = nod.act_on_answers(self.con, {})
+        self.assertEqual([a["request_id"] for a in acted], [rid])
+        self.assertIsNone(self._row("req_gone")["acted_at"])
+
+    def test_an_acted_card_never_swallows_the_next_escalation(self) -> None:
+        # File -> owner answers Retry -> the pass acts -> the retry escalates
+        # AGAIN. The fresh card must reach the phone: the acted card's dedupe
+        # key must not be reused, or the server swallows the re-file and the
+        # owner never learns the retry failed.
+        first = nod.merge_conflict(self.channels, "conflict", con=self.con,
+                                   run_id=30, title="t")
+        self.nod.resolve(first["request_id"], option_id="retry", kind="custom")
+        nod.act_on_answers(self.con, {})
+        second = nod.merge_conflict(self.channels, "conflict again",
+                                    con=self.con, run_id=30, title="t")
+        self.assertFalse(second["deduped"])
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        self.assertNotEqual(
+            self.nod.requests[first["request_id"]]["dedupe_key"],
+            self.nod.requests[second["request_id"]]["dedupe_key"])
+        # The acted row survived the second filing untouched: still acted.
+        self.assertIsNotNone(self._row(first["request_id"])["acted_at"])
+        # But an open, un-acted escalation still dedupes a re-file.
+        third = nod.merge_conflict(self.channels, "conflict again",
+                                   con=self.con, run_id=30, title="t")
+        self.assertTrue(third["deduped"])
+        self.assertEqual(third["request_id"], second["request_id"])
+
+    def test_a_withdrawn_card_never_swallows_the_next_escalation(self) -> None:
+        # The other route to the same trap: the card was withdrawn because
+        # the merge landed, then a later merge for the same run escalates.
+        first = nod.merge_conflict(self.channels, "conflict", con=self.con,
+                                   run_id=31, title="t")
+        nod.withdraw_merge_cards(self.con, {}, 31, note="landed")
+        second = nod.merge_conflict(self.channels, "conflict again",
+                                    con=self.con, run_id=31, title="t")
+        self.assertFalse(second["deduped"])
+        self.assertNotEqual(first["request_id"], second["request_id"])
+
+    def test_non_merge_cards_are_never_acted_on(self) -> None:
+        got = nod.blocked_run(self.channels, "q?", title="t", con=self.con,
+                              run_id=15)
+        self.nod.resolve(got["request_id"], option_id="answer", text="yes")
+        self.assertEqual(nod.act_on_answers(self.con, {}), [])
+        self.assertEqual(self.resolver.calls, [])
+
+
+class WithdrawTests(ActingTestCase):
+    def test_withdraw_cancels_every_pending_card_for_the_run(self) -> None:
+        first = self._merge_card(run_id=20, dedupe_key="a")
+        second = self._merge_card(run_id=20, dedupe_key="b")
+        other = self._merge_card(run_id=21)
+        self.assertEqual(
+            nod.withdraw_merge_cards(self.con, {}, 20, note="merge landed"), 2)
+        for rid in (first, second):
+            self.assertEqual(self.nod.requests[rid]["status"], "cancelled")
+            row = self._row(rid)
+            self.assertEqual(row["status"], "withdrawn")
+            self.assertEqual(row["decision_text"], "merge landed")
+            self.assertIsNotNone(row["acted_at"])
+        self.assertEqual(self._row(other)["status"], "pending")
+        # Withdrawn cards are out of the answers pass's reach for good.
+        self.assertEqual([a["request_id"]
+                          for a in nod.act_on_answers(self.con, {})], [])
+
+    def test_withdraw_survives_a_failed_cancel_and_still_marks(self) -> None:
+        nod.record(self.con, "req_gone", kind="merge_conflict", channel="chan-gone",
+                   run_id=22)
+        good = self._merge_card(run_id=22)
+        self.assertEqual(nod.withdraw_merge_cards(self.con, {}, 22), 2)
+        self.assertEqual(self._row("req_gone")["status"], "withdrawn")
+        self.assertEqual(self._row(good)["status"], "withdrawn")
+        self.assertEqual(self.nod.requests[good]["status"], "cancelled")
+
+    def test_withdraw_with_nothing_pending_is_a_no_op(self) -> None:
+        self.assertEqual(nod.withdraw_merge_cards(self.con, {}, 404), 0)
+
+
+class StagePrefixTests(NodTestCase):
+    def test_stage_prefixes_the_summary(self) -> None:
+        got = nod.merge_conflict(self.channels, "held", stage="tripwires",
+                                 title="t", summary="2 findings hold the door")
+        card = self.nod.requests[got["request_id"]]
+        self.assertEqual(card["summary"], "[tripwires] 2 findings hold the door")
+
+    def test_no_stage_leaves_existing_calls_unchanged(self) -> None:
+        got = nod.merge_conflict(self.channels, "held", title="t",
+                                 summary="plain")
+        self.assertEqual(self.nod.requests[got["request_id"]]["summary"], "plain")
 
 
 if __name__ == "__main__":

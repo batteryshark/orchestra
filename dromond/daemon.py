@@ -18,7 +18,7 @@ import traceback
 import time
 from datetime import datetime, timezone
 
-from dromond import (conductor, config, db, http, observer, project,
+from dromond import (conductor, config, db, http, nod, observer, project,
                          supervise, runway, sweeper, work_client)
 
 DEFAULT_INTERVAL = 60
@@ -125,11 +125,26 @@ def _poll_runway(con) -> int:
     return len(results)
 
 
+def _act_on_nod_answers(con, cfg: dict) -> list[dict]:
+    """The acting half of the human loop: answered merge cards do something.
+
+    Never raises, matching _poll_runway: an unreachable Nod or a broken act
+    must not end a tick. The pass itself is cheap when idle — one SQL query,
+    no network — and skips polling entirely when Nod is not configured.
+    """
+    try:
+        return nod.act_on_answers(con, cfg)
+    except Exception as exc:
+        print(f"dromond daemon: nod answers pass failed: {exc!r}",
+              file=sys.stderr)
+        return []
+
+
 def tick() -> dict:
     """One pass. Returns a small report; never raises for a Work-side fault."""
     cfg = config.load()
     report = {"swept": [], "conducted": [], "released": [], "reaped": [],
-              "paused": False, "runway": 0}
+              "paused": False, "runway": 0, "nod_answers": []}
     con = db.connect()
     try:
         _harvest_children()
@@ -144,6 +159,7 @@ def tick() -> dict:
             return report
         report["released"] = supervise.process_ready(con, supervise.spawn_supervisor)
         report["runway"] = _poll_runway(con)
+        report["nod_answers"] = _act_on_nod_answers(con, cfg)
         # ponytail: one project-list fetch per tick keeps the cache warm at the
         # cost of an HTTP round trip a minute; drive it off a Work event when
         # phase 3's hooks land.
