@@ -24,7 +24,7 @@ Per-project configuration, in ``.dromond/config.toml``::
     check_timeout = 1800     # per-check seconds
     require_clean = true     # refuse to land while the base checkout is dirty
     judge_tripwires = true   # a model judges tripwired facts against the mission first
-    resolver_profile = "big" # staffs the resolver run a merge escalation can
+    resolver_profile = "big" # resolver staffing; unset = best tier-1 profile
                              # dispatch (default: the highest-priority tier-3 profile)
 
     [merge.checks]           # declared checks, run in declared order

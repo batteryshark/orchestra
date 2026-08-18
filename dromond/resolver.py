@@ -93,8 +93,14 @@ def _refuse(reason: str) -> None:
 
 def resolver_profile(cfg: dict) -> tuple[str, dict] | None:
     """``[merge] resolver_profile`` when set; otherwise the highest-priority
-    (lowest number) enabled tier-3 profile. None, with the reason on stderr,
-    when neither exists."""
+    (lowest number) enabled tier-1 profile. None, with the reason on stderr,
+    when neither exists.
+
+    The fallback is tier 1, not tier 3 (owner, 2026-08-18): most escalations
+    are a mechanical rebase a workhorse handles, and staffing every one heavy
+    is wasteful. A merge that deserves more gets it by naming
+    [merge] resolver_profile.
+    """
     named = merge.merge_cfg(cfg).get("resolver_profile")
     if named:
         try:  # a staffing moment (W-0187): the enabled set gates it
@@ -103,11 +109,11 @@ def resolver_profile(cfg: dict) -> tuple[str, dict] | None:
             _refuse(str(exc))
             return None
     heavy = sorted(((name, p) for name, p in config.enabled_profiles(cfg).items()
-                    if config.tier_of(p.get("tier")) == 3),
+                    if config.tier_of(p.get("tier")) == 1),
                    key=lambda kv: (config.priority_of(kv[1]), kv[0]))
     if not heavy:
         _refuse("no [merge] resolver_profile is set and no enabled profile is "
-                f"tier = 3; set one in {paths.global_config_path()}")
+                f"tier = 1; set one in {paths.global_config_path()}")
         return None
     return heavy[0][0], config.profile_cfg(cfg, heavy[0][0])
 
