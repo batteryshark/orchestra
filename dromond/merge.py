@@ -24,6 +24,8 @@ Per-project configuration, in ``.dromond/config.toml``::
     check_timeout = 1800     # per-check seconds
     require_clean = true     # refuse to land while the base checkout is dirty
     judge_tripwires = true   # a model judges tripwired facts against the mission first
+    resolver_profile = "big" # staffs the resolver run a merge escalation can
+                             # dispatch (default: the highest-priority tier-3 profile)
 
     [merge.checks]           # declared checks, run in declared order
     test = "uv run python -m unittest discover -s tests"
@@ -45,6 +47,7 @@ never posts to Work and never resolves a conflict.
 when a run reaches ``done``, which lands the branch and then *reports* —
 Work thread, item transition, Nod card. Nothing in it may break finalization.
 """
+import inspect
 import os
 import shutil
 import subprocess
@@ -73,6 +76,9 @@ DEFAULTS = {
     # dispatched to delete dead code must not escalate its own deletions. Off
     # means every tripwire escalates, as before.
     "judge_tripwires": True,
+    # Which profile a "Dispatch a resolver" answer staffs (resolver.py). None
+    # means the highest-priority enabled tier-3 profile.
+    "resolver_profile": None,
 }
 CHECK_OUTPUT_MAX_CHARS = 4000
 # ponytail: whole diff into the review prompt, capped. Chunk it only if real
@@ -596,6 +602,17 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
         # than becoming a note under an item the sweeper moves to review.
         result = _escalate(blank_result(merge_cfg(cfg)["base"] or "the base",
                                         branch), "merge", str(exc))
+    if result["ok"] and hasattr(nod, "withdraw_merge_cards"):
+        # A landed branch answers its own escalation: the phone card filed
+        # for an earlier failure of this run is stale the moment the retry
+        # (or a resolver) lands it. hasattr: this branch runs before nod.py
+        # grows the withdrawal; nothing here may break finalization either.
+        try:
+            nod.withdraw_merge_cards(con, cfg, int(run["id"]),
+                                     note=f"landed as {result['commit'][:12]}")
+        except Exception as exc:
+            print(f"dromond: run {run['id']} stale merge card not withdrawn: "
+                  f"{exc}", file=sys.stderr)
     request_id = None if result["ok"] else _file_card(con, cfg, run, result)
     report = _report_text(run, result, request_id)
     _thread(con, int(run["id"]), report)
@@ -683,12 +700,18 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
                       + "\n".join(f"- `{f}`" for f in result["conflicts"]))
     detail.append(f"The branch is kept. `dromond merge {result['branch']}` "
                   f"retries it by hand.")
+    # A tripwire card and a conflict card stopped looking identical when
+    # merge_conflict grew `stage`; pass it only once it exists, so this
+    # branch runs against a nod.py that has not grown it yet.
+    staged = {}
+    if "stage" in inspect.signature(nod.merge_conflict).parameters:
+        staged["stage"] = result["stage"]
     try:
         created = nod.merge_conflict(
             channels, "\n\n".join(detail), con=con, run_id=int(run["id"]),
             work_item=run.get("work_item"),
             title=f"{result['branch']} did not land on {result['base']}",
-            summary=result["escalation"][:200])
+            summary=result["escalation"][:200], **staged)
     except (nod.NodError, nod.NodChannelError) as exc:
         print(f"dromond: run {run['id']} merge escalation not filed: {exc}",
               file=sys.stderr)
