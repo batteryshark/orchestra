@@ -924,8 +924,14 @@ def cmd_merge(args):
     criteria = Path(args.criteria_file).read_text() if args.criteria_file else ""
     con = db.connect()
     proj = project.resolve(con, config.load())
+    # The by-hand retry judges tripwires against the same mission the
+    # automatic landing does — the row is found by its branch name.
+    row = con.execute("SELECT * FROM runs WHERE branch=? ORDER BY id DESC LIMIT 1",
+                      (args.branch,)).fetchone()
+    mission = merge.run_mission(dict(row)) if row else ""
     con.close()
     result = merge.merge_run(proj.path, args.branch, criteria=criteria,
+                             mission=mission,
                              item_id=args.item,
                              settings=config.load(proj.project_id))
     print(json.dumps(result, indent=2))

@@ -179,6 +179,84 @@ class MergeTestCase(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual([], result["dirty"])
 
+    def test_a_mission_that_ordered_the_deletions_lands_them(self):
+        # Run 35 was dispatched to delete dead code, deleted six files, and the
+        # deletion tripwire escalated the exact work it was sent to do. The
+        # judge exists so that never reaches a phone again.
+        self.run_branch({"notes.txt": None, "feature.py": "x = 1\n"})
+        asked = []
+
+        def judge(cfg, mission, fired, diff):
+            asked.append((mission, tuple(fired)))
+            return {"verdict": "mission_work",
+                    "rationale": "the mission is dead-code deletion"}
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings,
+                                 mission="Delete the dead notes file.",
+                                 judge=judge)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(1, len(asked))
+        self.assertIn("Delete the dead notes file.", asked[0][0])
+        self.assertTrue(any("delete" in f for f in asked[0][1]))
+        # The facts stay on the record even though nobody was asked.
+        self.assertTrue(result["tripwires"])
+        self.assertEqual("mission_work", result["tripwire_verdict"]["verdict"])
+        self.assertNotIn("notes.txt", git(self.root, "ls-tree", "--name-only", "main"))
+
+    def test_a_judge_that_says_escalate_still_escalates(self):
+        self.run_branch({"notes.txt": None})
+        result = merge.merge_run(
+            self.root, BRANCH, settings=self.settings,
+            mission="Refactor one function in feature.py.",
+            judge=lambda cfg, m, f, d: {"verdict": "escalate",
+                                        "rationale": "nothing here asks for a deletion"})
+        self.assertFalse(result["ok"])
+        self.assertEqual("tripwires", result["stage"])
+        self.assertIn("nothing here asks for a deletion", result["escalation"])
+
+    def test_no_mission_means_no_judgment_means_escalate(self):
+        # The real judge refuses an empty mission before any model call; the
+        # pipeline must escalate on that refusal, exactly as before the judge
+        # existed.
+        self.run_branch({"notes.txt": None})
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+        self.assertFalse(result["ok"])
+        self.assertEqual("tripwires", result["stage"])
+
+    def test_judging_can_be_turned_off(self):
+        self.config("[merge]\njudge_tripwires = false\n")
+        called = []
+        self.run_branch({"notes.txt": None})
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings,
+                                 mission="Delete everything.",
+                                 judge=lambda *a: called.append(1))
+        self.assertFalse(result["ok"])
+        self.assertEqual([], called, "the judge must not even be consulted")
+
+    def test_the_judge_itself_fails_toward_escalation(self):
+        # No nameable profile, a dead turn, an unparsable reply: each is an
+        # escalate, never a landing.
+        v = merge.judge_tripwires({}, "", ["deletes 1 file(s)"], "diff")
+        self.assertEqual("escalate", v["verdict"])
+        # A cfg whose judge profile RESOLVES, so the turn actually runs and
+        # the reply-parsing paths are the thing under test. With an empty cfg
+        # the profile lookup fails first and the turn is never consulted.
+        cfg = {"settings": {"observer_profile": "j"},
+               "profiles": {"j": {"backend": "opencode", "model": "m"}}}
+        ran = []
+        v = merge.judge_tripwires(cfg, "a mission", ["deletes 1 file(s)"], "diff",
+                                  turn=lambda p, t: ran.append(1) or "not json at all")
+        self.assertEqual([1], ran, "the turn must actually have run")
+        self.assertEqual("escalate", v["verdict"])
+        v = merge.judge_tripwires(cfg, "a mission", ["deletes 1 file(s)"], "diff",
+                                  turn=lambda p, t: (_ for _ in ()).throw(RuntimeError("dead")))
+        self.assertEqual("escalate", v["verdict"])
+        self.assertIn("dead", v["rationale"])
+        # And the accepting path, same resolved profile.
+        v = merge.judge_tripwires(cfg, "a mission", ["deletes 1 file(s)"], "diff",
+                                  turn=lambda p, t: '{"verdict": "mission_work", "rationale": "asked for"}')
+        self.assertEqual("mission_work", v["verdict"])
+
     def test_clean_merge_lands_and_deletes_the_branch(self):
         self.run_branch({"feature.py": "x = 1\n"})
         before = git(self.root, "rev-parse", "main")

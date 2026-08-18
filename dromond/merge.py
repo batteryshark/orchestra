@@ -23,6 +23,7 @@ Per-project configuration, in ``.dromond/config.toml``::
     project_paths = ["src"]  # tripwire: a touched file outside these prefixes
     check_timeout = 1800     # per-check seconds
     require_clean = true     # refuse to land while the base checkout is dirty
+    judge_tripwires = true   # a model judges tripwired facts against the mission first
 
     [merge.checks]           # declared checks, run in declared order
     test = "uv run python -m unittest discover -s tests"
@@ -68,6 +69,10 @@ DEFAULTS = {
     # On by default. A run landing while the owner edits is rare and confusing;
     # turn it off for a checkout nobody works in by hand.
     "require_clean": True,
+    # Tripwires yield to a judgment turn before they yield to the phone: a run
+    # dispatched to delete dead code must not escalate its own deletions. Off
+    # means every tripwire escalates, as before.
+    "judge_tripwires": True,
 }
 CHECK_OUTPUT_MAX_CHARS = 4000
 # ponytail: whole diff into the review prompt, capped. Chunk it only if real
@@ -154,6 +159,69 @@ def tripwires(cfg: dict, workdir: Path, base_sha: str, head_sha: str) -> list[st
     return tripped
 
 
+JUDGE_DIFF_MAX_CHARS = 60_000
+
+JUDGE_INSTRUCTIONS = """\
+You are Dromond's merge judge. A finished run's branch tripped a mechanical
+tripwire, and the only question is whether the flagged facts are what the
+mission asked for.
+
+Mission:
+{mission}
+
+Tripwires fired:
+{fired}
+
+The diff (may be truncated):
+{diff}
+
+A run sent to delete dead code will delete files; a run sent to refactor one
+module has no business deleting six. Judge ONLY whether the flagged facts are
+the mission's own work. When the mission does not clearly call for them, say
+escalate — a human look costs a tap, a wrong landing costs an evening.
+
+Reply with ONE JSON object and nothing else:
+{{"verdict": "mission_work|escalate", "rationale": "<one sentence>"}}
+"""
+
+
+def judge_tripwires(cfg: dict | None, mission: str, fired: list[str],
+                    diff: str, turn=None) -> dict:
+    """Ask a model whether the tripwired facts are the mission's own work.
+
+    Tripwires are mechanical and know nothing of intent: a run titled
+    "dead-code deletion" deleted six files and the deletion tripwire escalated
+    the exact work the run was dispatched to do (run 35). Code coordinates and
+    agents judge (DESIGN principle 6) — so the tripwire now yields to a
+    judgment turn before it yields to the phone.
+
+    Every failure lands on "escalate": no nameable judge, an unparsable reply,
+    a dead turn. The tripwire's old behaviour is the floor, never the ceiling.
+    """
+    from dromond import observer  # SEAM (W-0166): observer imports this module
+
+    if not (mission or "").strip():
+        return {"verdict": "escalate", "rationale": "no mission to judge against"}
+    try:
+        profile = observer.observer_profile(cfg or {})
+    except Exception as exc:
+        return {"verdict": "escalate", "rationale": f"no judge profile: {exc}"}
+    prompt = JUDGE_INSTRUCTIONS.format(
+        mission=mission.strip()[:4000],
+        fired="\n".join(f"- {f}" for f in fired),
+        diff=diff[:JUDGE_DIFF_MAX_CHARS])
+    try:
+        reply = (turn or observer.model_turn)(profile, prompt)
+    except Exception as exc:
+        return {"verdict": "escalate", "rationale": f"judge turn failed: {exc}"}
+    found = observer.last_json_object(reply or "", "verdict") or {}
+    verdict = str(found.get("verdict", "")).strip().lower()
+    if verdict != "mission_work":
+        verdict = "escalate"
+    return {"verdict": verdict,
+            "rationale": str(found.get("rationale") or "no rationale given")[:2000]}
+
+
 def agent_review(diff: str, criteria: str) -> dict:
     """Stage 3 SEAM: cheap agent review of the diff against acceptance criteria.
 
@@ -179,7 +247,8 @@ def blank_result(base: str, branch: str, checks_skipped: bool = True) -> dict:
             "checks": [], "checks_skipped": checks_skipped, "tripwires": [],
             "review": None, "conflicts": [], "revert_command": None,
             "branch_deleted": False, "refresh": None, "note": None,
-            "kept_ref": None, "dropped": [], "dirty": []}
+            "kept_ref": None, "dropped": [], "dirty": [],
+            "tripwire_verdict": None}
 
 
 def _ignored_by_base(root: Path, paths: list[str]) -> list[str]:
@@ -269,7 +338,8 @@ def dirty_paths(root: Path, base: str) -> list[str]:
 
 def merge_run(root: Path, branch: str, criteria: str = "",
               item_id: str | None = None, review=None,
-              settings: dict | None = None) -> dict:
+              settings: dict | None = None, mission: str = "",
+              judge=None) -> dict:
     """Verify ``branch`` and land it on the base branch. Returns the result dict.
 
     Never touches the owner's working tree: the rebase, the checks and the
@@ -320,8 +390,20 @@ def merge_run(root: Path, branch: str, criteria: str = "",
 
         result["tripwires"] = tripwires(cfg, scratch, base_sha, rebased_sha)
         if result["tripwires"]:
-            return _escalate(result, "tripwires",
-                             "; ".join(result["tripwires"]))
+            verdict = {"verdict": "escalate", "rationale": "judging is off"}
+            if cfg["judge_tripwires"]:
+                tripped_diff = _out(["diff", base_sha, rebased_sha],
+                                    scratch)[:JUDGE_DIFF_MAX_CHARS]
+                verdict = (judge or judge_tripwires)(
+                    settings, mission, result["tripwires"], tripped_diff)
+            result["tripwire_verdict"] = verdict
+            if verdict["verdict"] != "mission_work":
+                return _escalate(result, "tripwires",
+                                 "; ".join(result["tripwires"])
+                                 + f" — judge: {verdict['rationale']}")
+            # The facts stay on the result: a landed merge still SAYS it
+            # deleted six files, it just no longer asks permission to have
+            # done what the mission ordered.
 
         if criteria.strip():
             diff = _out(["diff", base_sha, rebased_sha], scratch)[:REVIEW_DIFF_MAX_CHARS]
@@ -439,6 +521,25 @@ def _escalate(result: dict, stage: str, reason: str) -> dict:
 
 # --- the completion seam (W-0174: the supervisor merges, not a human) --------
 
+def run_mission(run: dict) -> str:
+    """What the run was dispatched to do, for the tripwire judge.
+
+    The brief's Mission section is the authoritative text; the run title is
+    the fallback when the brief file has aged out. A missing mission is an
+    empty string, and the judge treats that as unjudgeable — escalate.
+    """
+    brief_path = run.get("brief_path")
+    if brief_path:
+        try:
+            text = Path(brief_path).read_text(encoding="utf-8")
+            if "## Mission" in text:
+                section = text.split("## Mission", 1)[1]
+                return section.split("\n## ", 1)[0].strip()[:4000]
+        except OSError:
+            pass
+    return str(run.get("title") or "").strip()
+
+
 def at_completion(con, cfg: dict, run, status: str) -> str | None:
     """SEAM: land a verified run's branch and report where it went.
 
@@ -477,7 +578,8 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
     # merge.agent_review is wired to a real dispatch.
     try:
         result = merge_run(project.root_for(con, run), branch,
-                           item_id=run.get("work_item"), settings=cfg)
+                           item_id=run.get("work_item"), settings=cfg,
+                           mission=run_mission(run))
     except RuntimeError as exc:
         # git itself refused — most importantly the compare-and-swap losing to
         # a base that moved under us, which is meant to fail LOUDLY. Shape it
