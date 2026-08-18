@@ -93,13 +93,15 @@ def _refuse(reason: str) -> None:
 
 def resolver_profile(cfg: dict) -> tuple[str, dict] | None:
     """``[merge] resolver_profile`` when set; otherwise the highest-priority
-    (lowest number) enabled tier-1 profile. None, with the reason on stderr,
+    (lowest number) enabled tier-2 profile. None, with the reason on stderr,
     when neither exists.
 
-    The fallback is tier 1, not tier 3 (owner, 2026-08-18): most escalations
-    are a mechanical rebase a workhorse handles, and staffing every one heavy
-    is wasteful. A merge that deserves more gets it by naming
-    [merge] resolver_profile.
+    The fallback is tier 2 (owner, 2026-08-18). By the time a resolver fires
+    the mechanical cases are already filtered out — the judge lands
+    mission-consistent tripwires and swap races self-retry — so what remains
+    is reconciling two sides' intent, which is judgment. Resolvers are also
+    rare: the same rare-plus-judgment shape that staffs the observer above
+    tier 1. Tier 3 stays one config line away for a merge that deserves it.
     """
     named = merge.merge_cfg(cfg).get("resolver_profile")
     if named:
@@ -109,11 +111,11 @@ def resolver_profile(cfg: dict) -> tuple[str, dict] | None:
             _refuse(str(exc))
             return None
     heavy = sorted(((name, p) for name, p in config.enabled_profiles(cfg).items()
-                    if config.tier_of(p.get("tier")) == 1),
+                    if config.tier_of(p.get("tier")) == 2),
                    key=lambda kv: (config.priority_of(kv[1]), kv[0]))
     if not heavy:
         _refuse("no [merge] resolver_profile is set and no enabled profile is "
-                f"tier = 1; set one in {paths.global_config_path()}")
+                f"tier = 2; set one in {paths.global_config_path()}")
         return None
     return heavy[0][0], config.profile_cfg(cfg, heavy[0][0])
 

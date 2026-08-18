@@ -21,7 +21,8 @@ BRANCH = "dromond/run-1"
 
 PROFILES = {
     "cheap": {"backend": "opencode", "tier": 1, "priority": 10},
-    "cheaper": {"backend": "opencode", "tier": 1, "priority": 5},
+    "mid": {"backend": "opencode", "tier": 2, "priority": 10},
+    "midder": {"backend": "opencode", "tier": 2, "priority": 5},
     "big": {"backend": "opencode", "tier": 3, "priority": 10},
 }
 
@@ -196,21 +197,22 @@ class DispatchTestCase(ResolverFixture):
         new_id, _ = self.dispatch(cfg)
         self.assertEqual("cheap", self.db_run(new_id)["profile"])
 
-    def test_without_one_the_top_tier_1_profile_is_staffed(self) -> None:
-        # Tier 1, not tier 3 (owner, 2026-08-18): most escalations are a
-        # mechanical rebase a workhorse handles, and staffing every one heavy
-        # is wasteful. Anything bigger is one config line away.
+    def test_without_one_the_top_tier_2_profile_is_staffed(self) -> None:
+        # Tier 2 (owner, 2026-08-18): what reaches a resolver is the residue
+        # the mechanical filters could not handle — reconciling intent is
+        # judgment, and resolvers are rare, the same shape that staffs the
+        # observer above tier 1. Tier 3 is one config line away.
         self.run_branch({"app.py": "print('branch')\n"})
         self.add_run()
         new_id, _ = self.dispatch({"profiles": PROFILES})
-        self.assertEqual("cheaper", self.db_run(new_id)["profile"])  # priority 5 < 10
+        self.assertEqual("midder", self.db_run(new_id)["profile"])  # priority 5 < 10
 
     def test_no_profile_at_all_refuses_on_stderr(self) -> None:
         self.run_branch({"app.py": "print('branch')\n"})
         self.add_run()
         new_id, err = self.dispatch({"profiles": {"big": PROFILES["big"]}})
         self.assertIsNone(new_id)
-        self.assertIn("tier = 1", err)
+        self.assertIn("tier = 2", err)
         self.assertIsNone(self.db_run(2), "no run row may be left behind")
 
     def test_a_missing_run_or_gone_branch_refuses_on_stderr(self) -> None:
