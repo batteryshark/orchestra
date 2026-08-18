@@ -927,7 +927,6 @@ CLAUDE_SCREEN_TIMEOUT = 35.0
 # week was never seen. Keep reading this long after them.
 CLAUDE_SCREEN_GRACE = 10.0
 # Below this the cache is fresh enough to trust and the screen read is skipped.
-CLAUDE_CACHE_FRESH_H = 1.0
 
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CLAUDE_ROWS = {"Current session": "five_hour",
@@ -1093,11 +1092,12 @@ def claude(path: Path | str = CLAUDE_CACHE, now_ms: float | None = None,
     cached = parse_claude(state, now_ms)
     # now_ms is the injectable clock the whole adapter is tested against; the
     # freshness check has to read the same one or a test pins nothing.
-    age = age_hours(cached.as_of,
-                    now=None if now_ms is None else now_ms / 1000) \
-        if cached.known else None
-    if age is not None and age < CLAUDE_CACHE_FRESH_H:
-        return cached
+    # NO cache-freshness shortcut. The per-model rows -- Fable's week -- exist
+    # only on the /usage screen and are never written to the cache file, so
+    # skipping the read whenever the cache looked fresh disabled that feature
+    # outright. Reading /usage refreshes the cache as a side effect, which is
+    # how a fresh cache came to hide the very thing that refreshed it. The
+    # throttle below is the only gate.
 
     global _CLAUDE_LAST
     if screen is not None:

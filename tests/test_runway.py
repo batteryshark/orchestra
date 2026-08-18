@@ -634,6 +634,16 @@ class XaiAdapterTests(unittest.TestCase):
 class ClaudeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        # Removing the cache-freshness shortcut means claude() always considers
+        # a screen read. These cases are about the cache FILE, so refuse the
+        # screen rather than spawn Claude Code on the developer's machine.
+        self._no_screen = mock.patch.object(runway, "read_claude_screen",
+                                            return_value={})
+        self._no_screen.start()
+        self.addCleanup(self._no_screen.stop)
+        runway._CLAUDE_LAST = None
+        self.addCleanup(setattr, runway, "_CLAUDE_LAST", None)
+
         self.path = Path(self.tmp.name) / ".claude.json"
 
     def tearDown(self) -> None:
@@ -957,12 +967,26 @@ class SkipTests(unittest.TestCase):
     apart from an outage -- so it showed an orange 'Not reported' that read as
     a fault every five minutes."""
 
+    def _fake_adapters(self):
+        """Stand-ins for the real six. poll_all must never reach a network or
+        spawn a subprocess in a test -- two adapters shell out now, and one of
+        them opens a pseudo-terminal."""
+        def make(name):
+            def adapter():
+                return runway.from_windows(
+                    name, [runway.make_window("weekly", 50.0, None)])
+            adapter.__name__ = name
+            return adapter
+        return tuple(make(n) for n in ("claude", "codex", "minimax"))
+
     def test_a_skipped_provider_is_reported_not_hidden(self) -> None:
-        results = runway.poll_all({"runway": {"skip": ["minimax"]}})
+        with mock.patch.object(runway, "ADAPTERS", self._fake_adapters()):
+            results = runway.poll_all({"runway": {"skip": ["minimax"]}})
         by_name = {r.provider: r for r in results}
         self.assertIn("minimax", by_name, "a skipped provider still gets a row")
         self.assertFalse(by_name["minimax"].known)
         self.assertIn("no plan configured", by_name["minimax"].reason)
+        self.assertTrue(by_name["claude"].known, "the rest still poll")
 
     def test_a_skipped_provider_is_not_polled(self) -> None:
         called = []
@@ -1087,13 +1111,22 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertEqual(98.0, runway.as_of_now(by["5h"])["remaining"])
         self.assertEqual("2999-01-01T00:00:00Z", by["weekly"]["resets_at"])
 
-    def test_a_fresh_cache_is_not_worth_a_subprocess(self) -> None:
+    def test_a_fresh_cache_does_not_skip_the_screen(self) -> None:
+        # It used to. The per-model rows live only on the screen and are never
+        # written to the cache, and reading /usage refreshes the cache as a
+        # side effect -- so a fresh cache hid the very thing that refreshed it,
+        # and Fable never appeared again.
+        runway._CLAUDE_LAST = None
         called = []
         with tempfile.TemporaryDirectory() as tmp:
             r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 60_000,
-                              screen=lambda state: called.append(1) or {})
-        self.assertEqual([], called)
-        self.assertEqual(83.0, {w["label"]: w for w in r.windows}["weekly"]["remaining"])
+                              screen=lambda state: called.append(1) or
+                              {"five_hour": 5.0, "seven_day": 61.0, "week:fable": 53.0})
+        self.assertEqual([1], called)
+        by = {w["label"]: w for w in r.windows}
+        self.assertEqual(39.0, by["weekly"]["remaining"])
+        self.assertIn("weekly \u00b7 fable", by)
+        runway._CLAUDE_LAST = None
 
     def test_a_screen_that_says_nothing_keeps_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
