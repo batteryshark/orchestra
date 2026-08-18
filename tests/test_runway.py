@@ -1123,6 +1123,39 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertEqual(first.remaining, second.remaining)
         runway._CLAUDE_LAST = None
 
+    def test_a_partial_read_is_retried_sooner_than_a_complete_one(self) -> None:
+        # A read missing the per-model rows was rate limited, not finished.
+        # Caching it for the full interval locked Fable out for twenty minutes.
+        runway._CLAUDE_LAST = None
+        answers = [{"five_hour": 5.0, "seven_day": 61.0},
+                   {"five_hour": 5.0, "seven_day": 61.0, "week:fable": 53.0}]
+        calls = []
+
+        def reader(state):
+            calls.append(1)
+            return answers[min(len(calls) - 1, len(answers) - 1)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp)
+            stale = 1_786_000_000_000 + 86 * 3600000
+            with mock.patch.object(runway, "read_claude_screen", reader):
+                runway.claude(path, now_ms=stale)              # partial
+                self.assertEqual(1, len(calls))
+                # A partial answer is held only briefly, so the next poll asks.
+                runway._CLAUDE_LAST = (runway.time.monotonic()
+                                       - runway.CLAUDE_PARTIAL_EVERY_S - 1,
+                                       runway._CLAUDE_LAST[1])
+                second = runway.claude(path, now_ms=stale)
+                self.assertEqual(2, len(calls))
+                # Now it is complete, so the long interval applies.
+                runway._CLAUDE_LAST = (runway.time.monotonic()
+                                       - runway.CLAUDE_PARTIAL_EVERY_S - 1,
+                                       runway._CLAUDE_LAST[1])
+                runway.claude(path, now_ms=stale)
+                self.assertEqual(2, len(calls), "a complete read is not re-asked")
+        self.assertIn("weekly \u00b7 fable", [w["label"] for w in second.windows])
+        runway._CLAUDE_LAST = None
+
     def test_a_per_model_week_is_reported_but_never_the_scalar(self) -> None:
         # Anthropic meters some models separately. Fable's weekly running out
         # says nothing about Opus, so it must not become "how much Claude is

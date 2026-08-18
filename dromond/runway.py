@@ -914,6 +914,11 @@ def parse_claude(data: dict, now_ms: float | None = None) -> Runway:
 # /usage view, the per-model breakdown first. Reading it three times an hour is
 # plenty for a weekly number.
 CLAUDE_SCREEN_EVERY_S = 1200.0
+# A read that came back WITHOUT the per-model rows is a rate-limited one, not a
+# finished one. Caching it for the full interval locks Fable out for twenty
+# minutes over a section that answers on the next try, so a partial read is
+# kept only long enough to avoid hammering.
+CLAUDE_PARTIAL_EVERY_S = 120.0
 _CLAUDE_LAST: tuple[float, dict] | None = None
 
 CLAUDE_SCREEN_TIMEOUT = 35.0
@@ -1097,12 +1102,17 @@ def claude(path: Path | str = CLAUDE_CACHE, now_ms: float | None = None,
     global _CLAUDE_LAST
     if screen is not None:
         used = screen(state)
-    elif _CLAUDE_LAST and time.monotonic() - _CLAUDE_LAST[0] < CLAUDE_SCREEN_EVERY_S:
-        used = _CLAUDE_LAST[1]  # too soon to ask again; reuse the last answer
     else:
-        used = read_claude_screen(state)
-        if used:
-            _CLAUDE_LAST = (time.monotonic(), used)
+        fresh_for = (CLAUDE_SCREEN_EVERY_S
+                     if _CLAUDE_LAST and any(k.startswith("week:")
+                                             for k in _CLAUDE_LAST[1])
+                     else CLAUDE_PARTIAL_EVERY_S)
+        if _CLAUDE_LAST and time.monotonic() - _CLAUDE_LAST[0] < fresh_for:
+            used = _CLAUDE_LAST[1]  # too soon to ask again
+        else:
+            used = read_claude_screen(state)
+            if used:
+                _CLAUDE_LAST = (time.monotonic(), used)
     if not used:
         return cached  # keep the cache, and its age still rides on the entry
     windows, cache_windows = [], {w["label"]: w for w in cached.windows}
