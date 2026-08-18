@@ -77,6 +77,20 @@ class DaemonTests(unittest.TestCase):
             self.assertEqual(daemon.run(interval=1, once=True), 0)
         self.assertEqual(ticked.call_count, 1)
 
+    def test_tick_carries_the_nod_answers_report(self) -> None:
+        acted = [{"request_id": "req_1", "action": "retry", "outcome": "landed"}]
+        with mock.patch.object(daemon.nod, "act_on_answers",
+                               return_value=acted) as pass_:
+            report = daemon.tick()
+        self.assertEqual(report["nod_answers"], acted)
+        pass_.assert_called_once()
+
+    def test_tick_survives_the_nod_answers_pass_raising(self) -> None:
+        with mock.patch.object(daemon.nod, "act_on_answers",
+                               side_effect=RuntimeError("nod exploded")):
+            report = daemon.tick()  # must not raise
+        self.assertEqual(report["nod_answers"], [])
+
     def test_a_failing_tick_does_not_end_the_daemon(self) -> None:
         with mock.patch.object(daemon, "tick", side_effect=RuntimeError("boom")):
             self.assertEqual(daemon.run(interval=1, once=True), 0)

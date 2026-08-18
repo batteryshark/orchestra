@@ -29,12 +29,15 @@ Token handling: tokens come from ``DROMOND_NOD_DECISIONS_TOKEN`` /
 Authorization header and nowhere else — never a log line, never an
 exception message, never the database.
 
-NOT WIRED YET: nothing calls these helpers. The supervisor/sweeper hookup
-is a later item. ``dromond nod test|show|cancel`` is the manual surface.
+Wiring: ``messaging.py`` files and awaits blocked-run asks, ``merge.py``
+files merge-escalation cards, and ``daemon.tick()`` runs ``act_on_answers``
+so a tapped merge card actually does something. ``dromond nod
+test|show|cancel`` is the manual surface.
 """
 import json
 import os
 import sqlite3
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -301,8 +304,16 @@ def blocked_run(target, question: str, **ctx) -> dict:
                            body_markdown=question, **ctx)
 
 
-def merge_conflict(target, detail: str, **ctx) -> dict:
-    """A merge conflict: retry the merge, dispatch a resolver, or leave it."""
+def merge_conflict(target, detail: str, stage: str = "", **ctx) -> dict:
+    """A merge conflict: retry the merge, dispatch a resolver, or leave it.
+
+    ``stage`` (``tripwires``, ``rebase``, ``checks``) prefixes the summary
+    line — the owner misread a tripwire hold as a real merge conflict
+    because both cards said only "did not land". Optional, so existing
+    callers are unchanged.
+    """
+    if stage:
+        ctx["summary"] = f"[{stage}] {ctx.get('summary', '')}".rstrip()
     return file_escalation(target, kind="merge_conflict",
                            options=[RETRY, RESOLVER, LEAVE],
                            body_markdown=detail, **ctx)
@@ -436,6 +447,114 @@ def unmirrored(con: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(con.execute(
         "SELECT * FROM nod_requests WHERE status!='pending' AND mirrored_at IS NULL "
         "AND work_item IS NOT NULL ORDER BY created_at"))
+
+
+# --- the acting half (DESIGN §9): a tapped merge card does something --------
+
+def act_on_answers(con: sqlite3.Connection, cfg: dict) -> list[dict]:
+    """Act on answered merge cards. Runs on every daemon tick.
+
+    ``merge._file_card`` offers retry / dispatch a resolver / leave it; this
+    is where the tap becomes the action. For each merge card not yet acted
+    on: read the decision through the authenticated API (never a callback
+    body), act, and stamp ``acted_at`` — the once-and-only-once guard, so an
+    answered card never retriggers on a later tick.
+
+    Coherence with the Work mirror: ``mirrored_at`` is not touched here, so
+    ``unmirrored`` still lists an acted card for mirroring. And a card whose
+    decision another reader already saved (status flipped, ``acted_at``
+    still NULL) is acted on from the stored columns, with no network call.
+
+    Cheap when idle: no un-acted merge rows means one SQL query and no
+    network at all. Returns ``{request_id, action, outcome}`` per card.
+    """
+    rows = list(con.execute(
+        "SELECT * FROM nod_requests WHERE kind='merge_conflict' "
+        "AND acted_at IS NULL ORDER BY created_at"))
+    if not rows:
+        return []
+    channels = from_cfg(cfg)
+    acted = []
+    for row in rows:
+        rid = row["request_id"]
+        status = row["status"]
+        decision = {"option_id": row["option_id"],
+                    "option_kind": row["option_kind"],
+                    "text": row["decision_text"]}
+        if status == "pending":
+            if channels is None:
+                continue  # the human loop is off; the card stays pending
+            try:
+                view = channels.for_channel_id(row["channel"]).decision(rid)
+            except (NodError, NodChannelError) as exc:
+                print(f"dromond: nod card {rid} unreadable: {exc}",
+                      file=sys.stderr)
+                continue
+            status = view.get("status", "pending")
+            if status == "pending":
+                continue  # still unanswered: untouched, unmarked
+            save_decision(con, rid, view)
+            decision = view.get("decision") or {}
+        acted.append({"request_id": rid,
+                      **_act_on_merge_decision(con, cfg, row, status, decision)})
+        con.execute("UPDATE nod_requests SET acted_at=? WHERE request_id=?",
+                    (_now(), rid))
+        con.commit()
+    return acted
+
+
+def _act_on_merge_decision(con, cfg: dict, row, status: str,
+                           decision: dict) -> dict:
+    """One card's action. The resolver import is lazy: that module lands on
+    the sibling branch, and this one must import cleanly before the merge."""
+    option = decision.get("option_id")
+    run_id = int(row["run_id"]) if row["run_id"] is not None else None
+    if option == "retry" and run_id is not None:
+        from dromond import resolver
+        return {"action": "retry",
+                "outcome": resolver.retry_landing(con, cfg, run_id)}
+    if option == "resolver" and run_id is not None:
+        from dromond import resolver
+        reason = (decision.get("text") or "").strip() or \
+            f"the owner answered run {run_id}'s merge card: dispatch a resolver"
+        new_id = resolver.dispatch_resolver(con, cfg, run_id, reason)
+        return {"action": "resolver",
+                "outcome": (f"dispatched run {new_id}" if new_id is not None
+                            else "not dispatched")}
+    # "leave", a dismissed card, or cancelled/expired: recorded, nothing runs
+    return {"action": "leave", "outcome": f"left ({status})"}
+
+
+def withdraw_merge_cards(con: sqlite3.Connection, cfg: dict, run_id: int,
+                         note: str = "") -> int:
+    """Withdraw every still-pending merge card for a run. Returns how many.
+
+    Called from the landing path when a merge succeeds after all: the
+    escalation resolved itself, so the card leaves the owner's phone instead
+    of sitting "Pending" forever. Never raises — a failed cancel is a
+    printed warning and the row is still marked ``withdrawn`` (with
+    ``acted_at`` set, so the answers pass skips it), and the loop moves on.
+    """
+    rows = list(con.execute(
+        "SELECT request_id, channel FROM nod_requests WHERE run_id=? AND "
+        "kind='merge_conflict' AND status='pending'", (run_id,)))
+    if not rows:
+        return 0
+    channels = from_cfg(cfg)
+    for row in rows:
+        rid = row["request_id"]
+        try:
+            if channels is None:
+                raise NodChannelError("the human loop is not configured")
+            channels.for_channel_id(row["channel"]).cancel(rid)
+        except Exception as exc:  # marked regardless: the escalation is over
+            print(f"dromond: nod card {rid} not cancelled: {exc}",
+                  file=sys.stderr)
+        con.execute(
+            "UPDATE nod_requests SET status='withdrawn', acted_at=?, "
+            "decision_text=? WHERE request_id=?", (_now(), note or None, rid))
+    con.commit()
+    return len(rows)
 
 
 def _now() -> str:
