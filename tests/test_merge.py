@@ -471,6 +471,41 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class FileCardStageTestCase(unittest.TestCase):
+    """The stage pass-through: a tripwire card and a conflict card stop
+    looking identical once nod.merge_conflict grows ``stage=`` — and the
+    guard lets this branch run against a nod.py that has not grown it yet."""
+
+    def _result(self) -> dict:
+        result = merge.blank_result("main", "dromond/run-7")
+        return merge._escalate(result, "tripwires", "touches 99 files")
+
+    def test_stage_is_passed_once_merge_conflict_accepts_it(self) -> None:
+        seen = {}
+
+        def grown(target, detail, *, stage=None, **ctx):
+            seen["stage"] = stage
+            return {"request_id": "req_9"}
+
+        with mock.patch.object(merge.nod, "from_cfg", return_value=object()), \
+                mock.patch.object(merge.nod, "merge_conflict", grown):
+            rid = merge._file_card(None, {}, {"id": 7}, self._result())
+        self.assertEqual("req_9", rid)
+        self.assertEqual("tripwires", seen["stage"])
+
+    def test_todays_merge_conflict_is_not_passed_a_stage(self) -> None:
+        seen = {}
+
+        def today(target, detail, **ctx):
+            seen.update(ctx)
+            return {"request_id": "req_9"}
+
+        with mock.patch.object(merge.nod, "from_cfg", return_value=object()), \
+                mock.patch.object(merge.nod, "merge_conflict", today):
+            merge._file_card(None, {}, {"id": 7}, self._result())
+        self.assertNotIn("stage", seen)
+
+
 class KeptRefTestCase(unittest.TestCase):
     """A merged run's diff must outlive its branch."""
 
