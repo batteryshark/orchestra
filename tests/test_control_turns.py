@@ -148,6 +148,24 @@ class ControlTurnTestCase(unittest.TestCase):
         self.assertIn("staffed big over stub", reason)
         events = traces.events_for_run(self.con, row["id"])
         self.assertIn("reasoning", {e["kind"] for e in events})
+        # The staffing decision belongs to the project it staffed for. Without
+        # it the turn is pinned nowhere, which is how "why was this staffed"
+        # went missing from the board it was staffed on.
+        self.assertEqual(row["project_id"], CFG.get("project_id"),
+                         "a staffing turn carries the project it decided for")
+
+    def test_a_staffing_turn_carries_the_project_it_decided_for(self) -> None:
+        cfg = dict(CFG, project_id="proj-scheduler")
+        with mock.patch.object(observer.subprocess, "run",
+                               return_value=fake_proc()):
+            router.choose(self.con, cfg, "W-1 · rewrite the scheduler", "stub",
+                          dict(cfg["profiles"]["stub"]))
+        row = self.con.execute(
+            "SELECT * FROM runs WHERE layer='router'").fetchone()
+        self.assertEqual(row["project_id"], "proj-scheduler")
+        pinned = http.snapshot(self.con)["pinned_turns"]
+        self.assertEqual([t["project_id"] for t in pinned], ["proj-scheduler"],
+                         "and is therefore pinned on that project's board")
 
     def test_a_merge_judge_turn_is_recorded_through_the_merge(self) -> None:
         from dromond import merge
