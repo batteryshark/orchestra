@@ -60,14 +60,14 @@ struct Snapshot: Decodable, Sendable {
     let proposals: [Proposal]
     /// The most recent control turn (W-0214), pinned at the top of the Runs
     /// tab. Never in `runs`, so the badge and the live count never move.
-    let pinnedTurn: Run?
+    let pinnedTurns: [Run]
 
     enum CodingKeys: String, CodingKey {
         case version, runs, home, projects, profiles, runway, dispatch, daemon
         case statistics, findings, proposals
         case generatedAt = "generated_at"
         case liveRuns = "live_runs"
-        case pinnedTurn = "pinned_turn"
+        case pinnedTurns = "pinned_turns"
     }
 
     init(from decoder: Decoder) throws {
@@ -93,7 +93,7 @@ struct Snapshot: Decodable, Sendable {
         statistics = (try? v.decode(Statistics.self, forKey: .statistics)) ?? Statistics()
         findings = (try? v.decode([Finding].self, forKey: .findings)) ?? []
         proposals = (try? v.decode([Proposal].self, forKey: .proposals)) ?? []
-        pinnedTurn = try? v.decode(Run.self, forKey: .pinnedTurn)
+        pinnedTurns = (try? v.decode([Run].self, forKey: .pinnedTurns)) ?? []
     }
 }
 

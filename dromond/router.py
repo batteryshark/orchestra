@@ -143,7 +143,8 @@ def _choose(con, cfg: dict, snapshot: str, name: str, profile: dict, *,
             text = turn(router, packet, timeout=TURN_TIMEOUT)
         else:
             text = observer.model_turn(router, packet, timeout=TURN_TIMEOUT,
-                                       con=con, layer="router", meta=meta)
+                                       con=con, layer="router", meta=meta,
+                                       project_id=cfg.get("project_id"))
     # A dead binary, a wedged process, a backend that changed its output: the
     # dispatch goes either way, so nothing this turn does may propagate.
     # SystemExit counts too — `runners.build_cmd` exits for CLI use.

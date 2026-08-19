@@ -79,11 +79,12 @@ struct RunsView: View {
         let live = matching.filter(\.live)
         let rest = matching.filter { !$0.live }
         List {
-            // W-0214: the most recent control turn — the staffing, merge, or
-            // observer decision that just happened — pinned above the fleet.
+            // W-0214: the most recent control turn for THIS project — the
+            // staffing, merge, or observer decision that just happened —
+            // pinned above the fleet.
             // It is never in `state.runs`, so the badge and the live count
             // do not move for it. It opens the same detail screen as a run.
-            if query.isEmpty, let turn = state.snapshot?.pinnedTurn {
+            if query.isEmpty, let turn = state.pinnedTurn {
                 Section("Latest decision") {
                     NavigationLink(value: turn) { TurnRow(turn: turn) }
                 }

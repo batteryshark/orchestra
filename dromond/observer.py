@@ -441,13 +441,16 @@ def prompt_for(con, run, *, limit: int = DIGEST_EVENTS) -> str:
 
 
 def record_turn(con, layer: str, profile: dict, log_path: str, ok: bool,
-                note: str = "", meta: dict | None = None) -> int | None:
+                note: str = "", meta: dict | None = None,
+                project_id: str | None = None) -> int | None:
     """File a control turn as a terminal runs row and ingest its transcript.
 
     The transcript lands in the logs directory and stays there: it ages out
     under the same ``prune_raw_logs`` rule as any terminal run. The row is
     terminal at birth and carries ``layer`` and no work_item/branch, so every
-    fleet query either skips it by status or never matches it.
+    fleet query either skips it by status or never matches it. It DOES carry
+    ``project_id``: a decision about one project must not surface while the
+    reader is looking at another (W-0214 follow-up).
 
     Never raises and never masks the turn's own outcome: a turn that cannot
     be recorded is a lost trace, not a failed dispatch.
@@ -458,11 +461,12 @@ def record_turn(con, layer: str, profile: dict, log_path: str, ok: bool,
         run_id = int(con.execute(
             "INSERT INTO runs(profile, backend, model, title, requested_by, "
             "log_path, workdir, status, exit_code, summary, started_at, "
-            "finished_at, layer) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "finished_at, layer, project_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (profile.get("name") or layer, backend, profile.get("model"),
              f"{layer} turn", "dromond", log_path,
              tempfile.gettempdir(), "done" if ok else "failed",
-             0 if ok else 1, (note or "")[:500], now, now, layer)).lastrowid)
+             0 if ok else 1, (note or "")[:500], now, now, layer,
+             project_id)).lastrowid)
         traces.ingest(con, run_id, log_path, backend)
         con.commit()
         if meta is not None:
@@ -509,6 +513,7 @@ def note_turn(con, turn_id: int | None, summary: str) -> None:
 
 def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
                workdir: str | None = None, layer: str | None = None,
+               project_id: str | None = None,
                con=None, meta: dict | None = None) -> str:
     """One cheap model call, out of band. Returns the model's last text.
 
@@ -535,7 +540,7 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
         except FileNotFoundError as exc:
             if layer:
                 record_turn(con, layer, profile, _write_transcript(layer, ""),
-                            False, f"{cmd[0]} is not installed", meta)
+                            False, f"{cmd[0]} is not installed", meta, project_id)
             raise ObserverTurnError(f"{cmd[0]} is not installed") from exc
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
@@ -543,14 +548,14 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
                 out = out.decode("utf-8", "replace")
             if layer:
                 record_turn(con, layer, profile, _write_transcript(layer, out),
-                            False, f"the turn timed out after {timeout}s", meta)
+                            False, f"the turn timed out after {timeout}s", meta, project_id)
             raise ObserverTurnError(f"the observer turn timed out after {timeout}s") from exc
         log_path = _write_transcript(layer, stdout) if layer else None
         if proc.returncode != 0 and not stdout.strip():
             detail = (proc.stderr or "").strip().splitlines()
             note = f"{cmd[0]} exited {proc.returncode}: {detail[-1][:200] if detail else ''}"
             if layer:
-                record_turn(con, layer, profile, log_path, False, note, meta)
+                record_turn(con, layer, profile, log_path, False, note, meta, project_id)
             raise ObserverTurnError(note)
         # The backends speak JSONL on stdout; reuse the same tolerant reader the
         # supervisor uses rather than a second parser.
@@ -567,11 +572,12 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
         if not (text or "").strip():
             if layer:
                 record_turn(con, layer, profile, log_path, False,
-                            "the turn produced no text", meta)
+                            "the turn produced no text", meta, project_id)
             raise ObserverTurnError("the observer turn produced no text")
         if layer:
             record_turn(con, layer, profile, log_path, True,
-                        (text or "").strip().splitlines()[0][:200], meta)
+                        (text or "").strip().splitlines()[0][:200], meta,
+                        project_id)
         return text
     finally:
         if own:
@@ -634,7 +640,8 @@ def judge(con, run_id: int, cfg: dict | None = None, *, turn=None) -> dict:
         text = turn(profile, prompt_for(con, run))
     else:
         text = model_turn(profile, prompt_for(con, run),
-                          con=con, layer="observer", meta=meta)
+                          con=con, layer="observer", meta=meta,
+                          project_id=run["project_id"])
     verdict = parse_verdict(text)
     verdict["profile"] = profile["name"]
     if meta.get("turn_id"):

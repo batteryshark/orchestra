@@ -139,6 +139,15 @@ final class AppState: ObservableObject {
     }
 
     var liveRuns: [Run] { runs.filter(\.live) }
+
+    /// The latest control turn for what the tabs display. Scoped like `runs`:
+    /// a staffing decision about another project pinned above this board
+    /// reads as if it happened here.
+    var pinnedTurn: Run? {
+        let turns = snapshot?.pinnedTurns ?? []
+        guard let selectedProjectID else { return turns.first }
+        return turns.first { $0.projectID == selectedProjectID }
+    }
     var projects: [Project] { snapshot?.projects ?? [] }
     var profiles: [Profile] { snapshot?.profiles ?? [] }
     var selectedProject: Project? {

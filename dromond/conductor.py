@@ -510,12 +510,14 @@ Reply with ONE JSON object and nothing else:
 
 
 def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
-               con=None, meta: dict | None = None) -> str:
+               con=None, meta: dict | None = None,
+               project_id: str | None = None) -> str:
     """One fresh stateless session. Reuses the observer's out-of-band caller
     (§7): a separate process, its own prompt, no session ever resumed."""
     try:
         return observer.model_turn(profile, prompt, timeout=timeout,
-                                   layer="conductor", con=con, meta=meta)
+                                   layer="conductor", con=con, meta=meta,
+                                   project_id=project_id)
     except observer.ObserverTurnError as exc:
         raise PlannerTurnError(str(exc)) from exc
 
@@ -552,7 +554,8 @@ def parse_decision(text: str, *, actions=ACTIONS, key: str = "action") -> dict:
 
 
 def take_turn(profile: dict, packet: str, *, slug: str, instructions=INSTRUCTIONS,
-              turn=None, actions=ACTIONS, key: str = "action", con=None) -> dict:
+              turn=None, actions=ACTIONS, key: str = "action", con=None,
+              project_id: str | None = None) -> dict:
     """Invoke one session and take one decision back."""
     prompt = (f"{instructions}\nYou are session dromond/{slug}. It exists for "
               f"this one decision.\n\n{packet}")
@@ -560,7 +563,8 @@ def take_turn(profile: dict, packet: str, *, slug: str, instructions=INSTRUCTION
     if turn is not None:
         text = turn(profile, prompt)
     else:
-        text = model_turn(profile, prompt, con=con, meta=meta)
+        text = model_turn(profile, prompt, con=con, meta=meta,
+                          project_id=project_id)
     decision = parse_decision(text, actions=actions, key=key)
     observer.note_turn(con, meta.get("turn_id"),
                        f"{decision['action']}: {decision.get('rationale', '')}")

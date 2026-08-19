@@ -238,7 +238,7 @@ class SnapshotTests(ServerCase):
             set(payload),
             {"version", "generated_at", "home", "runs", "live_runs", "dispatch",
              "projects", "profiles", "runway", "statistics", "findings",
-             "proposals", "daemon", "pinned_turn"})
+             "proposals", "daemon", "pinned_turns"})
         self.assertEqual(payload["findings"], [])   # DESIGN §9 tables absent
         self.assertEqual(payload["proposals"], [])
         self.assertEqual(payload["dispatch"], {"paused": False, "since": None})

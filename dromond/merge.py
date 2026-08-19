@@ -230,7 +230,8 @@ def judge_tripwires(cfg: dict | None, mission: str, fired: list[str],
             reply = turn(profile, prompt)
         else:
             reply = observer.model_turn(profile, prompt, layer="merge",
-                                        meta=meta)
+                                        meta=meta,
+                                        project_id=(cfg or {}).get("project_id"))
     except Exception as exc:
         return {"verdict": "escalate", "rationale": f"judge turn failed: {exc}"}
     found = observer.last_json_object(reply or "", "verdict") or {}

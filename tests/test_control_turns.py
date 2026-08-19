@@ -177,17 +177,43 @@ class ControlTurnTestCase(unittest.TestCase):
         before = http.snapshot(self.con)
         self.assertEqual(before["live_runs"], 1)
         observer.record_turn(self.con, "router", PROFILE,
-                             _write(self.tmp.name), True, "staffed big")
+                             _write(self.tmp.name), True, "staffed big",
+                             project_id="proj-a")
         after = http.snapshot(self.con)
         self.assertEqual(after["live_runs"], 1, "the badge count is unchanged")
         shown = {r["id"] for r in after["runs"]}
         self.assertIn(live_id, shown)
-        pinned = after["pinned_turn"]
+        pinned = after["pinned_turns"][0]
         self.assertIsNotNone(pinned)
         self.assertNotIn(pinned["id"], shown,
                          "a control turn is never a fleet entry")
         self.assertEqual(pinned["layer"], "router")
         self.assertEqual(pinned["summary"], "staffed big")
+
+    def test_a_turn_is_pinned_only_on_the_project_it_acted_on(self) -> None:
+        """One decision per project. A staffing turn for another project
+        pinned above this board reads as if it happened here."""
+        observer.record_turn(self.con, "router", PROFILE,
+                             _write(self.tmp.name), True, "staffed for A",
+                             project_id="proj-a")
+        observer.record_turn(self.con, "merge", PROFILE,
+                             _write(self.tmp.name), True, "escalated for B",
+                             project_id="proj-b")
+        # An older turn for A must lose to A's newest, not to B's.
+        observer.record_turn(self.con, "observer", PROFILE,
+                             _write(self.tmp.name), True, "watched A again",
+                             project_id="proj-a")
+        pinned = http.snapshot(self.con)["pinned_turns"]
+        by_project = {t["project_id"]: t for t in pinned}
+        self.assertEqual(set(by_project), {"proj-a", "proj-b"})
+        self.assertEqual(by_project["proj-a"]["summary"], "watched A again")
+        self.assertEqual(by_project["proj-b"]["summary"], "escalated for B")
+
+    def test_a_turn_with_no_project_is_pinned_nowhere(self) -> None:
+        """It names no project, so there is no board it belongs above."""
+        observer.record_turn(self.con, "router", PROFILE,
+                             _write(self.tmp.name), True, "no project")
+        self.assertEqual(http.snapshot(self.con)["pinned_turns"], [])
 
     def test_statistics_and_the_performance_review_skip_turns(self) -> None:
         from dromond import review

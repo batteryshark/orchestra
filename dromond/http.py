@@ -93,7 +93,7 @@ from dromond import (auth, config, db, dispatch, paths, proc, profile_edit,
 # v7 (W-0189): ``daemon.observer`` — whether the spin observer can run at
 # all, its profile and its first-look cadence, or the exact fix when it
 # cannot. Health that looks fine while nothing is watching is the bug.
-SNAPSHOT_VERSION = 9
+SNAPSHOT_VERSION = 10
 
 DEFAULT_PORT = 3011
 KEY_ENV = "DROMOND_KEY"
@@ -490,14 +490,21 @@ def _runs(con) -> list[dict]:
     return [_run_payload(con, r, blocked) for r in rows]
 
 
-def _pinned_turn(con) -> dict | None:
-    """The most recent control turn (W-0214), pinned at the top of the Runs
-    tab. Its summary is the decision one-liner and names the escalation it
-    produced; the row opens in the same detail screen as any run."""
-    row = con.execute(
-        _RUN_SELECT + "WHERE r.layer IS NOT NULL ORDER BY r.id DESC LIMIT 1"
-    ).fetchone()
-    return _run_payload(con, row, {}) if row else None
+def _pinned_turns(con) -> list[dict]:
+    """The most recent control turn PER PROJECT (W-0214), pinned at the top of
+    the Runs tab. Its summary is the decision one-liner and names the
+    escalation it produced; the row opens in the same detail screen as any run.
+
+    Per project, not one globally: the reader filters the board to a project,
+    and a staffing decision about another one pinned above it reads as if it
+    happened here. A turn with no project names nothing and is not pinned.
+    """
+    rows = con.execute(
+        _RUN_SELECT + "WHERE r.layer IS NOT NULL AND r.project_id IS NOT NULL "
+        "AND r.id IN (SELECT MAX(id) FROM runs WHERE layer IS NOT NULL "
+        "AND project_id IS NOT NULL GROUP BY project_id) ORDER BY r.id DESC"
+    ).fetchall()
+    return [_run_payload(con, r, {}) for r in rows]
 
 
 def _messages(con, run_id: int) -> list[dict]:
@@ -813,9 +820,11 @@ def snapshot(con=None) -> dict:
             "home": str(paths.home()),
             "runs": runs,
             "live_runs": sum(1 for r in runs if r["live"]),
-            # v9 (W-0214): the most recent control turn, pinned at the top of
-            # the Runs tab. Never in ``runs``, never in ``live_runs``.
-            "pinned_turn": _pinned_turn(con),
+            # v10 (W-0214 follow-up): the most recent control turn per
+            # project, pinned at the top of the Runs tab. Never in ``runs``,
+            # never in ``live_runs``. The client shows the one for the project
+            # it is scoped to.
+            "pinned_turns": _pinned_turns(con),
             # v5 (W-0186): what the project picker offers, derived from the
             # runs above — never a roster of every project on the machine.
             "projects": _projects(runs),
