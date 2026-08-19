@@ -304,18 +304,29 @@ def blocked_run(target, question: str, **ctx) -> dict:
                            body_markdown=question, **ctx)
 
 
-def merge_conflict(target, detail: str, stage: str = "", **ctx) -> dict:
-    """A merge conflict: retry the merge, dispatch a resolver, or leave it.
+# A card must only offer what can actually resolve its stage. `dirty` is the
+# one stage no agent may act on: a resolver's only route to "landing" it is to
+# stash the owner's in-flight work and hope the pop succeeds, which is exactly
+# what must never happen (run 62, 2026-08-19). Retry is real there — it lands
+# the moment the owner has committed or stashed their own overlapping files.
+STAGE_OPTIONS = {"dirty": [RETRY, LEAVE]}
 
-    ``stage`` (``tripwires``, ``rebase``, ``checks``) prefixes the summary
-    line — the owner misread a tripwire hold as a real merge conflict
-    because both cards said only "did not land". Optional, so existing
-    callers are unchanged.
+
+def merge_conflict(target, detail: str, stage: str = "", **ctx) -> dict:
+    """A merge escalation: retry, dispatch a resolver where one can help,
+    or leave it.
+
+    ``stage`` (``dirty``, ``rebase``, ``checks``, ``tripwires``, ``merge``)
+    prefixes the summary line — the owner misread a tripwire hold as a real
+    merge conflict because both cards said only "did not land" — and picks
+    the option set, via ``STAGE_OPTIONS``. Optional, so existing callers are
+    unchanged.
     """
     if stage:
         ctx["summary"] = f"[{stage}] {ctx.get('summary', '')}".rstrip()
     return file_escalation(target, kind="merge_conflict",
-                           options=[RETRY, RESOLVER, LEAVE],
+                           options=STAGE_OPTIONS.get(stage,
+                                                     [RETRY, RESOLVER, LEAVE]),
                            body_markdown=detail, **ctx)
 
 

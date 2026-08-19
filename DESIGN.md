@@ -550,15 +550,20 @@ another branch or mid-operation, the refresh is skipped and the ready command
 lands in the result instead. The outcome — refreshed, skipped, or refused, and
 why — is always reported.
 
-**A merge refuses while the base checkout is dirty.** The merge itself cannot
-touch those files — it happens in a scratch worktree and the ref moves by
-`update-ref` — but landing anyway shifts the ground under someone mid-edit: the
-refresh then declines, correctly, and leaves them on a tree older than the
-branch just merged with no visible reason why. Refusing is one owner action
-from resolved; landing is a puzzle. Untracked files do not count, or a build
-directory would block every merge. `require_clean = false` turns it off for a
-checkout nobody edits by hand, and the refresh still declines rather than
-clobbers underneath it — the guard is the outer of two, not the only one.
+**A merge refuses only when the owner's edits overlap it.** A dirty base
+checkout is the normal state of a repo somebody works in, so refusing on any
+dirt at all escalated every run forever, and the resolver dispatched to clear
+one escalation hit the same guard and filed another. The merge cannot touch
+those files anyway — it happens in a scratch worktree and the ref moves by
+`update-ref`. Only files the owner is editing that the merge also rewrites are
+a real problem: that is precisely the case the refresh must refuse, leaving
+them on a stale index. So the guard waits until the merged file list is known
+and compares. Untracked files do not count, or a build directory would block
+every merge. `require_clean = false` turns even the overlap check off, and the
+refresh still declines rather than clobbers underneath it — the guard is the
+outer of two, not the only one. Dromond never resolves the overlap itself:
+committing or stashing work in flight is the owner's to do, so the card offers
+retry or leave it, and no resolver.
 
 **A run may not land what the base branch does not track.** A run commits with
 `git add -A`, so it sweeps up whatever sits in its worktree — including a live
