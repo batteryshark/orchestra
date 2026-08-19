@@ -526,6 +526,51 @@ class MergeTestCase(unittest.TestCase):
         self.assertFalse((self.root / "feature.py").exists())
         self.assertEqual("mine\n", (self.root / "sidequest.txt").read_text())
 
+    # --- a merge that had nothing to do (I-0077) ----------------------------
+
+    def _already_landed(self) -> str:
+        """Run 65's shape: the branch's work is already on main, and somebody
+        else committed afterwards. Returns that unrelated commit's sha."""
+        self.run_branch({"feature.py": "x = 1\n"})
+        git(self.root, "merge", "--quiet", "--no-ff", "-m", "run 62 landed it", BRANCH)
+        self.write("ota.sh", "the owner's own commit\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "--quiet", "-m", "OTA install, nothing to do with the run")
+        return git(self.root, "rev-parse", "main")
+
+    def test_a_branch_already_on_the_base_reports_no_merge_commit(self):
+        unrelated = self._already_landed()
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("merged", result["stage"])
+        self.assertEqual([], result["files_changed"])
+        # The run created nothing, so nothing is attributed to it — least of
+        # all the owner's commit that HEAD happened to be sitting on.
+        self.assertIsNone(result["commit"])
+        self.assertNotEqual(unrelated, result["commit"])
+        self.assertIsNone(result["revert_command"])
+        self.assertIn("nothing to merge", result["note"])
+        self.assertEqual(unrelated, git(self.root, "rev-parse", "main"))
+        self.assertTrue(result["branch_deleted"])
+
+    def test_the_report_for_a_no_op_merge_offers_no_revert(self):
+        unrelated = self._already_landed()
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+        report = merge._report_text({"id": 65}, result, None)
+        note = merge._note({"id": 65}, result, None)
+
+        # `git revert -m 1 <not a merge>` either errors or, without -m 1,
+        # destroys a bystander's change. It must not be offered at all.
+        self.assertNotIn("revert", report)
+        self.assertNotIn(unrelated, report)
+        self.assertNotIn(unrelated, note)
+        self.assertIn("nothing to merge", report)
+        self.assertIn("nothing to merge", note)
+        self.assertIn("merge commit: none", report)
+
 
 if __name__ == "__main__":
     unittest.main()

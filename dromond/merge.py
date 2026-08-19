@@ -42,7 +42,10 @@ Result shape (a plain dict, ready for the caller to post to Work)::
      "dropped", "dirty"}
 
 ``stage`` is where the run stopped: dirty | rebase | checks | tripwires |
-review | merged. ``refresh`` reports what happened to a checkout sitting on the base
+review | merged. ``commit`` is the merge commit this run created, and is None
+when the base already contained the branch — then there is no merge commit and
+no ``revert_command``, because a revert line aimed at a commit the run did not
+create either errors or undoes somebody else's work (I-0077). ``refresh`` reports what happened to a checkout sitting on the base
 branch (refreshed | skipped | refused, always with a reason). ``merge_run``
 never posts to Work and never resolves a conflict.
 
@@ -468,7 +471,17 @@ def merge_run(root: Path, branch: str, criteria: str = "",
         # to rebase onto the new base and try again, not to ask a human
         # whether to retry (owner, 2026-08-14; principle 6). Only a real
         # conflict, or losing the race repeatedly, is worth their attention.
+        merge_sha = None
         for attempt in range(SWAP_ATTEMPTS):
+            # `git merge --no-ff` of a branch the base ALREADY contains creates
+            # no commit at all: it says "Already up to date" and leaves HEAD on
+            # the base. Reading HEAD afterwards then reported whatever commit
+            # happened to be there — on run 65 an unrelated owner commit, with
+            # a `revert -m 1` line pointed at it (I-0077). Ask ancestry first,
+            # and let merge_sha stay None when the run created nothing.
+            if _git(["merge-base", "--is-ancestor", rebased_sha, base_sha],
+                    scratch, check=False).returncode == 0:
+                break
             _git(["checkout", "--detach", base_sha], scratch)
             _git(["merge", "--no-ff", "-m", subject, rebased_sha], scratch)
             merge_sha = _out(["rev-parse", "HEAD"], scratch)
@@ -500,14 +513,21 @@ def merge_run(root: Path, branch: str, criteria: str = "",
     result["ok"] = True
     result["stage"] = "merged"
     result["commit"] = merge_sha
-    result["refresh"] = _refresh_base_checkout(root, base, base_sha, merge_sha)
-    if result["refresh"]["command"]:
-        overlapped = result.get("overlap") or []
-        kept = (f" Your edits to {', '.join(overlapped[:3])} are untouched."
-                if overlapped else "")
-        result["note"] = (f"{result['refresh']['why']}; refresh it with "
-                          f"`{result['refresh']['command']}`.{kept}")
-    result["revert_command"] = f"git -C {root} revert -m 1 {merge_sha}"
+    if merge_sha is None:
+        # No commit, so no revert command: an escape hatch aimed at a commit
+        # this run did not create either errors or destroys a bystander's work.
+        result["note"] = f"already on {base}; nothing to merge"
+        result["refresh"] = {"status": "skipped", "command": None,
+                             "why": f"{base} did not move; nothing to refresh"}
+    else:
+        result["refresh"] = _refresh_base_checkout(root, base, base_sha, merge_sha)
+        if result["refresh"]["command"]:
+            overlapped = result.get("overlap") or []
+            kept = (f" Your edits to {', '.join(overlapped[:3])} are untouched."
+                    if overlapped else "")
+            result["note"] = (f"{result['refresh']['why']}; refresh it with "
+                              f"`{result['refresh']['command']}`.{kept}")
+        result["revert_command"] = f"git -C {root} revert -m 1 {merge_sha}"
     # Anchor the run's own commits before the branch name goes away. A run that
     # committed its own work leaves nothing for the checkpoint to record, so
     # the branch WAS the only pointer and `dromond show --changes` lost the
@@ -645,8 +665,10 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
         # (or a resolver) lands it. hasattr: this branch runs before nod.py
         # grows the withdrawal; nothing here may break finalization either.
         try:
-            nod.withdraw_merge_cards(con, cfg, int(run["id"]),
-                                     note=f"landed as {result['commit'][:12]}")
+            nod.withdraw_merge_cards(
+                con, cfg, int(run["id"]),
+                note=(f"landed as {result['commit'][:12]}" if result["commit"]
+                      else f"already on {result['base']}; nothing to merge"))
         except Exception as exc:
             print(f"dromond: run {run['id']} stale merge card not withdrawn: "
                   f"{exc}", file=sys.stderr)
@@ -688,12 +710,17 @@ def _report_text(run: dict, result: dict, request_id: str | None) -> str:
         lines.append(f"- review: {result['review'].get('verdict')} — "
                      f"{result['review'].get('notes', '')}")
     if result["ok"]:
+        landed = result["commit"] is not None
         head = (f"run {run['id']} landed `{result['branch']}` on "
-                f"`{result['base']}`.")
-        lines = [f"- merge commit: `{result['commit']}`", *lines,
+                f"`{result['base']}`." if landed else
+                f"run {run['id']}: `{result['branch']}` is already on "
+                f"`{result['base']}`; nothing to merge.")
+        lines = [f"- merge commit: `{result['commit']}`" if landed else
+                 "- merge commit: none (this run created no commit)",
+                 *lines,
                  f"- branch: {'deleted' if result['branch_deleted'] else 'kept'}",
                  f"- checkout: {(result['refresh'] or {}).get('why', 'not reported')}",
-                 f"- revert: `{result['revert_command']}`"]
+                 *([f"- revert: `{result['revert_command']}`"] if landed else [])]
     else:
         head = (f"run {run['id']} could not land `{result['branch']}` on "
                 f"`{result['base']}` — escalated at {result['stage']}.")
@@ -711,6 +738,9 @@ def _report_text(run: dict, result: dict, request_id: str | None) -> str:
 
 def _note(run: dict, result: dict, request_id: str | None) -> str:
     """The one summary line. The detail is in the run thread and on the item."""
+    if result["ok"] and result["commit"] is None:
+        return (f"{result['branch']} was already on {result['base']}; nothing "
+                f"to merge, no commit made")
     if result["ok"]:
         return (f"Merged {result['branch']} into {result['base']} as "
                 f"{result['commit'][:12]}; revert with "
