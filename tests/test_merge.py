@@ -123,12 +123,28 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual(["app.py"], result["conflicts"])
         self.assertEqual([], result["dropped"])
 
-    def test_a_dirty_base_checkout_refuses_the_merge(self):
-        # The merge cannot commit these files -- it happens in a scratch
-        # worktree -- but landing would move the ref under someone mid-edit,
-        # and the refresh would then decline and leave them on an older tree
-        # with no visible reason.
+    def test_a_dirty_base_checkout_that_the_merge_does_not_touch_still_lands(self):
+        # THE recurrence (runs 60/61/62): a repo whose owner works in it is
+        # dirty nearly always, and refusing on that escalated every single
+        # run -- including the resolver dispatched to clear the escalation.
+        # Edits the merge does not rewrite are none of its business.
         self.run_branch({"feature.py": "x = 1\n"})
+        self.write("app.py", "print('owner is editing this')\n")
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["app.py"], result["dirty"])
+        # Their work is untouched: never committed, never stashed, never reverted.
+        self.assertEqual("print('owner is editing this')\n",
+                         (self.root / "app.py").read_text())
+        self.assertIn("M app.py", git(self.root, "status", "--porcelain"))
+        self.assertEqual("refreshed", result["refresh"]["status"])
+
+    def test_an_edit_that_overlaps_the_merge_refuses(self):
+        # The one case that genuinely reaches a human: read-tree -m -u would
+        # refuse the refresh, stranding the owner on an index older than HEAD.
+        self.run_branch({"app.py": "x = 1\n"})
         self.write("app.py", "print('owner is editing this')\n")
         before = git(self.root, "rev-parse", "main")
 
@@ -137,10 +153,13 @@ class MergeTestCase(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual("dirty", result["stage"])
         self.assertEqual(["app.py"], result["dirty"])
-        self.assertIn("commit or stash", result["escalation"])
+        self.assertIn("overlap", result["escalation"])
+        self.assertIn("app.py", result["escalation"])
         self.assertEqual(before, git(self.root, "rev-parse", "main"))
         # The branch is untouched, so the merge is one command away once clean.
         self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
+        self.assertEqual("print('owner is editing this')\n",
+                         (self.root / "app.py").read_text())
 
     def test_an_untracked_file_is_not_dirty_enough_to_refuse(self):
         # A build directory or a scratch note is not work in flight, and
@@ -155,7 +174,7 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual("notes\n", (self.root / "scratch.txt").read_text())
 
     def test_require_clean_can_be_turned_off(self):
-        self.run_branch({"feature.py": "x = 1\n"})
+        self.run_branch({"app.py": "x = 1\n"})
         self.write("app.py", "print('owner is editing this')\n")
         self.config("[merge]\nrequire_clean = false\n")
 
@@ -361,11 +380,11 @@ class MergeTestCase(unittest.TestCase):
     def test_merge_leaves_the_dirty_working_tree_untouched(self):
         """The requirement that matters: the owner keeps their uncommitted work.
 
-        require_clean now refuses this merge before it starts, which is the
-        better answer. This still pins the layer underneath it: when the guard
-        is off, a merge must STILL never touch the owner's edits. Both
-        properties are real and the outer one must not be the only thing
-        standing between a run and someone's work in flight.
+        require_clean only refuses when the edit OVERLAPS the merge. This
+        pins the layer underneath it: with the guard off entirely, a merge
+        must STILL never touch the owner's edits. Both properties are real
+        and the outer one must not be the only thing standing between a run
+        and someone's work in flight.
         """
         self.run_branch({"feature.py": "x = 1\n"})
         self.config("[merge]\nrequire_clean = false\n")

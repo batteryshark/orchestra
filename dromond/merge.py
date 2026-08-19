@@ -22,7 +22,8 @@ Per-project configuration, in ``.dromond/config.toml``::
     allow_deletions = false  # tripwire: any deleted file
     project_paths = ["src"]  # tripwire: a touched file outside these prefixes
     check_timeout = 1800     # per-check seconds
-    require_clean = true     # refuse to land while the base checkout is dirty
+    require_clean = true     # escalate when the owner's uncommitted edits
+                             # OVERLAP the merged files (never on mere dirt)
     judge_tripwires = true   # a model judges tripwired facts against the mission first
     resolver_profile = "big" # resolver staffing; unset = best tier-2 profile
                              # dispatch (default: the highest-priority tier-3 profile)
@@ -69,8 +70,9 @@ DEFAULTS = {
     "allow_deletions": False,
     "project_paths": [],
     "check_timeout": 1800,
-    # On by default. A run landing while the owner edits is rare and confusing;
-    # turn it off for a checkout nobody works in by hand.
+    # On by default, and narrow: only an overlap between the owner's
+    # uncommitted edits and the merged files escalates. Off means even that
+    # lands, with the refresh left to decline underneath it.
     "require_clean": True,
     # Tripwires yield to a judgment turn before they yield to the phone: a run
     # dispatched to delete dead code must not escalate its own deletions. Off
@@ -364,20 +366,16 @@ def merge_run(root: Path, branch: str, criteria: str = "",
     result = blank_result(base, branch, checks_skipped=not cfg["checks"])
     base_sha = _out(["rev-parse", base], root)
 
-    # A dirty base checkout is the owner mid-edit. The merge itself cannot
-    # touch those files -- it happens in a scratch worktree and the ref moves
-    # by update-ref -- but landing anyway moves the ground under someone who is
-    # working: the refresh then declines, correctly, and leaves them on a tree
-    # that is older than the branch just merged, with no obvious reason why.
-    # Refusing is one owner action away from resolved; landing is a puzzle.
-    dirty = dirty_paths(root, base)
-    if cfg["require_clean"] and dirty:
-        result["dirty"] = dirty
-        shown = ", ".join(dirty[:5]) + (f", plus {len(dirty) - 5} more"
-                                        if len(dirty) > 5 else "")
-        return _escalate(result, "dirty",
-                         f"{base} has uncommitted changes ({shown}); "
-                         "commit or stash them and merge again")
+    # A dirty base checkout is the NORMAL state of a repo whose owner works in
+    # it, so refusing on any dirt at all escalated every run forever -- nine
+    # cards, one kind, and the resolver sent to clear one hit the same guard
+    # and filed another (runs 60/61/62, owner 2026-08-19). The merge cannot
+    # touch those files anyway: it happens in a scratch worktree and the ref
+    # moves by update-ref. Only an OVERLAP between the owner's edits and the
+    # merged files is a real problem -- that is the one case _refresh_base_-
+    # checkout must refuse, stranding them on a stale index. So the check
+    # waits until the merged file list is known; see below.
+    result["dirty"] = dirty_paths(root, base)
 
     holder = Path(tempfile.mkdtemp(prefix="dromond-merge-"))
     scratch = holder / "wt"
@@ -394,6 +392,19 @@ def merge_run(root: Path, branch: str, criteria: str = "",
         rebased_sha = _out(["rev-parse", "HEAD"], scratch)
         result["files_changed"] = _lines(
             ["diff", "--name-only", base_sha, rebased_sha], scratch)
+
+        # The only dirt worth a human: files the owner is editing that this
+        # merge also rewrites. Checked before the checks so a 30-minute suite
+        # is not burned first. Dromond never resolves it -- committing or
+        # stashing someone's work in flight is theirs to do, not ours.
+        overlap = sorted(set(result["dirty"]) & set(result["files_changed"]))
+        if cfg["require_clean"] and overlap:
+            shown = ", ".join(overlap[:5]) + (f", plus {len(overlap) - 5} more"
+                                              if len(overlap) > 5 else "")
+            return _escalate(result, "dirty",
+                             f"your uncommitted edits to {shown} overlap this "
+                             f"merge; commit or stash those files and merge "
+                             f"again")
 
         result["checks"], checks_ok = run_checks(cfg, scratch)
         if not checks_ok:

@@ -720,6 +720,15 @@ class StagePrefixTests(NodTestCase):
                                  summary="plain")
         self.assertEqual(self.nod.requests[got["request_id"]]["summary"], "plain")
 
+    def test_a_dirty_card_offers_no_resolver(self) -> None:
+        # A resolver's only route to "landing" a dirty base is to stash the
+        # owner's work in flight and hope the pop succeeds (run 62). Retry is
+        # real: it lands once they have committed or stashed it themselves.
+        got = nod.merge_conflict(self.channels, "your edits overlap",
+                                 stage="dirty", title="t", summary="s")
+        card = self.nod.requests[got["request_id"]]
+        self.assertEqual([o["id"] for o in card["options"]], ["retry", "leave"])
+
 
 if __name__ == "__main__":
     unittest.main()
