@@ -146,7 +146,9 @@ class RetryTestCase(ResolverFixture):
             note = resolver.retry_landing(self.con, {"nod": {"enabled": True}}, 1)
         self.assertIn("escalated at rebase", note)
         card = fake.requests["req_1"]
-        self.assertEqual(["retry", "resolver", "leave"],
+        # A rebase conflict offers the resolver, not another retry: the retry
+        # re-runs the same rebase into the same conflict (nod.STAGE_OPTIONS).
+        self.assertEqual(["resolver", "leave"],
                          [o["id"] for o in card["options"]])
         self.assertIn(BRANCH, card["title"])
 

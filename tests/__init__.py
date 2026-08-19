@@ -18,20 +18,34 @@ import os
 import shutil
 import tempfile
 
-# Any MAESTRO_* left in the developer's shell must not reach a test: it would
-# trip the deprecation shim, and it would decide the adoption guard for
-# modules that never asked about it.
-for _stale in [k for k in os.environ if k.startswith("MAESTRO_")]:
-    del os.environ[_stale]
-
-# Nor may a RUN's identity. The suite is often executed BY a supervised run,
-# which exports these into its own shell, and cli._authority() reads
-# DROMOND_RUN_ID to decide whether a caller is an agent -- so `dromond
-# profiles set` inside a test suddenly needed a Work decision, and four tests
-# failed for nobody's fault but the shell they were launched from (I-0008,
-# I-0009). A test's authority is the test's own business.
-for _inherited in ("DROMOND_RUN_ID", "DROMOND_RUN_TOKEN", "DROMOND_ROOT"):
-    os.environ.pop(_inherited, None)
+# NOTHING the launching shell exported may reach a test. Every MAESTRO_* and
+# every DROMOND_* goes, and the sandbox below puts back the only ones a test
+# is allowed to see. Three separate incidents, one cause:
+#
+#   MAESTRO_*  trips the deprecation shim, and decides the W-0188 adoption
+#              guard for modules that never asked about it.
+#   DROMOND_RUN_ID / _RUN_TOKEN / _ROOT  are a RUN's identity. The suite is
+#              often executed BY a supervised run, which exports these into
+#              its own shell, and cli._authority() reads DROMOND_RUN_ID to
+#              decide whether a caller is an agent -- so `dromond profiles
+#              set` inside a test suddenly needed a Work decision, and four
+#              tests failed for nobody's fault but the shell they were
+#              launched from (I-0008, I-0009).
+#   DROMOND_NOD_* / DROMOND_KEY  are LIVE CREDENTIALS. nod.load_secrets lets
+#              env win over the secrets file -- even over an explicit
+#              `secrets_file =` in a test's own config -- so a shell holding
+#              the human's real DROMOND_NOD_BASE_URL pointed every
+#              nod-enabled test at the live host instead of its FakeNod:
+#              cards filed for real, and each call blocking on the network
+#              (15s per request, 60s per await_answer long-poll chunk) until
+#              the suite looked hung. That is I-0074, and it reproduces
+#              exactly: test_conductor 23.7s/OK becomes 38.7s/FAILED on
+#              test_a_card_is_filed_and_mirrored the moment the vars are set.
+#
+# A prefix sweep rather than a list: the list is what let DROMOND_NOD_* in.
+for _leaked in [k for k in os.environ
+                if k.startswith(("MAESTRO_", "DROMOND_"))]:
+    del os.environ[_leaked]
 
 _SANDBOX = tempfile.mkdtemp(prefix="dromond-tests-")
 os.environ["DROMOND_HOME"] = os.path.join(_SANDBOX, "home")
