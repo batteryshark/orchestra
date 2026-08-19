@@ -141,6 +141,29 @@ class MergeTestCase(unittest.TestCase):
         self.assertIn("M app.py", git(self.root, "status", "--porcelain"))
         self.assertEqual("refreshed", result["refresh"]["status"])
 
+    def test_the_merge_commit_never_carries_the_owners_dirty_files(self):
+        """I-0012: a run merge published the owner's work in flight under the
+        run's message (bb3eb6f, 2026-08-14). The merge is built in a scratch
+        worktree, so the dirty file must appear in no commit it creates."""
+        self.run_branch({"feature.py": "x = 1\n"})
+        self.write("app.py", "print('half-finished, mine, not for main')\n")
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+
+        self.assertTrue(result["ok"], result)
+        merge_sha = git(self.root, "rev-parse", "HEAD")
+        landed = git(self.root, "show", "--name-only", "--format=", merge_sha)
+        self.assertNotIn("app.py", landed,
+                         "the owner's uncommitted file rode into the merge")
+        # And the content itself reached no commit anywhere in the repo —
+        # the pickaxe is the assertion that would have caught bb3eb6f.
+        self.assertEqual("", git(self.root, "log", "--all", "--oneline",
+                                 "-S", "half-finished, mine, not for main"))
+        # Still theirs, still uncommitted, still exactly as they left it.
+        self.assertIn("M app.py", git(self.root, "status", "--porcelain"))
+        self.assertEqual("print('half-finished, mine, not for main')\n",
+                         (self.root / "app.py").read_text())
+
     def test_an_edit_that_overlaps_the_merge_still_lands(self):
         # It used to escalate, and the card it filed could not be resolved by
         # either option it offered. The merge is safe anyway: it happens in a
