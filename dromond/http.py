@@ -1084,11 +1084,31 @@ def _write_stream(handler, frames) -> bool:
 
 # --- the server -------------------------------------------------------------
 
+# A phone on the tailnet (or Safari closing a tab) resets the socket while
+# ThreadingHTTPServer is still reading the request line. That is not a bug
+# in the handler; the stdlib dumps a full traceback for it anyway.
+_DROPPED = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exception()
+        if isinstance(exc, _DROPPED):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "dromond"
     sys_version = ""
     identity = None  # set by _gate, before any route runs
+
+    def handle(self):
+        try:
+            super().handle()
+        except _DROPPED:
+            pass
 
     # -- plumbing
     def log_message(self, fmt, *args):  # noqa: A003 — BaseHTTPRequestHandler API
@@ -1400,7 +1420,7 @@ def serve(stop: threading.Event | None = None, wake=None, addr=None,
     addr = bind_address(cfg) if addr is None else addr
     port = int(http_cfg(cfg).get("port") or DEFAULT_PORT) if port is None else port
     try:
-        srv = ThreadingHTTPServer((addr, port), Handler)
+        srv = Server((addr, port), Handler)
     except OSError as exc:
         print(f"dromond http: cannot bind {addr}:{port} — {exc}",
               file=sys.stderr, flush=True)
@@ -1423,7 +1443,7 @@ def serve(stop: threading.Event | None = None, wake=None, addr=None,
     srv.local = None
     if addr not in ("127.0.0.1", "::1", "localhost"):
         try:
-            local = ThreadingHTTPServer(("127.0.0.1", srv.server_port), Handler)
+            local = Server(("127.0.0.1", srv.server_port), Handler)
         except OSError as exc:
             print(f"dromond http: no loopback listener — {exc}",
                   file=sys.stderr, flush=True)

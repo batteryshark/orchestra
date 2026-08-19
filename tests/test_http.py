@@ -182,6 +182,25 @@ class AuthTests(ServerCase):
         self.assertEqual(self.request()[0], 200)
 
 
+class DroppedConnectionTests(unittest.TestCase):
+    def _server(self):
+        srv = mhttp.Server(("127.0.0.1", 0), mhttp.Handler)
+        self.addCleanup(srv.server_close)
+        return srv
+
+    def test_a_reset_is_not_printed(self) -> None:
+        with mock.patch.object(mhttp.ThreadingHTTPServer, "handle_error") as parent:
+            with mock.patch("sys.exception", return_value=ConnectionResetError()):
+                self._server().handle_error(None, ("100.1.2.3", 1))
+        parent.assert_not_called()
+
+    def test_a_real_fault_still_prints(self) -> None:
+        with mock.patch.object(mhttp.ThreadingHTTPServer, "handle_error") as parent:
+            with mock.patch("sys.exception", return_value=RuntimeError("boom")):
+                self._server().handle_error(None, ("100.1.2.3", 1))
+        parent.assert_called_once()
+
+
 class HostCheckTests(ServerCase):
     def test_a_foreign_host_header_is_refused(self) -> None:
         status, text = self.request(host="evil.example")

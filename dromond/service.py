@@ -289,9 +289,7 @@ def _win_install(start: bool = False) -> int:
 
 
 def _win_uninstall() -> int:
-    if _win_task_running():
-        subprocess.run(["schtasks", "/End", "/TN", WIN_TASK],
-                       capture_output=True, text=True)
+    _win_kill_daemons()
     if _win_task_exists():
         res = subprocess.run(["schtasks", "/Delete", "/TN", WIN_TASK, "/F"],
                              capture_output=True, text=True)
@@ -309,14 +307,36 @@ def _win_uninstall() -> int:
     return 0
 
 
+def _win_daemon_pids() -> list[int]:
+    """PIDs whose command line is the daemon, never this CLI process."""
+    me = os.getpid()
+    res = subprocess.run(
+        ["wmic", "process", "where",
+         "CommandLine like '%dromond%daemon%'",
+         "get", "ProcessId"],
+        capture_output=True, text=True)
+    pids = []
+    for token in (res.stdout or "").split():
+        if token.isdigit() and int(token) != me:
+            pids.append(int(token))
+    return pids
+
+
+def _win_kill_daemons() -> None:
+    """schtasks /End only stops the cmd wrapper; the python daemon stays up."""
+    subprocess.run(["schtasks", "/End", "/TN", WIN_TASK],
+                   capture_output=True, text=True)
+    for pid in _win_daemon_pids():
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, text=True)
+
+
 def _win_restart() -> int:
     if not _win_task_exists():
         print("dromond service: no scheduled task. "
               "`dromond daemon` or `dromond service install --start`")
         return 1
-    if _win_task_running():
-        subprocess.run(["schtasks", "/End", "/TN", WIN_TASK],
-                       capture_output=True, text=True)
+    _win_kill_daemons()
     _write_wrapper()
     res = subprocess.run(["schtasks", "/Run", "/TN", WIN_TASK],
                          capture_output=True, text=True)
