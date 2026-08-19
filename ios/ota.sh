@@ -16,12 +16,15 @@ cd "$(dirname "$0")"
 TEAM="${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
   | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}"
 PORT="${DROMOND_OTA_PORT:-8791}"
+# One app per path: Work publishes at /install, so Dromond gets its own and
+# neither unmounts the other when both are being handed to a phone.
+WEBPATH="${DROMOND_OTA_PATH:-/dromond}"
 OUT="${TMPDIR:-/tmp}/dromond-ota"
 HOST="$(tailscale status --json 2>/dev/null \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
 
 if [ "${1:-}" = "--off" ]; then
-  tailscale serve --set-path /install off 2>/dev/null || true
+  tailscale serve --set-path "$WEBPATH" off 2>/dev/null || true
   pkill -f "http.server $PORT" 2>/dev/null || true
   echo "ota: stopped serving; the tailnet path is removed"
   exit 0
@@ -63,7 +66,7 @@ cat > "$OUT/serve/manifest.plist" <<PLIST
 <plist version="1.0"><dict><key>items</key><array><dict>
   <key>assets</key><array><dict>
     <key>kind</key><string>software-package</string>
-    <key>url</key><string>https://$HOST/install/Dromond.ipa</string>
+    <key>url</key><string>https://$HOST$WEBPATH/Dromond.ipa</string>
   </dict></array>
   <key>metadata</key><dict>
     <key>bundle-identifier</key><string>com.batteryshark.dromond</string>
@@ -88,7 +91,7 @@ p{color:#8b95a5;font-size:14px;text-align:center;max-width:22rem;line-height:1.5
 <path transform="translate(78,96)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
 <path transform="translate(118,214)" fill="#61A5E8" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
 <path transform="translate(78,332)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/></svg>
-<a href="itms-services://?action=download-manifest&url=https://$HOST/install/manifest.plist">Install Dromond $VER ($BUILD)</a>
+<a href="itms-services://?action=download-manifest&url=https://$HOST$WEBPATH/manifest.plist">Install Dromond $VER ($BUILD)</a>
 <p>Tap install, then find Dromond on the home screen. The phone has to be on the tailnet.</p>
 </div>
 HTML
@@ -97,9 +100,9 @@ pkill -f "http.server $PORT" 2>/dev/null || true
 ( cd "$OUT/serve" && nohup python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 & )
 sleep 2
 # A PATH mapping, never the root: whatever is already served at / stays there.
-tailscale serve --bg --set-path /install "http://127.0.0.1:$PORT" >/dev/null
+tailscale serve --bg --set-path "$WEBPATH" "http://127.0.0.1:$PORT" >/dev/null
 
 echo
-echo "  Open this on the phone:  https://$HOST/install/"
+echo "  Open this on the phone:  https://$HOST$WEBPATH/"
 echo "  Dromond $VER ($BUILD) · $(du -h "$OUT/serve/Dromond.ipa" | cut -f1)"
 echo "  Stop serving with:       ./ios/ota.sh --off"
