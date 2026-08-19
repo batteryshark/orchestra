@@ -11,7 +11,8 @@ from pathlib import Path
 from dromond import (acp, auth, conductor, config, daemon, db, dispatch,
                          hooks, http, merge, messaging, migrate, names, nod,
                          observer, paths, proc, profile_edit, profiles, project,
-                         runway, service, supervise, sweeper, traces, worktree)
+                         review, runway, service, supervise, sweeper, traces,
+                         worktree)
 
 
 def _here(con) -> tuple:
@@ -918,6 +919,38 @@ def cmd_stats(args):
               f"{_spend(p['cost'], p.get('billing', 'api')):>12}")
 
 
+def cmd_review(args):
+    """W-0130: how each profile DID, not how much it ran — outcomes per
+    (profile, model) over terminal runs, worst first. The router reads tier,
+    priority and profile notes; this is the evidence for adjusting them."""
+    con = db.connect()
+    rows = review.performance(con)
+    con.close()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no finished runs to review")
+        return
+    print(f"{'profile':<14} {'model':<26} {'runs':>5} {'ok':>5} "
+          f"{'f/t/k':>7} {'avg':>7} {'tokens':>14} {'cost':>12}  note")
+    for r in rows:
+        notes = []
+        if r["uncaptured"]:
+            notes.append(f"{r['uncaptured']} without usage")
+        if r["plan_runs"]:
+            notes.append(f"{r['plan_runs']} plan-backed (no price)")
+        breaks = f"{r['failed']}/{r['timeout']}/{r['killed']}"
+        print(f"{r['profile'][:14]:<14} {(r['model'] or '–')[:26]:<26} "
+              f"{r['runs']:>5} {r['success'] * 100:>4.0f}% "
+              f"{breaks:>7} "
+              f"{_dur(r['avg_seconds']):>7} {_stat(r['tokens']):>14} "
+              f"{_stat(r['cost'], money=True):>12}  {'; '.join(notes)}")
+    print("\ninfluence routing: `dromond profiles note <name> \"...\"` — "
+          "the staffing turn reads notes, tier and priority.")
+
+
+
 def cmd_merge(args):
     criteria = Path(args.criteria_file).read_text(encoding="utf-8") if args.criteria_file else ""
     con = db.connect()
@@ -1256,6 +1289,11 @@ def main():
                                      "profile (DESIGN §11)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("review", help="performance review of runners: outcomes "
+                                      "per profile/model, worst first (W-0130)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("merge", help="verify a run branch and land it on the base (DESIGN §9)")
     s.add_argument("branch", help="run branch, e.g. dromond/run-7")
