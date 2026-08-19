@@ -18,7 +18,7 @@ struct RunsView: View {
               let id = arguments[safe: at + 1].flatMap(Int.init),
               let run = state.runs.first(where: { $0.id == id })
         else { return }
-        path = [run]
+        path = [.run(run)]
     }
 
     private var matching: [Run] {
@@ -33,7 +33,7 @@ struct RunsView: View {
         }
     }
 
-    @State private var path: [Run] = []
+    @State private var path: [RunsRoute] = []
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -44,7 +44,12 @@ struct RunsView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Runs")
             .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
-            .navigationDestination(for: Run.self) { RunDetailView(run: $0) }
+            .navigationDestination(for: RunsRoute.self) { route in
+                switch route {
+                case let .run(run): RunDetailView(run: run)
+                case .decisions: DecisionLogView()
+                }
+            }
             .searchable(text: $query, prompt: "id, title, work item, profile")
             // Everything searched here is an identifier — a slug, a profile
             // name, W-0171. Autocapitalising the first letter is wrong every
@@ -84,9 +89,16 @@ struct RunsView: View {
             // pinned above the fleet.
             // It is never in `state.runs`, so the badge and the live count
             // do not move for it. It opens the same detail screen as a run.
+            // I-0081: the latest decision is one line of a series. The second
+            // row is the way into the rest of it — the turns going back, which
+            // is where the observer's reasoning is actually readable.
             if query.isEmpty, let turn = state.pinnedTurn {
                 Section("Latest decision") {
-                    NavigationLink(value: turn) { TurnRow(turn: turn) }
+                    NavigationLink(value: RunsRoute.run(turn)) { TurnRow(turn: turn) }
+                    NavigationLink(value: RunsRoute.decisions) {
+                        Label("Decision log", systemImage: "list.bullet.rectangle")
+                            .font(.subheadline)
+                    }
                 }
             }
             if !live.isEmpty {
@@ -114,7 +126,7 @@ struct RunsView: View {
     }
 
     private func row(_ run: Run) -> some View {
-        NavigationLink(value: run) { RunRow(run: run) }
+        NavigationLink(value: RunsRoute.run(run)) { RunRow(run: run) }
             .swipeActions(edge: .trailing) {
                 if run.live {
                     Button("Stop", systemImage: "stop.circle", role: .destructive) {
@@ -127,9 +139,109 @@ struct RunsView: View {
     }
 }
 
-/// The pinned control turn: which layer decided, what it decided, and the
-/// escalation it produced — the summary names both. Opens the ordinary run
-/// detail screen, where its transcript is the trace tab.
+/// What the Runs tab can push. A plain `[Run]` path could not carry the
+/// decision log, and a view-based link beside a value-based path is the one
+/// combination SwiftUI does not keep straight.
+enum RunsRoute: Hashable {
+    case run(Run)
+    case decisions
+}
+
+/// Every control turn, newest first (I-0081).
+///
+/// The snapshot pins one turn per project — the newest. That reads as a single
+/// line with no history, which is not what a decision is: the observer looked
+/// at this run four times before it stopped it. This screen is the series, and
+/// each row opens the same detail screen, so the reasoning is the trace tab
+/// that already exists.
+///
+/// Scoped like the board it hangs off: the project picker on the Runs tab
+/// decides which project's turns these are.
+struct DecisionLogView: View {
+    @EnvironmentObject private var state: AppState
+    @State private var turns: [Run] = []
+    @State private var layer: String?
+    @State private var error: String?
+    @State private var loaded = false
+
+    /// The four layers a turn can come from. A closed set in the daemon, so
+    /// the picker names them rather than asking what exists.
+    private static let layers = ["observer", "router", "merge", "conductor"]
+
+    var body: some View {
+        List {
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            ForEach(turns) { turn in
+                NavigationLink(value: RunsRoute.run(turn)) { TurnRow(turn: turn) }
+            }
+            if turns.isEmpty && loaded && error == nil {
+                ContentUnavailableView(
+                    "No decisions",
+                    systemImage: "brain",
+                    description: Text(layer == nil
+                        ? "Nothing has been decided in this project yet."
+                        : "No \(layer ?? "") turn in this project yet.")
+                )
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("Decision log")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button { layer = nil } label: {
+                        if layer == nil {
+                            Label("All layers", systemImage: "checkmark")
+                        } else {
+                            Text("All layers")
+                        }
+                    }
+                    Divider()
+                    ForEach(Self.layers, id: \.self) { name in
+                        Button { layer = name } label: {
+                            if layer == name {
+                                Label(name, systemImage: "checkmark")
+                            } else {
+                                Text(name)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(layer ?? "All layers").lineLimit(1)
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                            .font(.caption2)
+                    }
+                }
+            }
+        }
+        // Reloads when the filter changes: the daemon applies the layer, so
+        // the page is a hundred of the turns asked for, not a hundred of
+        // everything with four of them left after a local filter.
+        .task(id: layer) { await load() }
+        .refreshable { await load() }
+    }
+
+    private func load() async {
+        do {
+            turns = try await state.api().turns(projectID: state.selectedProjectID,
+                                                layer: layer)
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loaded = true
+    }
+}
+
+/// One control turn: which layer decided, what it decided, and when. The
+/// summary names the escalation it produced. Opens the ordinary run detail
+/// screen, where its transcript is the trace tab.
 private struct TurnRow: View {
     let turn: Run
 
@@ -138,7 +250,9 @@ private struct TurnRow: View {
             HStack(spacing: 8) {
                 Image(systemName: "brain")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    // The observer is the layer the owner reads for; the
+                    // other three are the machine staffing and judging itself.
+                    .foregroundStyle(turn.layer == "observer" ? Color.accentColor : .secondary)
                     .accessibilityLabel("Control turn")
                 Text(turn.layer ?? "turn")
                     .font(.subheadline.monospaced().weight(.semibold))
@@ -152,7 +266,12 @@ private struct TurnRow: View {
             if !turn.summary.isEmpty {
                 Text(turn.summary)
                     .font(.subheadline)
-                    .lineLimit(2)
+                    .lineLimit(3)
+            }
+            if let at = turn.finishedAt ?? turn.startedAt {
+                Text(at.relativeStamp)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 3)

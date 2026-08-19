@@ -12,6 +12,10 @@ Shape:
   selected run's brief and committed changes when their tabs open. They are
   routes rather than snapshot fields because the snapshot carries every run
   every 4 seconds.
+- **The control-turn log** (I-0081): ``GET /api/turns`` is the SERIES of
+  control turns, newest first, optionally one project's and one layer's. The
+  snapshot pins only the latest per project; reading the observer's reasoning
+  over time is a screen you open, not a thing worth carrying on a 4s poll.
 - **One per-project read** (W-0186, reshaped by W-0187): ``GET
   /api/project?id=<projectId>`` carries that project's ENABLED SET — which
   of the global profiles it may staff — and its own statistics. ``POST
@@ -171,6 +175,14 @@ RUNWAY_ROUTE = "/api/runway"
 # statistics. ``POST`` the same path writes the enabled set. Unlisted in
 # auth.ROUTES, so the human's alone, like runway.
 PROJECT_ROUTE = "/api/project"
+# ``GET /api/turns?project=<projectId>&layer=<layer>&limit=<n>`` (I-0081) —
+# the control turns themselves, newest first. The snapshot pins one turn per
+# project; this is the series behind it, so the observer's decisions read as a
+# log. A route rather than a snapshot field for the same reason briefs are
+# (W-0183): it is read when the log is opened, not every 4 seconds. Unlisted
+# in auth.ROUTES, so the human's alone.
+TURNS_ROUTE = "/api/turns"
+RECENT_TURNS = 200
 # ``GET /api/config`` is the file as written; ``POST`` replaces it (W-0190).
 # Unlisted in auth.ROUTES, so the human's alone — the file holds the shared
 # secret and every profile.
@@ -808,6 +820,54 @@ def project_scope(project_id: str, con=None) -> dict:
             con.close()
 
 
+def control_turns(project_id: str = "", layer: str = "",
+                  limit: int = RECENT_TURNS, con=None) -> dict:
+    """``GET /api/turns`` (I-0081) — the control turns, newest first.
+
+    The snapshot pins the LATEST turn per project. This is the series behind
+    that one line: the observer's thinking, the router's staffing, the merge
+    judge's verdicts, read as a log going back.
+
+    The rows are the ordinary run payload, because a control turn IS a runs
+    row — so the client opens one in the same detail screen and reads its
+    transcript through the same trace renderer as any run.
+
+    Empty ``project_id`` means every project, matching the client's own "all
+    projects" scope. ``layer`` narrows to one of router/merge/observer/
+    conductor and is filtered HERE, not on the client, so ``limit`` counts the
+    turns that were asked for rather than whatever happened to be newest.
+    """
+    own = con is None
+    con = db.connect() if own else con
+    try:
+        where = ["r.layer IS NOT NULL"]
+        args: list = []
+        if project_id:
+            where.append("r.project_id=?")
+            args.append(project_id)
+        if layer:
+            where.append("r.layer=?")
+            args.append(layer)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = RECENT_TURNS
+        limit = max(1, min(limit, RECENT_TURNS))
+        rows = con.execute(
+            _RUN_SELECT + "WHERE " + " AND ".join(where) +
+            " ORDER BY r.id DESC LIMIT ?", (*args, limit)).fetchall()
+        return {
+            "turns": [_run_payload(con, r, {}) for r in rows],
+            "project_id": project_id or None,
+            "layer": layer or None,
+            "limit": limit,
+            "generated_at": db.now(),
+        }
+    finally:
+        if own:
+            con.close()
+
+
 def snapshot(con=None) -> dict:
     own = con is None
     con = db.connect() if own else con
@@ -1291,6 +1351,11 @@ class Handler(BaseHTTPRequestHandler):
             if not project_id:
                 return self._deny(400, "GET /api/project needs ?id=<projectId>")
             return self._json(project_scope(project_id))
+        if path == TURNS_ROUTE:
+            return self._json(control_turns(
+                (query.get("project") or [""])[0].strip(),
+                (query.get("layer") or [""])[0].strip(),
+                (query.get("limit") or [RECENT_TURNS])[0]))
         if path == CONFIG_ROUTE:
             cfg_path = config.ensure_global_config()
             return self._json({"path": str(cfg_path),

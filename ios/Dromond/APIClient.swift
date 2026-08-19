@@ -34,6 +34,30 @@ struct DromondAPI: Sendable {
         return page.runway
     }
 
+    /// The control turns as a SERIES (I-0081), newest first. The snapshot pins
+    /// only the latest one per project; this is the log behind it. A nil
+    /// `projectID` reads every project, matching the app's own "all projects"
+    /// scope, and `layer` narrows to one of router/merge/observer/conductor.
+    ///
+    /// The layer filter goes to the daemon rather than being applied here, so
+    /// `limit` counts the turns asked for — filtering a page of 100 locally
+    /// shows four observer turns and calls it the log.
+    func turns(projectID: String? = nil, layer: String? = nil,
+               limit: Int = 100) async throws -> [Run] {
+        var items = [URLQueryItem(name: "limit", value: String(limit))]
+        if let projectID, !projectID.isEmpty {
+            items.append(URLQueryItem(name: "project", value: projectID))
+        }
+        if let layer, !layer.isEmpty {
+            items.append(URLQueryItem(name: "layer", value: layer))
+        }
+        var components = URLComponents()
+        components.queryItems = items
+        let page: TurnsPage = try await get(
+            "api/turns" + (components.query.map { "?\($0)" } ?? ""))
+        return page.turns
+    }
+
     func project(id: String) async throws -> ProjectDetail {
         let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? id
         return try await get("api/project?id=\(escaped)")
@@ -212,6 +236,19 @@ struct RunwayPage: Decodable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case runway
+        case generatedAt = "generated_at"
+    }
+}
+
+/// `GET /api/turns` answers with an OBJECT, like `/api/runway` — the turns are
+/// under a key, and the rows are ordinary run payloads because a control turn
+/// is a runs row.
+struct TurnsPage: Decodable, Sendable {
+    let turns: [Run]
+    let generatedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case turns
         case generatedAt = "generated_at"
     }
 }

@@ -215,6 +215,77 @@ class ControlTurnTestCase(unittest.TestCase):
                              _write(self.tmp.name), True, "no project")
         self.assertEqual(http.snapshot(self.con)["pinned_turns"], [])
 
+    # --- the log: the series behind the pinned line (I-0081) -----------------
+
+    def test_the_log_is_the_series_not_only_the_newest(self) -> None:
+        """The pinned entry is one decision. The owner reads the reasoning
+        over time, so the log goes back."""
+        for note in ("watched once", "watched twice", "watched again"):
+            observer.record_turn(self.con, "observer", PROFILE,
+                                 _write(self.tmp.name), True, note,
+                                 project_id="proj-a")
+        observer.record_turn(self.con, "router", PROFILE,
+                             _write(self.tmp.name), True, "staffed for B",
+                             project_id="proj-b")
+        page = http.control_turns("proj-a", con=self.con)
+        self.assertEqual([t["summary"] for t in page["turns"]],
+                         ["watched again", "watched twice", "watched once"],
+                         "newest first, and every turn of this project")
+        self.assertEqual({t["project_id"] for t in page["turns"]}, {"proj-a"})
+        every = http.control_turns(con=self.con)["turns"]
+        self.assertEqual(len(every), 4, "no project named means every project")
+
+    def test_the_log_filters_by_layer(self) -> None:
+        observer.record_turn(self.con, "observer", PROFILE,
+                             _write(self.tmp.name), True, "watched",
+                             project_id="proj-a")
+        observer.record_turn(self.con, "router", PROFILE,
+                             _write(self.tmp.name), True, "staffed",
+                             project_id="proj-a")
+        page = http.control_turns("proj-a", "observer", con=self.con)
+        self.assertEqual([t["layer"] for t in page["turns"]], ["observer"])
+        self.assertEqual(page["layer"], "observer")
+        self.assertEqual(http.control_turns("proj-a", "merge",
+                                            con=self.con)["turns"], [],
+                         "a layer that has not decided anything is empty, "
+                         "not everything")
+
+    def test_the_log_is_turns_alone_and_carries_the_trace_link(self) -> None:
+        """A worker run in the log would be the fleet again — and the row has
+        to be a run payload, because the client opens it in the run detail
+        screen and reads its transcript there."""
+        self.con.execute(
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "project_id, started_at) VALUES('w','opencode','human','/p',"
+            "'running','proj-a',?)", (db.now(),))
+        self.con.commit()
+        turn_id = observer.record_turn(self.con, "observer", PROFILE,
+                                       _write(self.tmp.name), True, "watched",
+                                       project_id="proj-a")
+        turns = http.control_turns("proj-a", con=self.con)["turns"]
+        self.assertEqual([t["id"] for t in turns], [turn_id])
+        self.assertEqual(turns[0]["layer"], "observer")
+        self.assertIn("reasoning",
+                      {e["kind"] for e in traces.events_for_run(self.con, turn_id)})
+
+    def test_the_log_is_bounded(self) -> None:
+        for _ in range(4):
+            observer.record_turn(self.con, "observer", PROFILE,
+                                 _write(self.tmp.name), True, "watched",
+                                 project_id="proj-a")
+        # A query string arrives as text, and a hostile one arrives as junk.
+        self.assertEqual(len(http.control_turns("proj-a", limit="2",
+                                                con=self.con)["turns"]), 2)
+        self.assertEqual(http.control_turns("proj-a", limit="lots",
+                                            con=self.con)["limit"],
+                         http.RECENT_TURNS)
+        self.assertEqual(http.control_turns("proj-a", limit=10 ** 6,
+                                            con=self.con)["limit"],
+                         http.RECENT_TURNS, "the cap is the daemon's, not the "
+                         "caller's")
+        self.assertEqual(http.control_turns("proj-a", limit=0,
+                                            con=self.con)["limit"], 1)
+
     def test_statistics_and_the_performance_review_skip_turns(self) -> None:
         from dromond import review
         observer.record_turn(self.con, "merge", PROFILE,

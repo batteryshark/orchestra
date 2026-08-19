@@ -104,6 +104,32 @@ final class SnapshotDecoderTests: XCTestCase {
         XCTAssertEqual(options["opencode"]?.effortNote, "no --effort flag")
     }
 
+    /// The decision log (I-0081). The daemon answers with an OBJECT, like
+    /// `/api/runway` — decoding the bare array here is the mistake that route
+    /// already made once. The rows are run payloads, because a control turn IS
+    /// a runs row and the log opens it in the run detail screen.
+    func testTheDecisionLogDecodesAsAPageOfRuns() throws {
+        let page = try JSONDecoder().decode(TurnsPage.self, from: Data("""
+        {"turns": [
+          {"id": 91, "status": "done", "profile": "cheap", "backend": "opencode",
+           "layer": "observer", "project_id": "proj-a", "live": false,
+           "summary": "ok: steady progress", "finished_at": "2026-08-19T20:45:39Z"},
+          {"id": 88, "status": "failed", "profile": "cheap", "backend": "opencode",
+           "layer": "router", "project_id": "proj-a", "live": false,
+           "summary": "staffed big over stub"}],
+         "project_id": "proj-a", "layer": null, "limit": 100,
+         "generated_at": "2026-08-19T20:46:00Z"}
+        """.utf8))
+        XCTAssertEqual(page.turns.map(\.id), [91, 88])
+        XCTAssertEqual(page.turns.first?.layer, "observer")
+        XCTAssertEqual(page.turns.first?.summary, "ok: steady progress")
+        XCTAssertEqual(page.generatedAt, "2026-08-19T20:46:00Z")
+        // The row stamps the turn, so an unparseable date must not blank it.
+        XCTAssertNotEqual("2026-08-19T20:45:39Z".relativeStamp,
+                          "2026-08-19T20:45:39Z")
+        XCTAssertEqual("not a date".relativeStamp, "not a date")
+    }
+
     /// The upgrade path that must not lose anything: a phone that already had
     /// one server keeps it, pointed at the Keychain account its key is already
     /// under, so nobody is asked to retype a secret.

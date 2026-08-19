@@ -232,6 +232,31 @@ extension Double {
     }
 }
 
+extension String {
+    /// "12m ago" from a daemon timestamp. A stamp that will not parse is shown
+    /// as it came, never dropped.
+    var relativeStamp: String {
+        guard let date = Self.stampParser.date(from: self) else { return self }
+        return Self.stampRelative.localizedString(for: date, relativeTo: Date())
+    }
+
+    // Built once, never mutated after: both are configured here and only ever
+    // asked to format. `nonisolated(unsafe)` says exactly that — the
+    // alternative is a formatter per row, and a list of a hundred turns builds
+    // two hundred of them.
+    nonisolated(unsafe) private static let stampParser: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    nonisolated(unsafe) private static let stampRelative: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f
+    }()
+}
+
 extension Int {
     /// "12,480" — token counts are read, not computed with.
     var grouped: String {
