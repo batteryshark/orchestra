@@ -429,7 +429,7 @@ def prompt_for(con, run, *, limit: int = DIGEST_EVENTS) -> str:
     try:
         if run["brief_path"]:
             mission = Path(run["brief_path"]).read_text(
-                errors="replace")[:MISSION_CHARS]
+                encoding="utf-8", errors="replace")[:MISSION_CHARS]
     except OSError:
         mission = ""
     started = _epoch(run["started_at"])
@@ -777,10 +777,10 @@ def _retry_row(con, run, root) -> int:
          base_commit, run["work_item"], run["id"], db.now())).lastrowid)
     brief = paths.briefs_dir() / f"run-{run_id}.md"
     try:
-        text = Path(run["brief_path"]).read_text(errors="replace")
+        text = Path(run["brief_path"]).read_text(encoding="utf-8", errors="replace")
     except (OSError, TypeError):
         text = run["title"] or "Continue the original mission."
-    brief.write_text(text)
+    brief.write_text(text, encoding="utf-8")
     log = paths.logs_dir() / f"run-{run_id}.jsonl"
     log.touch()
     con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",

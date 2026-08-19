@@ -1,25 +1,34 @@
-"""launchd LaunchAgent for `dromond daemon` (DESIGN §2).
+"""User-session supervisor for `dromond daemon` (DESIGN §2).
 
-A LaunchAgent in the user session, never a system daemon: the agent CLIs
-need the login keychain and the user's project checkouts.
+macOS: a LaunchAgent. Windows: a per-user Scheduled Task at logon. Never a
+system daemon: the agent CLIs need the login keychain / credential store
+and the user's project checkouts.
 
-Installing writes the plist and nothing else. Loading is a separate,
+Installing writes the unit and nothing else. Loading is a separate,
 explicit `--start`, because writing a file is reversible and starting a
 process that dispatches agents is not.
 """
 import os
 import plistlib
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from dromond import paths
+from dromond import paths, proc
 
 # ponytail: one fixed label, so one daemon per login session. DESIGN §2 wants
 # a second daemon for a genuinely separate workspace — derive the label from
 # DROMOND_HOME when that arrives.
 LABEL = "local.dromond.daemon"
+WIN_TASK = "DromondDaemon"
+
+
+def _windows() -> bool:
+    return sys.platform == "win32"
+
+
+def _uid() -> int:
+    return os.getuid() if hasattr(os, "getuid") else 0
 
 
 def plist_path() -> Path:
@@ -27,7 +36,7 @@ def plist_path() -> Path:
 
 
 def _program() -> list[str]:
-    exe = shutil.which("dromond")
+    exe = proc.which("dromond")
     return [exe, "daemon"] if exe else [sys.executable, "-m", "dromond", "daemon"]
 
 
@@ -57,7 +66,7 @@ def build_plist() -> dict:
 
 
 def _service_target() -> str:
-    return f"gui/{os.getuid()}/{LABEL}"
+    return f"gui/{_uid()}/{LABEL}"
 
 
 def _launchctl(*args: str) -> subprocess.CompletedProcess:
@@ -69,6 +78,12 @@ def is_loaded() -> bool:
 
 
 def install(start: bool = False) -> int:
+    if _windows():
+        return _win_install(start)
+    return _darwin_install(start)
+
+
+def _darwin_install(start: bool = False) -> int:
     p = plist_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     existed = p.exists()
@@ -79,9 +94,9 @@ def install(start: bool = False) -> int:
     print(f"  logs: {paths.logs_dir()}/daemon.{{out,err}}.log")
     if not start:
         print("  not loaded (pass --start, or run "
-              f"`launchctl bootstrap gui/{os.getuid()} {p}`)")
+              f"`launchctl bootstrap gui/{_uid()} {p}`)")
         return 0
-    res = _launchctl("bootstrap", f"gui/{os.getuid()}", str(p))
+    res = _launchctl("bootstrap", f"gui/{_uid()}", str(p))
     if res.returncode != 0:
         print(f"dromond service: launchctl bootstrap failed: "
               f"{(res.stderr or res.stdout).strip()}")
@@ -91,6 +106,12 @@ def install(start: bool = False) -> int:
 
 
 def uninstall() -> int:
+    if _windows():
+        return _win_uninstall()
+    return _darwin_uninstall()
+
+
+def _darwin_uninstall() -> int:
     p = plist_path()
     if is_loaded():
         res = _launchctl("bootout", _service_target())
@@ -110,10 +131,16 @@ def restart() -> int:
     The dashboard's restart button re-execs the running process; this is the
     same intent from a terminal, and the two differ in what they can do. Under
     launchd, ``kickstart -k`` kills and relaunches, which picks up a changed
-    plist as well as changed code. Without launchd there is no supervisor to
-    restart anything, so the honest answer is to say what is running and let
-    the operator stop it.
+    plist as well as changed code. Without a supervisor there is nothing to
+    restart, so the honest answer is to say what is running and let the
+    operator stop it.
     """
+    if _windows():
+        return _win_restart()
+    return _darwin_restart()
+
+
+def _darwin_restart() -> int:
     if not is_loaded():
         running = subprocess.run(["pgrep", "-f", "dromond daemon"],
                                  capture_output=True, text=True)
@@ -137,6 +164,19 @@ def restart() -> int:
 
 
 def status() -> int:
+    if _windows():
+        return _win_status()
+    return _darwin_status()
+
+
+def status_line() -> str:
+    if _windows():
+        return f"scheduled task {WIN_TASK} ({'installed' if _win_task_exists() else 'not installed'})"
+    return (f"{plist_path()} "
+            f"({'installed' if plist_path().exists() else 'not installed'})")
+
+
+def _darwin_status() -> int:
     p = plist_path()
     print(f"dromond service: {LABEL}")
     print(f"  plist:  {p} ({'present' if p.exists() else 'absent'})")
@@ -151,4 +191,150 @@ def status() -> int:
             fields[key] = value.strip()
     print("  launchd: loaded" + "".join(
         f", {k} {v}" for k, v in fields.items() if v is not None))
+    return 0
+
+
+def wrapper_path() -> Path:
+    return paths.home() / "daemon.cmd"
+
+
+def _write_wrapper() -> Path:
+    program = _program()
+    logs = paths.logs_dir()
+    path_value = proc.enrich_path(dict(os.environ)).get("PATH", "")
+    quoted = subprocess.list2cmdline(program)
+    lines = [
+        "@echo off",
+        f'set "PATH={path_value}"',
+        'set "PYTHONIOENCODING=utf-8"',
+        'set "PYTHONUTF8=1"',
+    ]
+    for name in ("DROMOND_HOME", "DROMOND_CONFIG"):
+        value = paths.env(name)
+        if value:
+            lines.append(f'set "{name}={value}"')
+    lines += [
+        f'cd /d "{Path.home()}"',
+        f'{quoted} >> "{logs / "daemon.out.log"}" 2>> "{logs / "daemon.err.log"}"',
+        "",
+    ]
+    dest = wrapper_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(lines), encoding="utf-8")
+    return dest
+
+
+def _ps(script: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True)
+
+
+def _win_task_exists() -> bool:
+    res = subprocess.run(
+        ["schtasks", "/Query", "/TN", WIN_TASK],
+        capture_output=True, text=True)
+    return res.returncode == 0
+
+
+def _win_task_running() -> bool:
+    res = subprocess.run(
+        ["schtasks", "/Query", "/TN", WIN_TASK, "/FO", "LIST"],
+        capture_output=True, text=True)
+    if res.returncode != 0:
+        return False
+    return any(line.strip().lower() == "status: running"
+               for line in res.stdout.splitlines())
+
+
+def _win_install(start: bool = False) -> int:
+    wrapper = _write_wrapper()
+    existed = _win_task_exists()
+    # PT0S = no execution time limit (schtasks defaults to 72 hours).
+    script = (
+        f'$action = New-ScheduledTaskAction -Execute "cmd.exe" '
+        f'-Argument "/c `"{wrapper}`"" -WorkingDirectory "{Path.home()}"; '
+        f'$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; '
+        f'$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries '
+        f'-DontStopIfGoingOnBatteries -RestartCount 3 '
+        f'-RestartInterval (New-TimeSpan -Minutes 1) '
+        f'-ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; '
+        f'$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME '
+        f'-LogonType Interactive -RunLevel Limited; '
+        f'Register-ScheduledTask -TaskName "{WIN_TASK}" -Action $action '
+        f'-Trigger $trigger -Settings $settings -Principal $principal -Force '
+        f'| Out-Null'
+    )
+    res = _ps(script)
+    if res.returncode != 0:
+        print(f"dromond service: scheduled task failed: "
+              f"{(res.stderr or res.stdout).strip()}")
+        return 1
+    print(f"dromond service: {'rewrote' if existed else 'wrote'} "
+          f"scheduled task {WIN_TASK}")
+    print(f"  runs: {wrapper}")
+    print(f"  logs: {paths.logs_dir()}/daemon.{{out,err}}.log")
+    if not start:
+        print("  not started (pass --start, or run "
+              f"`schtasks /Run /TN {WIN_TASK}`)")
+        return 0
+    run = subprocess.run(["schtasks", "/Run", "/TN", WIN_TASK],
+                         capture_output=True, text=True)
+    if run.returncode != 0:
+        print(f"dromond service: schtasks /Run failed: "
+              f"{(run.stderr or run.stdout).strip()}")
+        return 1
+    print(f"  started scheduled task {WIN_TASK}")
+    return 0
+
+
+def _win_uninstall() -> int:
+    if _win_task_running():
+        subprocess.run(["schtasks", "/End", "/TN", WIN_TASK],
+                       capture_output=True, text=True)
+    if _win_task_exists():
+        res = subprocess.run(["schtasks", "/Delete", "/TN", WIN_TASK, "/F"],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"dromond service: schtasks /Delete failed: "
+                  f"{(res.stderr or res.stdout).strip()}")
+            return 1
+        print(f"dromond service: removed scheduled task {WIN_TASK}")
+    else:
+        print(f"dromond service: no scheduled task {WIN_TASK}")
+    wrapper = wrapper_path()
+    if wrapper.exists():
+        wrapper.unlink()
+        print(f"dromond service: removed {wrapper}")
+    return 0
+
+
+def _win_restart() -> int:
+    if not _win_task_exists():
+        print("dromond service: no scheduled task. "
+              "`dromond daemon` or `dromond service install --start`")
+        return 1
+    if _win_task_running():
+        subprocess.run(["schtasks", "/End", "/TN", WIN_TASK],
+                       capture_output=True, text=True)
+    _write_wrapper()
+    res = subprocess.run(["schtasks", "/Run", "/TN", WIN_TASK],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"dromond service: schtasks /Run failed: "
+              f"{(res.stderr or res.stdout).strip()}")
+        return 1
+    print(f"dromond service: restarted scheduled task {WIN_TASK}")
+    return 0
+
+
+def _win_status() -> int:
+    wrapper = wrapper_path()
+    print(f"dromond service: {WIN_TASK}")
+    print(f"  wrapper: {wrapper} ({'present' if wrapper.exists() else 'absent'})")
+    if not _win_task_exists():
+        print("  scheduled task: not installed")
+        return 0
+    state = "running" if _win_task_running() else "ready"
+    print(f"  scheduled task: installed, {state}")
     return 0

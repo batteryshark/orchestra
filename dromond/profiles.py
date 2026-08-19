@@ -23,7 +23,9 @@ REASONIX_CONFIG = Path("~/.reasonix/config.toml")
 def _run(cmd: list[str]) -> tuple[str | None, str | None]:
     """(stdout, error) — exactly one is None."""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True,
+        from dromond.proc import resolve_cmd
+        res = subprocess.run(resolve_cmd(cmd), capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
                              timeout=DISCOVER_TIMEOUT)
     except FileNotFoundError:
         return None, f"{cmd[0]} is not installed"
@@ -103,7 +105,7 @@ def discover(runner=_run, reasonix_config: Path = REASONIX_CONFIG) -> dict:
                                parse_codex_models)
     path = reasonix_config.expanduser()
     try:
-        results["reasonix"] = {"data": parse_reasonix_config(path.read_text()),
+        results["reasonix"] = {"data": parse_reasonix_config(path.read_text(encoding="utf-8")),
                                "error": None}
     except OSError:
         results["reasonix"] = {"data": None, "error": f"{path} not found"}

@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dromond import config, paths, profiles, work_client
+from dromond.proc import chmod
 
 # The harnesses. The config KEY is still `backend`; "harness" is the word
 # every human-facing string uses (W-0181).
@@ -304,7 +305,7 @@ def set_enabled(project_id: str, names) -> dict:
                     "error": f"not a configured profile: {', '.join(unknown)}; "
                              f"configured: {', '.join(sorted(configured)) or 'none'}"}
     path = config.ensure_global_config()
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     header = f'[project."{project_id}"]'
     try:
         after = render(text, project_id, {"enabled_profiles": names},
@@ -324,9 +325,9 @@ def write_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".config-", suffix=".toml")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.chmod(tmp, 0o600)
+        chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -547,7 +548,7 @@ def save(name: str, changes: dict, *, authority: str = "human",
     for an agent asking for a spend-committing change — the filed decision.
     """
     path = config.ensure_global_config()
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     try:
         current = _file_profiles(text)
     except ValueError as exc:

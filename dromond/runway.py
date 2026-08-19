@@ -40,9 +40,7 @@ renders it in the one block DeepSeek's balance already used.
 """
 import functools
 import selectors
-import shutil
 import subprocess
-import pty
 import select
 import json
 import os
@@ -58,6 +56,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dromond import db
+from dromond.proc import fchmod as _fchmod, which as which_exe
+
+try:
+    import pty
+except ImportError:
+    pty = None
 
 HTTP_TIMEOUT = 10
 
@@ -580,7 +584,7 @@ def _write_auth(path: Path, data: dict) -> str | None:
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        os.fchmod(fd, 0o600)
+        _fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
             fh.write("\n")
@@ -1002,9 +1006,9 @@ def read_claude_screen(state: dict, timeout: float = CLAUDE_SCREEN_TIMEOUT) -> d
     Returns {} for anything that does not work, and the caller falls back to
     the cache file.
     """
-    exe = shutil.which("claude")
+    exe = which_exe("claude")
     cwd = claude_screen_cwd(state)
-    if not exe or cwd is None:
+    if not exe or cwd is None or pty is None:
         return {}
     try:
         master, slave = pty.openpty()
@@ -1242,7 +1246,7 @@ def read_codex_app_server(timeout: float = 20.0) -> dict:
     the account was actually at 11% -- a number that decides whether to
     dispatch. Asking is the only way to know.
     """
-    exe = shutil.which("codex")
+    exe = which_exe("codex")
     if not exe:
         raise RuntimeError("codex is not installed")
     proc = subprocess.Popen([exe, "app-server", "--stdio"],

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1032,7 +1033,8 @@ class KeyTests(unittest.TestCase):
         key, minted = mhttp.ensure_key()
         self.assertTrue(minted)
         self.assertGreaterEqual(len(key), 32)
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        if sys.platform != "win32":
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         again, minted_again = mhttp.ensure_key()
         self.assertEqual(again, key)
         self.assertFalse(minted_again)
@@ -1070,7 +1072,7 @@ class DashboardFileTests(unittest.TestCase):
         """A tab with no textarea is a dead control, same class of miss as
         the restart route shipping without its button."""
         page = (Path(__file__).resolve().parents[1]
-                / "dromond" / "dashboard.html").read_text()
+                 / "dromond" / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn('data-view="settings"', page)
         self.assertIn('id="cfgtext"', page)
         self.assertIn("/api/config", page)
@@ -1082,12 +1084,12 @@ class DashboardFileTests(unittest.TestCase):
         reach it, so the feature was invisible and got re-delegated.
         """
         page = (Path(__file__).resolve().parents[1]
-                / "dromond" / "dashboard.html").read_text()
+                 / "dromond" / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn('id="restart"', page)
         self.assertIn("/api/restart", page)
 
     def setUp(self) -> None:
-        self.text = mhttp.DASHBOARD.read_text()
+        self.text = mhttp.DASHBOARD.read_text(encoding="utf-8")
 
     def test_every_run_detail_tab_has_a_pane_and_trace_is_first(self) -> None:
         """A tab with no builder in PANES is a dead control on the strip."""

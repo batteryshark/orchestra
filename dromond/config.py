@@ -456,7 +456,7 @@ def profile_notes_path() -> Path:
 
 def load_profile_notes() -> dict:
     try:
-        data = json.loads(profile_notes_path().read_text())
+        data = json.loads(profile_notes_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -467,7 +467,7 @@ def forget_profile_note(name: str) -> None:
     notes = load_profile_notes()
     if notes.pop(name, None) is None:
         return
-    profile_notes_path().write_text(json.dumps(notes, indent=2))
+    profile_notes_path().write_text(json.dumps(notes, indent=2), encoding="utf-8")
 
 
 def apply_worker_env(cfg: dict, env: dict[str, str], root: Path) -> dict[str, str]:
@@ -489,5 +489,5 @@ def ensure_global_config() -> Path:
     p = paths.global_config_path()
     if not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(DEFAULT_CONFIG)
+        p.write_text(DEFAULT_CONFIG, encoding="utf-8")
     return p

@@ -11,14 +11,13 @@ sets ``wake``, so a tick starts at once instead of waiting out the interval.
 """
 import os
 import signal
-import subprocess
 import sys
 import threading
 import traceback
 import time
 from datetime import datetime, timezone
 
-from dromond import (conductor, config, db, http, nod, observer, project,
+from dromond import (conductor, config, db, http, nod, observer, proc, project,
                          supervise, runway, sweeper, work_client)
 
 DEFAULT_INTERVAL = 60
@@ -40,18 +39,7 @@ def _harvest_children() -> int:
     path. A ZOMBIE pid still answers `kill(pid, 0)`, which once left run 9 in
     `spawning` forever.
     """
-    harvested = 0
-    while True:
-        try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            break  # nothing left to reap
-        except OSError:
-            break
-        if pid == 0:
-            break  # children exist but none have exited
-        harvested += 1
-    return harvested
+    return proc.harvest_children()
 
 
 def _alive(pid: int) -> bool:
@@ -60,16 +48,7 @@ def _alive(pid: int) -> bool:
     `kill(pid, 0)` succeeds on a zombie, so it alone is not liveness. A
     zombie has exited; anything waiting on its run must treat it as gone.
     """
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True  # alive, owned by someone else
-    except OSError:
-        return False
-    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                         capture_output=True, text=True)
-    state = (out.stdout or "").strip()
-    return not state.startswith("Z")
+    return proc.alive(pid)
 
 
 def _reap_orphans(con) -> list[int]:
