@@ -93,7 +93,7 @@ from dromond import (auth, config, db, dispatch, paths, proc, profile_edit,
 # v7 (W-0189): ``daemon.observer`` — whether the spin observer can run at
 # all, its profile and its first-look cadence, or the exact fix when it
 # cannot. Health that looks fine while nothing is watching is the bug.
-SNAPSHOT_VERSION = 8
+SNAPSHOT_VERSION = 9
 
 DEFAULT_PORT = 3011
 KEY_ENV = "DROMOND_KEY"
@@ -424,62 +424,80 @@ _RUN_SELECT = (
     "AS project_name FROM runs r ")
 
 
+def _run_payload(con, r, blocked: dict) -> dict:
+    summary = r["summary"] or ""
+    return {
+        "id": r["id"],
+        "slug": r["slug"],
+        "status": r["status"],
+        "profile": r["profile"],
+        "backend": r["backend"],
+        "model": r["model"],
+        "title": r["title"],
+        "work_item": r["work_item"],
+        "project_id": r["project_id"],
+        "project": r["project_work_id"] or r["project_name"],
+        "workdir": r["workdir"],
+        "branch": r["branch"],
+        "parent_run": r["parent_run"],
+        "requested_by": r["requested_by"],
+        "started_at": r["started_at"],
+        "finished_at": r["finished_at"],
+        "elapsed_seconds": _seconds(r["started_at"], r["finished_at"]),
+        "exit_code": r["exit_code"],
+        "live": r["status"] not in db.RUN_TERMINAL,
+        "blocked_on": blocked.get(r["id"], []),
+        "summary": summary[:SUMMARY_CHARS],
+        # v3 (W-0178): what the detail pane shows beside the trace. The
+        # token hash is never among them — see tests/test_auth.py.
+        "base_commit": r["base_commit"],
+        "checkpoint_commit": r["checkpoint_commit"],
+        "brief_path": r["brief_path"],
+        "session_ref": r["session_ref"],
+        "retry_of": r["retry_of"],
+        "layer": r["layer"],
+        "tokens_in": r["tokens_in"],
+        "tokens_out": r["tokens_out"],
+        "tokens_total": r["tokens_total"],
+        "cost_usd": r["cost_usd"],
+        # plan-backed runs have no price at all (W-0179): a subscription
+        # reporting 0 is not free work.
+        "billing": runway.kind_of(runway.provider_of(r["backend"], r["model"])),
+        "usage_source": r["usage_source"],
+        "messages": _messages(con, r["id"]),
+    }
+
+
 def _runs(con) -> list[dict]:
     """Every live run, plus the tail of finished ones. The board must show
-    what is running in full; history is a window."""
+    what is running in full; history is a window.
+
+    Control turns (W-0214, ``layer`` set) are never in this list: they are
+    not the fleet, so the live count and the tab badge do not move for them.
+    The most recent one is pinned separately — see ``_pinned_turn``.
+    """
     rows = list(con.execute(
-        _RUN_SELECT + f"WHERE r.status NOT IN {db.TERMINAL_SQL} ORDER BY r.id DESC"))
+        _RUN_SELECT + f"WHERE r.status NOT IN {db.TERMINAL_SQL} "
+        "AND r.layer IS NULL ORDER BY r.id DESC"))
     rows += list(con.execute(
         _RUN_SELECT + f"WHERE r.status IN {db.TERMINAL_SQL} "
-        "ORDER BY r.id DESC LIMIT ?", (RECENT_RUNS,)))
+        "AND r.layer IS NULL ORDER BY r.id DESC LIMIT ?", (RECENT_RUNS,)))
     blocked = {}
     for row in con.execute(
             "SELECT run_id, depends_on_run FROM dispatch_dependencies "
             "ORDER BY depends_on_run"):
         blocked.setdefault(row["run_id"], []).append(row["depends_on_run"])
-    out = []
-    for r in rows:
-        summary = r["summary"] or ""
-        out.append({
-            "id": r["id"],
-            "slug": r["slug"],
-            "status": r["status"],
-            "profile": r["profile"],
-            "backend": r["backend"],
-            "model": r["model"],
-            "title": r["title"],
-            "work_item": r["work_item"],
-            "project_id": r["project_id"],
-            "project": r["project_work_id"] or r["project_name"],
-            "workdir": r["workdir"],
-            "branch": r["branch"],
-            "parent_run": r["parent_run"],
-            "requested_by": r["requested_by"],
-            "started_at": r["started_at"],
-            "finished_at": r["finished_at"],
-            "elapsed_seconds": _seconds(r["started_at"], r["finished_at"]),
-            "exit_code": r["exit_code"],
-            "live": r["status"] not in db.RUN_TERMINAL,
-            "blocked_on": blocked.get(r["id"], []),
-            "summary": summary[:SUMMARY_CHARS],
-            # v3 (W-0178): what the detail pane shows beside the trace. The
-            # token hash is never among them — see tests/test_auth.py.
-            "base_commit": r["base_commit"],
-            "checkpoint_commit": r["checkpoint_commit"],
-            "brief_path": r["brief_path"],
-            "session_ref": r["session_ref"],
-            "retry_of": r["retry_of"],
-            "tokens_in": r["tokens_in"],
-            "tokens_out": r["tokens_out"],
-            "tokens_total": r["tokens_total"],
-            "cost_usd": r["cost_usd"],
-            # plan-backed runs have no price at all (W-0179): a subscription
-            # reporting 0 is not free work.
-            "billing": runway.kind_of(runway.provider_of(r["backend"], r["model"])),
-            "usage_source": r["usage_source"],
-            "messages": _messages(con, r["id"]),
-        })
-    return out
+    return [_run_payload(con, r, blocked) for r in rows]
+
+
+def _pinned_turn(con) -> dict | None:
+    """The most recent control turn (W-0214), pinned at the top of the Runs
+    tab. Its summary is the decision one-liner and names the escalation it
+    produced; the row opens in the same detail screen as any run."""
+    row = con.execute(
+        _RUN_SELECT + "WHERE r.layer IS NOT NULL ORDER BY r.id DESC LIMIT 1"
+    ).fetchone()
+    return _run_payload(con, row, {}) if row else None
 
 
 def _messages(con, run_id: int) -> list[dict]:
@@ -680,8 +698,8 @@ def _statistics(con, project_id: str | None = None) -> dict:
     tokens = cost = None
     for r in con.execute(
             "SELECT profile, backend, model, status, started_at, finished_at, "
-            "tokens_total, cost_usd FROM runs"
-            + (" WHERE project_id=?" if project_id else ""),
+            "tokens_total, cost_usd FROM runs WHERE layer IS NULL"
+            + (" AND project_id=?" if project_id else ""),
             (project_id,) if project_id else ()):
         total += 1
         by_status[r["status"]] = by_status.get(r["status"], 0) + 1
@@ -795,6 +813,9 @@ def snapshot(con=None) -> dict:
             "home": str(paths.home()),
             "runs": runs,
             "live_runs": sum(1 for r in runs if r["live"]),
+            # v9 (W-0214): the most recent control turn, pinned at the top of
+            # the Runs tab. Never in ``runs``, never in ``live_runs``.
+            "pinned_turn": _pinned_turn(con),
             # v5 (W-0186): what the project picker offers, derived from the
             # runs above — never a roster of every project on the machine.
             "projects": _projects(runs),

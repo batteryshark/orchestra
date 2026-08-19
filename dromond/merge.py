@@ -225,15 +225,26 @@ def judge_tripwires(cfg: dict | None, mission: str, fired: list[str],
         fired="\n".join(f"- {f}" for f in fired),
         diff=diff[:JUDGE_DIFF_MAX_CHARS])
     try:
-        reply = (turn or observer.model_turn)(profile, prompt)
+        meta: dict = {}
+        if turn is not None:
+            reply = turn(profile, prompt)
+        else:
+            reply = observer.model_turn(profile, prompt, layer="merge",
+                                        meta=meta)
     except Exception as exc:
         return {"verdict": "escalate", "rationale": f"judge turn failed: {exc}"}
     found = observer.last_json_object(reply or "", "verdict") or {}
     verdict = str(found.get("verdict", "")).strip().lower()
     if verdict != "mission_work":
         verdict = "escalate"
-    return {"verdict": verdict,
-            "rationale": str(found.get("rationale") or "no rationale given")[:2000]}
+    rationale = str(found.get("rationale") or "no rationale given")[:2000]
+    # The turn's own row reads the verdict it produced; an escalate carries
+    # its turn id back into the card ``_escalate`` files.
+    observer.note_turn(None, meta.get("turn_id"), f"{verdict}: {rationale}")
+    out = {"verdict": verdict, "rationale": rationale}
+    if meta.get("turn_id"):
+        out["turn_id"] = meta["turn_id"]
+    return out
 
 
 def agent_review(diff: str, criteria: str) -> dict:
@@ -426,7 +437,9 @@ def merge_run(root: Path, branch: str, criteria: str = "",
             if verdict["verdict"] != "mission_work":
                 return _escalate(result, "tripwires",
                                  "; ".join(result["tripwires"])
-                                 + f" — judge: {verdict['rationale']}")
+                                 + f" — judge: {verdict['rationale']}"
+                                 + (f" (judge turn #{verdict['turn_id']})"
+                                    if verdict.get("turn_id") else ""))
             # The facts stay on the result: a landed merge still SAYS it
             # deleted six files, it just no longer asks permission to have
             # done what the mission ordered.

@@ -62,6 +62,12 @@ Data-model invariants (DESIGN D4):
   Revocation is the ``revoke_run_token`` trigger below rather than a call
   every finalizer has to remember: reaching a terminal status nulls the hash,
   whichever code path got the run there. Owned by ``auth.py``.
+- ``runs.layer`` (schema v15, W-0214) marks a CONTROL TURN — a router,
+  merge-judge, observer or conductor model call — recorded as a terminal
+  runs row so its transcript normalizes into ``events`` and opens in the
+  same detail screen as a run. NULL is a worker run. Fleet queries exclude
+  turns with ``layer IS NULL``; queries keyed on work_item, branch or
+  parent_run never match one, because a turn carries none of them.
 - ``nod_requests`` (schema v7, the human loop) maps a Nod request id to the
   run and Work item it escalated, so a decision can be mirrored into the
   Work thread. ``channel`` is stored because a Nod issuer token is scoped to
@@ -76,7 +82,7 @@ from datetime import datetime, timezone
 
 from dromond import paths
 
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -105,6 +111,16 @@ RUNS_V11_COLUMNS = (
 # off for that dispatch — there was no decision to explain.
 RUNS_V13_COLUMNS = (
     ("routed_reason", "TEXT"),
+)
+# Schema v15 (W-0214). ``layer`` marks a CONTROL TURN — router / merge /
+# observer / conductor — recorded as a terminal runs row so its transcript
+# ingests into the same events table and opens in the same detail screen.
+# NULL is a worker run. Fleet queries (the snapshot, the statistics, the
+# performance review) exclude them with ``layer IS NULL``; queries keyed on
+# work_item / branch / parent_run never match one, because a control turn
+# carries none of them.
+RUNS_V15_COLUMNS = (
+    ("layer", "TEXT"),
 )
 
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
@@ -168,7 +184,8 @@ CREATE TABLE IF NOT EXISTS runs (
   cost_usd REAL,
   usage_source TEXT,
   run_token_hash TEXT,
-  routed_reason TEXT
+  routed_reason TEXT,
+  layer TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
@@ -382,7 +399,7 @@ def connect(db_file=None) -> sqlite3.Connection:
     if existing:  # extend a pre-existing table before SCHEMA's indexes run
         for name, sql_type in (RUNS_V2_COLUMNS + RUNS_V4_COLUMNS
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
-                               + RUNS_V13_COLUMNS):
+                               + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
     polls = {r["name"] for r in con.execute("PRAGMA table_info(runway_polls)")}

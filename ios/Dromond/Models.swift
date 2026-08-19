@@ -58,12 +58,16 @@ struct Snapshot: Decodable, Sendable {
     let statistics: Statistics
     let findings: [Finding]
     let proposals: [Proposal]
+    /// The most recent control turn (W-0214), pinned at the top of the Runs
+    /// tab. Never in `runs`, so the badge and the live count never move.
+    let pinnedTurn: Run?
 
     enum CodingKeys: String, CodingKey {
         case version, runs, home, projects, profiles, runway, dispatch, daemon
         case statistics, findings, proposals
         case generatedAt = "generated_at"
         case liveRuns = "live_runs"
+        case pinnedTurn = "pinned_turn"
     }
 
     init(from decoder: Decoder) throws {
@@ -89,6 +93,7 @@ struct Snapshot: Decodable, Sendable {
         statistics = (try? v.decode(Statistics.self, forKey: .statistics)) ?? Statistics()
         findings = (try? v.decode([Finding].self, forKey: .findings)) ?? []
         proposals = (try? v.decode([Proposal].self, forKey: .proposals)) ?? []
+        pinnedTurn = try? v.decode(Run.self, forKey: .pinnedTurn)
     }
 }
 
@@ -129,10 +134,13 @@ struct Run: Decodable, Identifiable, Hashable, Sendable {
     let costUSD: Double?
     let usageSource: String?
     let billing: String?
+    /// Set on a control turn (router / merge / observer / conductor), never
+    /// on a worker run. A turn row appears only as the pinned entry.
+    let layer: String?
 
     enum CodingKeys: String, CodingKey {
         case id, slug, status, profile, backend, model, title, project, live
-        case summary, branch, workdir, messages, billing
+        case summary, branch, workdir, messages, billing, layer
         case workItem = "work_item"
         case baseCommit = "base_commit"
         case checkpointCommit = "checkpoint_commit"
@@ -193,6 +201,7 @@ struct Run: Decodable, Identifiable, Hashable, Sendable {
         costUSD = try? v.decode(Double.self, forKey: .costUSD)
         usageSource = try? v.decode(String.self, forKey: .usageSource)
         billing = try? v.decode(String.self, forKey: .billing)
+        layer = try? v.decode(String.self, forKey: .layer)
     }
 
     /// Terminal runs are history; the rest are still the machine's business.

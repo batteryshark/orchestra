@@ -509,11 +509,13 @@ Reply with ONE JSON object and nothing else:
 """
 
 
-def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT) -> str:
+def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
+               con=None, meta: dict | None = None) -> str:
     """One fresh stateless session. Reuses the observer's out-of-band caller
     (§7): a separate process, its own prompt, no session ever resumed."""
     try:
-        return observer.model_turn(profile, prompt, timeout=timeout)
+        return observer.model_turn(profile, prompt, timeout=timeout,
+                                   layer="conductor", con=con, meta=meta)
     except observer.ObserverTurnError as exc:
         raise PlannerTurnError(str(exc)) from exc
 
@@ -550,12 +552,19 @@ def parse_decision(text: str, *, actions=ACTIONS, key: str = "action") -> dict:
 
 
 def take_turn(profile: dict, packet: str, *, slug: str, instructions=INSTRUCTIONS,
-              turn=None, actions=ACTIONS, key: str = "action") -> dict:
+              turn=None, actions=ACTIONS, key: str = "action", con=None) -> dict:
     """Invoke one session and take one decision back."""
     prompt = (f"{instructions}\nYou are session dromond/{slug}. It exists for "
               f"this one decision.\n\n{packet}")
-    return parse_decision((turn or model_turn)(profile, prompt),
-                          actions=actions, key=key)
+    meta: dict = {}
+    if turn is not None:
+        text = turn(profile, prompt)
+    else:
+        text = model_turn(profile, prompt, con=con, meta=meta)
+    decision = parse_decision(text, actions=actions, key=key)
+    observer.note_turn(con, meta.get("turn_id"),
+                       f"{decision['action']}: {decision.get('rationale', '')}")
+    return decision
 
 
 # --- acting on a decision ----------------------------------------------------
@@ -764,7 +773,7 @@ def conduct_goal(con, cfg: dict, client, goal: dict, board: dict, issues: list,
         runway_entries=runway_entries_for(runway_now),
         flight=flight_entries(flight))
     slug = names.generate_slug()
-    decision = take_turn(profile, packet, slug=slug, turn=turn)
+    decision = take_turn(profile, packet, slug=slug, turn=turn, con=con)
     # The comment watermark only ever moves forward, so a turn taken for some
     # other trigger cannot swallow a comment it never read.
     seen = [c["at"] for c in comments] + \
@@ -852,7 +861,7 @@ def alignment_planner(*, goal: dict, proposal: dict, run, cfg: dict | None = Non
         slug = names.generate_slug()
         decision = take_turn(profile, packet, slug=slug,
                              instructions=ALIGNMENT_INSTRUCTIONS, turn=turn,
-                             actions=("aligned", "pivot"), key="verdict")
+                             actions=("aligned", "pivot"), key="verdict", con=con)
         # take_turn speaks {action}; the seam's contract speaks {verdict}.
         verdict = decision["action"] if decision["action"] in ("aligned", "pivot") \
             else None
@@ -915,7 +924,7 @@ def judgment_turn(con, run_id: int, reason: str, *, detail: str | None = None,
         slug = names.generate_slug()
         decision = take_turn(profile, packet, slug=slug,
                              instructions=JUDGMENT_INSTRUCTIONS, turn=turn,
-                             actions=("dispatch", "propose", "ask_human"))
+                             actions=("dispatch", "propose", "ask_human"), con=con)
     except (PlannerUnconfigured, PlannerTurnError) as exc:
         print(f"dromond conductor: judgment turn for run {run_id} unavailable: {exc}")
         return _DEFERRED_REVIEW(con, run_id, reason, detail=detail, cfg=cfg)

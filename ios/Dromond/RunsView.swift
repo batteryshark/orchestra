@@ -79,6 +79,15 @@ struct RunsView: View {
         let live = matching.filter(\.live)
         let rest = matching.filter { !$0.live }
         List {
+            // W-0214: the most recent control turn — the staffing, merge, or
+            // observer decision that just happened — pinned above the fleet.
+            // It is never in `state.runs`, so the badge and the live count
+            // do not move for it. It opens the same detail screen as a run.
+            if query.isEmpty, let turn = state.snapshot?.pinnedTurn {
+                Section("Latest decision") {
+                    NavigationLink(value: turn) { TurnRow(turn: turn) }
+                }
+            }
             if !live.isEmpty {
                 Section("Live · \(live.count)") {
                     ForEach(live) { row($0) }
@@ -114,6 +123,38 @@ struct RunsView: View {
                     }
                 }
             }
+    }
+}
+
+/// The pinned control turn: which layer decided, what it decided, and the
+/// escalation it produced — the summary names both. Opens the ordinary run
+/// detail screen, where its transcript is the trace tab.
+private struct TurnRow: View {
+    let turn: Run
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "brain")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Control turn")
+                Text(turn.layer ?? "turn")
+                    .font(.subheadline.monospaced().weight(.semibold))
+                Text("· \(turn.profile)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                StatusChip(status: turn.status)
+            }
+            if !turn.summary.isEmpty {
+                Text(turn.summary)
+                    .font(.subheadline)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.vertical, 3)
     }
 }
 
