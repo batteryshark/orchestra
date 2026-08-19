@@ -186,10 +186,12 @@ class LandingTestCase(unittest.TestCase):
         log = self.item_log()
         self.assertIn("conflicted files: `app.py`", log)
         self.assertIn(f"dromond merge {BRANCH}", log)
-        # A needs-you event: one decision card, offering the three §9 options.
+        # A needs-you event: one decision card. A rebase conflict offers the
+        # resolver, not a retry — retrying re-runs the same rebase into the
+        # same conflict, so offering it reads as a way out when it is not.
         card = self.nod.requests["req_1"]
         self.assertEqual(DECISIONS_CHANNEL, card["channel_id"])
-        self.assertEqual(["retry", "resolver", "leave"],
+        self.assertEqual(["resolver", "leave"],
                          [o["id"] for o in card["options"]])
         self.assertIn("app.py", card["body_markdown"])
         # and the request id is recorded, so the answer can be mirrored later
