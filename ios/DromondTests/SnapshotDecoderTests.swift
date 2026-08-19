@@ -104,6 +104,39 @@ final class SnapshotDecoderTests: XCTestCase {
         XCTAssertEqual(options["opencode"]?.effortNote, "no --effort flag")
     }
 
+    /// The upgrade path that must not lose anything: a phone that already had
+    /// one server keeps it, pointed at the Keychain account its key is already
+    /// under, so nobody is asked to retype a secret.
+    func testTheFirstServerInheritsTheLegacyKeychainAccount() {
+        let first = Server(label: "", url: "http://mac:3011/",
+                           keyAccount: Keychain.legacyAccount)
+        XCTAssertEqual(Keychain.legacyAccount, first.keyAccount)
+        // A second server gets its own account, never the shared one.
+        let second = Server(label: "windows", url: "http://win:3011/")
+        XCTAssertEqual(second.id.uuidString, second.keyAccount)
+        XCTAssertNotEqual(first.keyAccount, second.keyAccount)
+    }
+
+    func testAServerNamesItselfByHostWhenUnlabelled() {
+        XCTAssertEqual("win.tailnet",
+                       Server(label: "", url: "http://win.tailnet:3011/").displayName)
+        XCTAssertEqual("windows box",
+                       Server(label: "windows box", url: "http://win:3011/").displayName)
+        // Whitespace is not a name.
+        XCTAssertEqual("win", Server(label: "  ", url: "http://win:3011/").displayName)
+    }
+
+    func testServersRoundTripThroughJSON() throws {
+        let servers = [Server(label: "mac", url: "http://mac:3011/",
+                              keyAccount: Keychain.legacyAccount),
+                       Server(label: "windows", url: "http://win:3011/")]
+        let data = try JSONEncoder().encode(servers)
+        let back = try JSONDecoder().decode([Server].self, from: data)
+        XCTAssertEqual(servers, back)
+        XCTAssertEqual(Keychain.legacyAccount, back[0].keyAccount,
+                       "the account must survive persistence or the key is orphaned")
+    }
+
     func testSSEDecoderJoinsDataLinesAndIgnoresKeepalives() {
         var decoder = SSEDecoder()
         XCTAssertNil(decoder.feed(line: ": keepalive"))

@@ -43,7 +43,7 @@ struct RunsView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Runs")
-            .toolbar { ProjectToolbarMenu() }
+            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
             .navigationDestination(for: Run.self) { RunDetailView(run: $0) }
             .searchable(text: $query, prompt: "id, title, work item, profile")
             // Everything searched here is an identifier — a slug, a profile

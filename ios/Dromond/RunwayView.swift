@@ -23,7 +23,7 @@ struct RunwayView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Runway")
-            .toolbar { ProjectToolbarMenu() }
+            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
             .refreshable { await state.refresh() }
         }
     }

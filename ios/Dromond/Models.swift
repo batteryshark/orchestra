@@ -1,5 +1,35 @@
 import Foundation
 
+/// One daemon this phone can talk to. The owner runs Dromond on a mac and on a
+/// Windows box; switching between them beats merging them, because every action
+/// -- kill, tell, merge -- has to know which daemon it is talking to, and a
+/// merged fleet view would have to answer that on every tap.
+struct Server: Codable, Identifiable, Hashable {
+    var id: UUID = UUID()
+    var label: String
+    var url: String
+
+    /// Its Keychain account. The first server keeps the pre-multi-server
+    /// account so an upgrading phone is never asked to retype its key.
+    var keyAccount: String
+
+    init(id: UUID = UUID(), label: String, url: String, keyAccount: String? = nil) {
+        self.id = id
+        self.label = label
+        self.url = url
+        self.keyAccount = keyAccount ?? id.uuidString
+    }
+
+    /// What to show when the owner did not name it: the host, which is what
+    /// tells one daemon from another at a glance.
+    var displayName: String {
+        let named = label.trimmingCharacters(in: .whitespaces)
+        if !named.isEmpty { return named }
+        return URL(string: url)?.host ?? url
+    }
+}
+
+
 /// Everything `/api/snapshot` serves, in one decode.
 ///
 /// The daemon builds this in one pass and every view reads from the same

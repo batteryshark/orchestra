@@ -142,6 +142,46 @@ struct ProjectToolbarMenu: ToolbarContent {
     }
 }
 
+/// Which daemon every screen is reading. Sits beside the project picker rather
+/// than inside Settings: switching machines is a thing done while looking at
+/// runs, not a thing done while configuring. Hidden entirely with one server,
+/// because a picker over a list of one is furniture.
+struct ServerToolbarMenu: ToolbarContent {
+    @EnvironmentObject private var state: AppState
+    @State private var settings = false
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Menu {
+                if state.servers.count > 1 {
+                    ForEach(state.servers) { server in
+                        Button {
+                            state.select(server.id)
+                        } label: {
+                            if server.id == state.selectedServer?.id {
+                                Label(server.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(server.displayName)
+                            }
+                        }
+                    }
+                    Divider()
+                }
+                Button("Servers…", systemImage: "gear") { settings = true }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "server.rack").font(.caption)
+                    if state.servers.count > 1 {
+                        Text(state.selectedServer?.displayName ?? "").lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                    }
+                }
+            }
+            .sheet(isPresented: $settings) { SettingsView() }
+        }
+    }
+}
+
 /// Shown when the last refresh failed. The data on screen is still the last
 /// good snapshot, so this says the connection broke — not that anything is
 /// wrong with what is displayed.

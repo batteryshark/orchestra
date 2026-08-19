@@ -40,7 +40,7 @@ struct ProfilesView: View {
                 }
             }
             .navigationTitle("Profiles")
-            .toolbar { ProjectToolbarMenu() }
+            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
             .refreshable { await state.refresh() }
             .sheet(item: $editing) { profile in
                 ProfileEditor(profile: profile, options: options, others: otherNames(profile))

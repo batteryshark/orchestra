@@ -52,7 +52,7 @@ struct FindingsView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Findings")
-            .toolbar { ProjectToolbarMenu() }
+            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
             .navigationDestination(for: Run.self) { RunDetailView(run: $0) }
             .refreshable { await state.refresh() }
             .alert("Check failed", isPresented: Binding(

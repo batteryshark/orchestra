@@ -2,8 +2,16 @@ import Foundation
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published var serverURL = UserDefaults.standard.string(forKey: "serverURL") ?? "http://localhost:3011/"
-    @Published var key = Keychain.load()
+    /// Every daemon this phone knows. Persisted as JSON; each server's key
+    /// lives in its own Keychain item, never here.
+    @Published private(set) var servers: [Server] = AppState.loadServers() {
+        didSet { AppState.saveServers(servers) }
+    }
+    /// Which one the app is talking to. Switching is a context change, not a
+    /// filter: the snapshot is dropped so no screen can show one daemon's runs
+    /// under another's name.
+    @Published private(set) var selectedServerID: UUID? =
+        UserDefaults.standard.string(forKey: "selectedServerID").flatMap(UUID.init)
     @Published private(set) var snapshot: Snapshot?
     @Published private(set) var error: String?
     @Published private(set) var loading = false
@@ -13,30 +21,102 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(selectedProjectID, forKey: "selectedProjectID") }
     }
 
-    var isConfigured: Bool { URL(string: serverURL) != nil && !key.isEmpty }
+    var selectedServer: Server? {
+        servers.first { $0.id == selectedServerID } ?? servers.first
+    }
+
+    var serverURL: String { selectedServer?.url ?? "" }
+    var key: String { selectedServer.map { Keychain.load(for: $0.keyAccount) } ?? "" }
+
+    var isConfigured: Bool {
+        guard let server = selectedServer else { return false }
+        return URL(string: server.url) != nil
+            && !Keychain.load(for: server.keyAccount).isEmpty
+    }
 
     func api() throws -> DromondAPI {
-        guard let url = URL(string: serverURL), let scheme = url.scheme,
+        guard let server = selectedServer,
+              let url = URL(string: server.url), let scheme = url.scheme,
               ["http", "https"].contains(scheme), url.host != nil else {
             throw APIError.invalidURL
         }
-        return DromondAPI(baseURL: url, key: key)
+        return DromondAPI(baseURL: url, key: Keychain.load(for: server.keyAccount))
     }
 
-    func saveSettings(serverURL: String, key: String) throws {
-        let oldURL = self.serverURL
-        let oldKey = self.key
-        self.serverURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.key = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            _ = try api()
-            try Keychain.save(self.key)
-            UserDefaults.standard.set(self.serverURL, forKey: "serverURL")
-        } catch {
-            self.serverURL = oldURL
-            self.key = oldKey
-            throw error
+    // --- the server list --------------------------------------------------
+
+    /// Add or update one server. The key is written first and rolled back if
+    /// the URL turns out to be unusable, so a half-saved server never becomes
+    /// the selected one.
+    @discardableResult
+    func saveServer(id: UUID?, label: String, url: String, key: String) throws -> Server {
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = URL(string: trimmedURL), let scheme = parsed.scheme,
+              ["http", "https"].contains(scheme), parsed.host != nil else {
+            throw APIError.invalidURL
         }
+        var server: Server
+        if let id, let index = servers.firstIndex(where: { $0.id == id }) {
+            server = servers[index]
+            server.label = label
+            server.url = trimmedURL
+            try Keychain.save(trimmedKey, for: server.keyAccount)
+            servers[index] = server
+        } else {
+            // The very first server inherits the pre-multi-server Keychain
+            // account, so an upgrading phone keeps the key it already had.
+            let account = servers.isEmpty ? Keychain.legacyAccount : nil
+            server = Server(label: label, url: trimmedURL, keyAccount: account)
+            try Keychain.save(trimmedKey, for: server.keyAccount)
+            servers.append(server)
+        }
+        if selectedServerID == nil { select(server.id) }
+        return server
+    }
+
+    func removeServer(_ server: Server) {
+        Keychain.delete(account: server.keyAccount)
+        servers.removeAll { $0.id == server.id }
+        if selectedServerID == server.id {
+            select(servers.first?.id)
+        }
+    }
+
+    /// Switching daemons drops everything the last one said. A stale snapshot
+    /// under a new server's name is worse than an empty screen.
+    func select(_ id: UUID?) {
+        guard id != selectedServerID else { return }
+        selectedServerID = id
+        UserDefaults.standard.set(id?.uuidString, forKey: "selectedServerID")
+        snapshot = nil
+        error = nil
+        selectedProjectID = nil  // projects are one daemon's, never shared
+    }
+
+    // --- persistence ------------------------------------------------------
+
+    private static let serversKey = "servers"
+
+    private static func loadServers() -> [Server] {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: serversKey),
+           let stored = try? JSONDecoder().decode([Server].self, from: data) {
+            return stored
+        }
+        // Migration: the single server this app used to hold. Its key stays
+        // where it is, under the legacy account, and the entry points at it.
+        guard let url = defaults.string(forKey: "serverURL"), !url.isEmpty,
+              !Keychain.load().isEmpty else { return [] }
+        let migrated = [Server(label: "", url: url,
+                               keyAccount: Keychain.legacyAccount)]
+        saveServers(migrated)
+        return migrated
+    }
+
+    private static func saveServers(_ servers: [Server]) {
+        guard let data = try? JSONEncoder().encode(servers) else { return }
+        UserDefaults.standard.set(data, forKey: serversKey)
     }
 
     func refresh() async {

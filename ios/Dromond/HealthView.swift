@@ -32,7 +32,7 @@ struct HealthView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Health")
-            .toolbar { ProjectToolbarMenu() }
+            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
             .refreshable { await state.refresh() }
             .task { await loadConfigPath() }
             .confirmationDialog(

@@ -151,7 +151,7 @@ struct ConnectView: View {
     private func connect() {
         focused = nil
         do {
-            try state.saveSettings(serverURL: serverURL, key: key)
+            try state.saveServer(id: nil, label: "", url: serverURL, key: key)
             error = nil
         } catch {
             self.error = error.localizedDescription
@@ -162,51 +162,143 @@ struct ConnectView: View {
 struct SettingsView: View {
     @EnvironmentObject private var state: AppState
     @Environment(\.dismiss) private var dismiss
-    @State private var serverURL = ""
+    @State private var editing: Server?
+    @State private var adding = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(state.servers) { server in
+                        Button {
+                            state.select(server.id)
+                            dismiss()
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(server.displayName)
+                                        .font(.body.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                    Text(server.url)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if server.id == state.selectedServer?.id {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                        .swipeActions {
+                            Button("Remove", role: .destructive) {
+                                state.removeServer(server)
+                            }
+                            Button("Edit") { editing = server }.tint(.blue)
+                        }
+                    }
+                } header: {
+                    Text("Servers")
+                } footer: {
+                    Text("One Dromond daemon each. Switching changes which "
+                         + "machine every screen is reading.")
+                }
+
+                Section {
+                    Button("Add a server") { adding = true }
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $adding) { ServerEditor(server: nil) }
+            .sheet(item: $editing) { ServerEditor(server: $0) }
+        }
+    }
+}
+
+/// Add or change one server. The key field is empty when editing — an existing
+/// secret is never read back onto the screen, and leaving it empty keeps it.
+struct ServerEditor: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    let server: Server?
+
+    @State private var label = ""
+    @State private var url = ""
     @State private var key = ""
     @State private var error: String?
     @FocusState private var focused: Bool
 
+    private var canSave: Bool {
+        !url.trimmingCharacters(in: .whitespaces).isEmpty
+            && (server != nil || !key.trimmingCharacters(in: .whitespaces).isEmpty)
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("Connection") {
-                    TextField("http://mac.tailnet:3011/", text: $serverURL)
+                Section {
+                    TextField("mac, windows box, …", text: $label)
+                        .focused($focused)
+                    TextField("http://host:3011/", text: $url)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
+                        .textContentType(.URL)
                         .focused($focused)
-                    SecureField("Shared key", text: $key)
+                    SecureField(server == nil ? "Shared key"
+                                              : "Shared key (unchanged if blank)",
+                                text: $key)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .textContentType(.password)
                         .focused($focused)
+                } header: {
+                    Text("Server")
+                } footer: {
+                    Text("A name is optional; the host is used when it is blank.")
                 }
-                if let error { Text(error).foregroundStyle(.red) }
+                if let error {
+                    Section { Text(error).foregroundStyle(.red) }
+                }
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("Settings")
+            .navigationTitle(server == nil ? "Add a server" : "Edit server")
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Done") { focused = false }
                 }
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        do {
-                            try state.saveSettings(serverURL: serverURL, key: key)
-                            dismiss()
-                            Task { await state.refresh() }
-                        } catch {
-                            self.error = error.localizedDescription
-                        }
-                    }
+                    Button("Save", action: save).disabled(!canSave)
                 }
             }
             .onAppear {
-                serverURL = state.serverURL
-                key = state.key
+                label = server?.label ?? ""
+                url = server?.url ?? ""
             }
+        }
+    }
+
+    private func save() {
+        focused = false
+        do {
+            // Editing with a blank key keeps the stored one rather than
+            // wiping a secret the owner never meant to touch.
+            let existing = server.map { Keychain.load(for: $0.keyAccount) } ?? ""
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            try state.saveServer(id: server?.id, label: label, url: url,
+                                 key: trimmed.isEmpty ? existing : trimmed)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 }
