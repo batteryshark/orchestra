@@ -45,6 +45,10 @@ Definition of done — the branch's WORK lands on `{base}`:
 
 Do not force-push. Do not delete `{branch}` or its kept ref. If you land a
 fresh branch, the original `{branch}` stays untouched.
+
+Never commit, stage, or stash uncommitted work in `{base}`'s checkout. It is
+the owner's, it is in flight, and a failed pop loses it. If a merge is blocked
+by their edits, stop and say which files — that is theirs to clear, not yours.
 """
 
 
