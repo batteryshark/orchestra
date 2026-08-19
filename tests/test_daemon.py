@@ -6,13 +6,14 @@ patched out and the plist is written under DROMOND_LAUNCH_AGENTS.
 import os
 import plistlib
 import signal
+import sys
 import tempfile
 import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import daemon, db, service, runway
+from dromond import daemon, db, proc, service, runway
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -50,7 +51,7 @@ class DaemonTests(unittest.TestCase):
     def test_tick_reaps_a_run_whose_supervisor_vanished(self) -> None:
         # PID 1 exists (launchd) and is not ours -> alive; a free high pid is not.
         dead = self._run(supervisor_pid=_free_pid())
-        alive = self._run(supervisor_pid=1)
+        alive = self._run(supervisor_pid=os.getpid())
         self.con.commit()
         report = daemon.tick()
         self.assertEqual(report["reaped"], [dead])
@@ -95,6 +96,8 @@ class DaemonTests(unittest.TestCase):
         with mock.patch.object(daemon, "tick", side_effect=RuntimeError("boom")):
             self.assertEqual(daemon.run(interval=1, once=True), 0)
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "os.kill(SIGTERM) terminates immediately on Windows")
     def test_sigterm_stops_the_loop_between_ticks(self) -> None:
         """launchd stops the job with SIGTERM; it must never land mid-pass."""
         previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
@@ -133,6 +136,7 @@ class ServiceTests(unittest.TestCase):
         self.launchctl = mock.patch.object(
             service, "_launchctl",
             return_value=mock.Mock(returncode=1, stdout="", stderr="")).start()
+        mock.patch.object(service, "_windows", return_value=False).start()
 
     def tearDown(self) -> None:
         mock.patch.stopall()
@@ -183,9 +187,7 @@ def _free_pid() -> int:
     """A pid that is not running. ponytail: probes upward from a high number;
     a same-second pid reuse would flake, which no test here can trigger."""
     for pid in range(99000, 99999):
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not proc.alive(pid):
             return pid
     raise unittest.SkipTest("no free pid found")
 
@@ -201,7 +203,8 @@ class ServiceRestartTests(unittest.TestCase):
             calls.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with mock.patch.object(service, "is_loaded", return_value=True), \
+        with mock.patch.object(service, "_windows", return_value=False), \
+             mock.patch.object(service, "is_loaded", return_value=True), \
              mock.patch.object(service, "_launchctl", side_effect=fake):
             self.assertEqual(0, service.restart())
         self.assertEqual("kickstart", calls[0][0])
@@ -210,13 +213,15 @@ class ServiceRestartTests(unittest.TestCase):
     def test_restart_reports_a_bare_daemon_rather_than_pretending(self) -> None:
         # Nothing supervises a foreground daemon, so there is nothing to
         # restart; saying so beats a success message that changed nothing.
-        with mock.patch.object(service, "is_loaded", return_value=False), \
+        with mock.patch.object(service, "_windows", return_value=False), \
+             mock.patch.object(service, "is_loaded", return_value=False), \
              mock.patch("subprocess.run",
                         return_value=subprocess.CompletedProcess([], 0, "4242\n", "")):
             self.assertEqual(1, service.restart())
 
     def test_restart_says_so_when_nothing_runs(self) -> None:
-        with mock.patch.object(service, "is_loaded", return_value=False), \
+        with mock.patch.object(service, "_windows", return_value=False), \
+             mock.patch.object(service, "is_loaded", return_value=False), \
              mock.patch("subprocess.run",
                         return_value=subprocess.CompletedProcess([], 1, "", "")):
             self.assertEqual(1, service.restart())

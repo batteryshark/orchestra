@@ -38,6 +38,7 @@ import threading
 import time
 
 from dromond import config, db, messaging, observer, runners, traces
+from dromond.proc import resolve_cmd, session_kwargs
 
 # Verified live (2026-08): `reasonix acp` and `opencode acp` both answer
 # initialize + session/new with loadSession: true.
@@ -154,9 +155,10 @@ class Peer:
     def start(self) -> None:
         try:
             self.proc = subprocess.Popen(
-                self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, cwd=self.cwd, env=self.env,
-                text=True, bufsize=1, start_new_session=True)
+                resolve_cmd(self.cmd), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=self.cwd, env=self.env, text=True, bufsize=1,
+                **session_kwargs())
         except OSError as exc:
             raise AcpError(f"cannot start {self.cmd[0]}: {exc}") from exc
         self._readers = [

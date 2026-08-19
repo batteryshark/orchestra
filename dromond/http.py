@@ -55,12 +55,12 @@ Shape:
   a ``file@offset`` cursor for the log — and both are behind the same gate,
   with the run trace scoped to the run a token names (``auth.ROUTES``).
 """
+import functools
 import gzip
 import json
 import os
 import re
 import secrets
-import shutil
 import signal
 import subprocess
 import sys
@@ -72,8 +72,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from dromond import (auth, config, db, dispatch, paths, profile_edit, profiles,
-                         project, runway, traces)
+from dromond import (auth, config, db, dispatch, paths, proc, profile_edit,
+                         profiles, project, runway, traces)
 
 # Bumped by ANY change to the snapshot payload (DESIGN §3 acceptance).
 # v3 (W-0178): the run rows carry what the dashboard's detail pane shows —
@@ -223,13 +223,18 @@ def ensure_key() -> tuple[str, bool]:
             f'  key = "{secrets.token_urlsafe(32)}"\n'
             "to it (and keep the file mode 0600).")
     key = secrets.token_urlsafe(32)
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     if text and not text.endswith("\n"):
         text += "\n"
     path.write_text(text + KEY_BLOCK.format(key=key, port=DEFAULT_PORT,
-                                            header=HEADER))
-    os.chmod(path, 0o600)
+                                            header=HEADER), encoding="utf-8")
+    proc.chmod(path, 0o600)
     return key, True
+
+
+def _tailscale_exe() -> str:
+    return (proc.which("tailscale")
+            or "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
 
 
 def tailscale_address() -> str | None:
@@ -239,15 +244,37 @@ def tailscale_address() -> str | None:
     ponytail: shells out to `tailscale ip -4`; scanning interfaces for the
     100.64.0.0/10 range would guess at a CGNAT lease that may not be ours.
     """
-    exe = (shutil.which("tailscale")
-           or "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    return _tailscale_ip()
+
+
+def tailscale_dns_name() -> str | None:
+    """This machine's MagicDNS name, so a Host allowlist can accept it."""
+    return _tailscale_dns()
+
+
+def _tailscale_ip() -> str | None:
     try:
-        out = subprocess.run([exe, "ip", "-4"], capture_output=True,
+        out = subprocess.run([_tailscale_exe(), "ip", "-4"], capture_output=True,
                              text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     found = (out.stdout or "").split()
     return found[0] if out.returncode == 0 and found else None
+
+
+def _tailscale_dns() -> str | None:
+    try:
+        out = subprocess.run([_tailscale_exe(), "status", "--json"],
+                             capture_output=True, text=True, timeout=5)
+        data = json.loads(out.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    name = str((data.get("Self") or {}).get("DNSName") or "").strip().rstrip(".")
+    return name or None
+
+
+_tailscale_ip = functools.cache(_tailscale_ip)
+_tailscale_dns = functools.cache(_tailscale_dns)
 
 
 def bind_address(cfg: dict | None = None) -> str:
@@ -268,6 +295,12 @@ def allowed_hosts(addr: str, cfg: dict | None = None) -> set[str]:
     tail = tailscale_address()
     if tail:
         hosts.add(tail)
+    dns = tailscale_dns_name()
+    if dns:
+        hosts.add(dns)
+        short = dns.split(".")[0]
+        if short:
+            hosts.add(short)
     for extra in http_cfg(cfg).get("hosts") or []:
         if str(extra).strip():
             hosts.add(str(extra).strip())
@@ -808,7 +841,7 @@ def run_brief(con, run_id: int) -> dict:
                 "message": "no brief file: this run was launched from its "
                            "title alone"}
     try:
-        text = Path(path).read_text(errors="replace")
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return {"run": run_id, "path": path, "text": None,
                 "message": f"the brief file is gone: {exc.strerror or exc}"}
@@ -894,7 +927,7 @@ def stop_run(con, run_id: int) -> dict:
     signalled = False
     if r["pid"]:
         try:
-            os.killpg(r["pid"], signal.SIGTERM)
+            proc.signal_group(r["pid"], signal.SIGTERM)
             signalled = True
         except (ProcessLookupError, PermissionError, OSError):
             pass
@@ -933,7 +966,7 @@ def tell_run(con, run_id: int, text: str, now: bool = False) -> dict:
     con.commit()
     if now and r["pid"]:
         try:
-            os.killpg(r["pid"], signal.SIGTERM)
+            proc.signal_group(r["pid"], signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             pass
     return {"run": run_id, "queued": True, "immediate": bool(now)}
@@ -952,7 +985,7 @@ def check_run(con, run_id: int, observe: bool = True) -> dict:
     alive = None
     if r["pid"]:
         try:
-            os.killpg(r["pid"], 0)
+            proc.signal_group(r["pid"], 0)
             alive = True
         except PermissionError:
             alive = True
@@ -1051,11 +1084,31 @@ def _write_stream(handler, frames) -> bool:
 
 # --- the server -------------------------------------------------------------
 
+# A client that resets the socket while ThreadingHTTPServer is still
+# reading the request line is not a bug in the handler; the stdlib dumps
+# a full traceback for it anyway.
+_DROPPED = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exception()
+        if isinstance(exc, _DROPPED):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "dromond"
     sys_version = ""
     identity = None  # set by _gate, before any route runs
+
+    def handle(self):
+        try:
+            super().handle()
+        except _DROPPED:
+            pass
 
     # -- plumbing
     def log_message(self, fmt, *args):  # noqa: A003 — BaseHTTPRequestHandler API
@@ -1210,7 +1263,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(project_scope(project_id))
         if path == CONFIG_ROUTE:
             cfg_path = config.ensure_global_config()
-            return self._json({"path": str(cfg_path), "text": cfg_path.read_text()})
+            return self._json({"path": str(cfg_path),
+                               "text": cfg_path.read_text(encoding="utf-8")})
         if path == OPTIONS_ROUTE:
             # What the harnesses actually offer, for the model/effort
             # pickers (DESIGN §5). Cached: it costs three subprocesses.
@@ -1366,7 +1420,7 @@ def serve(stop: threading.Event | None = None, wake=None, addr=None,
     addr = bind_address(cfg) if addr is None else addr
     port = int(http_cfg(cfg).get("port") or DEFAULT_PORT) if port is None else port
     try:
-        srv = ThreadingHTTPServer((addr, port), Handler)
+        srv = Server((addr, port), Handler)
     except OSError as exc:
         print(f"dromond http: cannot bind {addr}:{port} — {exc}",
               file=sys.stderr, flush=True)
@@ -1389,7 +1443,7 @@ def serve(stop: threading.Event | None = None, wake=None, addr=None,
     srv.local = None
     if addr not in ("127.0.0.1", "::1", "localhost"):
         try:
-            local = ThreadingHTTPServer(("127.0.0.1", srv.server_port), Handler)
+            local = Server(("127.0.0.1", srv.server_port), Handler)
         except OSError as exc:
             print(f"dromond http: no loopback listener — {exc}",
                   file=sys.stderr, flush=True)

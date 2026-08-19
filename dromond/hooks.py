@@ -217,11 +217,24 @@ def codex_trust_status() -> str:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return f"NOT provisioned ({path} unreadable) — run `dromond init`"
-    missing = [key for key, _ in records if f'[hooks.state."{key}"]' not in text]
+    missing = [key for key, _ in records
+               if _trust_header(key) not in text
+               and f'[hooks.state."{key}"]' not in text]
     if missing:
         return (f"NOT provisioned for {len(missing)} of {len(records)} hooks — "
                 "run `dromond init`")
     return f"provisioned for {len(records)} hook(s) in {path}"
+
+
+def _toml_basic(value: str) -> str:
+    """Escape a value for a TOML basic string. Windows paths need this:
+    ``C:\\Users\\...`` otherwise ``\\U`` is a unicode escape and Codex
+    refuses the whole config.toml."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _trust_header(key: str) -> str:
+    return f'[hooks.state."{_toml_basic(key)}"]'
 
 
 def provision_codex_trust() -> str:
@@ -241,9 +254,9 @@ def provision_codex_trust() -> str:
         return f"hook trust: cannot read {path}: {exc}"
     lines = []
     for key, digest in records:
-        if f'[hooks.state."{key}"]' in text:
+        if _trust_header(key) in text or f'[hooks.state."{key}"]' in text:
             continue  # already recorded — possibly by Codex itself; leave it
-        lines += [f'[hooks.state."{key}"]', "enabled = true",
+        lines += [_trust_header(key), "enabled = true",
                   f'trusted_hash = "{digest}"', ""]
     if not lines:
         return f"hook trust: already recorded in {path}"

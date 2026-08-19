@@ -2,7 +2,6 @@
 import argparse
 import json
 import os
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -11,8 +10,8 @@ from pathlib import Path
 
 from dromond import (acp, auth, conductor, config, daemon, db, dispatch,
                          hooks, http, merge, messaging, migrate, names, nod,
-                         observer, paths, profile_edit, profiles, project, runway,
-                         service, supervise, sweeper, traces, worktree)
+                         observer, paths, proc, profile_edit, profiles, project,
+                         runway, service, supervise, sweeper, traces, worktree)
 
 
 def _here(con) -> tuple:
@@ -120,7 +119,7 @@ def cmd_dispatch(args):
     _gate_dispatch(con, cfg, requester)
     mission = " ".join(args.mission)
     if args.brief_file:
-        mission = Path(args.brief_file).read_text()
+        mission = Path(args.brief_file).read_text(encoding="utf-8")
     if not mission.strip():
         raise SystemExit("dromond: empty mission (pass text, or --brief-file)")
     # A staffing moment (W-0187): the project's enabled set gates it, and a
@@ -396,7 +395,7 @@ def cmd_interrupt(args):
         con.commit()
         if r["pid"] and not live:
             try:
-                os.killpg(r["pid"], signal.SIGTERM)
+                proc.signal_group(r["pid"], signal.SIGTERM)
             except ProcessLookupError:
                 pass
         how = ("the worker's turn is cancelled gracefully over ACP and the same "
@@ -496,8 +495,8 @@ def cmd_kill(args):
     con.commit()
     if r["pid"]:
         try:
-            os.killpg(r["pid"], signal.SIGTERM)
-            print(f"sent SIGTERM to run {args.run_id} (pgid {r['pid']})")
+            proc.signal_group(r["pid"], signal.SIGTERM)
+            print(f"sent SIGTERM to run {args.run_id} (pid {r['pid']})")
         except ProcessLookupError:
             print(f"run {args.run_id} marked killed (process already gone)")
     else:
@@ -732,7 +731,7 @@ def cmd_profiles(args):
 def cmd_doctor(args):
     print("dromond doctor\n")
     for tool in ("codex", "claude", "opencode", "reasonix", "git"):
-        path = shutil.which(tool)
+        path = proc.which(tool)
         print(f"  {tool:<9} {'available · ' + path if path else 'not found'}")
     gp = paths.global_config_path()
     print(f"\n  global config: {gp} ({'present' if gp.is_file() else 'absent'})")
@@ -753,8 +752,7 @@ def cmd_doctor(args):
     # run, and that used to be silent. Doctor names the fix.
     for line in observer.status_report(cfg):
         print(line)
-    print(f"  service:  {service.plist_path()} "
-          f"({'installed' if service.plist_path().exists() else 'not installed'})")
+    print(f"  service:  {service.status_line()}")
     # DESIGN §6: a backend whose hook is missing (or whose Codex trust was
     # never provisioned) cannot be told anything, so doctor says so plainly.
     for line in hooks.hook_report():
@@ -921,7 +919,7 @@ def cmd_stats(args):
 
 
 def cmd_merge(args):
-    criteria = Path(args.criteria_file).read_text() if args.criteria_file else ""
+    criteria = Path(args.criteria_file).read_text(encoding="utf-8") if args.criteria_file else ""
     con = db.connect()
     proj = project.resolve(con, config.load())
     # The by-hand retry judges tripwires against the same mission the
@@ -1104,6 +1102,7 @@ def cmd_supervise(args):
 # --- parser -----------------------------------------------------------------
 
 def main():
+    _win_stdio()
     p = argparse.ArgumentParser(
         prog="dromond",
         description="Local control plane: dispatch codex/claude/opencode/reasonix "
@@ -1293,7 +1292,9 @@ def main():
     s.add_argument("--once", action="store_true", help="one tick, then exit")
     s.set_defaults(fn=cmd_daemon)
 
-    s = sub.add_parser("service", help="manage the launchd LaunchAgent for the daemon")
+    s = sub.add_parser("service",
+                       help="manage the user-session supervisor for the daemon "
+                            "(launchd on macOS, scheduled task on Windows)")
     s.add_argument("action", choices=("install", "uninstall", "status", "restart"))
     s.add_argument("--start", action="store_true",
                    help="also load and start it now (install only)")
@@ -1341,3 +1342,13 @@ def main():
 
     args = p.parse_args()
     args.fn(args)
+
+
+def _win_stdio() -> None:
+    """Windows consoles default to cp1252; Dromond's copy uses arrows and §."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")

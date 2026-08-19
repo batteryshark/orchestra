@@ -158,7 +158,8 @@ class ConfigTests(unittest.TestCase):
             "add_dirs = [\"~/ref\", \"/abs/ref\"]\n")
         profile = config.profile_cfg(config.load(PROJECT_ID), "mine")
         self.assertEqual(profile["add_dirs"],
-                         [str(Path("~/ref").expanduser()), "/abs/ref"])
+                         [str(Path("~/ref").expanduser()),
+                          str(Path("/abs/ref").expanduser())])
         self.assertEqual(config.profile_cfg(config.load("other"), "mine")["add_dirs"], [])
 
     def test_malformed_add_dirs_is_a_clear_error(self) -> None:

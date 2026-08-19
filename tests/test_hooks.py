@@ -50,9 +50,10 @@ class HookFixture(unittest.TestCase):
         self.work.add_task("W-0001", "demo item")
         self.work_url = self.work.start()
         self.global_config = self.tmp_path / "global.toml"
+        secrets = (self.tmp_path / "nod-secrets.env").as_posix()
         self.global_config.write_text(
-            CONFIG.format(secrets=self.tmp_path / "nod-secrets.env")
-            + f'api_url = "{self.work_url}"\n')
+            CONFIG.format(secrets=secrets) + f'api_url = "{self.work_url}"\n',
+            encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
             "DROMOND_CONFIG": str(self.global_config),
             "DROMOND_HOME": str(self.tmp_path / "home"),
@@ -168,7 +169,7 @@ class CodexTrustTests(HookFixture):
         keys = [key for key, _ in hooks.codex_trust_records()]
         self.assertEqual(len(keys), 2)
         for key in keys:
-            self.assertIn(f'[hooks.state."{key}"]', text)
+            self.assertIn(hooks._trust_header(key), text)
         self.assertIn("trusted_hash = \"sha256:", text)
         self.assertIn("provisioned for 2 hook(s)", hooks.codex_trust_status())
         # The bypass flag is never added to a spawn command.
@@ -180,16 +181,23 @@ class CodexTrustTests(HookFixture):
         hooks.install_file(Path(os.environ["CODEX_HOME"]) / "hooks.json", "codex")
         key = hooks.codex_trust_records()[0][0]
         path = Path(os.environ["CODEX_HOME"]) / "config.toml"
-        path.write_text(f'[hooks.state."{key}"]\nenabled = true\n'
+        path.write_text(hooks._trust_header(key) + "\nenabled = true\n"
                         'trusted_hash = "sha256:written-by-codex-itself"\n')
         hooks.provision_codex_trust()
         text = path.read_text()
-        self.assertEqual(text.count(f'[hooks.state."{key}"]'), 1)
+        self.assertEqual(text.count(hooks._trust_header(key)), 1)
         self.assertIn("written-by-codex-itself", text)
 
     def test_status_reports_missing_trust(self) -> None:
         hooks.install_file(Path(os.environ["CODEX_HOME"]) / "hooks.json", "codex")
         self.assertIn("NOT provisioned", hooks.codex_trust_status())
+
+    def test_windows_paths_are_toml_escaped(self) -> None:
+        raw = r"C:\Users\alice\.codex\hooks.json:sessionstart:0:0"
+        self.assertEqual(
+            hooks._toml_basic(raw),
+            r"C:\\Users\\alice\\.codex\\hooks.json:sessionstart:0:0")
+        self.assertIn(r'\\Users', hooks._trust_header(raw))
 
 
 # --- the hook at runtime --------------------------------------------------------

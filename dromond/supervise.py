@@ -18,7 +18,6 @@ DESIGN D3, simplified from Orchestra's 1,388-LOC counterpart:
 import json
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -30,6 +29,7 @@ from pathlib import Path
 from dromond import (acp, auth, brief, config, db, dispatch, findings,
                          merge, messaging, observer, paths, project, runners,
                          traces, worktree)
+from dromond.proc import enrich_path, resolve_cmd, session_kwargs, terminate_group
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 POLL_INTERVAL = 0.5
@@ -47,8 +47,9 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
         handle = open(err, "ab")
     except OSError:
         handle = subprocess.DEVNULL
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=handle, start_new_session=True)
+    proc = subprocess.Popen(resolve_cmd(cmd), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=handle,
+                            **session_kwargs(detached=True))
     if handle is not subprocess.DEVNULL:
         handle.close()
     # Keep Popen alive and reap the detached child without delaying dispatch.
@@ -87,7 +88,7 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
                          work_item=item if (item or "").startswith("W-") else None,
                          recent_commits=worktree.recent_commits(Path(workdir)))
     bp = paths.briefs_dir() / f"run-{run_id}.md"
-    bp.write_text(text)
+    bp.write_text(text, encoding="utf-8")
     lp = paths.logs_dir() / f"run-{run_id}.jsonl"
     lp.touch()
     con.execute(
@@ -158,7 +159,8 @@ def create_followup(con, root: Path, parent, requester: str, text: str,
     landed = (worktree.recent_commits(Path(root), since=parent["base_commit"])
               if parent["base_commit"] and (Path(root) / ".git").exists() else [])
     bp.write_text(brief.compose_continuation(run_id=run_id, parent_run=parent["id"],
-                                             instructions=text, landed=landed))
+                                             instructions=text, landed=landed),
+                  encoding="utf-8")
     lp = paths.logs_dir() / f"run-{run_id}.jsonl"
     lp.touch()
     con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",
@@ -258,29 +260,17 @@ def _stall_seconds(raw) -> int | None:
 
 
 def _terminate_process_group(pid: int) -> None:
-    try:
-        os.killpg(pid, signal.SIGTERM)
-        return
-    except ProcessLookupError:
-        return
-    except Exception:
-        pass
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except Exception:
-        pass
+    terminate_group(pid)
 
 
-def _wait_after_term(proc: subprocess.Popen, timeout: float = 15) -> None:
+def _wait_after_term(child: subprocess.Popen, timeout: float = 15) -> None:
     try:
-        proc.wait(timeout=timeout)
+        child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # It already had its SIGTERM and its grace period. This is the kill.
+        terminate_group(child.pid, force=True)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
+            child.wait(timeout=2)
         except Exception:
             pass
 
@@ -296,9 +286,10 @@ def _run_proc(con, run, cmd, env, log_path, run_id, deadline,
     # layer (a) is the stall detection already in the loop below.
     spin = observer.Watcher(run_id, run["project_id"])
     with open(log_path, "ab") as log:
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT, cwd=run["workdir"],
-                                env=env, start_new_session=True)
+        proc = subprocess.Popen(
+            resolve_cmd(cmd), stdin=subprocess.DEVNULL, stdout=log,
+            stderr=subprocess.STDOUT, cwd=run["workdir"],
+            env=env, **session_kwargs())
     cur = con.execute(
         "UPDATE runs SET pid=?, status='running' "
         f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
@@ -563,7 +554,7 @@ def supervise(root: Path, run_id: int) -> int:
         "stall_timeout",
         settings.get("stall_timeout", config.DEFAULT_STALL_TIMEOUT_SECONDS)))
     deadline = _ts_to_epoch(run["started_at"]) + timeout
-    prompt = Path(run["brief_path"]).read_text() if run["brief_path"] else (run["title"] or "")
+    prompt = Path(run["brief_path"]).read_text(encoding="utf-8") if run["brief_path"] else (run["title"] or "")
     brief_prompt = prompt
     resume_ref = run["session_ref"] if run["parent_run"] else None
     restart_note = None  # set when a dead session sent the work back to square one
@@ -591,6 +582,7 @@ def supervise(root: Path, run_id: int) -> int:
             cmd = cmd[:2] + ["-o", last_msg_file] + cmd[2:]  # `codex exec -o FILE ...`
         env = dict(os.environ, DROMOND_ROOT=str(root), DROMOND_RUN_ID=str(run_id),
                    **{auth.TOKEN_ENV: run_token})
+        env = enrich_path(env)
         env = config.apply_worker_env(cfg, env, root)
         env = runners.apply_backend_env(profile, env)
         outcome, exit_code = _run_proc(con, run, cmd, env, run["log_path"],
@@ -656,9 +648,9 @@ def supervise(root: Path, run_id: int) -> int:
     if transport == "acp":
         env = runners.apply_backend_env(
             profile, config.apply_worker_env(
-                cfg, dict(os.environ, DROMOND_ROOT=str(root),
-                          DROMOND_RUN_ID=str(run_id),
-                          **{auth.TOKEN_ENV: run_token}), root))
+                cfg, enrich_path(dict(os.environ, DROMOND_ROOT=str(root),
+                                      DROMOND_RUN_ID=str(run_id),
+                                      **{auth.TOKEN_ENV: run_token})), root))
         status, exit_code = acp.supervise_run(
             con, run, profile, prompt=prompt, run_id=run_id, env=env,
             deadline=deadline, stall_timeout=stall_timeout)
@@ -679,7 +671,7 @@ def supervise(root: Path, run_id: int) -> int:
             or latest["summary"].startswith(acp.FAILURE_PREFIX)):
         last_text = latest["summary"]
     if last_msg_file and Path(last_msg_file).is_file():
-        txt = Path(last_msg_file).read_text(errors="replace").strip()
+        txt = Path(last_msg_file).read_text(encoding="utf-8", errors="replace").strip()
         if txt:
             last_text = txt
         os.unlink(last_msg_file)

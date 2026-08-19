@@ -622,7 +622,7 @@ def _read_env_file(path: Path) -> dict:
         raise SystemExit(f"dromond: {path} is readable by other users — "
                          f"run `chmod 600 {path}`")
     values = {}
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
