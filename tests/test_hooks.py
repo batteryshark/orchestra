@@ -193,10 +193,10 @@ class CodexTrustTests(HookFixture):
         self.assertIn("NOT provisioned", hooks.codex_trust_status())
 
     def test_windows_paths_are_toml_escaped(self) -> None:
-        raw = r"C:\Users\batte\.codex\hooks.json:sessionstart:0:0"
+        raw = r"C:\Users\alice\.codex\hooks.json:sessionstart:0:0"
         self.assertEqual(
             hooks._toml_basic(raw),
-            r"C:\\Users\\batte\\.codex\\hooks.json:sessionstart:0:0")
+            r"C:\\Users\\alice\\.codex\\hooks.json:sessionstart:0:0")
         self.assertIn(r'\\Users', hooks._trust_header(raw))
 
 

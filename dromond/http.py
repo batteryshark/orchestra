@@ -1084,9 +1084,9 @@ def _write_stream(handler, frames) -> bool:
 
 # --- the server -------------------------------------------------------------
 
-# A phone on the tailnet (or Safari closing a tab) resets the socket while
-# ThreadingHTTPServer is still reading the request line. That is not a bug
-# in the handler; the stdlib dumps a full traceback for it anyway.
+# A client that resets the socket while ThreadingHTTPServer is still
+# reading the request line is not a bug in the handler; the stdlib dumps
+# a full traceback for it anyway.
 _DROPPED = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
 
 
