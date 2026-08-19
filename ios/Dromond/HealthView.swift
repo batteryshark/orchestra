@@ -80,13 +80,20 @@ struct HealthView: View {
             if let problem = daemon.error, !problem.isEmpty {
                 Banner(text: problem, icon: "exclamationmark.octagon.fill", tint: .red)
             }
+            // History, not current state: last_error sticks until the next
+            // failure, so a fixed crash from days ago used to sit here in
+            // alarm orange next to a healthy daemon. Collapsed by default —
+            // the daemon log holds the traceback worth acting on.
             if let last = daemon.lastError, !last.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
+                DisclosureGroup {
+                    WrappedText(text: last, font: .caption, color: .secondary)
+                        .padding(.top, 2)
+                } label: {
                     Text(daemon.lastErrorAt.map { "Last error · \(Self.stamp($0))" } ?? "Last error")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    WrappedText(text: last, font: .caption, color: .orange)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
+                .tint(.secondary)
                 .padding(.top, 4)
             }
 
