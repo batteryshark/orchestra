@@ -16,9 +16,9 @@ cd "$(dirname "$0")"
 TEAM="${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
   | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}"
 PORT="${DROMOND_OTA_PORT:-8791}"
-# One app per path: Work publishes at /install, so Dromond gets its own and
-# neither unmounts the other when both are being handed to a phone.
-WEBPATH="${DROMOND_OTA_PATH:-/dromond}"
+# Every app installs from one namespace, one app per leaf, so publishing one
+# never unmounts another and the tailnet has a single obvious place to look.
+WEBPATH="${DROMOND_OTA_PATH:-/ios-installer/dromond}"
 OUT="${TMPDIR:-/tmp}/dromond-ota"
 HOST="$(tailscale status --json 2>/dev/null \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
