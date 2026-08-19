@@ -13,7 +13,8 @@ from dromond import db, http, runway
 def performance(con) -> list[dict]:
     """One row per (profile, model) over TERMINAL runs, worst first.
 
-    A live run is not a review subject, so it is excluded. Success is
+    A live run is not a review subject, so it is excluded. Neither is a
+    control turn (W-0214): a router turn is not the profile's work. Success is
     ``done / terminal runs``; tokens and cost are sums of what was captured,
     with ``uncaptured`` counting the runs that carry no usage (DESIGN §11 —
     null is "not captured", never a zero). A plan-backed run has no price
@@ -22,7 +23,7 @@ def performance(con) -> list[dict]:
     rows: dict[tuple, dict] = {}
     for r in con.execute(
             "SELECT profile, backend, model, status, started_at, finished_at, "
-            "tokens_total, cost_usd FROM runs WHERE status IN "
+            "tokens_total, cost_usd FROM runs WHERE layer IS NULL AND status IN "
             f"({','.join('?' * len(db.RUN_TERMINAL))})", db.RUN_TERMINAL):
         key = (r["profile"], r["model"] or "")
         entry = rows.setdefault(key, {

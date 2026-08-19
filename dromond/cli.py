@@ -255,7 +255,7 @@ def cmd_status(args):
               f"{(r['title'] or '')[:50]}")
     recent = list(con.execute(
         f"SELECT * FROM runs WHERE status IN {db.TERMINAL_SQL} "
-        "ORDER BY id DESC LIMIT 5"))
+        "AND layer IS NULL ORDER BY id DESC LIMIT 5"))
     if recent:
         print("## recent finished")
         for r in recent[::-1]:
@@ -266,7 +266,11 @@ def cmd_status(args):
 
 def cmd_runs(args):
     con = db.connect()
-    where = [f"status NOT IN {db.TERMINAL_SQL}"] if args.active else []
+    # Control turns (W-0214) are not the fleet; `dromond show <id>` still
+    # opens one directly.
+    where = ["layer IS NULL"]
+    if args.active:
+        where.append(f"status NOT IN {db.TERMINAL_SQL}")
     params = []
     if args.here:
         proj, _ = _here(con)

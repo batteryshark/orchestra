@@ -40,7 +40,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dromond import config, db, dispatch, nod, paths, runners
+from dromond import config, db, dispatch, nod, paths, runners, traces
 
 # Layer (c) cadence: first look five minutes in, then every half hour (§7).
 # A workhorse (tier 1) gets looked at much sooner: a heavy model thinking for
@@ -440,38 +440,142 @@ def prompt_for(con, run, *, limit: int = DIGEST_EVENTS) -> str:
             f"\n--- last {limit} trace events ---\n{digest(con, run['id'], limit)}\n")
 
 
+def record_turn(con, layer: str, profile: dict, log_path: str, ok: bool,
+                note: str = "", meta: dict | None = None) -> int | None:
+    """File a control turn as a terminal runs row and ingest its transcript.
+
+    The transcript lands in the logs directory and stays there: it ages out
+    under the same ``prune_raw_logs`` rule as any terminal run. The row is
+    terminal at birth and carries ``layer`` and no work_item/branch, so every
+    fleet query either skips it by status or never matches it.
+
+    Never raises and never masks the turn's own outcome: a turn that cannot
+    be recorded is a lost trace, not a failed dispatch.
+    """
+    try:
+        backend = profile.get("backend", "opencode")
+        now = db.now()
+        run_id = int(con.execute(
+            "INSERT INTO runs(profile, backend, model, title, requested_by, "
+            "log_path, workdir, status, exit_code, summary, started_at, "
+            "finished_at, layer) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (profile.get("name") or layer, backend, profile.get("model"),
+             f"{layer} turn", "dromond", log_path,
+             tempfile.gettempdir(), "done" if ok else "failed",
+             0 if ok else 1, (note or "")[:500], now, now, layer)).lastrowid)
+        traces.ingest(con, run_id, log_path, backend)
+        con.commit()
+        if meta is not None:
+            meta["turn_id"] = run_id
+        return run_id
+    except Exception as exc:
+        print(f"dromond observer: could not record the {layer} turn: {exc!r}",
+              flush=True)
+        return None
+
+
+def _write_transcript(layer: str, stdout: str) -> str:
+    """The retained transcript, in the logs directory. Written BEFORE the
+    outcome is judged, so a failed turn leaves the same readable log a good
+    one does; retention prunes it under the run-log rule."""
+    path = paths.logs_dir() / f"turn-{layer}-{time.time_ns()}.jsonl"
+    path.write_text(stdout or "", encoding="utf-8", errors="replace")
+    return str(path)
+
+
+def note_turn(con, turn_id: int | None, summary: str) -> None:
+    """The decision one-liner on the turn's row — what the pinned entry shows.
+
+    This is also where the two-way link lives: the summary names the run the
+    turn acted on and the Nod card it produced, and the card's detail names
+    this turn (``apply_verdict`` / ``merge`` write that half). ``con=None``
+    opens a short-lived connection (the merge judge is never handed one).
+    """
+    if not turn_id:
+        return
+    own = con is None
+    con = db.connect() if own else con
+    try:
+        con.execute("UPDATE runs SET summary=? WHERE id=? AND layer IS NOT NULL",
+                    (summary[:500], turn_id))
+        con.commit()
+    except Exception as exc:
+        print(f"dromond observer: could not note turn {turn_id}: {exc!r}",
+              flush=True)
+    finally:
+        if own:
+            con.close()
+
+
 def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
-               workdir: str | None = None) -> str:
+               workdir: str | None = None, layer: str | None = None,
+               con=None, meta: dict | None = None) -> str:
     """One cheap model call, out of band. Returns the model's last text.
 
     A separate process with its own prompt: the worker's session is never
     resumed, never interrupted, and never billed for this.
+
+    With ``layer`` set (router / merge / observer / conductor) the turn is a
+    CONTROL turn (W-0214): its transcript is retained instead of unlinked,
+    and the turn is recorded as a terminal runs row whose events normalize
+    through ``traces.ingest`` — including a FAILED turn, which used to leave
+    no trace at all. ``con`` is borrowed when given, opened for the recording
+    otherwise. ``meta`` receives ``turn_id`` so the caller can link the
+    decision back to it.
     """
     cmd = runners.build_cmd(profile, workdir=workdir or tempfile.gettempdir(),
                             title="dromond-observer", prompt=prompt)
+    own = layer is not None and con is None
+    con = db.connect() if own else con
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
-    except FileNotFoundError as exc:
-        raise ObserverTurnError(f"{cmd[0]} is not installed") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ObserverTurnError(f"the observer turn timed out after {timeout}s") from exc
-    if proc.returncode != 0 and not proc.stdout.strip():
-        detail = (proc.stderr or "").strip().splitlines()
-        raise ObserverTurnError(
-            f"{cmd[0]} exited {proc.returncode}: {detail[-1][:200] if detail else ''}")
-    # The backends speak JSONL on stdout; reuse the same tolerant reader the
-    # supervisor uses rather than a second parser.
-    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
-    try:
-        handle.write(proc.stdout)
-        handle.close()
-        _, text = runners.parse_log(handle.name)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                  stdin=subprocess.DEVNULL)
+            stdout = proc.stdout
+        except FileNotFoundError as exc:
+            if layer:
+                record_turn(con, layer, profile, _write_transcript(layer, ""),
+                            False, f"{cmd[0]} is not installed", meta)
+            raise ObserverTurnError(f"{cmd[0]} is not installed") from exc
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or ""
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", "replace")
+            if layer:
+                record_turn(con, layer, profile, _write_transcript(layer, out),
+                            False, f"the turn timed out after {timeout}s", meta)
+            raise ObserverTurnError(f"the observer turn timed out after {timeout}s") from exc
+        log_path = _write_transcript(layer, stdout) if layer else None
+        if proc.returncode != 0 and not stdout.strip():
+            detail = (proc.stderr or "").strip().splitlines()
+            note = f"{cmd[0]} exited {proc.returncode}: {detail[-1][:200] if detail else ''}"
+            if layer:
+                record_turn(con, layer, profile, log_path, False, note, meta)
+            raise ObserverTurnError(note)
+        # The backends speak JSONL on stdout; reuse the same tolerant reader the
+        # supervisor uses rather than a second parser.
+        if layer:
+            _, text = runners.parse_log(log_path)
+        else:
+            handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+            try:
+                handle.write(stdout)
+                handle.close()
+                _, text = runners.parse_log(handle.name)
+            finally:
+                os.unlink(handle.name)
+        if not (text or "").strip():
+            if layer:
+                record_turn(con, layer, profile, log_path, False,
+                            "the turn produced no text", meta)
+            raise ObserverTurnError("the observer turn produced no text")
+        if layer:
+            record_turn(con, layer, profile, log_path, True,
+                        (text or "").strip().splitlines()[0][:200], meta)
+        return text
     finally:
-        os.unlink(handle.name)
-    if not (text or "").strip():
-        raise ObserverTurnError("the observer turn produced no text")
-    return text
+        if own:
+            con.close()
 
 
 def last_json_object(text: str, key: str) -> dict | None:
@@ -525,9 +629,16 @@ def judge(con, run_id: int, cfg: dict | None = None, *, turn=None) -> dict:
         raise KeyError(f"no run {run_id}")
     cfg = config.load(run["project_id"]) if cfg is None else cfg
     profile = observer_profile(cfg)            # raises ObserverUnconfigured
-    text = (turn or model_turn)(profile, prompt_for(con, run))
+    meta: dict = {}
+    if turn is not None:
+        text = turn(profile, prompt_for(con, run))
+    else:
+        text = model_turn(profile, prompt_for(con, run),
+                          con=con, layer="observer", meta=meta)
     verdict = parse_verdict(text)
     verdict["profile"] = profile["name"]
+    if meta.get("turn_id"):
+        verdict["turn_id"] = meta["turn_id"]
     return verdict
 
 
@@ -548,10 +659,12 @@ def apply_verdict(con, run_id: int, verdict: dict, cfg: dict | None = None, *,
                {k: v for k, v in verdict.items() if k not in ("reason", "action")})
         con.commit()
     result = {"run": run_id, "action": action, "reason": reason, "layer": layer}
+    turn_id = verdict.get("turn_id")
     if action == "tell":
         message = verdict.get("message") or CORRECTION.format(reason=reason)
         told = http.tell_run(con, run_id, message)
         result["tell"] = told
+        note_turn(con, turn_id, f"tell run {run_id}: {reason}")
         return result
     if action == "stop":
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -561,10 +674,17 @@ def apply_verdict(con, run_id: int, verdict: dict, cfg: dict | None = None, *,
             con, run, title=f"Run {run_id} stopped by the spin observer",
             detail=f"The {layer} layer stopped run {run_id}.\n\n{reason}\n\n"
                    "Nothing retries this automatically: the observer stopped "
-                   "it on judgement, not on an infrastructure fault.",
+                   "it on judgement, not on an infrastructure fault."
+                   + (f"\n\nThe turn that decided this is recorded as run "
+                      f"#{turn_id}." if turn_id else ""),
             cfg=cfg)
+        nod_id = (result["escalation"] or {}).get("nod")
+        note_turn(con, turn_id,
+                  f"stop run {run_id}: {reason}"
+                  + (f" · nod {nod_id}" if nod_id else ""))
         result["stopped"] = http.stop_run(con, run_id)
         return result
+    note_turn(con, turn_id, f"{action}: {reason}" if reason else action)
     return result
 
 

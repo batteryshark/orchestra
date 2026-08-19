@@ -121,7 +121,7 @@ def _one_line(exc) -> str:
 
 
 def _choose(con, cfg: dict, snapshot: str, name: str, profile: dict, *,
-            turn=None) -> tuple[str, dict, str | None]:
+            turn=None, meta: dict | None = None) -> tuple[str, dict, str | None]:
     """The staffing decision. ``choose`` owns its fail-safe boundary."""
     router_name = str((cfg.get("work") or {}).get("router") or "").strip()
     if not router_name:
@@ -139,7 +139,11 @@ def _choose(con, cfg: dict, snapshot: str, name: str, profile: dict, *,
     packet = build_packet(snapshot, enabled, {p["provider"]: p
                                               for p in runway.latest_polls(con)})
     try:
-        text = (turn or observer.model_turn)(router, packet, timeout=TURN_TIMEOUT)
+        if turn is not None:
+            text = turn(router, packet, timeout=TURN_TIMEOUT)
+        else:
+            text = observer.model_turn(router, packet, timeout=TURN_TIMEOUT,
+                                       con=con, layer="router", meta=meta)
     # A dead binary, a wedged process, a backend that changed its output: the
     # dispatch goes either way, so nothing this turn does may propagate.
     # SystemExit counts too — `runners.build_cmd` exits for CLI use.
@@ -173,9 +177,16 @@ def choose(con, cfg: dict, snapshot: str, name: str, profile: dict, *,
     Never raises. A staffing turn that fails is the router's problem, never
     the item's, so the caller always gets a profile it can dispatch.
     """
+    meta: dict = {}
     try:
-        return _choose(con, cfg, snapshot, name, profile, turn=turn)
+        chosen, picked, reason = _choose(con, cfg, snapshot, name, profile,
+                                         turn=turn, meta=meta)
     except (Exception, SystemExit) as exc:
         detail = _one_line(exc) or type(exc).__name__
-        return name, profile, (f"the staffing turn failed ({detail}); "
-                               f"staffed {name}")
+        chosen, picked, reason = name, profile, (
+            f"the staffing turn failed ({detail}); staffed {name}")
+    if reason:
+        # The turn's row carries the one line the item's run row carries, so
+        # the pinned entry in the Runs tab reads the decision, not a replay.
+        observer.note_turn(con, meta.get("turn_id"), reason)
+    return chosen, picked, reason
