@@ -530,7 +530,10 @@ def _decide(cfg: dict, name: str, changes: dict, keys: set[str],
         created = client.create_decision(
             title=f"Dromond profile '{name}': {', '.join(sorted(keys))}"[:300],
             detail=detail[:19000],
-            options=["Apply it", "Decline"])
+            options=["Apply it", "Decline"],
+            # Work refuses an agent decision without a recommendationReason.
+            recommendation_reason=("No lean: this change commits spend, which "
+                                   "DESIGN §5 keeps a human call."))
     except work_client.WorkError as exc:
         result["error"] = f"work rejected the decision ({exc.code})"
         return result

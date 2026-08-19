@@ -160,15 +160,26 @@ class WorkClient:
             payload["tags"] = list(tags)
         return self._call("POST", "/api/tasks", payload)
 
-    def create_decision(self, title: str, detail: str | None = None,
-                        options: list | None = None, refs: list | None = None,
-                        project_path: str | None = None):
-        """A choice only the human may make — lands in the needs-you queue."""
-        payload = {"title": title}
+    def create_decision(self, title: str, *, recommendation_reason: str,
+                        detail: str | None = None, options: list | None = None,
+                        refs: list | None = None,
+                        project_path: str | None = None,
+                        recommended_option: str | None = None):
+        """A choice only the human may make — lands in the needs-you queue.
+
+        Work refuses an agent-filed decision without a
+        ``recommendationReason`` (``decision_reason_required``): with a
+        recommendation it says why that option, without one it says why no
+        lean is possible. Every call this client makes carries the agent
+        identity, so the reason is required here too."""
+        payload = {"title": title,
+                   "recommendationReason": recommendation_reason}
         if detail is not None:
             payload["detail"] = detail
         if options:
             payload["options"] = list(options)
+        if recommended_option is not None:
+            payload["recommendedOption"] = recommended_option
         if refs:
             payload["refs"] = list(refs)
         if project_path is not None:

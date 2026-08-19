@@ -275,6 +275,12 @@ def _decision(client, run, goal_id: str, proposal: dict, tag: str,
             detail="\n\n".join(detail)[:19000],
             options=[f"Create it as a new backlog task under {goal_id}",
                      "Decline — create nothing"],
+            # Work refuses an agent decision without a recommendationReason.
+            # No lean is the honest answer: adopting scope is the owner's call.
+            recommendation_reason=("No lean: whether new scope is adopted is "
+                                   "the owner's call. The planner verdict and "
+                                   "tripwires above are evidence, not a "
+                                   "recommendation."),
             refs=[goal_id], project_path=proposal.get("project"))
     except WorkError as exc:
         return {"action": "rejected", "stage": "decision", "error": exc.code}

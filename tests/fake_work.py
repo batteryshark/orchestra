@@ -377,7 +377,7 @@ def _make_handler(state: FakeWork):
                                            "Agents cannot set delegated.")
                     parent = state.tasks.get(body.get("parentId") or "")
                     if not body.get("parentId"):
-                        return self._error(403, "agent_task_requires_goal_parent",
+                        return self._error(403, "agent_task_parent_required",
                                            "Agent-created tasks must be parented "
                                            "to a delegated goal.")
                     if not parent or not parent.get("delegated"):
@@ -397,12 +397,32 @@ def _make_handler(state: FakeWork):
                 body = self._body()
                 if not (body.get("title") or "").strip():
                     return self._error(400, "invalid_input", "title is required.")
+                # Work's rule: a recommendation carries its reason, and an
+                # agent-filed decision carries one either way — with a
+                # recommendation it says why that option, without one it says
+                # why no lean is possible. Only silence is refused.
+                recommended = body.get("recommendedOption")
+                reason = (body.get("recommendationReason") or "").strip()
+                if recommended and recommended not in (body.get("options") or []):
+                    return self._error(400, "invalid_input",
+                                       "recommendedOption must exactly match "
+                                       "one of the recorded options.")
+                if recommended and not reason:
+                    return self._error(400, "decision_reason_required",
+                                       "A recommendation must carry a "
+                                       "recommendationReason.")
+                if self._agent() and not reason:
+                    return self._error(403, "decision_reason_required",
+                                       "Agent-filed decisions state a "
+                                       "recommendationReason.")
                 ts = state.now()
                 decision_id = f"decision_{state._tick}"
                 state.decisions[decision_id] = {
                     "id": decision_id, "title": body["title"],
                     "detail": body.get("detail", ""),
                     "options": body.get("options") or [], "refs": body.get("refs") or [],
+                    "recommendedOption": recommended,
+                    "recommendationReason": reason or None,
                     "projectPath": body.get("projectPath"), "status": "open",
                     "createdAt": ts, "updatedAt": ts}
                 return self._send(201, state.decisions[decision_id])
