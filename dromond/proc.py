@@ -46,13 +46,22 @@ def resolve_cmd(cmd: list[str]) -> list[str]:
     return out
 
 
+# The Win32 creation flags, named here because CPython only defines them on
+# Windows: reading them off `subprocess` directly makes the Windows branch
+# unrunnable from a mac, so its test could only fail. The values are fixed by
+# the Win32 API, so naming them costs nothing and buys a testable branch.
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
 def session_kwargs(*, detached: bool = False) -> dict:
     """Popen kwargs that put the child in its own session / process group."""
     if not IS_WIN:
         return {"start_new_session": True}
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    flags = CREATE_NEW_PROCESS_GROUP
     if detached:
-        flags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+        flags |= DETACHED_PROCESS | CREATE_NO_WINDOW
     return {"creationflags": flags}
 
 
@@ -136,8 +145,15 @@ def harvest_children() -> int:
     return harvested
 
 
-def terminate_group(pid: int) -> None:
-    """Stop a worker and anything it spawned. Never raises."""
+def terminate_group(pid: int, *, force: bool = False) -> None:
+    """Stop a worker and anything it spawned. Never raises.
+
+    ``force`` skips the polite signal. It is for the LAST resort — a child
+    that already ignored a SIGTERM and outlived its grace period. Without it
+    such a worker was merely asked again, politely, forever: SIGTERM succeeds
+    against a process that ignores it, so the escalation to SIGKILL below
+    (which only fires when SIGTERM RAISES) never ran.
+    """
     if IS_WIN:
         try:
             subprocess.run(
@@ -146,13 +162,14 @@ def terminate_group(pid: int) -> None:
         except (OSError, subprocess.SubprocessError):
             pass
         return
-    try:
-        os.killpg(pid, signal.SIGTERM)
-        return
-    except ProcessLookupError:
-        return
-    except Exception:
-        pass
+    if not force:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            return
+        except ProcessLookupError:
+            return
+        except Exception:
+            pass
     try:
         os.killpg(pid, signal.SIGKILL)
     except Exception:

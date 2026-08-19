@@ -267,7 +267,8 @@ def _wait_after_term(child: subprocess.Popen, timeout: float = 15) -> None:
     try:
         child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        terminate_group(child.pid)
+        # It already had its SIGTERM and its grace period. This is the kill.
+        terminate_group(child.pid, force=True)
         try:
             child.wait(timeout=2)
         except Exception:
