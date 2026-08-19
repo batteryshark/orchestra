@@ -125,14 +125,15 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(self.sweep(), [])
         self.assertIsNone(self.db_run())
 
-    def test_legacy_agents_list_still_counts_as_delegated(self) -> None:
-        # CONTRACT v0.2 tolerant read: an older Work instance without the
-        # `delegated` field hands work over via the `agents` name list.
+    def test_a_legacy_agents_list_is_history_not_delegation(self) -> None:
+        # It records which agent did the work in an older system. Reading it
+        # as delegation offered 96 finished records to the runner, so Work
+        # stopped emitting the key and the contract stopped honouring it.
+        # Only an explicit human tick dispatches.
         self.work.add_task("W-0001", "legacy shape", agents=["dromond"])
         del self.work.tasks["W-0001"]["delegated"]
-        actions = self.sweep()
-        self.assertEqual([a["action"] for a in actions], ["dispatch"])
-        self.assertEqual(self.db_run()["work_item"], "W-0001")
+        self.assertEqual(self.sweep(), [])
+        self.assertIsNone(self.db_run())
 
     def test_no_double_dispatch_while_run_is_live(self) -> None:
         self.work.add_task("W-0001", "one run only", delegated=True)

@@ -50,10 +50,17 @@ def item_kind(item_id: str) -> str:
 
 
 def is_delegated(item: dict, identity: str) -> bool:
-    """CONTRACT v0.2 §2: the ``delegated`` boolean hands an item to
-    automation. Tolerant read: an older Work instance without the field may
-    still carry an ``agents`` name list containing our identity."""
-    return bool(item.get("delegated")) or identity in (item.get("agents") or [])
+    """CONTRACT §2: the ``delegated`` boolean, and nothing else, hands an item
+    to automation.
+
+    A legacy ``agents`` name list used to count here as a tolerant read. It no
+    longer does, and must not: that list is history — it recorded which agent
+    did the work in an older system — so reading it as delegation once offered
+    96 finished records to the runner (Work, lib/local-workspace.mjs). Work no
+    longer emits the key at all, which made this branch both dead and pointed
+    the wrong way. Delegation is only ever an explicit human tick.
+    """
+    return bool(item.get("delegated"))
 
 
 # --- snapshot ---------------------------------------------------------------
