@@ -96,7 +96,7 @@ class WorkClient:
         got = self._call("GET", "/api/health")
         return None if got is None else (got.get("workspace") or {}).get("root")
 
-    # --- writeback: the four contract verbs (CONTRACT §3) -------------------
+    # --- writeback: the five contract verbs (CONTRACT §3) ------------------
 
     def move_task(self, task_id: str, status: str, note: str | None = None):
         body = {"status": status, **({"note": note} if note else {})}
