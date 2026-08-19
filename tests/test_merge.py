@@ -141,25 +141,43 @@ class MergeTestCase(unittest.TestCase):
         self.assertIn("M app.py", git(self.root, "status", "--porcelain"))
         self.assertEqual("refreshed", result["refresh"]["status"])
 
-    def test_an_edit_that_overlaps_the_merge_refuses(self):
-        # The one case that genuinely reaches a human: read-tree -m -u would
-        # refuse the refresh, stranding the owner on an index older than HEAD.
+    def test_an_edit_that_overlaps_the_merge_still_lands(self):
+        # It used to escalate, and the card it filed could not be resolved by
+        # either option it offered. The merge is safe anyway: it happens in a
+        # scratch worktree and the ref moves by update-ref, so the owner keeps
+        # both their edit and their pre-merge tree.
         self.run_branch({"app.py": "x = 1\n"})
         self.write("app.py", "print('owner is editing this')\n")
         before = git(self.root, "rev-parse", "main")
 
         result = merge.merge_run(self.root, BRANCH, settings=self.settings)
 
-        self.assertFalse(result["ok"])
-        self.assertEqual("dirty", result["stage"])
-        self.assertEqual(["app.py"], result["dirty"])
-        self.assertIn("overlap", result["escalation"])
-        self.assertIn("app.py", result["escalation"])
-        self.assertEqual(before, git(self.root, "rev-parse", "main"))
-        # The branch is untouched, so the merge is one command away once clean.
-        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["app.py"], result["overlap"])
+        self.assertNotEqual(before, git(self.root, "rev-parse", "main"),
+                            "the merge landed")
+        # The owner's work in flight is never touched, committed, or stashed.
         self.assertEqual("print('owner is editing this')\n",
                          (self.root / "app.py").read_text())
+        # Their checkout keeps the pre-merge tree, and the note says so with
+        # the one command that fixes it.
+        self.assertEqual("refused", result["refresh"]["status"])
+        self.assertIn("read-tree", result["note"])
+        self.assertIn("app.py", result["note"])
+
+    def test_require_clean_restores_the_old_refusal(self):
+        # The escape hatch for anyone who wants the merge to wait.
+        self.run_branch({"app.py": "x = 1\n"})
+        self.write("app.py", "print('owner is editing this')\n")
+        self.config("[merge]\nrequire_clean = true\n")
+        before = git(self.root, "rev-parse", "main")
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("dirty", result["stage"])
+        self.assertEqual(before, git(self.root, "rev-parse", "main"))
+        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
 
     def test_an_untracked_file_is_not_dirty_enough_to_refuse(self):
         # A build directory or a scratch note is not work in flight, and

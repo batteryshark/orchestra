@@ -304,12 +304,20 @@ def blocked_run(target, question: str, **ctx) -> dict:
                            body_markdown=question, **ctx)
 
 
-# A card must only offer what can actually resolve its stage. `dirty` is the
-# one stage no agent may act on: a resolver's only route to "landing" it is to
-# stash the owner's in-flight work and hope the pop succeeds, which is exactly
-# what must never happen (run 62, 2026-08-19). Retry is real there — it lands
-# the moment the owner has committed or stashed their own overlapping files.
-STAGE_OPTIONS = {"dirty": [RETRY, LEAVE]}
+# A card must only offer what can actually resolve its stage — and if no
+# option can, the card must not exist at all (owner, 2026-08-19: "do NOT send
+# me a notification for something I can't do anything about"). Two rules:
+#
+#   dirty  — no card. The merge lands anyway now and the owner's checkout
+#            keeps its pre-merge tree; see merge.merge_run. Kept here only
+#            for a workspace that opts back in with require_clean = true,
+#            where Retry IS real: it lands the moment they commit or stash.
+#   rebase — a content conflict. Retry re-runs the same rebase and hits the
+#            same conflict, so offering it is a lie; a resolver is the only
+#            thing that can move it.
+STAGE_OPTIONS = {"dirty": [RETRY, LEAVE],
+                 "rebase": [RESOLVER, LEAVE],
+                 "merge": [RESOLVER, LEAVE]}
 
 
 def merge_conflict(target, detail: str, stage: str = "", **ctx) -> dict:
@@ -370,6 +378,19 @@ def client_for_kind(target: "Nod | NodClient", kind: str) -> NodClient:
     return target
 
 
+def _assert_actionable(kind: str, options) -> None:
+    """No card without a way out. A card whose every option is a dismissal
+    tells someone their work is stuck and hands them nothing to do about it,
+    which is worse than staying quiet — alerts are the deliberate exception,
+    since they report rather than ask."""
+    if kind == "alert":
+        return
+    if not any(o.get("kind") != "dismiss" for o in options):
+        raise NodChannelError(
+            f"a {kind} card offers no option that can resolve it; "
+            f"fix the caller rather than notifying a human who is stuck")
+
+
 def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options,
                     con: sqlite3.Connection | None = None,
                     run_id: int | None = None, work_item: str | None = None,
@@ -385,6 +406,7 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
     phone, and Nod's server-side dedupe must not eat it. An open, un-acted
     escalation still dedupes exactly as before.
     """
+    _assert_actionable(kind, options)
     client = client_for_kind(target, kind)
     if dedupe_key is None:
         dedupe_key = ":".join(

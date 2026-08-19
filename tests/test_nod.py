@@ -263,6 +263,30 @@ class EscalationKindTests(NodTestCase):
         self.assertEqual([o["id"] for o in card["options"]],
                          ["retry", "resolver", "leave"])
 
+    def test_a_content_conflict_offers_a_resolver_not_a_retry(self) -> None:
+        # Retry re-runs the same rebase and hits the same conflict. Offering
+        # it reads as a way out when it is not one.
+        got = nod.merge_conflict(self.channels, "app.py conflicts",
+                                 stage="rebase",
+                                 title="Merge conflict on run 9", run_id=9)
+        card = self.nod.requests[got["request_id"]]
+        self.assertEqual([o["id"] for o in card["options"]],
+                         ["resolver", "leave"])
+
+    def test_a_card_with_no_way_out_is_never_filed(self) -> None:
+        # A notification about something the reader cannot act on is worse
+        # than silence: it says "you are stuck" and hands them nothing.
+        with self.assertRaises(nod.NodChannelError):
+            nod.file_escalation(self.channels, kind="merge_conflict",
+                                title="Stuck", options=[nod.LEAVE],
+                                body_markdown="nothing you can do", run_id=9)
+        self.assertEqual(self.nod.requests, {})
+
+    def test_an_alert_may_be_dismiss_only(self) -> None:
+        # Alerts report rather than ask, so a lone Dismiss is honest there.
+        got = nod.alert(self.channels, "disk is filling up", title="Disk")
+        self.assertIn(got["request_id"], self.nod.requests)
+
     def test_pivot_proposal_offers_accept_and_reject_with_reason(self) -> None:
         got = nod.pivot_proposal(self.channels, "Drop the cache layer",
                                  title="Pivot proposed", run_id=3)

@@ -22,8 +22,10 @@ Per-project configuration, in ``.dromond/config.toml``::
     allow_deletions = false  # tripwire: any deleted file
     project_paths = ["src"]  # tripwire: a touched file outside these prefixes
     check_timeout = 1800     # per-check seconds
-    require_clean = true     # escalate when the owner's uncommitted edits
-                             # OVERLAP the merged files (never on mere dirt)
+    require_clean = false    # opt-in: refuse the merge when the owner's
+                             # uncommitted edits OVERLAP the merged files.
+                             # Off by default — the merge lands either way and
+                             # the checkout simply keeps its pre-merge tree.
     judge_tripwires = true   # a model judges tripwired facts against the mission first
     resolver_profile = "big" # resolver staffing; unset = best tier-2 profile
                              # dispatch (default: the highest-priority tier-3 profile)
@@ -73,7 +75,7 @@ DEFAULTS = {
     # On by default, and narrow: only an overlap between the owner's
     # uncommitted edits and the merged files escalates. Off means even that
     # lands, with the refresh left to decline underneath it.
-    "require_clean": True,
+    "require_clean": False,
     # Tripwires yield to a judgment turn before they yield to the phone: a run
     # dispatched to delete dead code must not escalate its own deletions. Off
     # means every tripwire escalates, as before.
@@ -405,11 +407,18 @@ def merge_run(root: Path, branch: str, criteria: str = "",
         result["files_changed"] = _lines(
             ["diff", "--name-only", base_sha, rebased_sha], scratch)
 
-        # The only dirt worth a human: files the owner is editing that this
-        # merge also rewrites. Checked before the checks so a 30-minute suite
-        # is not burned first. Dromond never resolves it -- committing or
-        # stashing someone's work in flight is theirs to do, not ours.
+        # An overlap between the owner's edits and the merged files no
+        # longer stops the merge. It used to file a card whose only options
+        # were Retry (does nothing until the owner acts) and Leave it (the
+        # branch piles up) -- a notification with no resolution in it, which
+        # is worse than no notification (owner, 2026-08-19). The merge is
+        # safe regardless: it happens in a scratch worktree, the ref moves by
+        # update-ref, and _refresh_base_checkout REFUSES to overwrite a local
+        # edit, so the owner keeps their work and their pre-merge tree and
+        # gets a one-line refresh command. require_clean = true restores the
+        # old refusal for anyone who wants the merge to wait.
         overlap = sorted(set(result["dirty"]) & set(result["files_changed"]))
+        result["overlap"] = overlap
         if cfg["require_clean"] and overlap:
             shown = ", ".join(overlap[:5]) + (f", plus {len(overlap) - 5} more"
                                               if len(overlap) > 5 else "")
@@ -493,8 +502,11 @@ def merge_run(root: Path, branch: str, criteria: str = "",
     result["commit"] = merge_sha
     result["refresh"] = _refresh_base_checkout(root, base, base_sha, merge_sha)
     if result["refresh"]["command"]:
+        overlapped = result.get("overlap") or []
+        kept = (f" Your edits to {', '.join(overlapped[:3])} are untouched."
+                if overlapped else "")
         result["note"] = (f"{result['refresh']['why']}; refresh it with "
-                          f"`{result['refresh']['command']}`")
+                          f"`{result['refresh']['command']}`.{kept}")
     result["revert_command"] = f"git -C {root} revert -m 1 {merge_sha}"
     # Anchor the run's own commits before the branch name goes away. A run that
     # committed its own work leaves nothing for the checkpoint to record, so
