@@ -674,20 +674,22 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
                   f"{exc}", file=sys.stderr)
     request_id = None
     if not result["ok"]:
-        # A conflict's FIRST escalation is a question with an obvious answer:
-        # the owner tapped "dispatch a resolver" within 13 seconds, twice in
-        # one evening (runs 99 and 104). A question the system can answer is
-        # never sent to a phone — the resolver dispatches itself, and the
-        # card is reserved for the resolver's own failure, which is a real
-        # judgment point. Stages beyond content conflicts (dirty, checks,
-        # tripwires) still card: no automatic move exists for those.
+        # ANY landing failure's FIRST escalation is a question with an
+        # obvious answer: dispatch a resolver. The rule started as an
+        # enumeration — rebase and merge only, from runs 99 and 104 — and the
+        # checks stage leaked straight through it and rang the phone twice in
+        # one evening (runs 163 and 165, 2026-08-20): the class the doctrine
+        # bans, reborn by enumeration. The rule is now the default for every
+        # stage but one: `dirty` is the human's own checkout state, and an
+        # automatic move there would touch their in-flight work. The card is
+        # reserved for the resolver's own failure — a real judgment point.
         resolved_id = None
-        if result["stage"] in ("rebase", "merge") and not _is_resolver(run):
+        if result["stage"] != "dirty" and not _is_resolver(run):
             from dromond import resolver  # lazy, matching nod.py's import
             try:
                 resolved_id = resolver.dispatch_resolver(
                     con, cfg, int(run["id"]),
-                    f"auto: {result['stage']} conflict on {result['branch']}")
+                    f"auto: {result['stage']} failure on {result['branch']}")
             except Exception as exc:
                 print(f"dromond: run {run['id']} auto-resolver not dispatched: "
                       f"{exc}", file=sys.stderr)

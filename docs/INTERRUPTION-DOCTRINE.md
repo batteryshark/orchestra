@@ -30,7 +30,7 @@ Each offense dies by a structural rule, not a policy note.
 | Offense | Rule that kills the class | Enforced by |
 |---|---|---|
 | Dead-end card (Retry no-op + Leave pile-up) | No card without a resolving option. Dirty is not a stage: the merge lands. | `interrupt.has_way_out` + `nod._assert_actionable`; default `require_clean = false` |
-| Obvious-answer card (resolver in 13s) | A known act is never an interrupt. First rebase/merge conflict is **act**. | `merge.at_completion` calls `interrupt.decide_merge`; test_merge_landing.py::test_a_rebase_conflict_dispatches_the_resolver_not_the_phone |
+| Obvious-answer card (resolver in 13s) | A known act is never an interrupt. ANY landing failure's first escalation is **act** — every stage but `dirty` dispatches the resolver. Enumerating stages is forbidden: the checks stage leaked through the rebase/merge enumeration and rang the phone twice in one evening (runs 163/165, 2026-08-20). | `merge.at_completion`; test_merge_landing.py::test_a_rebase_conflict_dispatches_the_resolver_not_the_phone and ::test_a_failed_check_dispatches_the_resolver_not_the_phone |
 | Stale alarm as current state | Current fields never carry history. `outcome`/`error` are now; `last_error` is then. | `http.record_health`: `outcome=ok` ⇒ `error is None` |
 | Noise drowning signal | Signal has a named layer. Filter in SQL, not on the client. | `GET /api/turns?layer=` |
 | Notification scoped wrong | Pin or notify only the project named on the event. No project → pin nowhere. | `http._pinned_turns` requires `project_id` |
