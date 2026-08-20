@@ -5,8 +5,8 @@ Deterministic code only (DESIGN principle 6) — one pass:
 - **Report**: a finished run posts an attributed comment and transitions its
   item (success → review/resolved; anything else → blocked/needs_human).
   Never done/closed — the human closes (CONTRACT §3 verb 2).
-- **Claim**: an item a human marked ``delegated`` (CONTRACT v0.2 §2; a
-  legacy ``agents`` list naming our identity still counts) that sits
+- **Claim**: an item a human marked ``delegated`` (CONTRACT §2; a legacy
+  ``agents`` list is history and never counts as delegation) that sits
   in ``ready`` (task) / ``queued`` (issue) with no live run gets one: a
   fresh dispatch, or a session continuation when a prior run for the item
   left a resumable session (the "answer from the phone, the run picks it

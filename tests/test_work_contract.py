@@ -46,6 +46,14 @@ def _find_work_checkout() -> Path | None:
 
 WORK_CHECKOUT = _find_work_checkout()
 
+# Skip is for machines that legitimately lack the sibling checkout. On the
+# machine that OWNS the contract, a silent skip reads as green while testing
+# nothing — set WORK_CONTRACT_REQUIRED=1 there so a moved checkout FAILS.
+if os.environ.get("WORK_CONTRACT_REQUIRED") and not (NODE and WORK_CHECKOUT):
+    raise RuntimeError(
+        "WORK_CONTRACT_REQUIRED is set but node or the Work checkout is "
+        "missing (set WORK_CHECKOUT to the project-manager-thing path)")
+
 # What dromond/work_client.py actually sends, statically: one row per verb,
 # with every body shape the client can produce. Conformance means (a) the
 # operation exists in the live catalog at this method/path, (b) no schema-
