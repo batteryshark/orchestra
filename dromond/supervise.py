@@ -478,7 +478,7 @@ def process_ready(con, launcher) -> list[dict]:
             "JOIN dispatch_dependencies e ON e.run_id=d.run_id "
             "JOIN runs p ON p.id=e.depends_on_run "
             "WHERE d.status='pending' AND e.kind='requires_success' "
-            "AND p.status IN ('failed','timeout','killed')")]
+            f"AND p.status IN {db.TERMINAL_SQL} AND p.status != 'done'")]
         if not broken:
             break
         ts = db.now()
@@ -591,8 +591,8 @@ def supervise(root: Path, run_id: int) -> int:
         if outcome == "timeout":
             status = "timeout"
             break
-        if run["status"] == "killed":
-            status = "killed"
+        if run["status"] in ("killed", "halted"):
+            status = run["status"]
             break
         if run["status"] == "interrupt" or _pending_delivery_offset(con, run_id) is not None:
             # Resume the same session after a safe-boundary stop, a --now stop,
@@ -659,8 +659,8 @@ def supervise(root: Path, run_id: int) -> int:
     # --- finalization ---
     latest = con.execute("SELECT status, summary FROM runs WHERE id=?",
                          (run_id,)).fetchone()
-    if latest and latest["status"] == "killed":
-        status, exit_code = "killed", None
+    if latest and latest["status"] in ("killed", "halted"):
+        status, exit_code = latest["status"], None
     traces.ingest(con, run_id, run["log_path"], run["backend"])  # final tail
     session_ref, last_text = runners.parse_log(run["log_path"])
     if latest and latest["summary"] and (
@@ -676,6 +676,10 @@ def supervise(root: Path, run_id: int) -> int:
             last_text = txt
         os.unlink(last_msg_file)
     summary = (last_text or "").strip()[:2000] or None
+    reason = findings.halt_reason(last_text)
+    if reason and status != "killed":
+        status = "halted"
+        summary = reason
     if status != "done" and not summary:
         # A backend that dies before speaking (revoked auth, dead quota) still
         # logs why. Without this the human sees "failed" and nothing else.

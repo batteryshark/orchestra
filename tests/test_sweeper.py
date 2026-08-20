@@ -428,6 +428,47 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                       Path(followup["brief_path"]).read_text())
         self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
 
+    def test_a_halted_run_blocks_the_item_with_its_reason(self) -> None:
+        self.work.add_task("W-0001", "doomed", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.finish_run(run["id"], "halted", "the vendor API is gone")
+        actions = self.sweep()
+        self.assertIn({"action": "report", "item": "W-0001", "run": run["id"],
+                       "to": "blocked"}, actions)
+        task = self.work.tasks["W-0001"]
+        self.assertEqual(task["status"], "blocked")
+        notes = " ".join(str(e) for e in task.get("log", []))
+        self.assertIn("the vendor API is gone", notes)
+
+    def test_a_sweep_passes_over_a_halted_item(self) -> None:
+        self.work.add_task("W-0001", "doomed", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.finish_run(run["id"], "halted", "the vendor API is gone")
+        self.sweep()
+        launched = len(self.launched)
+        actions = self.sweep()
+        self.assertNotIn("dispatch", [a["action"] for a in actions])
+        self.assertEqual(len(self.launched), launched)
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
+
+    def test_clearing_a_halt_dispatches_fresh(self) -> None:
+        self.work.add_task("W-0001", "doomed", delegated=True)
+        self.sweep()
+        first = self.db_run()
+        self.finish_run(first["id"], "halted", "the vendor API is gone",
+                        session_ref="sess-42")
+        self.sweep()
+        self.work.human_move("W-0001", "ready")
+        actions = self.sweep()
+        self.assertIn("dispatch", [a["action"] for a in actions])
+        fresh = self.db_run()
+        self.assertNotEqual(fresh["id"], first["id"])
+        self.assertIsNone(fresh["parent_run"])
+        self.assertIsNone(fresh["session_ref"])
+        self.assertEqual(fresh["work_item"], "W-0001")
+
     def test_a_killed_runs_session_is_never_resumed(self) -> None:
         """Live failure (run 27): the sweeper resumed a KILLED run's session,
         the backend answered `no session matches`, and the item failed in

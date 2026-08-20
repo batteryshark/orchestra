@@ -74,9 +74,9 @@ OBSERVER_TIER = 1        # workhorse (W-0181); named "cheap" before the numbers
 INFRA_TERMINAL = ("failed", "timeout")
 # ponytail: DESIGN §7 also lists `killed` as infrastructure-shaped, but in
 # this codebase NOTHING sets `killed` except a human (`dromond kill`,
-# dashboard stop) and this module's own stop verdict. Auto-retrying a
-# deliberate stop is worse than missing a retry, so `killed` is excluded
-# until something mechanical can produce it.
+# dashboard stop) and this module's own stop verdict. `halted` is the worker
+# stopping itself. Auto-retrying a deliberate stop is worse than missing a
+# retry, so both stay out of this set.
 
 _EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit", "str_replace_editor",
                "apply_patch", "patch", "file_change", "create_file", "write_file"}

@@ -38,6 +38,28 @@ _WORDS = re.compile(r"[^a-z0-9]+")
 
 # --- parsing ----------------------------------------------------------------
 
+def halt_reason(text: str | None) -> str | None:
+    """Non-empty ``halt`` from the last handoff-shaped JSON block, else None.
+
+    A halt-only block counts: a doomed run need not also file a handoff.
+    """
+    for raw in reversed(_BLOCK.findall(text or "")):
+        try:
+            candidate = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        if "halt" not in candidate and "findings" not in candidate \
+                and "proposals" not in candidate:
+            continue
+        reason = candidate.get("halt")
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()[:2000]
+        return None
+    return None
+
+
 def parse_handoff(text: str | None) -> tuple[dict, list[str]]:
     """Split a final message into (handoff, protocol problems).
 

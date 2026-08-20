@@ -51,6 +51,16 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(len(handoff["findings"]), 1)
 
+    def test_halt_reason_reads_the_handoff_marker(self) -> None:
+        text = '```json\n{"findings": [], "proposals": [], "halt": "api gone"}\n```'
+        self.assertEqual(findings.halt_reason(text), "api gone")
+        self.assertEqual(findings.halt_reason(
+            '```json\n{"halt": "doomed without a handoff"}\n```'),
+            "doomed without a handoff")
+        self.assertIsNone(findings.halt_reason(HANDOFF % ("", "")))
+        self.assertIsNone(findings.halt_reason('```json\n{"halt": "  "}\n```'))
+        self.assertIsNone(findings.halt_reason("no block here"))
+
     def test_non_list_field_does_not_lose_the_sibling(self) -> None:
         handoff, problems = findings.parse_handoff(
             '```json\n{"findings": "none", "proposals": [%s]}\n```' % PROPOSAL)

@@ -194,7 +194,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
 -- a terminal status (supervisor, sweeper reaper, HTTP stop, `dromond kill`,
 -- observer) and one of them would eventually forget.
 CREATE TRIGGER IF NOT EXISTS revoke_run_token AFTER UPDATE OF status ON runs
-WHEN NEW.status IN ('done','failed','timeout','killed')
+WHEN NEW.status IN ('done','failed','timeout','killed','halted')
      AND NEW.run_token_hash IS NOT NULL
 BEGIN
   UPDATE runs SET run_token_hash=NULL WHERE id=NEW.id;
@@ -380,8 +380,8 @@ CREATE INDEX IF NOT EXISTS idx_conductor_turns_goal
   ON conductor_turns(goal_id, id);
 """
 
-RUN_TERMINAL = ("done", "failed", "timeout", "killed")
-TERMINAL_SQL = "('done','failed','timeout','killed')"
+RUN_TERMINAL = ("done", "failed", "timeout", "killed", "halted")
+TERMINAL_SQL = "(" + ",".join(f"'{s}'" for s in RUN_TERMINAL) + ")"
 
 
 def now() -> str:
@@ -417,6 +417,8 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in NOD_REQUESTS_V14_COLUMNS:
             if name not in cards:
                 con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
+    # Recreate so an older database picks up new terminal statuses in WHEN.
+    con.execute("DROP TRIGGER IF EXISTS revoke_run_token")
     con.executescript(SCHEMA)
     con.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
