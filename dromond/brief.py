@@ -14,7 +14,7 @@ PROTOCOL_CARD = """\
 - Commit your git changes before you stop.
 - Operator messages may arrive between actions; apply them, then continue the mission.
 - Your final message is the handoff: what changed, how you verified it, what remains.
-- End it with a ```json block: {"findings": [], "proposals": []} — both keys required, [] is fine.
+- End it with a ```json block: {"findings": [], "proposals": []} — both keys required, [] is fine. "halt": "reason" stops the run until a human moves the item to ready.
 - finding: {claim, where, confidence: observed|suspected, why_not_fixed}. proposal: {title, why}.
 """
 

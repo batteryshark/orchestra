@@ -459,6 +459,11 @@ class RetryTests(ObserverCase):
         self.assertEqual(
             observer.after_terminal(self.con, run_id)["action"], "none")
 
+    def test_a_halted_run_is_not_retried(self) -> None:
+        run_id = self.make_run(status="halted")
+        self.assertEqual(
+            observer.after_terminal(self.con, run_id)["action"], "none")
+
     def test_a_paused_dispatch_defers_the_retry(self) -> None:
         from dromond import dispatch
         run_id = self.make_run(status="failed")
