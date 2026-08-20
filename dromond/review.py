@@ -28,7 +28,7 @@ def performance(con) -> list[dict]:
         key = (r["profile"], r["model"] or "")
         entry = rows.setdefault(key, {
             "profile": r["profile"], "model": r["model"], "runs": 0,
-            "done": 0, "failed": 0, "timeout": 0, "killed": 0,
+            "done": 0, "failed": 0, "timeout": 0, "killed": 0, "halted": 0,
             "seconds": 0.0, "tokens": None, "cost": None,
             "plan_runs": 0, "uncaptured": 0})
         entry["runs"] += 1

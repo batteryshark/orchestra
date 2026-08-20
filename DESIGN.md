@@ -406,7 +406,11 @@ run's released one. Code retries **once**, automatically, for infrastructure-sha
 terminal states — `failed` and `timeout` — reusing the same brief. `killed` is
 **not** among them: nothing sets it except a human's stop, the dashboard button,
 or the observer's own stop verdict, and retrying any of those would fight the
-person who asked for the stop. A run that finished but produced bad work is a
+person who asked for the stop. `halted` is the worker stopping itself with a
+reason in the handoff JSON (`"halt": "reason"`); it is not failed, is never
+retried, and its session is never resumed. Clearing a halt is one human
+action: move the item to `ready`, and the next sweep dispatches fresh.
+A run that finished but produced bad work is a
 judgment failure and goes to a planner turn, never to retry — the same brief
 through the same model reproduces the same bad work. Two consecutive
 infrastructure failures on the same item stop and escalate.
@@ -775,6 +779,7 @@ document is the settled result; the rows below say which item settled what.
 | W-0145 | Goal shape and the planner packet (§1, §10) |
 | W-0146 | Contract verb 5: propose follow-on work (§1, §9) |
 | W-0147 | No budgets; retry policy; the spin observer (§7) |
+| W-0247 | Halt with a reason: a worker-stopped run stays stopped (§7) |
 | W-0148 | Backend hook / interrupt / ACP matrix — research (§6) |
 | W-0149 | Claude and Codex local quota formats — research (§11) |
 | W-0150 | Dashboard and the one API (§3) |
