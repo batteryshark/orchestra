@@ -33,6 +33,61 @@ _OPENCODE_DELEGATION_PERMISSIONS = (
 )
 
 
+# ponytail: Claude Code 2.1+ `-p` bills Max quota when these are unset. maestro-p
+# drives the TUI instead (PTY, AGPL); port that if Anthropic makes `-p` API-only.
+API_AUTH_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+LANES = ("quota", "api")
+QUOTA_EXHAUSTED = (
+    "usage limit reached",
+    "5-hour limit reached",
+    "weekly limit reached",
+    "5-hour limit exceeded",
+    "weekly limit exceeded",
+)
+
+
+def lane_of(profile: dict) -> str | None:
+    lane = profile.get("lane")
+    return lane if lane in LANES else None
+
+
+def has_api_credentials(env: dict[str, str]) -> bool:
+    return any(env.get(name) for name in API_AUTH_VARS)
+
+
+def write_lane(log_path: str, lane: str) -> None:
+    """One lifecycle line the claude parser already records as a trace event."""
+    line = json.dumps({"type": "system", "subtype": "lane", "lane": lane})
+    try:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def quota_exhausted(log_path: str) -> str | None:
+    """The backend's own words for spent Max quota, or None."""
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                lowered = line.lower()
+                if any(phrase in lowered for phrase in QUOTA_EXHAUSTED):
+                    return line.strip()[:300]
+    except OSError:
+        pass
+    return None
+
+
+def next_lane(profile: dict, env: dict[str, str], log_path: str,
+              already_fell_back: bool) -> dict | None:
+    """API-lane profile copy after a spent quota run, else None."""
+    if already_fell_back or lane_of(profile) != "quota":
+        return None
+    if not quota_exhausted(log_path) or not has_api_credentials(env):
+        return None
+    return {**profile, "lane": "api"}
+
+
 def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
     """Apply per-process backend policy without changing the user's global config.
 
@@ -47,6 +102,11 @@ def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
        delivered PER RUN here rather than installed into the user's own
        ``~/.config/opencode`` — the human's interactive sessions stay clean.
     """
+    if profile.get("backend") == "claude" and lane_of(profile) == "quota":
+        updated = dict(env)
+        for name in API_AUTH_VARS:
+            updated.pop(name, None)
+        return updated
     if profile.get("backend") != "opencode":
         return env
     plugin = paths.opencode_plugin_path()

@@ -572,6 +572,11 @@ def supervise(root: Path, run_id: int) -> int:
     # loop below; absent means exec, unchanged for all four backends. There is
     # no mid-run fallback between the two — see acp.supervise_run.
     transport = acp.transport_for(profile)
+    parent_env = dict(os.environ, DROMOND_ROOT=str(root), DROMOND_RUN_ID=str(run_id),
+                      **{auth.TOKEN_ENV: run_token})
+    parent_env = enrich_path(parent_env)
+    parent_env = config.apply_worker_env(cfg, parent_env, root)
+    quota_fell_back = False
     while transport == "exec":
         cmd = runners.build_cmd(profile, workdir=run["workdir"],
                                 title=f"dromond-run-{run_id}", prompt=prompt,
@@ -580,11 +585,9 @@ def supervise(root: Path, run_id: int) -> int:
         if profile["backend"] == "codex" and not resume_ref:
             last_msg_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
             cmd = cmd[:2] + ["-o", last_msg_file] + cmd[2:]  # `codex exec -o FILE ...`
-        env = dict(os.environ, DROMOND_ROOT=str(root), DROMOND_RUN_ID=str(run_id),
-                   **{auth.TOKEN_ENV: run_token})
-        env = enrich_path(env)
-        env = config.apply_worker_env(cfg, env, root)
-        env = runners.apply_backend_env(profile, env)
+        env = runners.apply_backend_env(profile, parent_env)
+        if lane := runners.lane_of(profile):
+            runners.write_lane(run["log_path"], lane)
         outcome, exit_code = _run_proc(con, run, cmd, env, run["log_path"],
                                        run_id, deadline, stall_timeout)
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
@@ -642,6 +645,14 @@ def supervise(root: Path, run_id: int) -> int:
             # rides along; nothing else has seen it.
             prompt = brief_prompt if prompt == brief_prompt \
                 else f"{brief_prompt}\n\n{prompt}"
+            continue
+        retry = runners.next_lane(profile, parent_env, run["log_path"],
+                                  quota_fell_back) if status == "failed" else None
+        if retry:
+            quota_fell_back = True
+            profile = retry
+            print(f"dromond: run {run_id}: quota exhausted; retrying on the api lane",
+                  file=sys.stderr)
             continue
         break
 
