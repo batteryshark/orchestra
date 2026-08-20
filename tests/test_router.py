@@ -6,14 +6,16 @@ function that would start a backend process. ``DROMOND_HOME``/``DROMOND_CONFIG``
 are sandboxed by the sweeper fixture, so the real config and database are never
 touched.
 """
+import io
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from dromond import config, db, router, sweeper
+from dromond import cli, config, db, router, sweeper
 from tests.test_sweeper import SweeperFixture
 
 # Three profiles across the three tiers, so "picked a different one" is a real
@@ -142,6 +144,37 @@ class RouterUnitTestCase(unittest.TestCase):
         self.assertIn("staffed stub", reason)
         # And a disabled profile is not even offered in the packet.
         self.assertNotIn("- big:", self.calls[0][1])
+
+    def test_an_exhausted_profile_is_excluded(self) -> None:
+        self.con.execute(
+            "INSERT INTO runway_polls(provider, remaining, unit, resets_at, "
+            "as_of, polled_at) VALUES('anthropic', 0, 'percent', NULL, NULL, ?)",
+            (db.now(),))
+        self.con.commit()
+        name, profile, reason = self.choose(
+            turn=self.turn(reply("big", "looks hard")))
+        self.assertEqual(name, "stub")
+        self.assertIsNone(profile.get("model"))
+        self.assertIn("exhausted", reason)
+        self.assertIn("big", reason)
+        self.assertNotIn("- big:", self.calls[0][1])
+        # In-flight still resolves the preset (W-0187): exclusion is staffing only.
+        self.assertEqual(config.profile_cfg(self.cfg, "big")["model"],
+                         "anthropic/opus")
+
+    def test_dromond_profiles_shows_the_exhausted_reason(self) -> None:
+        self.con.execute(
+            "INSERT INTO runway_polls(provider, remaining, unit, resets_at, "
+            "as_of, polled_at) VALUES('anthropic', 0, 'percent', NULL, NULL, ?)",
+            (db.now(),))
+        self.con.commit()
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            cli.cmd_profiles(SimpleNamespace(action=None))
+        text = out.getvalue()
+        self.assertIn("big", text)
+        self.assertIn("exhausted:", text)
+        self.assertIn("0% left", text)
 
     # --- the fallback ladder ------------------------------------------------
 
@@ -295,6 +328,14 @@ class RoutedSweepTestCase(SweeperFixture, unittest.TestCase):
         self.work.human_move("W-0005", "ready")
         self.work.human_log("W-0005", "one more pass please")
         self.turns.clear()
+        # The account burns after the first run. A resume is not a staffing
+        # moment (W-0187), so the lineage profile still launches.
+        con = db.connect()
+        con.execute(
+            "INSERT INTO runway_polls(provider, remaining, unit, polled_at) "
+            "VALUES('anthropic', 0, 'percent', ?)", (db.now(),))
+        con.commit()
+        con.close()
         self.assertEqual([a["action"] for a in self.sweep()], ["dispatch"])
         second = self.db_run()
         self.assertNotEqual(second["id"], first["id"])
