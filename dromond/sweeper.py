@@ -144,16 +144,17 @@ def _last_session_run(con, item_id: str):
     """Latest run for the item whose backend session can resume, newest first.
 
     A run that ended ON ITS OWN — `done`, `failed`, `timeout` — is a
-    conversation to continue. `killed` is not: a human or the observer STOPPED
-    it, so its context is deliberately abandoned and its backend session may
-    not exist at all (live run 27 resumed one, and the backend answered `no
-    session matches` in under a second). A kill stops the ITEM, not just one
-    process, so nothing behind it is resumed either — the item gets a fresh run.
+    conversation to continue. `killed` and `halted` are not: a human, the
+    observer, or the worker itself STOPPED it, so its context is deliberately
+    abandoned and its backend session may not exist at all (live run 27
+    resumed a killed one, and the backend answered `no session matches` in
+    under a second). A stop stops the ITEM, not just one process, so nothing
+    behind it is resumed either — the item gets a fresh run.
     """
     for row in con.execute(
             f"SELECT * FROM runs WHERE work_item=? AND status IN {db.TERMINAL_SQL} "
             "ORDER BY id DESC", (item_id,)):
-        if row["status"] == "killed":
+        if row["status"] in ("killed", "halted"):
             return None
         if row["session_ref"]:
             return row
