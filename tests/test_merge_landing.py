@@ -172,6 +172,29 @@ class LandingTestCase(unittest.TestCase):
 
     # --- an escalation stops, reports, and reaches the phone -----------------
 
+    def test_a_rebase_conflict_dispatches_the_resolver_not_the_phone(self) -> None:
+        """The owner answered 'dispatch a resolver' within 13 seconds, twice
+        in one evening (runs 99/104). A question the system can answer is
+        never sent to a phone: the resolver auto-dispatches, and the card is
+        reserved for its failure."""
+        self.run_branch({"app.py": "print('branch')\n"})
+        self.commit_on_main("app.py", "print('main')\n")
+        run = self.add_run()
+        with mock.patch("dromond.resolver.dispatch_resolver", return_value=42):
+            note = merge.at_completion(self.con, self.cfg, run, "done")
+        self.assertEqual({}, self.nod.requests, "no card while a move exists")
+        self.assertIn("Resolver run 42 dispatched automatically", note)
+
+    def test_a_resolvers_own_conflict_reaches_the_human(self) -> None:
+        """One automatic attempt. The second failure is judgment, not retry."""
+        self.run_branch({"app.py": "print('branch')\n"})
+        self.commit_on_main("app.py", "print('main')\n")
+        run = dict(self.add_run())
+        run["title"] = "Resolve the landing of dromond/run-99"
+        merge.at_completion(self.con, self.cfg, run, "done")
+        self.assertEqual(1, len(self.nod.requests),
+                         "the resolver's failure is a real card")
+
     def test_conflicting_run_keeps_its_branch_and_reaches_blocked(self) -> None:
         self.run_branch({"app.py": "print('branch')\n"})
         self.commit_on_main("app.py", "print('main')\n")

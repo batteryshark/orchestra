@@ -672,11 +672,39 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
         except Exception as exc:
             print(f"dromond: run {run['id']} stale merge card not withdrawn: "
                   f"{exc}", file=sys.stderr)
-    request_id = None if result["ok"] else _file_card(con, cfg, run, result)
+    request_id = None
+    if not result["ok"]:
+        # A conflict's FIRST escalation is a question with an obvious answer:
+        # the owner tapped "dispatch a resolver" within 13 seconds, twice in
+        # one evening (runs 99 and 104). A question the system can answer is
+        # never sent to a phone — the resolver dispatches itself, and the
+        # card is reserved for the resolver's own failure, which is a real
+        # judgment point. Stages beyond content conflicts (dirty, checks,
+        # tripwires) still card: no automatic move exists for those.
+        resolved_id = None
+        if result["stage"] in ("rebase", "merge") and not _is_resolver(run):
+            from dromond import resolver  # lazy, matching nod.py's import
+            try:
+                resolved_id = resolver.dispatch_resolver(
+                    con, cfg, int(run["id"]),
+                    f"auto: {result['stage']} conflict on {result['branch']}")
+            except Exception as exc:
+                print(f"dromond: run {run['id']} auto-resolver not dispatched: "
+                      f"{exc}", file=sys.stderr)
+        if resolved_id is not None:
+            result["auto_resolver"] = resolved_id
+        else:
+            request_id = _file_card(con, cfg, run, result)
     report = _report_text(run, result, request_id)
     _thread(con, int(run["id"]), report)
     _post_to_work(con, cfg, run, result, report)
     return _note(run, result, request_id)
+
+
+def _is_resolver(run: dict) -> bool:
+    """A resolver resolving a resolver is a loop, not persistence: the second
+    failure is the human's to judge."""
+    return str(run.get("requested_by") or "") == "resolver" or         str(run.get("title") or "").startswith("Resolve the landing of")
 
 
 def _thread(con, run_id: int, body: str) -> None:
@@ -745,9 +773,12 @@ def _note(run: dict, result: dict, request_id: str | None) -> str:
         return (f"Merged {result['branch']} into {result['base']} as "
                 f"{result['commit'][:12]}; revert with "
                 f"`{result['revert_command']}`")
+    tail = f" Nod card {request_id}." if request_id else ""
+    if not tail and result.get("auto_resolver"):
+        tail = (f" Resolver run {result['auto_resolver']} dispatched "
+                f"automatically; a card follows only if it fails.")
     return (f"Merge escalated at {result['stage']}: {result['escalation']}. "
-            f"Branch {result['branch']} kept."
-            + (f" Nod card {request_id}." if request_id else ""))
+            f"Branch {result['branch']} kept." + tail)
 
 
 def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
