@@ -21,6 +21,11 @@ PROTOCOL_CARD = """\
 WORK_SNAPSHOT_MAX_CHARS = 2000
 RECENT_COMMITS_MAX_CHARS = 900
 
+# House style for every writeback. Read from disk so an edit to the doc
+# is an edit to every brief, with no code change (W-0250).
+# ponytail: repo-relative path; a wheel install would need package_data.
+WRITEBACK_STYLE = Path(__file__).resolve().parent.parent / "docs/WRITEBACK-STYLE.md"
+
 # Only runs carrying a Work item get this: a worker with no item has no
 # checklist to answer, and a brief never teaches a verb it cannot use.
 WORK_CHECKLIST_PROTOCOL = """\
@@ -31,6 +36,11 @@ did not, with the reason: `--decline "not attempted, blocked on X"`. Declining
 is expected and is not a failure — leaving an item unanswered is, and the item
 cannot move to review or blocked while any is unanswered.
 """
+
+
+def writeback_section() -> str:
+    """Load the house style. The path is the source; this is not a copy."""
+    return WRITEBACK_STYLE.read_text(encoding="utf-8").rstrip() + "\n"
 
 
 def _protocol_card(profile: dict) -> str:
@@ -79,6 +89,7 @@ Project: `{root}` · Working directory: `{workdir}`.
             parts.append(WORK_CHECKLIST_PROTOCOL.format(item=work_item))
     if extra_context:
         parts.append(f"## Additional context\n\n{extra_context}\n")
+    parts.append(writeback_section())
     parts.append(_protocol_card(profile))
     return "\n".join(parts)
 
