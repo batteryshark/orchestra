@@ -13,10 +13,16 @@ def _compose(mission: str = "", **kwargs) -> str:
         requester="human", root=Path("/p"), workdir="/p", **kwargs)
 
 
+def _without_writeback(text: str) -> str:
+    # D6 measures the protocol card and header, not the path-loaded style doc.
+    return text.replace(brief.writeback_section(), "")
+
+
 class BriefBudgetTests(unittest.TestCase):
     def test_fixed_portion_stays_inside_d6_budget(self) -> None:
         """Fails when the fixed injection grows past the D6 ceiling."""
-        self.assertLessEqual(len(_compose(mission="")), FIXED_CHAR_CEILING)
+        self.assertLessEqual(len(_without_writeback(_compose(mission=""))),
+                             FIXED_CHAR_CEILING)
 
     def test_protocol_card_renders_within_ten_lines(self) -> None:
         lines = [l for l in brief.PROTOCOL_CARD.splitlines() if l.strip()]
@@ -27,7 +33,7 @@ class BriefBudgetTests(unittest.TestCase):
             run_id=1, slug="calm_otter",
             profile={"name": "lead", "spawn_profiles": ["worker", "cheap"]},
             mission="", requester="human", root=Path("/p"), workdir="/p")
-        self.assertLessEqual(len(text), FIXED_CHAR_CEILING)
+        self.assertLessEqual(len(_without_writeback(text)), FIXED_CHAR_CEILING)
         card_lines = [l for l in brief._protocol_card(
             {"spawn_profiles": ["worker", "cheap"]}).splitlines() if l.strip()]
         self.assertLessEqual(len(card_lines), 10)
@@ -88,6 +94,26 @@ class BriefContentTests(unittest.TestCase):
     def test_the_recent_commit_block_is_capped(self) -> None:
         text = _compose(mission="m", recent_commits=["c" * 200] * 40)
         self.assertNotIn("c" * (brief.RECENT_COMMITS_MAX_CHARS + 1), text)
+
+    def test_a_fresh_dispatch_brief_contains_the_writeback_style(self) -> None:
+        text = _compose(mission="m")
+        style = brief.WRITEBACK_STYLE.read_text(encoding="utf-8")
+        self.assertIn("## Writeback", text)
+        self.assertIn(style.strip(), text)
+        self.assertIn("human operator", text)
+        self.assertIn("comments, resolution summaries, filed issues, "
+                      "proposed tasks, and recommendation reasons", text)
+
+    def test_style_doc_is_referenced_by_path(self) -> None:
+        """An edit to the doc is an edit to the brief. brief.py holds no copy."""
+        src = Path(brief.__file__).read_text(encoding="utf-8")
+        self.assertIn("docs/WRITEBACK-STYLE.md", src)
+        self.assertEqual(brief.WRITEBACK_STYLE.name, "WRITEBACK-STYLE.md")
+        self.assertTrue(brief.WRITEBACK_STYLE.is_file())
+        # The STE body lives in the doc, not as a string in brief.py.
+        self.assertNotIn("One idea per sentence", src)
+        self.assertIn("One idea per sentence",
+                      brief.WRITEBACK_STYLE.read_text(encoding="utf-8"))
 
     def test_a_resumed_run_is_told_what_landed_while_it_worked(self) -> None:
         # The case that matters most: its worktree branched before these
