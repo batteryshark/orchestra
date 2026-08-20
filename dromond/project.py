@@ -55,6 +55,7 @@ def remember(con, workspace_root: str, entries: list) -> int:
 
     root = Path(workspace_root).expanduser()
     ts, count = db.now(), 0
+    seen: list = []
     for entry in entries:
         project_id = entry.get("projectId")
         if not project_id:
@@ -68,7 +69,17 @@ def remember(con, workspace_root: str, entries: list) -> int:
                 "INSERT OR REPLACE INTO projects(path, project_id, work_id, name, "
                 "refreshed_at) VALUES(?,?,?,?,?)",
                 (str(absolute), project_id, entry.get("id"), entry.get("name"), ts))
+            seen.append(str(absolute))
             count += 1
+    # A Work-sourced row whose path Work no longer names is stale — a moved or
+    # deleted project, or a worktree copy that briefly won discovery (I-0013's
+    # ghost lived here long after Work was fixed). Prune those; locally
+    # adopted rows (work_id NULL) are never Work's to delete.
+    if seen:
+        marks = ",".join("?" * len(seen))
+        con.execute(
+            f"DELETE FROM projects WHERE work_id IS NOT NULL AND path NOT IN ({marks})",
+            seen)
     con.commit()
     return count
 
@@ -84,9 +95,10 @@ def adopt(con, root: Path, name: str | None = None) -> "Project":
     A locally adopted project is the same row with ``work_id`` NULL. Nothing
     downstream cares: a run resolves by path and carries ``project_id``, and
     writeback is skipped for a run with no Work item anyway. ``remember`` only
-    ever inserts or replaces the paths Work names, so a later refresh cannot
-    delete this row — and if Work is ever told about the same directory, its
-    entry replaces this one, which is the right precedence.
+    ever inserts or replaces the paths Work names, and the stale-row prune
+    skips work_id-NULL rows, so a later refresh cannot delete this row — and
+    if Work is ever told about the same directory, its entry replaces this
+    one, which is the right precedence.
     """
     from dromond import db  # local: db imports paths, not project
 

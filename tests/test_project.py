@@ -72,6 +72,24 @@ class ProjectResolutionTests(unittest.TestCase):
     def resolve(self, where):
         return project.resolve(self.con, {}, str(where))
 
+    def test_a_moved_project_leaves_no_stale_work_row(self) -> None:
+        """A worktree copy that briefly won discovery cached a wrong path, and
+        the ghost outlived the Work-side fix by days (I-0013's afterlife):
+        refresh only ever upserted, never pruned. A Work-sourced path Work no
+        longer names must go; a locally adopted row must survive every prune."""
+        self.seed([{"projectId": DEMO_ID, "id": "demo", "name": "Demo",
+                    "path": "demo/inner"}])          # the wrong (stale) path
+        project.adopt(self.con, self.workspace / "demo" / "src", "Mine")
+        self.seed([{"projectId": DEMO_ID, "id": "demo", "name": "Demo",
+                    "path": "demo"}])                # Work now names the truth
+        paths_cached = [r["path"] for r in self.con.execute(
+            "SELECT path FROM projects ORDER BY path")]
+        self.assertIn(str(self.workspace / "demo"), paths_cached)
+        self.assertNotIn(str(self.workspace / "demo" / "inner"), paths_cached,
+                         "the stale Work-sourced path must be pruned")
+        self.assertIn(str(self.workspace / "demo" / "src"), paths_cached,
+                      "a locally adopted row is never Work's to delete")
+
     def test_subdirectory_resolves_to_its_project(self) -> None:
         self.seed()
         hit = self.resolve(self.workspace / "demo" / "src")
