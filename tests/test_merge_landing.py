@@ -185,6 +185,22 @@ class LandingTestCase(unittest.TestCase):
         self.assertEqual({}, self.nod.requests, "no card while a move exists")
         self.assertIn("Resolver run 42 dispatched automatically", note)
 
+    def test_a_failed_check_dispatches_the_resolver_not_the_phone(self) -> None:
+        """The resolver rule began as a stage enumeration, and the checks
+        stage leaked straight through it onto the phone twice in one evening
+        (runs 163/165, 2026-08-20). Any landing failure but `dirty` is a
+        known act: the resolver goes first, the card waits for ITS failure."""
+        self.global_config.write_text(
+            self.global_config.read_text()
+            + '\n[merge.checks]\ntest = "false"\n')
+        self.cfg = config.load(PROJECT_ID)
+        self.run_branch({"feature.py": "x = 1\n"})
+        run = self.add_run()
+        with mock.patch("dromond.resolver.dispatch_resolver", return_value=77):
+            note = merge.at_completion(self.con, self.cfg, run, "done")
+        self.assertEqual({}, self.nod.requests, "no card while a move exists")
+        self.assertIn("Resolver run 77 dispatched automatically", note)
+
     def test_a_resolvers_own_conflict_reaches_the_human(self) -> None:
         """One automatic attempt. The second failure is judgment, not retry."""
         self.run_branch({"app.py": "print('branch')\n"})
