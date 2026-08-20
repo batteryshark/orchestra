@@ -298,6 +298,17 @@ def _report(con, client: WorkClient, actions: list) -> bool:
                 ok = False
                 continue
         except WorkError as exc:
+            if getattr(exc, "code", None) == "issue_closed":
+                # Terminal refusal: a human already closed the issue, so the
+                # outcome the report wanted is settled. Mark it reported —
+                # retrying forever turned two closed issues into permanent
+                # sweep noise (2026-08-20). Only transient failures retry.
+                print(f"dromond sweep: report {item_id} superseded by a "
+                      f"human close — marked reported")
+                con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
+                            (db.now(), run["id"]))
+                con.commit()
+                continue
             print(f"dromond sweep: report {item_id} rejected: {exc}")
             ok = False
             continue
