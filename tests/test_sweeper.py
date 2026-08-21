@@ -105,6 +105,19 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("## Work item snapshot", text)
         self.assertIn("Make CI green again.", text)
 
+    def test_a_parent_with_children_is_skipped_not_retried(self) -> None:
+        """Work refuses a parent claim (409 parent_is_container); the sweeper
+        treats that as terminal — skip and say why — never a retry loop.
+        Same law as issue_closed; run 202 burned a dispatch learning it."""
+        self.work.add_task("W-0100", "The epic", delegated=True)
+        self.work.add_task("W-0101", "The slice", delegated=True,
+                           parent_id="W-0100")
+        actions = self.sweep()
+        dispatched = [a for a in actions if a.get("action") == "dispatch"]
+        self.assertEqual([a["item"] for a in dispatched], ["W-0101"])
+        self.assertEqual(self.work.tasks["W-0100"]["status"], "ready",
+                         "the parent is never claimed")
+
     def test_claims_assigned_queued_issue(self) -> None:
         self.work.add_issue("issue_auth_timeout", "Auth times out",
                             delegated=True, body="Login hangs on retry.")

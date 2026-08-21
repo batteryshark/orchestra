@@ -240,6 +240,14 @@ def _make_handler(state: FakeWork):
                     return self._error(404, "not_found")
                 body = self._body()
                 status = body.get("status")
+                # Mirrors live Work since run 211: a parent with children is
+                # a container, never claimable by an agent.
+                if self._agent() and status == "in_progress" and any(
+                        t.get("parentId") == task["id"]
+                        for t in state.tasks.values()):
+                    return self._error(409, "parent_is_container",
+                                       "An epic with children is not "
+                                       "claimable; delegate its children.")
                 if self._agent() and status not in AGENT_TASK_STATUSES:
                     return self._error(403, "task_status_forbidden",
                                        "Agents may only move tasks to "

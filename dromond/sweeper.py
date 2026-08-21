@@ -473,6 +473,15 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             actions.append({"action": "dispatch", "item": item_id, "run": run_id,
                             "resumed": bool(prior)})
         except WorkError as exc:
+            if getattr(exc, "code", None) == "parent_is_container":
+                # Terminal refusal, same law as issue_closed: an epic with
+                # children is never claimable — its slices are. Work is the
+                # authority (409); retrying every pass would be the report-
+                # retry noise loop reborn (runs 76/155, then run 202's whole
+                # dispatch burned discovering this the expensive way).
+                print(f"dromond sweep: {item_id} is a container — skipped; "
+                      f"delegate its children")
+                continue
             print(f"dromond sweep: claim {item_id} rejected: {exc}")
             ok = False
     return ok
