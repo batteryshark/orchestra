@@ -2,7 +2,7 @@
 
 State is central (DESIGN §2): the sweeper owns the whole workspace, resolves
 each item's project from Work, and writes to one database under
-``DROMOND_HOME``. The fixture therefore builds a workspace with a project
+``ORCHESTRA_HOME``. The fixture therefore builds a workspace with a project
 directory in it, not a project with a state directory.
 """
 import json
@@ -13,8 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import brief, config, db, project, sweeper
-from dromond.work_client import WorkClient, WorkError
+from orchestra import brief, config, db, project, sweeper
+from orchestra.work_client import WorkClient, WorkError
 from tests.fake_work import FakeWork
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
@@ -28,7 +28,7 @@ backend = "opencode"
 
 [work]
 enabled = true
-agent_identity = "dromond"
+agent_identity = "orchestra"
 profile = "stub"
 poll_interval = 7
 """
@@ -43,7 +43,7 @@ def tool_line(tool: str, **args) -> str:
 
 
 class SweeperFixture:
-    """Workspace + fake Work + a throwaway DROMOND_HOME. Mixed into the case
+    """Workspace + fake Work + a throwaway ORCHESTRA_HOME. Mixed into the case
     below and into tests/test_dispatch.py, which needs the same harness."""
 
     def setUp(self) -> None:
@@ -58,8 +58,8 @@ class SweeperFixture:
         self.global_config = self.tmp_path / "global.toml"
         self.global_config.write_text(CONFIG + f'api_url = "{url}"\n')
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.global_config),
-            "DROMOND_HOME": str(self.tmp_path / "home")})
+            "ORCHESTRA_CONFIG": str(self.global_config),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home")})
         self.env.start()
         db.connect().close()
         self.cfg = config.load()
@@ -144,7 +144,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.sweep()
         issue = self.work.issues["issue_auth_timeout"]
         self.assertEqual(issue["state"], "in_progress")
-        self.assertEqual(issue["claimedBy"], {"kind": "agent", "name": "dromond"})
+        self.assertEqual(issue["claimedBy"], {"kind": "agent", "name": "orchestra"})
         self.assertIn("dispatched run", issue["messages"][-1]["body"])
         run = self.db_run()
         self.assertEqual(run["work_item"], "issue_auth_timeout")
@@ -163,7 +163,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         # as delegation offered 96 finished records to the runner, so Work
         # stopped emitting the key and the contract stopped honouring it.
         # Only an explicit human tick dispatches.
-        self.work.add_task("W-0001", "legacy shape", agents=["dromond"])
+        self.work.add_task("W-0001", "legacy shape", agents=["orchestra"])
         del self.work.tasks["W-0001"]["delegated"]
         self.assertEqual(self.sweep(), [])
         self.assertIsNone(self.db_run())
@@ -637,7 +637,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(cursor, self.work.tasks["W-0001"]["updatedAt"])
 
     def test_unreachable_work_degrades_gracefully(self) -> None:
-        dead = WorkClient("http://127.0.0.1:9", identity="dromond", timeout=0.5)
+        dead = WorkClient("http://127.0.0.1:9", identity="orchestra", timeout=0.5)
         self.assertEqual(sweeper.sweep(self.cfg, dead, launcher=self.launcher), [])
         con = db.connect()
         self.assertIsNone(db.meta_get(con, "work_cursor_tasks"))
@@ -662,7 +662,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
     # --- config -------------------------------------------------------------
 
     def test_work_config_merges_and_gates(self) -> None:
-        self.assertEqual(self.cfg["work"]["agent_identity"], "dromond")
+        self.assertEqual(self.cfg["work"]["agent_identity"], "orchestra")
         self.assertEqual(self.cfg["work"]["poll_interval"], 7)
         self.global_config.write_text(
             CONFIG.replace("enabled = true", "enabled = false"))
@@ -748,12 +748,12 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual([a["action"] for a in self.sweep()], ["dispatch"])
         self.assertEqual(self.db_run()["profile"], "stub")
 
-    def test_dromond_dispatch_refuses_a_profile_the_project_disabled(self) -> None:
-        """`dromond dispatch --to NAME` staffs a run, so it goes through the
+    def test_orchestra_dispatch_refuses_a_profile_the_project_disabled(self) -> None:
+        """`orchestra dispatch --to NAME` staffs a run, so it goes through the
         same gate the sweeper does — and says which project refused."""
         from argparse import Namespace
 
-        from dromond import cli
+        from orchestra import cli
         self.global_config.write_text(
             self.global_config.read_text()
             + "\n[profiles.other]\nbackend = \"codex\"\n"
@@ -766,7 +766,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         args = Namespace(mission=["do the thing"], to="stub", after=None,
                          brief_file=None, context=None, title=None,
                          worktree=False, sync=False)
-        with mock.patch.dict(os.environ, {"DROMOND_ROOT": str(self.root)}), \
+        with mock.patch.dict(os.environ, {"ORCHESTRA_ROOT": str(self.root)}), \
                 self.assertRaises(SystemExit) as caught:
             cli.cmd_dispatch(args)
         message = str(caught.exception)

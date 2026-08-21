@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import db, spawn
+from orchestra import db, spawn
 
 CFG = {"profiles": {
     "lead": {"backend": "codex", "spawn_profiles": ["worker", "phantom"]},
@@ -84,7 +84,7 @@ class EnabledSetTests(unittest.TestCase):
 class RequestSpawnTests(unittest.TestCase):
     def test_rejection_is_recorded_as_a_finding_and_run_continues(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict(os.environ, {"DROMOND_HOME": str(Path(tmp) / "home")}):
+                mock.patch.dict(os.environ, {"ORCHESTRA_HOME": str(Path(tmp) / "home")}):
             root = Path(tmp)
             con = db.connect()
             con.execute(
@@ -122,7 +122,7 @@ class SpawnBoundsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(
-            os.environ, {"DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            os.environ, {"ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         self.con = db.connect()
         self.addCleanup(self.tmp.cleanup)

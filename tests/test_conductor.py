@@ -21,15 +21,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from dromond import conductor, config, db, findings, observer
+from orchestra import conductor, config, db, findings, observer
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.test_sweeper import PROJECT_ID, SweeperFixture
 
 def session_of(prompt: str) -> str:
     """The session slug a prompt announces. Each turn mints its own."""
     for line in prompt.splitlines():
-        if "You are session dromond/" in line:
-            return line.split("dromond/")[1].split(".")[0].strip()
+        if "You are session orchestra/" in line:
+            return line.split("orchestra/")[1].split(".")[0].strip()
     raise AssertionError("the prompt named no session")
 
 
@@ -205,7 +205,7 @@ class TriggerTests(ConductorFixture, unittest.TestCase):
         self.add_goal()
         self.make_run(status="running")
         self.work.tasks["W-0100"]["log"].append(
-            {"at": self.work.now(), "message": "[dromond/happy_otter] dispatched"})
+            {"at": self.work.now(), "message": "[orchestra/happy_otter] dispatched"})
         self.assertEqual(self.conduct(), [])
 
     def test_low_runway_fires_once_per_reset_window(self) -> None:
@@ -393,7 +393,7 @@ class ActionTests(ConductorFixture, unittest.TestCase):
         self.assertIn("Build the API half.", Path(run["brief_path"]).read_text())
         self.assertIn("## Work item snapshot", Path(run["brief_path"]).read_text())
         self.assertRegex(self.goal_log(),
-                         r"\[dromond/\w+_\w+\] dispatched run \d+ on W-0100")
+                         r"\[orchestra/\w+_\w+\] dispatched run \d+ on W-0100")
 
     def test_dispatch_can_target_an_open_child(self) -> None:
         self.add_goal()

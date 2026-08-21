@@ -1,27 +1,27 @@
-# Dromond — design v1.0
+# Orchestra — design v1.0
 
 2026-08-13. Every subsystem is decided; a build session can take any item
 without hitting an open design question.
 
-This document says what Dromond is and how it behaves. It does not argue for
+This document says what Orchestra is and how it behaves. It does not argue for
 itself — the reasoning behind each decision, including the options rejected,
 lives in the Work tickets listed at the end.
 
-## What Dromond is
+## What Orchestra is
 
 A local control plane that turns agent CLIs (Codex, Claude Code, OpenCode,
 Reasonix) into a coordinated team. It consumes Work items as its source of
 intent and writes results back through Work's contract verbs (CONTRACT.md).
-Human-first: the person delegates, approves, and closes; Dromond executes.
+Human-first: the person delegates, approves, and closes; Orchestra executes.
 
 ## Principles
 
-1. **Dromond dispatches; it does not own intent.** It is a dispatch service for
+1. **Orchestra dispatches; it does not own intent.** It is a dispatch service for
    harnesses: take a mission, pick a profile, run a harness in an isolated
    worktree, watch it, land the result. Work is where intent lives and
    where results are recorded — the sweeper is the front door — but the
-   execution half knows nothing about it, and `dromond dispatch` from a shell
-   works with no Work involved. Dromond is never the place work is born.
+   execution half knows nothing about it, and `orchestra dispatch` from a shell
+   works with no Work involved. Orchestra is never the place work is born.
 2. **Waiting is free.** Event-driven wakeups only — hooks, child-settled
    interrupts, dependency release, Nod callbacks. No polling turns, no timer
    check-ins.
@@ -46,7 +46,7 @@ Work (system of record)
   goal / task, ticked `delegated` by a human
         │  sweeper claims                              ▲
         ▼                                              │ comments, facts,
-Dromond daemon (LaunchAgent, Mac, ~/.dromond)          │ artifacts, issues,
+Orchestra daemon (LaunchAgent, Mac, ~/.orchestra)          │ artifacts, issues,
   dispatch → worktree run → supervise → complete ──────┘ proposals
         │           │            │
         │           │            └─ findings[] + proposals[] → filed by code
@@ -62,14 +62,14 @@ Dromond daemon (LaunchAgent, Mac, ~/.dromond)          │ artifacts, issues,
 
 ## 1. Work integration
 
-The contract (work-management/CONTRACT.md) is the only coupling. Dromond talks
+The contract (work-management/CONTRACT.md) is the only coupling. Orchestra talks
 to Work through its sanctioned agent surface and never writes Work's files: the
 daemon uses `/api/agent/*` over HTTP with an `X-Work-Agent` identity, and a run
 that needs Work directly uses the `work` CLI, which carries the same identity
 and exposes its own capability catalog (`work agent operations`,
 `work agent instructions <op>`).
 
-Every write is made by Dromond's code: the sweeper claims and reports facts, the
+Every write is made by Orchestra's code: the sweeper claims and reports facts, the
 supervisor files findings and proposals, merge posts its comment, the conductor
 logs planner turns. What remains for a run is occasional context reading.
 
@@ -82,14 +82,14 @@ project — is set at creation.
 
 **Goals.** A goal is a Work task tagged `goal` and ticked `delegated`: the epic
 pattern Work already renders, a parent task that accumulates children. No new
-item kind — Work never learns a Dromond concept.
+item kind — Work never learns a Orchestra concept.
 
-**The plan surface is hybrid.** Ephemeral steps stay Dromond runs; they die with
+**The plan surface is hybrid.** Ephemeral steps stay Orchestra runs; they die with
 the run. Work that outlives one run, or that the human would want to see,
 comment on, or reprioritize from the phone, becomes a **child task under the
 goal**. That is what verb 5 proposes.
 
-**Project identity.** Work owns what projects exist; Dromond owns what is
+**Project identity.** Work owns what projects exist; Orchestra owns what is
 running. Projects are discovered from Work — never a second registry — and
 per-project settings key on Work's immutable `projectId`, which survives folder
 renames.
@@ -100,10 +100,10 @@ renames.
 launchd **LaunchAgent** in the user session on the Mac. The agent CLIs, their
 credentials, and the project checkouts live there; a system daemon runs outside
 the login session, cannot reach the keychain, and would fail at first spawn.
-Work may live on another machine — Dromond reaches it over Tailscale.
+Work may live on another machine — Orchestra reaches it over Tailscale.
 
-**State is central**: `~/.dromond/` holds the SQLite database, briefs, logs, and
-worktrees. A worktree lives at `~/.dromond/worktrees/<projectId>/run-N`, keyed
+**State is central**: `~/.orchestra/` holds the SQLite database, briefs, logs, and
+worktrees. A worktree lives at `~/.orchestra/worktrees/<projectId>/run-N`, keyed
 by the immutable UUID rather than the Work id, which is mutable and would
 strand the directory on a rename. Projects get no state
 directory of their own, so there is nothing to gitignore per repo, deleting a
@@ -120,7 +120,7 @@ later — because this was got wrong three separate times, each through a
 different door.
 
 A worktree is released when its run reaches a terminal state; the branch
-outlives it, carrying the commits until a merge lands them. `dromond prune`
+outlives it, carrying the commits until a merge lands them. `orchestra prune`
 sweeps whatever a crash left behind. A checkout holding uncommitted work is
 kept and reported rather than removed, since those changes die with the
 directory while committed work survives on the branch.
@@ -128,7 +128,7 @@ directory while committed work survives on the branch.
 The CLI resolves the current directory to a Work project rather than walking up
 for a state directory.
 
-**Configuration** lives at `~/.config/dromond/config.toml`: `[profiles.NAME]`
+**Configuration** lives at `~/.config/orchestra/config.toml`: `[profiles.NAME]`
 tables, `[work] api_url`, the API secret, the Nod issuer token, and
 `[project."<projectId>"]` tables carrying per-project settings and that
 project's enabled profile set. Profiles themselves are global, living only in
@@ -139,7 +139,7 @@ may not live in `.work/` — the contract forbids cross-boundary file writes.
 guaranteed. Switching rewrites config and restarts, and is refused while runs
 are in flight unless forced: in-flight items reference the old server, and
 `W-####` ids are unique only within a workspace. A genuinely separate workspace
-gets a **second Dromond daemon** on another port.
+gets a **second Orchestra daemon** on another port.
 
 ## 3. HTTP surface and dashboard
 
@@ -155,8 +155,8 @@ gets a **second Dromond daemon** on another port.
   and the daemon's own log. No websockets — actions are POSTs.
 - **Auth**: every route, including reads, requires a credential — the snapshot
   and traces carry source code, prompts, and transcripts. Two credentials share
-  the `X-Dromond-Key` header:
-  - the **human's shared secret**, generated at `dromond init` into 0600 config
+  the `X-Orchestra-Key` header:
+  - the **human's shared secret**, generated at `orchestra init` into 0600 config
     with an env override, pasted once into the iOS Keychain; and
   - a **per-run token**, minted at dispatch, stored only as a hash, injected
     into the worker's environment, and revoked the moment the run reaches a
@@ -204,8 +204,8 @@ this design considered.
 **Nothing predicts file overlap.** Which files a run touches is unknowable in
 advance; merge handles collisions (§9).
 
-**Isolation**: every run gets a git worktree on branch `dromond/run-<id>`,
-created under `~/.dromond/worktrees/`.
+**Isolation**: every run gets a git worktree on branch `orchestra/run-<id>`,
+created under `~/.orchestra/worktrees/`.
 
 ## 5. Profiles and delegation
 
@@ -214,7 +214,7 @@ model, a reasoning effort, a tier, and a priority. The word is **harness**
 wherever a human reads it; the config key stays `backend`, because renaming it
 would break every existing profile and all four runners. Mailboxes address **run ids**, so
 two concurrent runs may share one profile and neither is "the" holder of it.
-There is no roster and no agent-as-person anywhere in Dromond.
+There is no roster and no agent-as-person anywhere in Orchestra.
 
 **Discovery, not typing.** Model lists come from the harnesses themselves
 (`opencode models`, `codex debug models`, Reasonix's config with its declared
@@ -225,7 +225,7 @@ effort from real lists.
 never overridden per project — that was tried and removed. A project's
 `[project."<projectId>"] enabled_profiles` lists which profiles it may staff a
 run with; absent means all of them. Enablement binds at exactly two moments:
-when a run is **staffed** (the sweeper, `dromond dispatch`, the conductor's
+when a run is **staffed** (the sweeper, `orchestra dispatch`, the conductor's
 dispatch action, and the observer's and planner's own profile picks) and when a
 running agent **delegates**. A run already in flight is never revalidated — it
 keeps the preset it launched with, stale or not, which is the accepted cost of
@@ -252,7 +252,7 @@ so rather than pretending otherwise.
 
 **Profiles are managed, not hand-edited.** The dashboard adds, edits, and
 removes them, with the discovery pickers above feeding the model and effort
-fields, and the CLI keeps parity (`dromond profiles`). There are no default
+fields, and the CLI keeps parity (`orchestra profiles`). There are no default
 profiles: a profile that names no model would launch whatever the backend
 happens to default to, which is the guessing discovery exists to end. A fresh
 install has none and says so.
@@ -314,15 +314,15 @@ rather than falling back to exec mid-run, which would leave a run whose
 transport nobody can reason about. The pending-delivery badge (§7) keeps
 boundary delivery honest for the backends still on exec.
 
-**Hooks are mandatory and install at `dromond init`.** One shared `dromond hook`
+**Hooks are mandatory and install at `orchestra init`.** One shared `orchestra hook`
 binary serves Claude, Codex, and Reasonix — but their *file formats* are not
 identical: Claude and Codex take matcher groups, while Reasonix takes a flat
 handler list and reports the nested form as invalid. Codex's hook trust lives
 in `$CODEX_HOME/config.toml` as `[hooks.state."<path>:<event>:<group>:<index>"]`
-records, written at init and reported by `dromond doctor`.
+records, written at init and reported by `orchestra doctor`.
 OpenCode has no shell hooks and gets a small JS plugin listening for
 `session.idle` and `permission.asked`. Codex's one-time hook trust is
-provisioned at init and verified by `dromond doctor`; spawning with a
+provisioned at init and verified by `orchestra doctor`; spawning with a
 bypass-trust flag every time would silently disable a deliberate safety feature,
 so that flag stays a documented escape hatch.
 
@@ -337,7 +337,7 @@ its own design.
 Broadcast is `tell` × N; notes and reports go to Work item threads; handoff is a
 checkpoint.
 
-**`ask`**: the Stop hook holds the session open, Dromond files a Nod decision
+**`ask`**: the Stop hook holds the session open, Orchestra files a Nod decision
 request (§8), and the answer is injected back through the hook. Question and
 answer are both mirrored into the Work thread. Nod's `expires_at` is the
 declared fallback.
@@ -355,7 +355,7 @@ messaging waits for a use case and a discovery story.
 
 **Brief budget: ≤300 fixed tokens per dispatch** — header, mission, and a
 ~10-line protocol card, with the Work snapshot capped at 2,000 characters and
-frozen at dispatch. Per-verb detail loads on demand through `dromond <verb>
+frozen at dispatch. Per-verb detail loads on demand through `orchestra <verb>
 --help`. The continuation wrapper stays ~130 tokens.
 
 ## 7. Supervision: traces, the observer, retry
@@ -393,7 +393,7 @@ and a cheap **out-of-band observer turn** for long runs — first look at five m
 cheap model, so the worker never knows it happened and a productive long run is
 undisturbed. Exactly three outcomes: do nothing, `tell` a correction, or stop
 and escalate. **It may never silently kill a run** — long is not wrong. Also
-available on demand as `dromond check <run>`. The observer profile is named explicitly and is deliberately NOT the cheapest: deciding whether a run is converging or merely busy is a judgement, and it is asked rarely — first look, then hourly — so the model matters more than the tokens. The tier scan cannot choose while two profiles share a tier, and an unnameable observer must be loud rather than silently off.
+available on demand as `orchestra check <run>`. The observer profile is named explicitly and is deliberately NOT the cheapest: deciding whether a run is converging or merely busy is a judgement, and it is asked rarely — first look, then hourly — so the model matters more than the tokens. The tier scan cannot choose while two profiles share a tier, and an unnameable observer must be loud rather than silently off.
 
 **A resume that cannot resume is not a failure.** When a backend reports the
 session missing, the run restarts fresh in a new session, exactly once, and the
@@ -428,14 +428,14 @@ no settings.
 **Escalations are delivered through Nod** (github.com/batteryshark/nod), a
 self-hosted decision service that already owns Apple push, a TestFlight iOS app,
 macOS/Windows/TUI clients, channels, signed on-device decisions, and audit
-records. Dromond builds no push plumbing of its own.
+records. Orchestra builds no push plumbing of its own.
 
 Issuer API: `POST /api/v1/requests`, `GET /api/v1/requests/{id}/decision`,
 `GET /api/v1/requests/{id}/wait` (long-poll, `timeout_seconds` 1–60, returns
 `timed_out`), `POST /api/v1/requests/{id}/cancel`. Bearer issuer token in 0600
 config.
 
-- **Two channels**: `dromond-decisions` (needs an answer) and `dromond-alerts`
+- **Two channels**: `orchestra-decisions` (needs an answer) and `orchestra-alerts`
   (informational, dismiss-only), so alerts can be muted without muting
   decisions.
 - **Answers happen in the card** via Nod's options, with `links` carrying "open
@@ -447,7 +447,7 @@ config.
   is answerable only in Nod, so an outage degrades to Work's pull queue.
 - **Callback-driven** (`callback_url` wakes the daemon) with a `wait` long-poll
   as a startup backstop. Nod's callback is unsigned and best-effort by design,
-  so Dromond always re-reads the decision through the API before acting.
+  so Orchestra always re-reads the decision through the API before acting.
 
 **What escalates**: anything entering the needs-you queue — blocked runs, pivot
 proposals, merge conflicts, failure escalations — plus goal completion. Never
@@ -470,7 +470,7 @@ goal needs this next step". **Code files them**, so a worker cannot forget.
 - **Fingerprint dedup** on `(project, where, normalized claim)`: a repeat
   increments an occurrence count rather than filing a duplicate. It also tries
   to note the recurrence on the existing issue, which Work currently refuses on
-  an unclaimed issue — so until that changes, the count is visible in Dromond
+  an unclaimed issue — so until that changes, the count is visible in Orchestra
   and the rejection is recorded.
 - **A proposal needs a goal to parent to.** The sweeper dispatches any delegated
   item, so a run serving a plain task or an issue has no goal; its proposals are
@@ -546,7 +546,7 @@ rather than silently.
 **Refreshing the owner's checkout**: when that checkout sits on the base branch —
 the ordinary case — a moved ref would leave the tree at pre-merge content, with
 `git status` reporting every merged file as deleted. So after the ref moves,
-Dromond runs `git read-tree -m -u <old> <new>` there. That plumbing **refuses
+Orchestra runs `git read-tree -m -u <old> <new>` there. That plumbing **refuses
 rather than clobbers** when local edits are in the way, which is the entire
 reason it is safe to run unattended; it is never forced, and no variant that
 discards work is ever used as a fallback. If it refuses, or the checkout is on
@@ -565,7 +565,7 @@ them on a stale index. So the guard waits until the merged file list is known
 and compares. Untracked files do not count, or a build directory would block
 every merge. `require_clean = false` turns even the overlap check off, and the
 refresh still declines rather than clobbers underneath it — the guard is the
-outer of two, not the only one. Dromond never resolves the overlap itself:
+outer of two, not the only one. Orchestra never resolves the overlap itself:
 committing or stashing work in flight is the owner's to do, so the card offers
 retry or leave it, and no resolver.
 
@@ -653,12 +653,12 @@ event re-wakes it.
 
 **A turn returns** one structured object `{action, rationale}` where action is
 `dispatch` | `propose` | `ask_human` | `wait` | `done`. Only state-changing turns
-post to the goal's Work thread; `wait` turns go to Dromond's log, or an
+post to the goal's Work thread; `wait` turns go to Orchestra's log, or an
 overnight goal leaves fifty "still waiting" comments. Attribution is
-`dromond/<run-slug>`.
+`orchestra/<run-slug>`.
 
 The planner profile is configurable **per project**, default tier 2 (generalist) — a Work
-item carries no Dromond settings, so per-project is the finest key that exists;
+item carries no Orchestra settings, so per-project is the finest key that exists;
 the observer's profile has the same limit.
 
 "Budget low" is a **runway** reading (§11), never a grant: there are no budgets.
@@ -672,7 +672,7 @@ no valid event is simply not a gate.
 
 ## 11. Statistics and runway
 
-**Statistics come from Dromond's own data.** At completion a run records token
+**Statistics come from Orchestra's own data.** At completion a run records token
 counts and cost alongside wall-clock on the run row, taken from whatever each
 backend actually emits — which is not a uniform "result event": Claude and
 Reasonix carry it in a final result, Codex in `turn.completed`, and OpenCode
@@ -734,15 +734,15 @@ hands.
 
 **A run inherits its harness's own tool configuration**, exactly as it would
 when launched by hand. Should a run ever need a specific MCP server, a profile
-declares it and Dromond passes it through the backend's own flag
+declares it and Orchestra passes it through the backend's own flag
 (`--mcp-config`, `-c` overrides, config content).
 
 **Skills are scoped to the backend.** A run receives the skill directory for its
-own backend plus the shared set (`.agents`, `AGENTS.md`, `DROMOND.md`). Copying
+own backend plus the shared set (`.agents`, `AGENTS.md`, `ORCHESTRA.md`). Copying
 another harness's directory in is not merely wasteful: its settings can carry
-hooks that fire inside a run Dromond is already hooking.
+hooks that fire inside a run Orchestra is already hooking.
 
-**Global skills exist as an overlay.** `~/.dromond/skills/` syncs into every
+**Global skills exist as an overlay.** `~/.orchestra/skills/` syncs into every
 run, with project-level skills winning on conflict. Harness-side orchestration
 skills need somewhere every run can see them.
 
@@ -756,7 +756,7 @@ environment. Anything the worker spawns inherits it, and it dies with the run.
 
 **Tool denials stay minimal.** One denial exists: OpenCode's native delegation
 tools, which can leave a task child blocked forever on its own permission ask.
-Dromond brokers delegation itself (§5), so nothing is lost. A general
+Orchestra brokers delegation itself (§5), so nothing is lost. A general
 `deny_tools` list waits for a second real case.
 
 A containment profile bounds what a run may reach at the process level.
@@ -802,8 +802,8 @@ document is the settled result; the rows below say which item settled what.
 | W-0155 | Dispatch: no caps, ordering, queue state (§4) |
 | W-0157 | Messaging delivery tiers per backend (§6) |
 | W-0169 | Run environment: skills and directories (§12) |
-| W-0188 | Renamed Maestro to Dromond, 2026-08-14. "Maestro" collides with at least three active projects, one of them a near-identical AI-agent orchestration product. |
+| W-0188 | Renamed Maestro to Orchestra, 2026-08-14. "Maestro" collides with at least three active projects, one of them a near-identical AI-agent orchestration product. |
 
 Standing decisions carried in: the planner profile is per-project configurable,
 default tier 2 (generalist); orchestration and scoping skills stay harness-side, named by
-the protocol card for discovery, with no coupling into Dromond.
+the protocol card for discovery, with no coupling into Orchestra.

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from dromond import cli, db, dispatch, supervise
+from orchestra import cli, db, dispatch, supervise
 from tests.test_sweeper import PROJECT_ID, SweeperFixture
 
 
@@ -216,7 +216,7 @@ class PauseSwitchTests(SweeperFixture, unittest.TestCase):
             cli._gate_dispatch(con, self.cfg, "human")
         con.close()
         self.assertIn("paused", str(caught.exception))
-        self.assertIn("dromond resume", str(caught.exception))
+        self.assertIn("orchestra resume", str(caught.exception))
 
     def test_deferred_dependency_release_is_held_by_the_pause(self) -> None:
         con = db.connect()
@@ -276,14 +276,14 @@ class PauseSwitchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.env = mock.patch.dict(os.environ, {"DROMOND_HOME": self.tmp.name})
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_HOME": self.tmp.name})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.con = db.connect()
         self.addCleanup(self.con.close)
 
     def test_the_http_route_and_the_module_agree(self) -> None:
-        from dromond import http
+        from orchestra import http
         self.assertFalse(dispatch.paused(self.con))
 
         http.set_dispatch_paused(self.con, True)

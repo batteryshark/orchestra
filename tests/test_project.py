@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import config, db, paths, project
+from orchestra import config, db, paths, project
 from tests.fake_work import FakeWork
 
 DEMO_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
@@ -16,7 +16,7 @@ class PathsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
-        self.env = mock.patch.dict(os.environ, {"DROMOND_HOME": str(self.home)})
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_HOME": str(self.home)})
         self.env.start()
 
     def tearDown(self) -> None:
@@ -25,7 +25,7 @@ class PathsTests(unittest.TestCase):
 
     def test_everything_lives_under_one_home(self) -> None:
         self.assertEqual(paths.home(), self.home)
-        self.assertEqual(paths.db_path(), self.home / "dromond.db")
+        self.assertEqual(paths.db_path(), self.home / "orchestra.db")
         self.assertEqual(paths.briefs_dir(), self.home / "briefs")
         self.assertEqual(paths.logs_dir(), self.home / "logs")
         self.assertEqual(paths.worktrees_dir("demo"),
@@ -39,10 +39,10 @@ class PathsTests(unittest.TestCase):
                          self.home / "worktrees" / uuid)
         self.assertTrue(paths.worktrees_dir(uuid).is_dir())
 
-    def test_home_default_is_dot_dromond_in_the_user_home(self) -> None:
+    def test_home_default_is_dot_orchestra_in_the_user_home(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
-            del os.environ["DROMOND_HOME"]
-            self.assertEqual(paths.home(), Path("~/.dromond").expanduser())
+            del os.environ["ORCHESTRA_HOME"]
+            self.assertEqual(paths.home(), Path("~/.orchestra").expanduser())
 
 
 class ProjectResolutionTests(unittest.TestCase):
@@ -55,8 +55,8 @@ class ProjectResolutionTests(unittest.TestCase):
         self.global_config = self.tmp_path / "global.toml"
         self.global_config.write_text("")
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_CONFIG": str(self.global_config)})
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.global_config)})
         self.env.start()
         self.con = db.connect()
 
@@ -183,10 +183,10 @@ class CliSurfaceTests(unittest.TestCase):
         self.project_dir = self.workspace / "demo"
         self.project_dir.mkdir(parents=True)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_CONFIG": str(self.tmp_path / "global.toml"),
-            "DROMOND_LAUNCH_AGENTS": str(self.tmp_path / "LaunchAgents"),
-            "DROMOND_ROOT": str(self.project_dir)})
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.tmp_path / "global.toml"),
+            "ORCHESTRA_LAUNCH_AGENTS": str(self.tmp_path / "LaunchAgents"),
+            "ORCHESTRA_ROOT": str(self.project_dir)})
         self.env.start()
         con = db.connect()
         project.remember(con, str(self.workspace),
@@ -208,16 +208,16 @@ class CliSurfaceTests(unittest.TestCase):
         return out.getvalue()
 
     def test_init_creates_no_directory_inside_the_project(self) -> None:
-        from dromond import cli
-        with mock.patch("dromond.cli.Path.cwd", return_value=self.project_dir):
+        from orchestra import cli
+        with mock.patch("orchestra.cli.Path.cwd", return_value=self.project_dir):
             text = self._run(cli.cmd_init)
         self.assertEqual(list(self.project_dir.iterdir()), [self.project_dir / ".git"])
-        self.assertFalse((self.project_dir / ".dromond").exists())
+        self.assertFalse((self.project_dir / ".orchestra").exists())
         self.assertIn(str(paths.home()), text)
         self.assertIn(DEMO_ID, text)
 
     def test_runs_lists_every_project_and_here_narrows_it(self) -> None:
-        from dromond import cli
+        from orchestra import cli
         con = db.connect()
         for pid, title in ((DEMO_ID, "mine"), (INNER_ID, "theirs")):
             con.execute("INSERT INTO runs(profile, backend, title, requested_by, "
@@ -233,7 +233,7 @@ class CliSurfaceTests(unittest.TestCase):
         self.assertNotIn("theirs", here)
 
     def test_doctor_reports_the_central_home(self) -> None:
-        from dromond import cli
+        from orchestra import cli
         text = self._run(cli.cmd_doctor)
         self.assertIn(str(paths.home()), text)
         self.assertIn(DEMO_ID, text)
@@ -248,7 +248,7 @@ class AdoptTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.env = mock.patch.dict(os.environ, {"DROMOND_HOME": str(self.root / "home")})
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_HOME": str(self.root / "home")})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.con = db.connect()

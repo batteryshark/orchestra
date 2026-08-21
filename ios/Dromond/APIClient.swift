@@ -205,7 +205,7 @@ struct DromondAPI: Sendable {
             throw APIError.invalidURL
         }
         var request = URLRequest(url: url)
-        request.setValue(key, forHTTPHeaderField: "X-Dromond-Key")
+        request.setValue(key, forHTTPHeaderField: "X-Orchestra-Key")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 30
         return request

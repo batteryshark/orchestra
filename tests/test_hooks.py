@@ -1,7 +1,7 @@
 """Hook installation and the messaging verbs (DESIGN §6, W-0098).
 
 Nothing here spawns a real harness, files a real Nod card, or writes into
-the developer's ~/.claude, ~/.codex, ~/.reasonix or ~/.dromond: every home
+the developer's ~/.claude, ~/.codex, ~/.reasonix or ~/.orchestra: every home
 is redirected at a throwaway directory, Nod is tests/fake_nod.py and Work is
 tests/fake_work.py.
 """
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import config, db, hooks, messaging, runners, traces
+from orchestra import config, db, hooks, messaging, runners, traces
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.fake_work import FakeWork
 
@@ -33,7 +33,7 @@ secrets_file = "{secrets}"
 
 [work]
 enabled = true
-agent_identity = "dromond"
+agent_identity = "orchestra"
 profile = "stub"
 """
 
@@ -55,14 +55,14 @@ class HookFixture(unittest.TestCase):
             CONFIG.format(secrets=secrets) + f'api_url = "{self.work_url}"\n',
             encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.global_config),
-            "DROMOND_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.global_config),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
             "CLAUDE_CONFIG_DIR": str(self.tmp_path / "claude"),
             "CODEX_HOME": str(self.tmp_path / "codex"),
             "REASONIX_HOME": str(self.tmp_path / "reasonix"),
-            "DROMOND_NOD_BASE_URL": self.nod_url,
-            "DROMOND_NOD_DECISIONS_CHANNEL": DECISIONS_CHANNEL,
-            "DROMOND_NOD_DECISIONS_TOKEN": DECISIONS_TOKEN,
+            "ORCHESTRA_NOD_BASE_URL": self.nod_url,
+            "ORCHESTRA_NOD_DECISIONS_CHANNEL": DECISIONS_CHANNEL,
+            "ORCHESTRA_NOD_DECISIONS_TOKEN": DECISIONS_TOKEN,
         })
         self.env.start()
         self.con = db.connect()
@@ -88,7 +88,7 @@ class HookFixture(unittest.TestCase):
         return self.con.execute("SELECT * FROM runs WHERE id=1").fetchone()
 
     def as_run(self, run_id=1):
-        return mock.patch.dict(os.environ, {"DROMOND_RUN_ID": str(run_id)})
+        return mock.patch.dict(os.environ, {"ORCHESTRA_RUN_ID": str(run_id)})
 
 
 # --- installation -------------------------------------------------------------
@@ -99,9 +99,9 @@ class InstallTests(HookFixture):
         hooks.install_file(path, "claude")
         data = json.loads(path.read_text())
         self.assertEqual(data["hooks"]["Stop"][0]["hooks"][0]["command"],
-                         "dromond hook --backend claude")
+                         "orchestra hook --backend claude")
         self.assertEqual(data["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-                         "dromond hook --backend claude --bind")
+                         "orchestra hook --backend claude --bind")
         # The Stop hook has to outlive a human deciding on an `ask`.
         self.assertEqual(data["hooks"]["Stop"][0]["hooks"][0]["timeout"],
                          hooks.HOOK_TIMEOUT)
@@ -113,7 +113,7 @@ class InstallTests(HookFixture):
         hooks.install_file(path, "reasonix")
         data = json.loads(path.read_text())
         self.assertEqual(data["hooks"]["Stop"][0]["command"],
-                         "dromond hook --backend reasonix")
+                         "orchestra hook --backend reasonix")
         self.assertNotIn("hooks", data["hooks"]["Stop"][0])
 
     def test_install_is_idempotent_and_keeps_foreign_hooks(self) -> None:
@@ -128,7 +128,7 @@ class InstallTests(HookFixture):
         self.assertEqual(json.loads(path.read_text()), first)
         commands = [h["command"] for g in first["hooks"]["Stop"] for h in g["hooks"]]
         self.assertIn("somebody-elses-tool", commands)
-        self.assertIn("dromond hook --backend codex", commands)
+        self.assertIn("orchestra hook --backend codex", commands)
 
     def test_unreadable_config_refuses_rather_than_clobbers(self) -> None:
         path = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"
@@ -140,7 +140,7 @@ class InstallTests(HookFixture):
 
     def test_opencode_plugin_is_per_run_not_global(self) -> None:
         hooks.install_all()
-        plugin = Path(str(self.tmp_path / "home" / "hooks" / "dromond-opencode.js"))
+        plugin = Path(str(self.tmp_path / "home" / "hooks" / "orchestra-opencode.js"))
         self.assertTrue(plugin.exists())
         self.assertIn("session.idle", plugin.read_text())
         self.assertIn("permission.asked", plugin.read_text())
@@ -203,10 +203,10 @@ class CodexTrustTests(HookFixture):
 # --- the hook at runtime --------------------------------------------------------
 
 class HookRuntimeTests(HookFixture):
-    def test_silent_outside_a_dromond_run(self) -> None:
+    def test_silent_outside_a_orchestra_run(self) -> None:
         # Installed user-wide: the human's own sessions must be untouched.
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("DROMOND_RUN_ID", None)
+            os.environ.pop("ORCHESTRA_RUN_ID", None)
             self.assertIsNone(hooks.run_hook("claude", {"session_id": "abc"}))
 
     def test_bind_records_the_session_ref(self) -> None:
@@ -303,7 +303,7 @@ class AskTests(HookFixture):
 
     def test_ask_refuses_when_the_human_loop_is_off(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("DROMOND_NOD_BASE_URL")
+            os.environ.pop("ORCHESTRA_NOD_BASE_URL")
             with self.assertRaises(SystemExit):
                 messaging.file_question(self.con, config.load(PROJECT_ID),
                                         self.run_row(), "anyone there?")

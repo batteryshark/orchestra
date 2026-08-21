@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import config, db, nod
+from orchestra import config, db, nod
 from tests.fake_nod import (ALERTS_CHANNEL, ALERTS_TOKEN, DECISIONS_CHANNEL,
                             DECISIONS_TOKEN, FakeNod)
 
@@ -27,7 +27,7 @@ class NodTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ,
-                                   {"DROMOND_HOME": str(self.root / "home")})
+                                   {"ORCHESTRA_HOME": str(self.root / "home")})
         self.env.start()
         self.con = db.connect()
         self.channels = nod.Nod({
@@ -318,7 +318,7 @@ class EscalationKindTests(NodTestCase):
 
 class CallbackTests(NodTestCase):
     def test_callback_body_is_never_trusted(self) -> None:
-        """A forged callback body must not become the decision Dromond acts on."""
+        """A forged callback body must not become the decision Orchestra acts on."""
         rid = self.client.create(title="approve me")["request_id"]
         forged = {"request_id": rid, "status": "resolved",
                   "decision": {"option_id": "accept", "option_kind": "approve"}}
@@ -367,7 +367,7 @@ class PersistenceTests(NodTestCase):
         nod.blocked_run(self.channels, "q?", title="t", con=self.con, run_id=7)
         nod.alert(self.channels, "fyi", title="t", con=self.con, run_id=7)
         self.con.commit()
-        blob = Path(os.environ["DROMOND_HOME"], "dromond.db").read_bytes()
+        blob = Path(os.environ["ORCHESTRA_HOME"], "orchestra.db").read_bytes()
         for token in (DECISIONS_TOKEN, ALERTS_TOKEN):
             self.assertNotIn(token.encode(), blob)
 
@@ -498,7 +498,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"
             path.write_text('[nod]\nenabled = true\ntimeout = 3\n')
-            with mock.patch.dict(os.environ, {"DROMOND_CONFIG": str(path)}):
+            with mock.patch.dict(os.environ, {"ORCHESTRA_CONFIG": str(path)}):
                 cfg = config.load()
         self.assertTrue(cfg["nod"]["enabled"])
         self.assertEqual(cfg["nod"]["timeout"], 3)
@@ -532,7 +532,7 @@ class ActingTestCase(NodTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.resolver = types.ModuleType("dromond.resolver")
+        self.resolver = types.ModuleType("orchestra.resolver")
         self.resolver.calls = []
         stub = self.resolver
 
@@ -546,12 +546,12 @@ class ActingTestCase(NodTestCase):
 
         stub.retry_landing = retry_landing
         stub.dispatch_resolver = dispatch_resolver
-        # The lazy `from dromond import resolver` binds whichever of these
+        # The lazy `from orchestra import resolver` binds whichever of these
         # exists; patch both so the stub wins before and after the merge.
-        import dromond
+        import orchestra
         for patcher in (mock.patch.dict(sys.modules,
-                                        {"dromond.resolver": stub}),
-                        mock.patch.object(dromond, "resolver", stub,
+                                        {"orchestra.resolver": stub}),
+                        mock.patch.object(orchestra, "resolver", stub,
                                           create=True),
                         mock.patch.object(nod, "from_cfg",
                                           return_value=self.channels)):

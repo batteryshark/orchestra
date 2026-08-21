@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import db, review
+from orchestra import db, review
 
 
 def _run(con, profile, model, status, tokens=None, cost=None,
@@ -20,7 +20,7 @@ class ReviewTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(
-            os.environ, {"DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            os.environ, {"ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         self.con = db.connect()
 

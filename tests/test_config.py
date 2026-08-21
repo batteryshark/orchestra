@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import config, profile_edit
+from orchestra import config, profile_edit
 
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
@@ -17,8 +17,8 @@ class ConfigTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.global_path = self.root / "global.toml"
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.global_path),
-            "DROMOND_HOME": str(self.root / "home")})
+            "ORCHESTRA_CONFIG": str(self.global_path),
+            "ORCHESTRA_HOME": str(self.root / "home")})
         self.env.start()
 
     def tearDown(self) -> None:
@@ -188,7 +188,7 @@ class ConfigTests(unittest.TestCase):
             config.profile_cfg(config.load(), "anything")
         message = str(ctx.exception)
         self.assertIn("no profiles configured", message)
-        self.assertIn("dromond profiles discover", message)
+        self.assertIn("orchestra profiles discover", message)
 
     def test_legacy_agents_table_is_a_clear_error(self) -> None:
         """D10 is greenfield: no alias — a legacy [agents.NAME] table must
@@ -248,7 +248,7 @@ class RunwayTableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "config.toml"
             path.write_text('[runway]\nskip = ["minimax"]\n')
-            with mock.patch.dict(os.environ, {"DROMOND_CONFIG": str(path)}):
+            with mock.patch.dict(os.environ, {"ORCHESTRA_CONFIG": str(path)}):
                 cfg = config.load()
         self.assertEqual(["minimax"], cfg["runway"]["skip"])
 

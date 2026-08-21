@@ -7,9 +7,9 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from dromond import merge
+from orchestra import merge
 
-BRANCH = "dromond/run-1"
+BRANCH = "orchestra/run-1"
 
 
 def git(root: Path, *args: str) -> str:
@@ -598,7 +598,7 @@ class FileCardStageTestCase(unittest.TestCase):
     guard lets this branch run against a nod.py that has not grown it yet."""
 
     def _result(self) -> dict:
-        result = merge.blank_result("main", "dromond/run-7")
+        result = merge.blank_result("main", "orchestra/run-7")
         return merge._escalate(result, "tripwires", "touches 99 files")
 
     def test_stage_is_passed_once_merge_conflict_accepts_it(self) -> None:
@@ -640,24 +640,24 @@ class KeptRefTestCase(unittest.TestCase):
         run("config", "user.name", "t")
         (root / "seed.txt").write_text("seed\n")
         run("add", "."); run("commit", "-qm", "seed")
-        run("checkout", "-q", "-b", "dromond/run-99")
+        run("checkout", "-q", "-b", "orchestra/run-99")
         (root / "worker.txt").write_text("the worker's own commit\n")
         run("add", "."); run("commit", "-qm", "work")
-        head = subprocess.run(["git", "-C", str(root), "rev-parse", "dromond/run-99"],
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "orchestra/run-99"],
                               capture_output=True, text=True).stdout.strip()
         run("checkout", "-q", "main")
 
-        result = merge.merge_run(root, "dromond/run-99", settings={"checks": []})
+        result = merge.merge_run(root, "orchestra/run-99", settings={"checks": []})
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["branch_deleted"], "the branch is gone")
-        self.assertEqual(result["kept_ref"], "refs/dromond/run-99")
+        self.assertEqual(result["kept_ref"], "refs/orchestra/run-99")
         # The branch itself is gone. Note the bare name still resolves, because
         # git's rev-parse searches refs/<name> and finds the kept ref — which
         # is why even the old branch-name fallback keeps working after a merge.
         gone = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify",
-                               "refs/heads/dromond/run-99^{commit}"],
+                               "refs/heads/orchestra/run-99^{commit}"],
                               capture_output=True, text=True)
         self.assertNotEqual(gone.returncode, 0, "the branch is deleted")
         kept = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify",
-                               "refs/dromond/run-99^{commit}"], capture_output=True, text=True)
+                               "refs/orchestra/run-99^{commit}"], capture_output=True, text=True)
         self.assertEqual(kept.stdout.strip(), head)

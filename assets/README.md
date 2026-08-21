@@ -1,4 +1,4 @@
-# Dromond — visual identity
+# Orchestra — visual identity
 
 Three hulls in echelon, the middle one leading. Many hulls, one direction, one
 shore.
@@ -26,15 +26,15 @@ the lettering only.
 
 | Asset | Goes | How |
 |---|---|---|
-| `dromond-mark.svg` | anywhere a square is wanted: docs, README hero, social card, 32px and up | plain `<img>`; it carries its own ground, so no background needed |
-| `dromond-favicon.svg` | browser tab | `<link rel="icon" type="image/svg+xml" href="assets/dromond-favicon.svg">` |
-| `dromond-wordmark.svg` | README and any light page | `<img>` |
-| `dromond-wordmark-dark.svg` | dashboard header and any dark page | `<img>`, or inline it and set the `.name` group's `stroke` to `currentColor` so it tracks the theme |
-| `dromond-icon-1024.png` | iOS app icon, the 1024×1024 App Store slot | drop into the `AppIcon` asset set |
+| `orchestra-mark.svg` | anywhere a square is wanted: docs, README hero, social card, 32px and up | plain `<img>`; it carries its own ground, so no background needed |
+| `orchestra-favicon.svg` | browser tab | `<link rel="icon" type="image/svg+xml" href="assets/orchestra-favicon.svg">` |
+| `orchestra-wordmark.svg` | README and any light page | `<img>` |
+| `orchestra-wordmark-dark.svg` | dashboard header and any dark page | `<img>`, or inline it and set the `.name` group's `stroke` to `currentColor` so it tracks the theme |
+| `orchestra-icon-1024.png` | iOS app icon, the 1024×1024 App Store slot | drop into the `AppIcon` asset set |
 
 Two copies live outside this directory and have to be edited with it:
-`dromond/dashboard.html` inlines the favicon as a data URI and draws the mark as
-inline SVG in its header, and `ios/Dromond/Assets.xcassets/AppIcon.appiconset/`
+`orchestra/dashboard.html` inlines the favicon as a data URI and draws the mark as
+inline SVG in its header, and `ios/Orchestra/Assets.xcassets/AppIcon.appiconset/`
 holds the 1024px PNG. Change a hull here and both need the same change.
 
 ### Light and dark
@@ -49,7 +49,7 @@ the places nobody checks.
 ### Regenerating the PNG
 
 ```
-rsvg-convert -w 1024 -h 1024 -b '#161B23' -o assets/dromond-icon-1024.png assets/dromond-mark.svg
+rsvg-convert -w 1024 -h 1024 -b '#161B23' -o assets/orchestra-icon-1024.png assets/orchestra-mark.svg
 ```
 
 The `-b` flag floods the tile's rounded corners with the same ink. The result is
@@ -66,8 +66,8 @@ For the wordmark, measure the same 22% from the mark tile's height.
 
 ## Minimum sizes
 
-- `dromond-mark.svg` — 32px. It holds there, but the tapered bows go soft.
-- `dromond-favicon.svg` — 16px. At 16px the taper is gone and it reads as three
+- `orchestra-mark.svg` — 32px. It holds there, but the tapered bows go soft.
+- `orchestra-favicon.svg` — 16px. At 16px the taper is gone and it reads as three
   stacked bars; the three-hull structure and the gaps survive, which is the
   part that has to.
 - Below 16px, use nothing.

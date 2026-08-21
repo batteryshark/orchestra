@@ -1,7 +1,7 @@
 """The daemon loop and its launchd LaunchAgent (DESIGN §2).
 
 Nothing here starts a daemon or talks to the real launchd: `launchctl` is
-patched out and the plist is written under DROMOND_LAUNCH_AGENTS.
+patched out and the plist is written under ORCHESTRA_LAUNCH_AGENTS.
 """
 import os
 import plistlib
@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import daemon, db, proc, service, runway
+from orchestra import daemon, db, proc, service, runway
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -24,8 +24,8 @@ class DaemonTests(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name).resolve()
         (self.tmp_path / "global.toml").write_text("")
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_CONFIG": str(self.tmp_path / "global.toml")})
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.tmp_path / "global.toml")})
         self.env.start()
         self.con = db.connect()
 
@@ -130,8 +130,8 @@ class ServiceTests(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name).resolve()
         self.agents = self.tmp_path / "LaunchAgents"
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_LAUNCH_AGENTS": str(self.agents)})
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_LAUNCH_AGENTS": str(self.agents)})
         self.env.start()
         self.launchctl = mock.patch.object(
             service, "_launchctl",
@@ -145,14 +145,14 @@ class ServiceTests(unittest.TestCase):
 
     def test_install_writes_the_plist_and_never_loads_it(self) -> None:
         self.assertEqual(service.install(), 0)
-        p = self.agents / "local.dromond.daemon.plist"
+        p = self.agents / "local.orchestra.daemon.plist"
         self.assertTrue(p.is_file())
         with open(p, "rb") as f:
             plist = plistlib.load(f)
-        self.assertEqual(plist["Label"], "local.dromond.daemon")
+        self.assertEqual(plist["Label"], "local.orchestra.daemon")
         self.assertEqual(plist["ProgramArguments"][-1], "daemon")
         self.assertTrue(plist["StandardOutPath"].startswith(str(self.tmp_path / "home")))
-        self.assertEqual(plist["EnvironmentVariables"]["DROMOND_HOME"],
+        self.assertEqual(plist["EnvironmentVariables"]["ORCHESTRA_HOME"],
                          str(self.tmp_path / "home"))
         self.launchctl.assert_not_called()
 
@@ -161,21 +161,21 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(service.install(start=True), 0)
         args = self.launchctl.call_args[0]
         self.assertEqual(args[0], "bootstrap")
-        self.assertTrue(args[2].endswith("local.dromond.daemon.plist"))
+        self.assertTrue(args[2].endswith("local.orchestra.daemon.plist"))
 
     def test_install_is_idempotent(self) -> None:
         service.install()
-        first = (self.agents / "local.dromond.daemon.plist").read_bytes()
+        first = (self.agents / "local.orchestra.daemon.plist").read_bytes()
         service.install()
-        self.assertEqual((self.agents / "local.dromond.daemon.plist").read_bytes(),
+        self.assertEqual((self.agents / "local.orchestra.daemon.plist").read_bytes(),
                          first)
 
-    def test_uninstall_removes_only_the_plist_dromond_wrote(self) -> None:
+    def test_uninstall_removes_only_the_plist_orchestra_wrote(self) -> None:
         service.install()
         keep = self.agents / "someone.elses.plist"
         keep.write_text("not ours")
         self.assertEqual(service.uninstall(), 0)
-        self.assertFalse((self.agents / "local.dromond.daemon.plist").exists())
+        self.assertFalse((self.agents / "local.orchestra.daemon.plist").exists())
         self.assertTrue(keep.exists())
 
     def test_status_reports_absent_before_install(self) -> None:
@@ -193,7 +193,7 @@ def _free_pid() -> int:
 
 
 class ServiceRestartTests(unittest.TestCase):
-    """`dromond service restart` is the deploy step for an editable install:
+    """`orchestra service restart` is the deploy step for an editable install:
     the code is read from the working tree, so restarting is all that ships."""
 
     def test_restart_kickstarts_a_loaded_agent(self) -> None:

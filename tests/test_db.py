@@ -5,14 +5,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import db, paths
+from orchestra import db, paths
 
 
 class DbTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.env = mock.patch.dict(os.environ, {"DROMOND_HOME": str(self.root / "home")})
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_HOME": str(self.root / "home")})
         self.env.start()
         self.con = db.connect()
 
@@ -22,11 +22,11 @@ class DbTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_database_is_central_not_per_project(self) -> None:
-        """DESIGN §2: one database under DROMOND_HOME; the project directory
+        """DESIGN §2: one database under ORCHESTRA_HOME; the project directory
         gets no state of its own."""
-        self.assertEqual(paths.db_path(), self.root / "home" / "dromond.db")
+        self.assertEqual(paths.db_path(), self.root / "home" / "orchestra.db")
         self.assertTrue(paths.db_path().is_file())
-        self.assertFalse((self.root / ".dromond").exists())
+        self.assertFalse((self.root / ".orchestra").exists())
 
     def test_project_id_is_carried_and_indexed(self) -> None:
         cur = self.con.execute(

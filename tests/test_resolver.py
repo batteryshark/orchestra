@@ -1,6 +1,6 @@
 """The merge card's two verbs (DESIGN §9): retry the landing, dispatch a resolver.
 
-Throwaway git repositories and a throwaway DROMOND_HOME. Nod's future surface
+Throwaway git repositories and a throwaway ORCHESTRA_HOME. Nod's future surface
 (``withdraw_merge_cards``) is STUBBED, never depended on; the one test that
 needs a real card uses tests/fake_nod.py. No real harness is ever launched —
 the ``resolver.launcher`` seam is replaced everywhere a dispatch could fire.
@@ -14,10 +14,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import db, nod, resolver
+from orchestra import db, nod, resolver
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 
-BRANCH = "dromond/run-1"
+BRANCH = "orchestra/run-1"
 
 PROFILES = {
     "cheap": {"backend": "opencode", "tier": 1, "priority": 10},
@@ -53,9 +53,9 @@ class ResolverFixture(unittest.TestCase):
         git(self.root, "commit", "--quiet", "-m", "initial")
         # Never the developer's real home, config, or Nod credentials.
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_CONFIG": str(self.tmp_path / "global.toml"),
-            "DROMOND_NOD_SECRETS_FILE": str(self.tmp_path / "no-secrets.env"),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.tmp_path / "global.toml"),
+            "ORCHESTRA_NOD_SECRETS_FILE": str(self.tmp_path / "no-secrets.env"),
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -140,9 +140,9 @@ class RetryTestCase(ResolverFixture):
         git(self.root, "commit", "--quiet", "-m", "main moves")
         self.add_run()
         with mock.patch.dict(os.environ, {
-                "DROMOND_NOD_BASE_URL": url,
-                "DROMOND_NOD_DECISIONS_CHANNEL": DECISIONS_CHANNEL,
-                "DROMOND_NOD_DECISIONS_TOKEN": DECISIONS_TOKEN}):
+                "ORCHESTRA_NOD_BASE_URL": url,
+                "ORCHESTRA_NOD_DECISIONS_CHANNEL": DECISIONS_CHANNEL,
+                "ORCHESTRA_NOD_DECISIONS_TOKEN": DECISIONS_TOKEN}):
             note = resolver.retry_landing(self.con, {"nod": {"enabled": True}}, 1)
         self.assertIn("escalated at rebase", note)
         card = fake.requests["req_1"]
@@ -181,7 +181,7 @@ class DispatchTestCase(ResolverFixture):
         self.assertEqual("W-0042", row["work_item"])
         self.assertEqual("spawning", row["status"])
         # Its OWN fresh worktree off the current base, never the failed branch.
-        self.assertEqual(f"dromond/run-{new_id}", row["branch"])
+        self.assertEqual(f"orchestra/run-{new_id}", row["branch"])
         self.assertNotEqual(str(self.root), row["workdir"])
         self.assertEqual([(self.root, new_id)], self.launched)
         brief = Path(row["brief_path"]).read_text()
@@ -190,7 +190,7 @@ class DispatchTestCase(ResolverFixture):
         self.assertIn(reason, brief)
         self.assertIn("Do not force-push", brief)
         self.assertIn(f"Do not delete `{BRANCH}`", brief)
-        self.assertIn(f"dromond merge {BRANCH}", brief)
+        self.assertIn(f"orchestra merge {BRANCH}", brief)
 
     def test_a_configured_resolver_profile_wins(self) -> None:
         self.run_branch({"app.py": "print('branch')\n"})

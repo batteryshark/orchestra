@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dromond import profiles
+from orchestra import profiles
 
 OPENCODE_FIXTURE = """\
 opencode/big-pickle

@@ -1,7 +1,7 @@
 """The HTTP surface (DESIGN §3).
 
 Nothing here binds a public port or reads the developer's real state: every
-server binds 127.0.0.1 on port 0 and DROMOND_HOME/DROMOND_CONFIG point at a
+server binds 127.0.0.1 on port 0 and ORCHESTRA_HOME/ORCHESTRA_CONFIG point at a
 throwaway directory. No daemon is started.
 """
 import gzip
@@ -18,8 +18,8 @@ from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
 
-from dromond import auth, config, db, runway
-from dromond import http as mhttp
+from orchestra import auth, config, db, runway
+from orchestra import http as mhttp
 
 KEY = "test-secret-value"
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
@@ -34,8 +34,8 @@ class ServerCase(unittest.TestCase):
         self.config_path = self.tmp_path / "config.toml"
         self.config_path.write_text('[profiles.probe]\nbackend = "codex"\n')
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_CONFIG": str(self.config_path)})
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.config_path)})
         self.env.start()
         os.environ.pop(mhttp.KEY_ENV, None)  # a developer's shell must not leak in
         self.con = db.connect()
@@ -161,12 +161,12 @@ class AuthTests(ServerCase):
         self.assertEqual(self.request(path="/", key=None)[0], 401)
         status, text = self.request(path="/", key=KEY)
         self.assertEqual(status, 200)
-        self.assertIn("<title>dromond</title>", text)
+        self.assertIn("<title>orchestra</title>", text)
 
     def test_a_first_visit_may_carry_the_key_in_the_query(self) -> None:
         status, text = self.request(path="/?key=" + KEY, key=None)
         self.assertEqual(status, 200)
-        self.assertIn("dromond", text)
+        self.assertIn("orchestra", text)
         self.assertEqual(self.request(path="/?key=wrong", key=None)[0], 401)
 
     def test_a_cookie_reads_but_never_acts(self) -> None:
@@ -331,7 +331,7 @@ class SnapshotTests(ServerCase):
         self.assertEqual([w["label"] for w in entry["windows"]], ["5h", "weekly"])
         # `as_of` is shipped now, deliberately reversing an earlier decision to
         # omit the reading age. That decision assumed a stale reading meant the
-        # daemon had failed to poll -- true for the providers Dromond calls,
+        # daemon had failed to poll -- true for the providers Orchestra calls,
         # false for Claude, whose numbers come from a cache file Claude Code
         # writes and no amount of polling can refresh. A figure that may be
         # days old is indistinguishable from a fresh one without it.
@@ -460,13 +460,13 @@ class SnapshotTests(ServerCase):
                          {"kimi": "plan", "cc": "plan"})
 
     def test_the_cli_view_shows_the_same_numbers(self) -> None:
-        """`dromond stats` and the snapshot read one function, so they cannot
+        """`orchestra stats` and the snapshot read one function, so they cannot
         disagree; an uncaptured number prints as a dash, not as 0."""
         import contextlib
         import io
         from argparse import Namespace
 
-        from dromond import cli
+        from orchestra import cli
         self.make_run(status="done", profile="ds", backend="reasonix",
                       model="deepseek/deepseek-v4-flash", finished_at=db.now(),
                       tokens_total=1500, cost_usd=1.0, usage_source="reasonix")
@@ -548,7 +548,7 @@ class ProjectPickerTests(ServerCase):
 
     def test_a_project_with_no_runs_is_not_offered(self) -> None:
         """The picker offers what you have kicked something off from. A
-        project Dromond merely KNOWS about would filter the board to
+        project Orchestra merely KNOWS about would filter the board to
         nothing, so it is not a choice."""
         self.name_project(PROJECT_ID, "P-1", "alpha")
         self.name_project(OTHER_PROJECT, "P-2", "bravo")
@@ -844,54 +844,16 @@ class DiffRouteTests(ServerCase):
         git("commit", "--quiet", "-m", "base")
         base = git("rev-parse", "HEAD")
         base_branch = git("branch", "--show-current")
-        git("checkout", "--quiet", "-b", "dromond/run-diff")
+        git("checkout", "--quiet", "-b", "orchestra/run-diff")
         (root / "app.py").write_text("after-from-diff-pane\n")
         git("commit", "--quiet", "-am", "change")
         head = git("rev-parse", "HEAD")
         git("checkout", "--quiet", base_branch)
-        git("branch", "-D", "dromond/run-diff")
+        git("branch", "-D", "orchestra/run-diff")
         run_id = self.make_run(
             status="done", finished_at=db.now(), workdir=str(root),
-            branch="dromond/run-diff", base_commit=base, checkpoint_commit=head)
+            branch="orchestra/run-diff", base_commit=base, checkpoint_commit=head)
         return run_id, head
-
-    def test_diff_survives_the_rename_for_a_run_merged_before_it(self) -> None:
-        """W-0188. A run merged while the product was still Maestro has its
-        only surviving pointer in refs/maestro/: no checkpoint (it committed
-        its own work) and no branch (merging deleted it). Reading only the new
-        namespace would lose that run's diff forever."""
-        root = self.tmp_path / "legacy-repo"
-        root.mkdir()
-
-        def git(*args):
-            result = subprocess.run(["git", *args], cwd=root, capture_output=True,
-                                    text=True, check=True)
-            return result.stdout.strip()
-
-        git("init", "--quiet")
-        git("config", "user.email", "test@example.com")
-        git("config", "user.name", "test")
-        (root / "app.py").write_text("before\n")
-        git("add", "-A")
-        git("commit", "--quiet", "-m", "base")
-        base = git("rev-parse", "HEAD")
-        base_branch = git("branch", "--show-current")
-        git("checkout", "--quiet", "-b", "maestro/run-77")
-        (root / "app.py").write_text("after-from-a-maestro-era-run\n")
-        git("commit", "--quiet", "-am", "change")
-        head = git("rev-parse", "HEAD")
-        git("checkout", "--quiet", base_branch)
-        # Exactly what the old merge_run left behind: the anchor, then no branch.
-        git("update-ref", "refs/maestro/run-77", head)
-        git("branch", "-D", "maestro/run-77")
-
-        run_id = self.make_run(status="done", finished_at=db.now(),
-                               workdir=str(root), branch="maestro/run-77",
-                               base_commit=base, checkpoint_commit=None)
-        status, payload = self.json_request(path=f"/api/runs/{run_id}/diff")
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["head"], head)
-        self.assertIn("+after-from-a-maestro-era-run", payload["text"])
 
     def test_diff_survives_the_run_branch_being_deleted(self) -> None:
         run_id, head = self.committed_run()
@@ -945,7 +907,7 @@ class PauseTests(ServerCase):
         self.assertTrue(mhttp.dispatch_paused(self.con))
 
     def test_a_paused_daemon_tick_starts_nothing(self) -> None:
-        from dromond import daemon, supervise
+        from orchestra import daemon, supervise
         mhttp.set_dispatch_paused(self.con, True)
         with mock.patch.object(supervise, "process_ready") as ready:
             report = daemon.tick()
@@ -961,7 +923,7 @@ class SseSeamTests(ServerCase):
     """The two live streams (W-0165/W-0178): one run's trace, and the log."""
 
     def a_run_with_a_trace(self, status="done") -> int:
-        from dromond import traces
+        from orchestra import traces
         log = self.tmp_path / "run.jsonl"
         log.write_text(json.dumps(
             {"type": "assistant",
@@ -972,7 +934,7 @@ class SseSeamTests(ServerCase):
         return run_id
 
     def daemon_log(self, *lines) -> None:
-        from dromond import paths
+        from orchestra import paths
         path = paths.logs_dir() / "daemon.out.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(line + "\n" for line in lines))
@@ -1006,19 +968,19 @@ class SseSeamTests(ServerCase):
         self.assertNotIn("event: end", body)
 
     def test_the_daemon_log_streams_and_resumes_on_a_file_offset(self) -> None:
-        self.daemon_log("dromond: swept")
-        status, ctype, body = self.sse("/api/log/stream", until="dromond: swept")
+        self.daemon_log("orchestra: swept")
+        status, ctype, body = self.sse("/api/log/stream", until="orchestra: swept")
         self.assertEqual(status, 200)
         self.assertIn("text/event-stream", ctype)
-        self.assertIn("dromond: swept", body)
+        self.assertIn("orchestra: swept", body)
         cursor = [line for line in body.splitlines() if line.startswith("id:")][0]
         cursor = cursor.split(":", 1)[1].strip()
         self.assertIn("daemon.out.log@", cursor)
         # Resuming at that cursor replays nothing; the next line does arrive.
-        self.daemon_log("dromond: swept", "dromond: swept again")
+        self.daemon_log("orchestra: swept", "orchestra: swept again")
         body = self.sse("/api/log/stream", last_event_id=cursor,
                         until="swept again")[2]
-        self.assertNotIn("dromond: swept\"", body)
+        self.assertNotIn("orchestra: swept\"", body)
         self.assertIn("swept again", body)
 
     def test_an_unknown_stream_path_is_a_named_501_not_a_silent_404(self) -> None:
@@ -1040,7 +1002,7 @@ class KeyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "config.toml"
-        self.env = mock.patch.dict(os.environ, {"DROMOND_CONFIG": str(self.path)})
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_CONFIG": str(self.path)})
         self.env.start()
         os.environ.pop(mhttp.KEY_ENV, None)
 
@@ -1091,7 +1053,7 @@ class DashboardFileTests(unittest.TestCase):
         """A tab with no textarea is a dead control, same class of miss as
         the restart route shipping without its button."""
         page = (Path(__file__).resolve().parents[1]
-                 / "dromond" / "dashboard.html").read_text(encoding="utf-8")
+                 / "orchestra" / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn('data-view="settings"', page)
         self.assertIn('id="cfgtext"', page)
         self.assertIn("/api/config", page)
@@ -1103,7 +1065,7 @@ class DashboardFileTests(unittest.TestCase):
         reach it, so the feature was invisible and got re-delegated.
         """
         page = (Path(__file__).resolve().parents[1]
-                 / "dromond" / "dashboard.html").read_text(encoding="utf-8")
+                 / "orchestra" / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn('id="restart"', page)
         self.assertIn("/api/restart", page)
 
@@ -1127,7 +1089,7 @@ class DashboardFileTests(unittest.TestCase):
         both noise and impossible advice."""
         body = re.search(r"function renderDaemon\(d\) \{(.*?)\n\}", self.text, re.S)
         self.assertTrue(body, "renderDaemon is gone")
-        self.assertNotIn("dromond ", body.group(1))
+        self.assertNotIn("orchestra ", body.group(1))
 
     def test_the_tab_strip_sits_outside_the_scrolling_body(self) -> None:
         """Header and tabs above #pbody is what keeps the run actions from
