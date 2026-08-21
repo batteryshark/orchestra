@@ -155,16 +155,17 @@ def release(con, item_id: str) -> None:
 # --- dependencies -----------------------------------------------------------
 
 def prerequisites(item: dict) -> list[str]:
-    """Work item ids this item must wait for. ``dependsOn`` is the declared
-    edge; ``blockedBy`` is the same constraint recorded from the other side.
-    Tolerant of both a bare id list and a list of ``{"id": ...}``."""
+    """Work item ids this item must wait for. ``dependsOn`` is the one edge
+    Work serves; the legacy reverse-edge record folds into it on Work's read
+    (work-management, lib/local-workspace.mjs), so the runner never reads a
+    second key. Tolerant of both a bare id list and a list of
+    ``{"id": ...}``."""
     found: list[str] = []
-    for key in ("dependsOn", "blockedBy"):
-        for dep in item.get(key) or []:
-            if isinstance(dep, dict):
-                dep = dep.get("id")
-            if dep and dep != item.get("id") and dep not in found:
-                found.append(dep)
+    for dep in item.get("dependsOn") or []:
+        if isinstance(dep, dict):
+            dep = dep.get("id")
+        if dep and dep != item.get("id") and dep not in found:
+            found.append(dep)
     return found
 
 

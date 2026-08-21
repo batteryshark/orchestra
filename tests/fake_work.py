@@ -61,16 +61,18 @@ class FakeWork:
                  agents=(), goal="", notes="", requirements="",
                  acceptance=(), project_path=None, depends_on=(),
                  blocked_by=(), parent_id=None, tags=()):
-        # ``delegated`` is the CONTRACT v0.2 signal; ``agents`` models the
-        # legacy shape older Work instances still serve (tolerant-read path).
-        # ``dependsOn``/``blockedBy`` are the hard ordering constraints a
-        # dispatcher must honor (DESIGN §4); Work always serves both.
+        # ``dependsOn`` is the single ordering edge a dispatcher must honor
+        # (DESIGN §4). Work's read path folds a legacy ``blockedBy`` record
+        # into ``dependsOn`` and never serves the key itself
+        # (work-management, lib/local-workspace.mjs) — mirror that here.
         ts = self.now()
+        # First-occurrence order, deduped — exactly Work's read fold.
+        folded = list(dict.fromkeys(list(depends_on) + list(blocked_by)))
         self.tasks[task_id] = {
             "id": task_id, "title": title, "status": status,
             "projectPath": project_path or self._default_project(),
             "delegated": delegated, "agents": list(agents),
-            "dependsOn": list(depends_on), "blockedBy": list(blocked_by),
+            "dependsOn": folded,
             "parentId": parent_id, "tags": list(tags),
             "sections": {"goal": goal, "notes": notes,
                          "requirements": requirements,
@@ -123,6 +125,15 @@ class FakeWork:
                             "message": f"Moved from {task['status']} to {status}."})
         task["status"] = status
         task["updatedAt"] = ts
+
+    def human_close_issue(self, issue_id, summary="closed by human"):
+        """A human closes an issue: settled, with a resolution summary."""
+        issue = self.issues[issue_id]
+        ts = self.now()
+        issue["state"] = "closed"
+        issue["resolutionSummary"] = summary
+        issue["claimedBy"] = None
+        issue["updatedAt"] = ts
 
     def human_reply(self, issue_id, body):
         issue = self.issues[issue_id]
