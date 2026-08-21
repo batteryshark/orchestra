@@ -11,7 +11,8 @@ PROTOCOL_CARD = """\
 ## Protocol
 
 - Keep file changes inside the working directory.
-- Commit your git changes before you stop.
+- Never run git write commands. The host checkpoints and lands this worktree.
+- Sandbox: worktree yes, .git no (EPERM), /tmp yes. Leave files; do not work around it.
 - Operator messages may arrive between actions; apply them, then continue the mission.
 - Your final message is the handoff: what changed, how you verified it, what remains.
 - End it with a ```json block: {"findings": [], "proposals": []} — both keys required, [] is fine. "halt": "reason" stops the run until a human moves the item to ready.
@@ -113,4 +114,4 @@ it overrides earlier instructions only where they conflict.
 
 {instructions.strip()}
 {since}
-Commit your git changes before you stop; end with the usual handoff summary."""
+Never run git write commands; the host checkpoints. End with the usual handoff summary."""
