@@ -172,6 +172,11 @@ progress_interval = 900
 # Swept runs get an isolated git worktree: nobody is watching a swept
 # dispatch, so it must not share a checkout with a working human.
 worktree = true
+# Sign-off (W-0269). Off: items stay in review for a human. On: a
+# verification run executes each acceptance criterion's stated method
+# against landed main. verify_profile must not be the worker's `profile`.
+verify = false
+# verify_profile = "judge"
 
 # --- Nod: the human loop (DESIGN §8) --------------------------------------
 # Escalations are delivered as Nod request cards. Off unless enabled.
