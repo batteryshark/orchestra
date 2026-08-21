@@ -485,42 +485,6 @@ def _find_command(obj) -> str | None:
     return None
 
 
-def parse_progress(log_path: str) -> str | None:
-    """One line describing what a live run has been doing, from its log alone.
-
-    Deterministic transcript reading, never a question put to the worker --
-    a status report costs a model turn, this costs a file read.
-    """
-    actions, last, said = 0, None, None
-    try:
-        with open(log_path, errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                command = _find_command(obj)
-                if command:
-                    actions += 1
-                    last = command
-                texts = _dig(obj, {"text"})
-                if texts and isinstance(texts[-1], str):
-                    said = texts[-1].strip().splitlines()[0] if texts[-1].strip() else said
-    except OSError:
-        return None
-    if not actions and not said:
-        return None
-    parts = [f"{actions} tool call{'s' if actions != 1 else ''}"] if actions else []
-    if last:
-        parts.append(f"last: {last.strip()[:120]}")
-    elif said:
-        parts.append(f"last said: {said[:120]}")
-    return "; ".join(parts)[:400]
-
-
 # Every harness words it differently, and none of them says it in a structured
 # event: Reasonix prints `error: no session matches "<ref>"`, Claude Code
 # "No conversation found with session ID", Codex "session not found". A resume

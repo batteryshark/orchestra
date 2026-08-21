@@ -236,6 +236,31 @@ class ParserTests(TraceTestCase):
         self.assertIsNone(traces.parse_line("newthing", '{"type": "assistant"}'))
 
 
+class ProgressTests(TraceTestCase):
+    """The heartbeat line the sweeper posts to Work (I-0121)."""
+
+    def test_one_tool_counts_as_one_on_every_backend(self) -> None:
+        # Each fixture runs exactly one tool, but they disagree about how to
+        # say so: opencode logs only the completed part, claude and codex log
+        # a call and a result, reasonix logs a dispatch and a result. All four
+        # must read as one, never two and never none.
+        for backend, rows in FIXTURES.items():
+            log = write_jsonl(self.dir / f"{backend}.jsonl", rows)
+            with self.subTest(backend=backend):
+                self.assertIn("1 tool call;", traces.progress(str(log), backend))
+
+    def test_a_restreamed_partial_dispatch_is_not_a_second_tool(self) -> None:
+        # Reasonix re-emits tool_dispatch while the arguments stream in: one
+        # live run logged 141 dispatches for 70 tools.
+        partial = dict(REASONIX[5]["tool"], partial=True)
+        log = write_jsonl(self.dir / "r.jsonl",
+                          REASONIX + [{"kind": "tool_dispatch", "tool": partial}])
+        self.assertIn("1 tool call;", traces.progress(str(log), "reasonix"))
+
+    def test_a_missing_log_is_not_an_error(self) -> None:
+        self.assertIsNone(traces.progress(str(self.dir / "gone.jsonl"), "claude"))
+
+
 class IngestTests(TraceTestCase):
     def test_ingest_is_incremental_and_idempotent(self) -> None:
         log = write_jsonl(self.dir / "o.jsonl", OPENCODE[:4])

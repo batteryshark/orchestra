@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from dromond import (brief, config, db, dispatch, names, paths, project,
-                         router, runners, supervise, verify)
+                         router, supervise, traces, verify)
 from dromond.work_client import WorkClient, WorkError, from_cfg
 
 CURSOR_KEYS = {"task": "work_cursor_tasks", "issue": "work_cursor_issues"}
@@ -522,9 +522,9 @@ def _iso_ago(seconds: int) -> str:
 def _progress(con, cfg: dict, client: WorkClient, actions: list) -> None:
     """Post a heartbeat for live runs so the board is not silent mid-run.
 
-    Derived from the worker's own log (runners.parse_progress), so it costs
-    a file read rather than a model turn -- the worker is never asked to
-    report. Rate-limited by [work] progress_interval; 0 disables.
+    Derived from the run's trace at posting time (traces.progress), so it
+    costs a file read rather than a model turn -- the worker is never asked
+    to report. Rate-limited by [work] progress_interval; 0 disables.
     """
     interval = int(work_cfg(cfg).get("progress_interval", 900) or 0)
     if interval <= 0:
@@ -534,7 +534,7 @@ def _progress(con, cfg: dict, client: WorkClient, actions: list) -> None:
         f"SELECT * FROM runs WHERE work_item IS NOT NULL AND status NOT IN {db.TERMINAL_SQL} "
         "AND (work_progress_at IS NULL OR work_progress_at < ?)", (cutoff,))
     for run in list(rows):
-        note = runners.parse_progress(run["log_path"])
+        note = traces.progress(run["log_path"], run["backend"])
         if not note:
             continue
         item_id, tag = run["work_item"], f"[{client.identity}/{run['slug'] or run['id']}]"
