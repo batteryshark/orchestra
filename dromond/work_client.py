@@ -187,6 +187,14 @@ class WorkClient:
         return self._call("POST", "/api/decisions", payload)
 
 
+def verifier_identity(slug: str) -> str:
+    """X-Work-Agent name Work's done-guard keys on (W-0269).
+
+    Prefix ``verify/``, then the run slug — never the worker's identity.
+    """
+    return f"verify/{slug}"
+
+
 def from_cfg(cfg: dict) -> WorkClient | None:
     """Client for the one configured Work server (DESIGN §2), or None when
     [work] is off."""

@@ -584,6 +584,17 @@ their attention.
 The Work item transitions to `review`, and the thread comment carries the merge
 commit, files changed, check results, and **the revert command**.
 
+**Sign-off is a run (W-0269).** When a swept item reaches `review` and
+`[work] verify` is on, the runner records a verification run on
+`verify_profile` — never the worker's profile or session. Code executes each
+acceptance criterion's stated method (command, grep, test, or read) against
+landed main and ticks with a one-line evidence note. All pass: the item moves
+to `done` with a house-style summary, posted as `verify/{slug}`. Any
+fail: `blocked`, naming the failing criteria, surface lane, no ring. Work
+accepts `done` from that verifier identity only; a worker identity stays
+refused; a human reopen always works. A `dependsOn` train proceeds through
+verifier-earned `done` with no other dispatch change.
+
 **A brief says what recently landed.** A run starts in a fresh worktree with no
 memory of the project, so it cannot tell work that is waiting from work that
 landed an hour ago — which is how two runs came to build the same thing at
