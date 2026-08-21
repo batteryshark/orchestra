@@ -3,7 +3,8 @@
 Mirrors the route shapes and server-side authority rules of
 work-management's local-api.mjs that the sweeper depends on:
 
-- agents may move tasks only to in_progress / review / blocked (403)
+- agents may move tasks only to in_progress / review / blocked (403);
+  a verifier identity (``verify/`` prefix, W-0269) may also move a task to done
 - agents may never PATCH a task (403)
 - only a queued issue can be claimed; state changes require the claimant
 - agents may set issue state only to in_progress / needs_human / resolved
@@ -259,11 +260,13 @@ def _make_handler(state: FakeWork):
                     return self._error(409, "parent_is_container",
                                        "An epic with children is not "
                                        "claimable; delegate its children.")
-                if self._agent() and status not in AGENT_TASK_STATUSES:
-                    return self._error(403, "task_status_forbidden",
-                                       "Agents may only move tasks to "
-                                       "in_progress, review, or blocked.")
-                if status in ("review", "blocked"):
+                agent = self._agent()
+                if agent and status not in AGENT_TASK_STATUSES:
+                    if not (status == "done" and agent.startswith("verify/")):
+                        return self._error(403, "task_status_forbidden",
+                                           "Agents may only move tasks to "
+                                           "in_progress, review, or blocked.")
+                if status in ("review", "blocked", "done"):
                     open_items = [i for section in ("requirements",
                                                     "acceptanceCriteria")
                                   for i in task.get(section) or []
