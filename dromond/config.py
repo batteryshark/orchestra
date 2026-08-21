@@ -220,6 +220,9 @@ expires_after = 86400
 #          session/request_permission. Ignored by the exec transport.
 # timeout / stall_timeout: per-profile overrides, in seconds
 # extra_args: appended to the backend CLI invocation
+# lane:    claude only. "quota" unsets ANTHROPIC_API_KEY so `-p` uses the
+#          Max subscription. "api" keeps the key. Spent quota retries once
+#          on the api lane when a key is present. The trace names the lane.
 # spawn_profiles: profiles this one may delegate to (D11); absent/empty =
 #                 may not delegate at all
 # note / note_at: freeform headroom note + when it was written (D10);

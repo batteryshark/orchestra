@@ -155,6 +155,18 @@ class ApplyBackendEnvTests(unittest.TestCase):
         profile = {"backend": "opencode", "opencode_native_subagents": True}
         self.assertIs(runners.apply_backend_env(profile, env), env)
 
+    def test_quota_lane_strips_the_api_key(self) -> None:
+        env = {"ANTHROPIC_API_KEY": "sk-ant-x", "KEEP": "1"}
+        out = runners.apply_backend_env({"backend": "claude", "lane": "quota"}, env)
+        self.assertNotIn("ANTHROPIC_API_KEY", out)
+        self.assertEqual(out["KEEP"], "1")
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-x")
+
+    def test_api_lane_keeps_the_key(self) -> None:
+        env = {"ANTHROPIC_API_KEY": "sk-ant-x"}
+        self.assertIs(runners.apply_backend_env({"backend": "claude", "lane": "api"}, env), env)
+        self.assertIs(runners.apply_backend_env({"backend": "claude"}, env), env)
+
 
 class ParseLogTests(unittest.TestCase):
     def test_session_ref_and_last_text(self) -> None:
@@ -289,6 +301,45 @@ class ParseUsageTests(unittest.TestCase):
             {"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0}}])
         self.assertEqual(usage["tokens_total"], 0)
         self.assertEqual(usage["usage_source"], "codex")
+
+
+class QuotaLaneTests(unittest.TestCase):
+    def test_spent_quota_falls_back_once_when_a_key_is_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.jsonl"
+            log.write_text("Claude AI usage limit reached\n")
+            profile = {"backend": "claude", "lane": "quota", "name": "q"}
+            env = {"ANTHROPIC_API_KEY": "sk-ant-x"}
+            retry = runners.next_lane(profile, env, str(log), False)
+            self.assertEqual(retry["lane"], "api")
+            self.assertIsNone(runners.next_lane(retry, env, str(log), True))
+
+    def test_no_fallback_without_a_key_or_a_limit_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.jsonl"
+            log.write_text("Claude AI usage limit reached\n")
+            profile = {"backend": "claude", "lane": "quota"}
+            self.assertIsNone(runners.next_lane(profile, {}, str(log), False))
+            log.write_text("ok\n")
+            self.assertIsNone(runners.next_lane(
+                profile, {"ANTHROPIC_API_KEY": "x"}, str(log), False))
+
+    def test_approaching_is_not_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.jsonl"
+            log.write_text("Usage limit approaching. Checkpoint now.\n")
+            self.assertIsNone(runners.quota_exhausted(str(log)))
+
+    def test_the_trace_names_the_lane(self) -> None:
+        from dromond import traces
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.jsonl"
+            log.write_text("")
+            runners.write_lane(str(log), "quota")
+            events = traces.parse_line("claude", log.read_text().strip())
+            self.assertEqual(events[0]["kind"], "lifecycle")
+            self.assertEqual(events[0]["name"], "lane")
+            self.assertIn('"lane": "quota"', events[0]["payload"])
 
 
 if __name__ == "__main__":
