@@ -127,17 +127,21 @@ def _choose(con, cfg: dict, snapshot: str, name: str, profile: dict, *,
     if not router_name:
         return name, profile, None
     enabled = config.enabled_profiles(cfg)
-    if len(enabled) < 2:
+    polls = {p["provider"]: p for p in runway.latest_polls(con)}
+    burns = runway.profile_burns(enabled, polls)
+    # Staffing only: in-flight runs keep the preset they launched with
+    # (W-0187). Exhausted names drop out of the packet, not off a live run.
+    staffable = {n: p for n, p in enabled.items() if n not in burns}
+    if len(staffable) < 2:
         return name, profile, (
-            f"skipped the staffing turn: {len(enabled)} profile enabled, "
+            f"skipped the staffing turn: {len(staffable)} profile staffable, "
             f"so there is nothing to decide; staffed {name}")
     try:
         router = config.staff_profile(cfg, router_name)
     except SystemExit as exc:
         return name, profile, (f"the router profile {router_name!r} is not "
                                f"staffable ({_one_line(exc)}); staffed {name}")
-    packet = build_packet(snapshot, enabled, {p["provider"]: p
-                                              for p in runway.latest_polls(con)})
+    packet = build_packet(snapshot, staffable, polls)
     try:
         if turn is not None:
             text = turn(router, packet, timeout=TURN_TIMEOUT)
@@ -152,6 +156,9 @@ def _choose(con, cfg: dict, snapshot: str, name: str, profile: dict, *,
         return name, profile, (f"the staffing turn could not run "
                                f"({_one_line(exc)}); staffed {name}")
     chosen, reason = parse_choice(text, enabled)
+    if chosen in burns:
+        return name, profile, (
+            f"{chosen} is exhausted ({burns[chosen]}); staffed {name}")
     if chosen is None:
         return name, profile, f"{reason}; staffed {name}"
     try:

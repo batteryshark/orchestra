@@ -710,10 +710,16 @@ def cmd_profiles(args):
                       + (f" (default {p['default_effort']})" if p["default_effort"] else ""))
         print(f"\n## claude\n  {found['claude']['error']}")
         return
-    entries = _here_cfg().get("profiles", {})
+    con = db.connect()
+    try:
+        entries = _here(con)[1].get("profiles", {})
+        polls = {p["provider"]: p for p in runway.latest_polls(con)}
+    finally:
+        con.close()
     if not entries:
         print("(no profiles configured)")
         return
+    burns = runway.profile_burns(entries, polls)
     # Routing order (W-0181): priority first, `nice`-style — lower is more
     # preferred — then name. The same order the dashboard and the planner see.
     print(f"{'name':<12} {'harness':<9} {'model':<24} {'effort':<7} "
@@ -731,6 +737,8 @@ def cmd_profiles(args):
         age = profiles.note_age(p.get("note_at"))
         if p.get("note"):
             print(f"{'':<12} note: {p['note']}" + (f" ({age})" if age else ""))
+        if name in burns:
+            print(f"{'':<12} exhausted: {burns[name]}")
 
 
 def cmd_doctor(args):

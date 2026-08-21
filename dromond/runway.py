@@ -1410,6 +1410,35 @@ def latest_polls(con) -> list[dict]:
         "as_of, MAX(id) AS id FROM runway_polls GROUP BY provider ORDER BY provider")]
 
 
+def exhaustion(entry: dict | None) -> str | None:
+    """Why this poll is a quota wall, or None if a new run may still spend.
+
+    Unknown and stale mean available (DESIGN §11). Remaining of 0 on a live
+    reading is the wall. ponytail: join at read time; a per-profile table if
+    two accounts share a provider and need separate burns.
+    """
+    if not entry or entry.get("remaining") is None:
+        return None
+    age = age_hours(entry.get("as_of"))
+    if (age is not None and age >= STALE_AFTER_H) or expired(entry.get("resets_at")):
+        return None
+    if entry["remaining"] > 0:
+        return None
+    return entry_text(entry)
+
+
+def profile_burns(profiles: dict, polls: dict) -> dict[str, str]:
+    """Profile name → exhaustion reason. Absent means the account can still run."""
+    out = {}
+    for name, profile in profiles.items():
+        provider = provider_of(profile.get("backend", "opencode"),
+                               profile.get("model"))
+        reason = exhaustion(polls.get(provider))
+        if reason:
+            out[name] = reason
+    return out
+
+
 def entry_text(entry: dict) -> str:
     """One poll ROW (a database dict, not a ``Runway``) as one readable
     phrase. Shared by every packet a model reads, so the conductor's runway
