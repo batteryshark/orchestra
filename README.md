@@ -3,6 +3,20 @@
   <img src="assets/dromond-wordmark.svg" alt="Dromond" width="360">
 </picture>
 
+## What this is
+
+Orchestra (the code still says Dromond until the rename lands) is the
+execution side of an agentic project: one dispatcher that brings every harness
+and every model under one roof.
+
+For humans and agents: a unified dispatcher that takes work on request or by
+programmatic dispatch, routes it, and completes bounded or complex exploratory
+work with full logging, handoffs, controls, escalation, and tool homogeneity.
+Plug in models and profiles, let them delegate to teams with tooling, and get
+complex work done reliably. New model? New tools? Plug them in. It does not
+depend on one harness, and it does not depend on extracting content out of a
+provider's harness: all your content lives under one roof. Its planning
+counterpart is Work.
 
 A dromond was a fast oared galley, and the name comes from the Greek *dromon*,
 "runner" — one hull that many runners drove at once. This is the same
