@@ -299,8 +299,8 @@ def _ignored_by_base(root: Path, paths: list[str]) -> list[str]:
 def rebase_dropping_ignored(root: Path, scratch: Path, base: str) -> tuple[bool, list[str], list[str]]:
     """Rebase the run branch, dropping anything the base does not track.
 
-    A run commits with `git add -A`, so it sweeps up whatever sits in its
-    worktree — including a service's live record store. Work rewrites those
+    The host checkpoints with `git add -A`, so it sweeps up whatever sits in
+    its worktree — including a service's live record store. Work rewrites those
     files continuously while the run holds its branch, so both sides edit the
     same append-only log and the rebase conflicts EVERY time. Nothing raced:
     two processes own one file, and retrying cannot help. That was the

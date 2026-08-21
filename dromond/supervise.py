@@ -384,7 +384,8 @@ def _checkpoint_commit(run: dict, terminal_status: str) -> str | None:
     """Commit an isolated worktree's leftover changes so nothing is lost.
 
     Shared-tree runs write into the human's checkout; Dromond never
-    auto-commits there — the worker is told to commit before stopping.
+    auto-commits there. Isolated runs leave files; this is the only commit
+    on the run branch, for every backend — including ones that could commit.
     """
     if not run.get("branch"):
         return None

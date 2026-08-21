@@ -218,6 +218,34 @@ class WorktreeRemovalTests(unittest.TestCase):
 
         self.assertTrue(wt.exists())
 
+    def test_checkpoint_commits_file_writes_the_run_left(self):
+        """W-0259: the host owns the commit, even when the backend could."""
+        wt = self.make_run(80, "done", commit=False)
+        write(wt / "feature.py", "x = 1\n")
+        run = dict(self.con.execute("SELECT * FROM runs WHERE id=80").fetchone())
+        run["base_commit"] = worktree.head(wt)
+
+        sha = supervise._checkpoint_commit(run, "done")
+
+        self.assertIsNotNone(sha)
+        self.assertNotEqual(sha, run["base_commit"])
+        self.assertEqual([], worktree.dirty_paths(wt))
+        self.assertIn("checkpoint run 80", self.git("log", "-1", "--format=%s",
+                                                    root=wt))
+        self.assertIn("feature.py", self.git("show", "--name-only", "--format=",
+                                             sha, root=wt))
+
+    def test_checkpoint_records_a_legacy_agent_commit(self):
+        """Older runs committed themselves. Checkpoint still points at HEAD."""
+        wt = self.make_run(81, "done", commit=True)
+        run = dict(self.con.execute("SELECT * FROM runs WHERE id=81").fetchone())
+        run["base_commit"] = self.git("rev-parse", "main")
+
+        sha = supervise._checkpoint_commit(run, "done")
+
+        self.assertEqual(sha, worktree.head(wt))
+        self.assertNotEqual(sha, run["base_commit"])
+
     def test_uncommitted_work_is_kept_and_reported_at_finalization(self):
         wt = self.make_run(5, "failed")
         write(wt / "README.md", "half-finished\n")
