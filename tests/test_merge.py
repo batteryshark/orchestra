@@ -108,6 +108,22 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual([".work/W-0171.md"], result["dropped"])
         self.assertEqual([], result["files_changed"])
 
+    def test_a_legacy_branch_with_agent_commits_still_lands(self):
+        """W-0259: history exists. Merge takes the agent's own commits too."""
+        git(self.root, "checkout", "--quiet", "-b", BRANCH)
+        self.write("one.py", "a = 1\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "--quiet", "-m", "agent: first")
+        self.write("two.py", "b = 2\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "--quiet", "-m", "agent: second")
+        git(self.root, "checkout", "--quiet", "main")
+
+        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(["one.py", "two.py"], result["files_changed"])
+
     def test_a_real_source_conflict_still_reaches_the_human(self):
         # The rule drops what the base says is not source. It must not soften
         # a genuine conflict in code, which is a judgment nobody can automate.
