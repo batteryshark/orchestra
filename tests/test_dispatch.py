@@ -88,6 +88,25 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
         self.assertEqual(self.db_run()["work_item"], "W-0002")
         self.assertEqual(self.waiting(), [])  # queue row cleared at dispatch
 
+    def test_an_open_issue_dependency_holds_until_the_issue_closes(self) -> None:
+        # Work's semantics: an issue in dependsOn is settled only when its
+        # state is closed (resolved folded into closed, 2026-08-14).
+        self.work.add_issue("I-0001", "the prerequisite issue", state="queued")
+        self.work.add_task("W-0001", "the dependent", delegated=True,
+                           depends_on=["I-0001"])
+        actions = self.sweep()
+        self.assertEqual([a["action"] for a in actions], ["hold"])
+        self.assertEqual(actions[0]["reason"], "dependency")
+        self.assertEqual(actions[0]["detail"], "I-0001")
+        # Honest queue state: it waits, so it is NOT in_progress and has no run.
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "ready")
+        self.assertIsNone(self.db_run())
+        self.work.human_close_issue("I-0001", summary="settled")
+        actions = self.sweep()
+        self.assertEqual([a["action"] for a in actions], ["dispatch"])
+        self.assertEqual(self.db_run()["work_item"], "W-0001")
+        self.assertEqual(self.waiting(), [])  # queue row cleared at dispatch
+
     def test_holding_is_logged_once_not_once_per_pass(self) -> None:
         self.work.add_task("W-0001", "the prerequisite", status="in_progress")
         self.work.add_task("W-0002", "the dependent", delegated=True,
