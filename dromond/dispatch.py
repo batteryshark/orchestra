@@ -125,8 +125,8 @@ def hold(con, item_id: str, kind: str, lane_index: int | None,
          reason: str, detail: str | None) -> bool:
     """Record that ``item_id`` waits, and why. Returns True when this is new
     or the reason changed, so a caller logs the transition once instead of
-    every pass. The Work item is NOT moved to in_progress — that happens at
-    actual dispatch and nowhere else."""
+    every pass. The Work item gets NO claim fact — that happens at actual
+    dispatch and nowhere else, so a waiting item never reads in_progress."""
     now = db.now()
     row = con.execute("SELECT reason, detail FROM dispatch_queue WHERE item_id=?",
                       (item_id,)).fetchone()

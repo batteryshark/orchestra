@@ -3,8 +3,13 @@
 Mirrors the route shapes and server-side authority rules of
 work-management's local-api.mjs that the sweeper depends on:
 
-- agents may move tasks only to in_progress / review / blocked (403);
-  a verifier identity (``verify/`` prefix, W-0269) may also move a task to done
+- **stored status has one writer class: humans** (CONTRACT 0.8). An agent
+  identity appends a run FACT — a task progress line, an issue message — and
+  every read serves a status DERIVED from those facts plus the human's stored
+  value. A legacy agent transition is bridged into its fact and writes no
+  status, exactly as Work's own bridge does.
+- agents may bridge a task move only from in_progress / review / blocked
+  (403); a verifier identity (``verify/`` prefix, W-0269) may also send done
 - agents may never PATCH a task (403)
 - only a queued issue can be claimed; state changes require the claimant
 - agents may set issue state only to in_progress / needs_human / resolved
@@ -22,10 +27,57 @@ import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_TASK_STATUSES = {"in_progress", "review", "blocked"}
+# The transition an old client sends, and the fact it really means.
+AGENT_MOVE_FACT = {"in_progress": "claimed", "review": "landed",
+                   "blocked": "halted"}
 # Work collapsed "resolved" into "closed" (2026-08-14); the API still accepts
 # "resolved" as an alias and stores "closed".
 AGENT_ISSUE_STATES = {"in_progress", "needs_human", "closed"}
+AGENT_ISSUE_FACT = {"in_progress": "claimed", "needs_human": "needs_human",
+                    "closed": "resolved"}
+
+# --- run facts (Work docs/ARTIFACT-SCHEMA.md § Run facts) --------------------
+# A compact mirror of Work's parser and precedence rule; the authoritative one
+# is lib/local-workspace.mjs. Tolerant read: the identity prefix is optional,
+# unknown verbs and keys are ignored, `run` and `sha` stop at their first
+# token, every other value runs to the next `key=` or the end of the fact.
+FACT_LINE = re.compile(r"^(?:\[[^\]\n]*\]\s*)?fact:\s*([a-z_]+)\b[ \t]*([\s\S]*)$",
+                       re.I)
+FACT_KEY = re.compile(r"(?:^|\s)([a-z][a-z0-9_]*)=", re.I)
+TASK_FACT_STATUS = {"claimed": "in_progress", "landed": "review",
+                    "halted": "blocked", "failed": "blocked"}
+ISSUE_FACT_STATE = {"claimed": "in_progress", "resolved": "closed",
+                    "needs_human": "needs_human"}
+
+
+def parse_fact(source: str, at: str) -> dict | None:
+    match = FACT_LINE.match((source or "").strip())
+    if not match:
+        return None
+    verb, tail = match.group(1).lower(), match.group(2)
+    keys = list(FACT_KEY.finditer(tail))
+    fields, free = {}, [tail if not keys else tail[:keys[0].start()]]
+    for position, key in enumerate(keys):
+        end = keys[position + 1].start() if position + 1 < len(keys) else len(tail)
+        value = tail[key.end():end].strip()
+        name = key.group(1).lower()
+        if name in ("run", "sha"):
+            first, _, rest = value.partition(" ")
+            value, _ = first, free.append(rest)
+        fields.setdefault(name, value)
+    return {"verb": verb, "fields": fields, "text": " ".join(free).strip(),
+            "at": at}
+
+
+def live_run_facts(entries: list[tuple[str, str]], human_move_at) -> list[dict]:
+    """The facts that govern the item now: those from the last ``claimed``,
+    and only while that claim is newer than the human's last move. Ties go to
+    the human — a human move dismisses every earlier run's narrative."""
+    facts = [f for f in (parse_fact(text, at) for text, at in entries) if f]
+    claims = [i for i, f in enumerate(facts) if f["verb"] == "claimed"]
+    if not claims or facts[claims[-1]]["at"] <= (human_move_at or ""):
+        return []
+    return facts[claims[-1]:]
 
 
 class FakeWork:
@@ -70,7 +122,10 @@ class FakeWork:
         # First-occurrence order, deduped — exactly Work's read fold.
         folded = list(dict.fromkeys(list(depends_on) + list(blocked_by)))
         self.tasks[task_id] = {
+            # `status` is what every read serves — DERIVED. `storedStatus` is
+            # the human's own value, and `statusAt` is when they last set it.
             "id": task_id, "title": title, "status": status,
+            "storedStatus": status, "statusAt": ts,
             "projectPath": project_path or self._default_project(),
             "delegated": delegated, "agents": list(agents),
             "dependsOn": folded,
@@ -97,13 +152,47 @@ class FakeWork:
         ts = self.now()
         self.issues[issue_id] = {
             "id": issue_id, "title": title, "state": state, "body": body,
+            "storedState": state, "stateHistory": [],
             "projectPath": project_path or self._default_project(),
             "delegated": delegated, "agents": list(agents),
             "claimedBy": None,
-            "resolutionSummary": None, "messages": [],
-            "createdAt": ts, "updatedAt": ts,
+            "resolutionSummary": None, "storedResolutionSummary": None,
+            "messages": [], "createdAt": ts, "updatedAt": ts,
         }
         return self.issues[issue_id]
+
+    # --- derivation (the read path every route ends with) -------------------
+
+    def _rederive_task(self, task) -> dict:
+        status, landed = task["storedStatus"], False
+        for fact in live_run_facts([(e["message"], e["at"]) for e in task["log"]],
+                                   task["statusAt"]):
+            if fact["verb"] == "landed":
+                landed = True
+            if fact["verb"] == "verified":
+                # Sign-off means done only on top of a landing.
+                status = "done" if landed else status
+                continue
+            status = TASK_FACT_STATUS.get(fact["verb"], status)
+        task["status"] = status
+        return task
+
+    def _rederive_issue(self, issue) -> dict:
+        human = [e["at"] for e in issue["stateHistory"] if e["actor"] == "human"]
+        state = issue["storedState"]
+        summary = issue["storedResolutionSummary"]
+        for fact in live_run_facts(
+                [(m["body"], m["createdAt"]) for m in issue["messages"]
+                 if (m.get("author") or {}).get("kind") == "agent"],
+                human[-1] if human else None):
+            nxt = ISSUE_FACT_STATE.get(fact["verb"])
+            if not nxt:
+                continue
+            state = nxt
+            if nxt == "closed":
+                summary = fact["fields"].get("summary") or fact["text"] or summary
+        issue["state"], issue["resolutionSummary"] = state, summary
+        return issue
 
     def reorder_lane(self, *task_ids):
         """Put these tasks first, in this order — the human dragging the
@@ -120,32 +209,52 @@ class FakeWork:
         task["updatedAt"] = ts
 
     def human_move(self, task_id, status):
+        """The one writer of stored status — and the move that dismisses every
+        earlier run's narrative."""
+        task = self.tasks[task_id]
+        ts = self.now()
+        task["log"].append({
+            "at": ts,
+            "message": f"Moved from {task['storedStatus']} to {status}."})
+        task["storedStatus"], task["statusAt"] = status, ts
+        task["updatedAt"] = ts
+        self._rederive_task(task)
+
+    def agent_claim(self, task_id, run=1, agent="dromond"):
+        """A run opening its window on a task the test did not sweep."""
         task = self.tasks[task_id]
         ts = self.now()
         task["log"].append({"at": ts,
-                            "message": f"Moved from {task['status']} to {status}."})
-        task["status"] = status
+                            "message": f"[{agent}] fact: claimed run={run}"})
         task["updatedAt"] = ts
+        return self._rederive_task(task)
 
     def human_close_issue(self, issue_id, summary="closed by human"):
         """A human closes an issue: settled, with a resolution summary."""
         issue = self.issues[issue_id]
+        self._human_issue_state(issue, "closed", summary=summary)
+
+    def _human_issue_state(self, issue, state, summary=None):
         ts = self.now()
-        issue["state"] = "closed"
-        issue["resolutionSummary"] = summary
+        issue["stateHistory"].append({"from": issue["storedState"], "to": state,
+                                      "actor": "human", "at": ts})
+        issue["storedState"], issue["storedResolutionSummary"] = state, summary
         issue["claimedBy"] = None
         issue["updatedAt"] = ts
+        self._rederive_issue(issue)
 
     def human_reply(self, issue_id, body):
         issue = self.issues[issue_id]
         ts = self.now()
         issue["messages"].append({"id": f"message_{self._tick}", "body": body,
                                   "author": {"kind": "human"}, "createdAt": ts})
-        if issue["state"] in ("needs_human", "closed"):
-            issue["state"] = "queued"
-            issue["claimedBy"] = None
-            issue["resolutionSummary"] = None
         issue["updatedAt"] = ts
+        if issue["state"] in ("needs_human", "closed"):
+            # Answering takes the item back: a human state event, which is
+            # what dismisses the run's facts.
+            self._human_issue_state(issue, "queued")
+        else:
+            self._rederive_issue(issue)
 
     def mutation_count(self) -> int:
         return sum(1 for method, _ in self.requests if method != "GET")
@@ -189,6 +298,12 @@ def _make_handler(state: FakeWork):
         def _body(self):
             length = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(length)) if length else {}
+
+        def _append_message(self, issue, body, author):
+            ts = state.now()
+            issue["messages"].append({"id": f"message_{ts}", "body": body,
+                                      "author": author, "createdAt": ts})
+            issue["updatedAt"] = ts
 
         def _filtered(self, records):
             query = self.path.partition("?")[2]
@@ -251,22 +366,22 @@ def _make_handler(state: FakeWork):
                 if not task:
                     return self._error(404, "not_found")
                 body = self._body()
-                status = body.get("status")
-                # Mirrors live Work since run 211: a parent with children is
-                # a container, never claimable by an agent.
-                if self._agent() and status == "in_progress" and any(
-                        t.get("parentId") == task["id"]
-                        for t in state.tasks.values()):
-                    return self._error(409, "parent_is_container",
-                                       "An epic with children is not "
-                                       "claimable; delegate its children.")
-                agent = self._agent()
-                if agent and status not in AGENT_TASK_STATUSES:
-                    if not (status == "done" and agent.startswith("verify/")):
-                        return self._error(403, "task_status_forbidden",
-                                           "Agents may only move tasks to "
-                                           "in_progress, review, or blocked.")
-                if status in ("review", "blocked", "done"):
+                status, agent = body.get("status"), self._agent()
+                if not agent:
+                    state.human_move(task["id"], status)
+                    return self._send(200, task)
+                # CONTRACT 0.8 bridge: a legacy transition becomes the fact it
+                # really meant, and writes no status.
+                verb = ("verified" if status == "done" and agent.startswith("verify/")
+                        else AGENT_MOVE_FACT.get(status))
+                if not verb:
+                    return self._error(403, "task_status_forbidden",
+                                       "Agents may only move tasks to "
+                                       "in_progress, review, or blocked.")
+                if verb in ("landed", "verified"):
+                    # Handing work back still means answering for every item.
+                    # Halting is never refused: a stopped run must be able to
+                    # say so, or nobody is left to move the item.
                     open_items = [i for section in ("requirements",
                                                     "acceptanceCriteria")
                                   for i in task.get(section) or []
@@ -276,15 +391,15 @@ def _make_handler(state: FakeWork):
                             409, "review_checklist_incomplete",
                             f"Cannot move {task['id']} to {status} with "
                             f"{len(open_items)} unaccounted checklist items.")
-                ts = state.now()
                 note = body.get("note") or ""
+                run = re.search(r"\brun[ =#]?(\d+)", note, re.I)
+                fields = (f" run={run.group(1)}" if verb == "claimed" and run
+                          else f" reason={note}" if verb == "halted" and note else "")
+                ts = state.now()
                 task["log"].append({
-                    "at": ts,
-                    "message": f"Moved from {task['status']} to {status}."
-                               + (f" {note}" if note else "")})
-                task["status"] = status
+                    "at": ts, "message": f"[{agent}] fact: {verb}{fields}"})
                 task["updatedAt"] = ts
-                return self._send(200, task)
+                return self._send(200, state._rederive_task(task))
             m = re.fullmatch(r"/api/tasks/([^/]+)/checklist", path)
             if m:
                 task = state.tasks.get(m.group(1))
@@ -323,7 +438,8 @@ def _make_handler(state: FakeWork):
                 ts = state.now()
                 task["log"].append({"at": ts, "message": self._body()["message"]})
                 task["updatedAt"] = ts
-                return self._send(200, task)
+                # A fact IS a log line, so this route derives like any other.
+                return self._send(200, state._rederive_task(task))
             m = re.fullmatch(r"/api/agent/issues/([^/]+)/claim", path)
             if m:
                 issue, agent = state.issues.get(m.group(1)), self._agent()
@@ -335,10 +451,13 @@ def _make_handler(state: FakeWork):
                     return self._error(409, "issue_not_queued")
                 if issue["claimedBy"] and issue["claimedBy"]["name"] != agent:
                     return self._error(409, "issue_claimed_by_other")
+                # Claiming is a fact, not a transition. Ownership is not
+                # status, so claimedBy is still written: the reply and state
+                # gates run off it.
                 issue["claimedBy"] = {"kind": "agent", "name": agent}
-                issue["state"] = "in_progress"
-                issue["updatedAt"] = state.now()
-                return self._send(200, issue)
+                self._append_message(issue, f"[{agent}] fact: claimed",
+                                     {"kind": "agent", "name": agent})
+                return self._send(200, state._rederive_issue(issue))
             m = re.fullmatch(r"/api/agent/issues/([^/]+)/replies", path)
             if m:
                 issue, agent = state.issues.get(m.group(1)), self._agent()
@@ -348,12 +467,10 @@ def _make_handler(state: FakeWork):
                     return self._error(409, "issue_closed")
                 if not issue["claimedBy"] or issue["claimedBy"]["name"] != agent:
                     return self._error(409, "issue_not_claimed")
-                ts = state.now()
-                issue["messages"].append({
-                    "id": f"message_{ts}", "body": self._body()["body"],
-                    "author": {"kind": "agent", "name": agent}, "createdAt": ts})
-                issue["updatedAt"] = ts
-                return self._send(200, issue)
+                self._append_message(issue, self._body()["body"],
+                                     {"kind": "agent", "name": agent})
+                # A fact IS a message, so this route derives like any other.
+                return self._send(200, state._rederive_issue(issue))
             m = re.fullmatch(r"/api/agent/issues/([^/]+)/state", path)
             if m:
                 issue, agent = state.issues.get(m.group(1)), self._agent()
@@ -375,11 +492,16 @@ def _make_handler(state: FakeWork):
                 if target == "closed" and not (body.get("resolutionSummary") or "").strip():
                     return self._error(400, "invalid_input",
                                        "resolutionSummary is required.")
-                issue["state"] = target
-                if target == "closed":
-                    issue["resolutionSummary"] = body["resolutionSummary"]
-                issue["updatedAt"] = state.now()
-                return self._send(200, issue)
+                # CONTRACT 0.8 bridge: the transition becomes its fact.
+                verb = AGENT_ISSUE_FACT[target]
+                value = (body.get("resolutionSummary") if target == "closed"
+                         else body.get("reason"))
+                key = "summary" if target == "closed" else "reason"
+                self._append_message(
+                    issue, f"[{agent}] fact: {verb}"
+                           + (f" {key}={value}" if value else ""),
+                    {"kind": "agent", "name": agent})
+                return self._send(200, state._rederive_issue(issue))
             if path == "/api/agent/issues":
                 if not self._agent():
                     return self._error(400, "agent_identity_required")

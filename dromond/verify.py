@@ -3,8 +3,12 @@
 When a swept item reaches ``review``, and ``[work] verify`` is on, the runner
 records a verification run on ``verify_profile`` — never the worker's profile
 or session — and executes each acceptance criterion's stated method against
-landed main. All pass: ``done``, house-style summary, verifier identity.
-Any fail: ``blocked`` naming those criteria, surface lane, no ring.
+landed main. All pass: it ticks them and appends ``fact: verified``, which
+reads **done** on top of the worker's landing. Any fail: ``fact: halted``
+naming those criteria, which reads blocked. Surface lane, no ring.
+
+The facts belong to the WORKER's claim window: a sign-off never claims, so a
+human move made in the meantime dismisses this run's narrative too.
 
 ponytail: stated methods are mechanical (command / grep / test / read), so
 code runs them. A model turn waits until a criterion needs judgment.
@@ -16,7 +20,7 @@ import sys
 from pathlib import Path
 
 from dromond import config, db, names, project
-from dromond.work_client import WorkClient, WorkError, verifier_identity
+from dromond.work_client import WorkClient, fact_line, verifier_identity
 
 METHOD_TIMEOUT = 60
 REQUESTED_BY = "verify"
@@ -168,18 +172,16 @@ def _writeback(client: WorkClient, item_id: str, run_id: int,
         body = (f"{tag} Verified. {item_id} is done.\n\n"
                 + ("\n".join(r["note"] for r in results) or "No acceptance criteria.")
                 + "\n\nNothing waits.")
-        target, note = "done", f"{tag} verified"
+        fact = fact_line(tag, "verified")
     else:
         named = "\n".join(f"- {r['text']}: {r['note']}" for r in failed)
         body = (f"{tag} Blocked. {item_id} failed verification.\n\n"
                 f"{named}\n\nOpen the blocked lane.")
-        target, note = "blocked", f"{tag} failed: " + ", ".join(
-            r["text"] or f"AC{r['index']}" for r in failed)
+        fact = fact_line(tag, "halted", reason=(
+            f"{item_id} failed verification: " + ", ".join(
+                r["text"] or f"AC{r['index']}" for r in failed))[:300])
     client.log_task(item_id, body[:19000])
-    try:
-        client.move_task(item_id, target, note=note[:300])
-    except WorkError as exc:
-        print(f"dromond verify: could not move {item_id} to {target}: {exc}")
+    client.log_task(item_id, fact)
 
 
 def _insert(con, worker, root: Path, profile_name: str, profile: dict,

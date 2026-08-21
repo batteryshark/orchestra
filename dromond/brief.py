@@ -34,8 +34,9 @@ Before you stop, account for every requirement and acceptance criterion above.
 Tick each one you verified: `work check {item} requirement|acceptance <index>`
 (indexes count from 0, as `work show {item}` lists them). Decline each one you
 did not, with the reason: `--decline "not attempted, blocked on X"`. Declining
-is expected and is not a failure — leaving an item unanswered is, and the item
-cannot move to review or blocked while any is unanswered.
+is expected and is not a failure — leaving an item unanswered is. Whatever you
+leave unanswered is declined for you, naming your run as the one that did not
+account for it.
 """
 
 
