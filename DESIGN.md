@@ -569,8 +569,8 @@ outer of two, not the only one. Dromond never resolves the overlap itself:
 committing or stashing work in flight is the owner's to do, so the card offers
 retry or leave it, and no resolver.
 
-**A run may not land what the base branch does not track.** A run commits with
-`git add -A`, so it sweeps up whatever sits in its worktree — including a live
+**A run may not land what the base branch does not track.** The host checkpoints
+with `git add -A`, so it sweeps up whatever sits in its worktree — including a live
 record store a service rewrites while the run holds its branch. Both sides then
 edit the same append-only file and the rebase conflicts every time; nothing
 raced, two processes simply own one file, and no retry can fix it. So the merge

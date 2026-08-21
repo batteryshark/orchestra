@@ -115,6 +115,26 @@ class BriefContentTests(unittest.TestCase):
         self.assertIn("One idea per sentence",
                       brief.WRITEBACK_STYLE.read_text(encoding="utf-8"))
 
+    def test_two_profiles_both_carry_the_git_law(self) -> None:
+        """W-0259: every harness gets the same write path — files, host commits."""
+        for name in ("codex", "claude"):
+            text = brief.compose(
+                run_id=1, slug="calm_otter", profile={"name": name},
+                mission="m", requester="human", root=Path("/p"), workdir="/p")
+            self.assertIn("Never run git write commands", text, name)
+            self.assertIn("host checkpoints", text, name)
+            self.assertIn("EPERM", text, name)
+            self.assertIn("worktree yes", text, name)
+            self.assertIn(".git no", text, name)
+            self.assertIn("/tmp yes", text, name)
+            self.assertNotIn("Commit your git changes", text, name)
+
+    def test_continuation_repeats_the_git_law(self) -> None:
+        text = brief.compose_continuation(run_id=5, parent_run=3,
+                                          instructions="carry on")
+        self.assertIn("Never run git write commands", text)
+        self.assertNotIn("Commit your git changes", text)
+
     def test_a_resumed_run_is_told_what_landed_while_it_worked(self) -> None:
         # The case that matters most: its worktree branched before these
         # commits, so it cannot see them and will rebuild them given the chance.
