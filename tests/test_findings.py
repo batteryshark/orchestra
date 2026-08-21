@@ -7,7 +7,7 @@ force human review whatever a planner would have said.
 import unittest
 from unittest import mock
 
-from dromond import db, findings
+from orchestra import db, findings
 from tests.fake_work import FakeWork
 from tests.test_sweeper import PROJECT_ID, SweeperFixture
 

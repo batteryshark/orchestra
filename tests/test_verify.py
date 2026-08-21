@@ -1,7 +1,7 @@
 """W-0269: verification earns done, or blocks with reasons."""
 import unittest
 
-from dromond import db
+from orchestra import db
 from tests.test_sweeper import SweeperFixture
 
 
@@ -15,7 +15,7 @@ class VerifyTests(SweeperFixture, unittest.TestCase):
             '[profiles.judge]\nbackend = "opencode"\n')
         self.global_config.write_text(
             text + 'verify = true\nverify_profile = "judge"\n')
-        from dromond import config
+        from orchestra import config
         self.cfg = config.load()
 
     def test_verified_criteria_move_review_to_done_with_evidence(self) -> None:
@@ -67,7 +67,7 @@ class VerifyTests(SweeperFixture, unittest.TestCase):
         self.work.agent_claim("W-0001", run=1)
         self.client.log_task("W-0001", "[verify/quiet_owl] fact: verified")
         self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
-        self.client.log_task("W-0001", "[dromond/x] fact: landed")
+        self.client.log_task("W-0001", "[orchestra/x] fact: landed")
         self.client.log_task("W-0001", "[verify/quiet_owl] fact: verified")
         self.assertEqual(self.work.tasks["W-0001"]["status"], "done")
         self.assertEqual(self.work.tasks["W-0001"]["storedStatus"], "ready")

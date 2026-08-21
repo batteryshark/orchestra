@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from dromond import names
+from orchestra import names
 
 
 def _memory_con() -> sqlite3.Connection:

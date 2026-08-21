@@ -1,13 +1,12 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/dromond-wordmark-dark.svg">
-  <img src="assets/dromond-wordmark.svg" alt="Dromond" width="360">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/orchestra-wordmark-dark.svg">
+  <img src="assets/orchestra-wordmark.svg" alt="Orchestra" width="360">
 </picture>
 
 ## What this is
 
-Orchestra (the code still says Dromond until the rename lands) is the
-execution side of an agentic project: one dispatcher that brings every harness
-and every model under one roof.
+Orchestra is the execution side of an agentic project: one dispatcher that
+brings every harness and every model under one roof.
 
 For humans and agents: a unified dispatcher that takes work on request or by
 programmatic dispatch, routes it, and completes bounded or complex exploratory
@@ -18,13 +17,9 @@ depend on one harness, and it does not depend on extracting content out of a
 provider's harness: all your content lives under one roof. Its planning
 counterpart is Work.
 
-A dromond was a fast oared galley, and the name comes from the Greek *dromon*,
-"runner" — one hull that many runners drove at once. This is the same
-arrangement in software: one dispatcher, many runners, one problem.
+**Orchestra — one dispatcher, many runners, one problem.**
 
-**Dromond — send a fleet at the problem.**
-
-Dromond is a local control plane that turns agent CLIs — Codex, Claude Code,
+Orchestra is a local control plane that turns agent CLIs — Codex, Claude Code,
 OpenCode, Reasonix — into a coordinated team. It takes delegated items from
 Work, runs each one in its own git worktree, supervises it to completion, and
 lands the verified result on the base branch.
@@ -33,8 +28,8 @@ lands the verified result on the base branch.
 
 One agent in your checkout does one thing at a time, and the checkout is why.
 Two agents editing the same files collide with each other, and either of them
-collides with you while you are editing. Dromond gives each run its own git
-worktree on its own branch, `dromond/run-N`, so a dozen runs can work on one
+collides with you while you are editing. Orchestra gives each run its own git
+worktree on its own branch, `orchestra/run-N`, so a dozen runs can work on one
 repository at once and none of them can see or overwrite what another is doing.
 Your own checkout is not one of the worktrees they get.
 
@@ -68,16 +63,16 @@ Captions and the full set: [`docs/screenshots/`](docs/screenshots/README.md).
 
 ## What you need
 
-- Python 3.11 or later and [uv](https://docs.astral.sh/uv/). Dromond runs on the
+- Python 3.11 or later and [uv](https://docs.astral.sh/uv/). Orchestra runs on the
   standard library and SQLite, and installs no other runtime dependency.
 - git, and a repository to work in.
 - At least one agent CLI — `codex`, `claude`, `opencode` or `reasonix` —
-  installed and signed in by you. Dromond drives the CLI you already
+  installed and signed in by you. Orchestra drives the CLI you already
   authenticate. It holds no provider credentials of its own.
 - Work, the companion app that holds items and the project list. A directory
-  takes its project identity from Work, so `dromond dispatch` refuses in a
+  takes its project identity from Work, so `orchestra dispatch` refuses in a
   directory Work does not know. This is the requirement with no substitute.
-- macOS for `dromond service`, which installs a launchd LaunchAgent. The daemon
+- macOS for `orchestra service`, which installs a launchd LaunchAgent. The daemon
   itself runs in the foreground anywhere.
 
 One machine, one daemon, one workspace of repositories. The daemon binds to this
@@ -87,59 +82,59 @@ it is built for.
 ## Install
 
 ```
-git clone https://github.com/batteryshark/dromond
-cd dromond
+git clone https://github.com/batteryshark/orchestra
+cd orchestra
 uv sync
 ```
 
 ## First run
 
-1. Prepare the central home at `~/.dromond/` and install the harness hooks.
+1. Prepare the central home at `~/.orchestra/` and install the harness hooks.
 
    ```
-   uv run dromond init
+   uv run orchestra init
    ```
 
 2. Check that the harnesses and the config are healthy. It names what is
    missing, including a harness whose hook did not install.
 
    ```
-   uv run dromond doctor
+   uv run orchestra doctor
    ```
 
 3. Add a launch profile. A bare `--backend`, `--model` or `--effort` offers the
    list the installed harness reports, so nothing is typed from memory.
 
    ```
-   uv run dromond profiles discover
-   uv run dromond profiles set fast --backend --model --effort --tier 1
+   uv run orchestra profiles discover
+   uv run orchestra profiles set fast --backend --model --effort --tier 1
    ```
 
 4. Send a run.
 
    ```
-   uv run dromond dispatch --to fast --worktree "Fix the failing auth test"
+   uv run orchestra dispatch --to fast --worktree "Fix the failing auth test"
    ```
 
 5. Watch it.
 
    ```
-   uv run dromond status
-   uv run dromond runs --active
-   uv run dromond show 1
+   uv run orchestra status
+   uv run orchestra runs --active
+   uv run orchestra show 1
    ```
 
 ## Run the control plane
 
 ```
-uv run dromond daemon                     # foreground
-uv run dromond service install --start    # launchd LaunchAgent, local.dromond.daemon
+uv run orchestra daemon                     # foreground
+uv run orchestra service install --start    # launchd LaunchAgent, local.orchestra.daemon
 ```
 
 The dashboard is served at `/` on port 3011, and the daemon prints its address
 at startup. Every route, reads included, requires the key — as the
-`X-Dromond-Key` header, or as `?key=` on a first visit in a browser.
-`dromond init` writes that shared secret into the config file at mode 0600 and
+`X-Orchestra-Key` header, or as `?key=` on a first visit in a browser.
+`orchestra init` writes that shared secret into the config file at mode 0600 and
 prints it once; it is what the browser and the iOS client hold.
 
 From the dashboard you send a running agent an instruction, delivered at its
@@ -147,13 +142,13 @@ next safe action boundary, and you pause dispatch so nothing new starts while
 in-flight runs continue. Two things have no button:
 
 ```
-uv run dromond check 7            # stall, loop, and an out-of-band observer turn
-uv run dromond kill 7
+uv run orchestra check 7            # stall, loop, and an out-of-band observer turn
+uv run orchestra kill 7
 ```
 
 ## Install it as a command
 
-`uv run dromond` works from a clone. To have `dromond` on your path everywhere,
+`uv run orchestra` works from a clone. To have `orchestra` on your path everywhere,
 while still editing the code:
 
 ```
@@ -165,7 +160,7 @@ time the command starts — there is no reinstall step. Restart the daemon to
 pick one up:
 
 ```
-dromond service restart
+orchestra service restart
 ```
 
 Under launchd that kickstarts the agent. With a daemon you started by hand,
@@ -174,11 +169,11 @@ leaves it to you.
 
 ### Teach an agent to drive it
 
-`skills/dromond/` is a skill for Claude Code and anything that reads the same
+`skills/orchestra/` is a skill for Claude Code and anything that reads the same
 format. Symlink it so it tracks the repository:
 
 ```
-ln -sfn "$PWD/skills/dromond" ~/.claude/skills/dromond
+ln -sfn "$PWD/skills/orchestra" ~/.claude/skills/orchestra
 ```
 
 It covers registering a project, dispatching, watching a trace, sending a
@@ -189,19 +184,19 @@ means a run *started* rather than succeeded.
 
 | What | Where |
 |---|---|
-| State: database, briefs, logs, worktrees | `~/.dromond/` |
-| Database | `~/.dromond/dromond.db` |
-| Config | `~/.config/dromond/config.toml` |
-| Run branches | `dromond/run-N` |
-| Environment overrides | `DROMOND_*` |
-| Work agent identity | `dromond` |
+| State: database, briefs, logs, worktrees | `~/.orchestra/` |
+| Database | `~/.orchestra/orchestra.db` |
+| Config | `~/.config/orchestra/config.toml` |
+| Run branches | `orchestra/run-N` |
+| Environment overrides | `ORCHESTRA_*` |
+| Work agent identity | `orchestra` |
 
 ## The repository
 
 | Path | What |
 |---|---|
-| `dromond/` | the package, one module per subsystem: `dispatch`, `supervise`, `merge`, `observer`, `sweeper`, `runway` |
-| `dromond/dashboard.html` | the whole dashboard, one hand-written file, no build step |
+| `orchestra/` | the package, one module per subsystem: `dispatch`, `supervise`, `merge`, `observer`, `sweeper`, `runway` |
+| `orchestra/dashboard.html` | the whole dashboard, one hand-written file, no build step |
 | `ios/` | the iOS client |
 | `assets/` | the mark and the wordmark; `assets/README.md` says where each goes |
 | `docs/screenshots/` | the images above, each captioned in its own README |
@@ -209,7 +204,7 @@ means a run *started* rather than succeeded.
 | `tests/`, `run_tests.py` | the suite |
 | `DESIGN.md` | every subsystem, decided, with the decision history at the end |
 
-`uv run dromond --help` lists every command; `uv run dromond <command> --help`
+`uv run orchestra --help` lists every command; `uv run orchestra <command> --help`
 explains one.
 
 ## License

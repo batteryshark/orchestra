@@ -3,7 +3,7 @@
 The question these tests ask is the one the old declaration could not
 answer: not "did the caller say it was an agent" but "what did the caller
 prove, and what may that identity do". Every server here binds 127.0.0.1
-on port 0 inside a throwaway DROMOND_HOME.
+on port 0 inside a throwaway ORCHESTRA_HOME.
 """
 import json
 import os
@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import auth, brief, db, profile_edit
-from dromond import http as mhttp
+from orchestra import auth, brief, db, profile_edit
+from orchestra import http as mhttp
 from tests.test_http import KEY, ServerCase
 
 
@@ -23,8 +23,8 @@ class TokenSecretTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(Path(self.tmp.name) / "home"),
-            "DROMOND_CONFIG": str(Path(self.tmp.name) / "config.toml")})
+            "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home"),
+            "ORCHESTRA_CONFIG": str(Path(self.tmp.name) / "config.toml")})
         self.env.start()
         self.con = db.connect()
 
@@ -54,7 +54,7 @@ class TokenSecretTests(unittest.TestCase):
         """The database bytes, a rendered brief, and the snapshot."""
         run_id = self.make_run()
         token = auth.mint(self.con, run_id)
-        from dromond import paths
+        from orchestra import paths
         text = brief.compose(
             run_id=run_id, slug="calm_otter",
             profile={"name": "codex", "backend": "codex",
@@ -67,7 +67,7 @@ class TokenSecretTests(unittest.TestCase):
         brief_path.write_text(text)
         self.con.commit()
         raw = token.encode()
-        files = sorted(Path(paths.db_path()).parent.glob("dromond.db*"))
+        files = sorted(Path(paths.db_path()).parent.glob("orchestra.db*"))
         self.assertTrue(files, "no database file to grep")
         for path in files:
             self.assertNotIn(raw, path.read_bytes(), f"{path.name} carries it")
@@ -96,11 +96,11 @@ class TokenSecretTests(unittest.TestCase):
             self.assertIsNone(auth.identify(self.con, token, None), status)
 
     def test_the_cli_reads_authority_from_the_token(self) -> None:
-        from dromond import cli
+        from orchestra import cli
         run_id = self.make_run()
         token = auth.mint(self.con, run_id)
         with mock.patch.dict(os.environ, {auth.TOKEN_ENV: token}, clear=False):
-            os.environ.pop("DROMOND_RUN_ID", None)
+            os.environ.pop("ORCHESTRA_RUN_ID", None)
             self.assertEqual(cli._authority(), "agent")
             self.con.execute("UPDATE runs SET status='done' WHERE id=?", (run_id,))
             self.con.commit()
@@ -270,8 +270,8 @@ class EffortDirectionTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "config.toml"
         self.path.write_text(self.CONFIG)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.path),
-            "DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            "ORCHESTRA_CONFIG": str(self.path),
+            "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
 
     def tearDown(self) -> None:

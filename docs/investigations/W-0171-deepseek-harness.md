@@ -10,16 +10,16 @@ Evaluated from published README, CLI reference, package contracts, and
 
 ## Recommendation
 
-Do not add dsh as a fifth Dromond backend.
+Do not add dsh as a fifth Orchestra backend.
 
 The product is a first-party DeepSeek harness with real ACP, MCP, hook, and
 session-log machinery. It does not clear the same bar W-0148 applied to Codex,
-Claude Code, OpenCode, and Reasonix. The two automation surfaces Dromond would
+Claude Code, OpenCode, and Reasonix. The two automation surfaces Orchestra would
 actually drive — shipped `dsh --profile headless` and the ACP demo — cannot
 resume a session by id, and headless does not emit a structured event stream on
 stdout.
 
-Dromond already runs DeepSeek models through Reasonix. A fifth `build_cmd` would
+Orchestra already runs DeepSeek models through Reasonix. A fifth `build_cmd` would
 buy a moving RC flag surface, not a better DeepSeek route. Hold until a tagged
 non-rc release grows `--resume` plus stdout JSONL (or ACP `session/load` plus
 richer `session/update`) on a published command.
@@ -31,12 +31,12 @@ under `$DSH_HOME` (else `~/.dsh`). Shipped templates: `web` and `headless`. The
 TUI package and legacy entrypoints were deleted on 2026-08-04; launcher help
 still shows `dsh --profile tui --resume <id>` as an example.
 
-| Surface | What it is | Dromond-relevant limit |
+| Surface | What it is | Orchestra-relevant limit |
 |---|---|---|
 | `dsh web` | Browser UI on `127.0.0.1:3080` | Human product, not a worker |
 | `dsh --profile headless "job"` | One-shot: create a fresh session, wait for idle, print last assistant text, exit | No `--resume`. Stdout is final text. Stderr is empty on success. No `--output-format` |
 | `pnpm run demo:acp` / `dsh-acp-demo` | Automation-only ACP server on JSON-RPC stdio | Example bin, not `dsh acp`. Fresh sessions only. Committed text only |
-| `deepseek-harness-sdk` | Python subprocess SDK over JSON-RPC | Reuses `session_id`. Returns events. Adds a runtime dependency Dromond does not take |
+| `deepseek-harness-sdk` | Python subprocess SDK over JSON-RPC | Reuses `session_id`. Returns events. Adds a runtime dependency Orchestra does not take |
 
 Headless is explicit: one submitted task, no interactive follow-up, last
 non-empty assistant text on stdout, exit 0 only when the owned `turn/end` is
@@ -46,7 +46,7 @@ contract.
 Internal persistence is real. The JSONL backend writes
 `<root>/--<cwd>--/<id>/session.jsonl.zstd` by default (`compression: 'none'`
 for raw `.jsonl`). `SESSION_FORMAT_VERSION` is `0` with no compatibility
-promise. Compressed files are not line-readable. Dromond's supervisor tails
+promise. Compressed files are not line-readable. Orchestra's supervisor tails
 stdout JSONL; it cannot tail a zstd session file without a new reader.
 
 Interrupt is supervisor-friendly: first `SIGTERM` drains plugins for five
@@ -54,7 +54,7 @@ seconds and exits 0; `SIGINT` reports 130; a second signal forces. Persistence
 is incremental, so kill is unlikely to corrupt a log. That is not the same as
 resume: neither headless nor ACP exposes load-by-id.
 
-Per-spawn isolation is the strongest Dromond fit:
+Per-spawn isolation is the strongest Orchestra fit:
 
 - `--patch <path>` overlays after profile and home layers (repeatable)
 - `$DSH_HOME` relocates the whole home
@@ -62,7 +62,7 @@ Per-spawn isolation is the strongest Dromond fit:
 - credentials from inherited env, then `$DSH_HOME/.credentials.yaml`, then `.env`
 
 Caveat: `$DSH_HOME/cordis.patch.yml` is shared by every profile and outranks
-the per-profile patch. A Dromond run must set its own `DSH_HOME` (or rely only
+the per-profile patch. A Orchestra run must set its own `DSH_HOME` (or rely only
 on `--patch`) so one run cannot rewrite another.
 
 MCP exists as `@deepseek-ai/dsh-mcp-client`. One plugin row per server, enabled
@@ -78,7 +78,7 @@ PostToolUse, Stop, SubagentStart, SubagentStop. Config is process-level, parsed
 once. 23 of Claude Code's 30 events are ignored. Stop can force another step
 via `steer()`, but `{"continue": false}` does not halt the run. The Codex
 bridge is a sibling package. Neither is documented as part of the shipped
-headless template; Dromond would `--patch` them on.
+headless template; Orchestra would `--patch` them on.
 
 ACP is real and narrow. `initialize` advertises baseline prompts only. No
 session, editor, terminal, filesystem, or MCP capability. `session/new` is
@@ -110,12 +110,12 @@ Maturity is the controlling signal:
 - Repo traction is large (~94k stars, ~8.6k forks, 12k commits). Traction is
   not a stable worker CLI.
 
-## Fit with Dromond (W-0148 matrix)
+## Fit with Orchestra (W-0148 matrix)
 
 | Bar | Codex / Claude / OpenCode / Reasonix | dsh now | Verdict |
 |---|---|---|---|
 | Headless structured stream | `--json` / `stream-json` / OpenCode `--format json` on stdout | Headless prints final text. Session JSONL is internal, often zstd. OTLP is optional | **Fail** |
-| Resume by id | All four resume. Kill+resume is the interrupt story | Headless always fresh. ACP fresh only. Python SDK reuses id | **Fail** on the exec/ACP paths Dromond uses |
+| Resume by id | All four resume. Kill+resume is the interrupt story | Headless always fresh. ACP fresh only. Python SDK reuses id | **Fail** on the exec/ACP paths Orchestra uses |
 | Safe interrupt | Plain kill is safe | SIGTERM/SIGINT drain; persistence is incremental | **Pass** (interrupt only) |
 | Per-spawn config | flags / `OPENCODE_CONFIG_CONTENT` / `-c` | `DSH_HOME` + `--patch` + env | **Pass**, if each run gets its own home |
 | Lifecycle hooks | Claude/Codex/Reasonix: Stop/SessionStart. OpenCode: JS plugin | Claude/Codex bridges exist; not default; partial mapping | **Partial** |
@@ -127,7 +127,7 @@ DESIGN §6 still says four backends and exec everywhere. dsh would be a fifth
 `build_cmd` that cannot resume and cannot feed the existing JSONL ingest
 without a new parser. That is more code than the gain.
 
-The plugin architecture is cleaner than wrapping foreign CLIs. Dromond does not
+The plugin architecture is cleaner than wrapping foreign CLIs. Orchestra does not
 need that cleanliness until the worker command exists.
 
 ## When to look again
@@ -142,7 +142,7 @@ Re-open this item when all of these are true:
 
 A smaller later spike, not a backend: pin `0.1.0-rc.6`, drive the Python SDK
 against one disposable worktree, and measure resume plus event completeness.
-Do not add `deepseek-harness-sdk` to Dromond for that spike. Do not add a
+Do not add `deepseek-harness-sdk` to Orchestra for that spike. Do not add a
 Switchyard-style in-process embed. Keep DeepSeek traffic on Reasonix until
 the CLI bar is met.
 

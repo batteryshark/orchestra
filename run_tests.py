@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the suite with one process per test module.
 
-Every module builds its own tempdir, its own DROMOND_HOME and its own fake
+Every module builds its own tempdir, its own ORCHESTRA_HOME and its own fake
 servers, so nothing is shared and nothing has to run in order. Serially that
 independence bought nothing; here it is the whole speedup, and the wall clock
 becomes the slowest single module instead of the sum of all of them.

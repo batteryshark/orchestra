@@ -1,8 +1,8 @@
 """The staffing turn (W-0183), unit and end-to-end through the sweeper.
 
 NO TEST HERE DISPATCHES A REAL MODEL. Every path either passes an explicit
-``turn`` stub or patches ``dromond.observer.model_turn``, which is the one
-function that would start a backend process. ``DROMOND_HOME``/``DROMOND_CONFIG``
+``turn`` stub or patches ``orchestra.observer.model_turn``, which is the one
+function that would start a backend process. ``ORCHESTRA_HOME``/``ORCHESTRA_CONFIG``
 are sandboxed by the sweeper fixture, so the real config and database are never
 touched.
 """
@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dromond import cli, config, db, router, sweeper
+from orchestra import cli, config, db, router, sweeper
 from tests.test_sweeper import SweeperFixture
 
 # Three profiles across the three tiers, so "picked a different one" is a real
@@ -45,7 +45,7 @@ note = "plenty of headroom this week"
 
 [work]
 enabled = true
-agent_identity = "dromond"
+agent_identity = "orchestra"
 profile = "stub"
 router = "cheap"
 poll_interval = 7
@@ -67,8 +67,8 @@ class RouterUnitTestCase(unittest.TestCase):
         path = Path(self.tmp.name) / "global.toml"
         path.write_text(ROUTED_CONFIG)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(path),
-            "DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            "ORCHESTRA_CONFIG": str(path),
+            "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         self.con = db.connect()
         self.cfg = config.load()
@@ -162,7 +162,7 @@ class RouterUnitTestCase(unittest.TestCase):
         self.assertEqual(config.profile_cfg(self.cfg, "big")["model"],
                          "anthropic/opus")
 
-    def test_dromond_profiles_shows_the_exhausted_reason(self) -> None:
+    def test_orchestra_profiles_shows_the_exhausted_reason(self) -> None:
         self.con.execute(
             "INSERT INTO runway_polls(provider, remaining, unit, resets_at, "
             "as_of, polled_at) VALUES('anthropic', 0, 'percent', NULL, NULL, ?)",
@@ -216,7 +216,7 @@ class RouterUnitTestCase(unittest.TestCase):
 
     def test_a_systemexit_from_the_turn_falls_back(self) -> None:
         def exits(profile, prompt, **kw):
-            raise SystemExit("dromond: that backend has no such model")
+            raise SystemExit("orchestra: that backend has no such model")
         name, _p, reason = self.choose(turn=exits)
         self.assertEqual(name, "stub")
         self.assertIn("could not run", reason)
@@ -233,7 +233,7 @@ class RouterUnitTestCase(unittest.TestCase):
         self.assertIn("named no profile", reason)
 
     def test_a_failure_while_building_the_packet_falls_back(self) -> None:
-        with mock.patch("dromond.router.runway.latest_polls",
+        with mock.patch("orchestra.router.runway.latest_polls",
                         side_effect=RuntimeError("runway database is unavailable")):
             name, _p, reason = self.choose(turn=self.turn(reply("big")))
         self.assertEqual(name, "stub")
@@ -261,7 +261,7 @@ class RoutedSweepTestCase(SweeperFixture, unittest.TestCase):
         # the call list rather than relying on it being unpatched.
         self.turns: list[str] = []
         self.answer = reply("big", "an ambiguous rewrite needs the heavy model")
-        patcher = mock.patch("dromond.observer.model_turn",
+        patcher = mock.patch("orchestra.observer.model_turn",
                              side_effect=self._turn)
         self.model_turn = patcher.start()
         self.addCleanup(patcher.stop)

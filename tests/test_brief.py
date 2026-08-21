@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from dromond import brief
+from orchestra import brief
 
 FIXED_CHAR_CEILING = 1200  # DESIGN D6: <= 300 fixed tokens per dispatch
 CONTINUATION_CHAR_CEILING = 600  # DESIGN D6: continuation wrapper ~130 tokens

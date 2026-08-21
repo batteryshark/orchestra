@@ -15,7 +15,7 @@ from unittest import mock
 
 import subprocess
 
-from dromond import cli, db, merge, project, supervise, traces
+from orchestra import cli, db, merge, project, supervise, traces
 
 
 def _git(root, *args) -> None:
@@ -29,9 +29,9 @@ STUB = """\
 import json, os, sys, time
 # W-0176: report what the worker's own environment carried, to a side file
 # and never to the log — a token in a trace is the leak tokens exist to end.
-if os.environ.get("DROMOND_TEST_ENV_SINK"):
-    open(os.environ["DROMOND_TEST_ENV_SINK"], "w").write(
-        os.environ.get("DROMOND_RUN_TOKEN", ""))
+if os.environ.get("ORCHESTRA_TEST_ENV_SINK"):
+    open(os.environ["ORCHESTRA_TEST_ENV_SINK"], "w").write(
+        os.environ.get("ORCHESTRA_RUN_TOKEN", ""))
 args = sys.argv[1:]
 # W-0191: the backend refusing to resume. "resume" fails only the --session
 # invocations, "always" fails every one of them.
@@ -77,9 +77,9 @@ class E2ETestCase(unittest.TestCase):
         stub.write_text(STUB)
         stub.chmod(0o755)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.global_config),
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_ROOT": str(self.root),
+            "ORCHESTRA_CONFIG": str(self.global_config),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_ROOT": str(self.root),
             "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
             "STUB_SLEEP": "0",
             "STUB_STEPS": "0",
@@ -142,9 +142,9 @@ class E2ETestCase(unittest.TestCase):
     def test_the_worker_carries_a_run_token_that_dies_with_the_run(self) -> None:
         """W-0176: minted at launch into the worker's environment, revoked
         when the run turns terminal, and in no file anybody reads."""
-        from dromond import auth
+        from orchestra import auth
         sink = self.tmp_path / "token-seen.txt"
-        os.environ["DROMOND_TEST_ENV_SINK"] = str(sink)
+        os.environ["ORCHESTRA_TEST_ENV_SINK"] = str(sink)
         run_id, _ = self._dispatch()
         con = db.connect()
         self.assertIsNone(con.execute(
@@ -212,7 +212,7 @@ class E2ETestCase(unittest.TestCase):
         lands on the summary."""
         run_id, _ = self._dispatch()
         con = db.connect()
-        con.execute("UPDATE runs SET branch='dromond/run-x' WHERE id=?", (run_id,))
+        con.execute("UPDATE runs SET branch='orchestra/run-x' WHERE id=?", (run_id,))
         con.commit()
         con.close()
         with mock.patch.object(merge, "merge_run",
@@ -417,7 +417,7 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                     "INSERT INTO runs(profile, backend, requested_by, workdir, "
                     "branch, status, started_at, session_ref) "
                     "VALUES('p','codex','human',?,?, 'done', ?, 'sess-1')",
-                    (str(root / "gone"), "dromond/run-1", db.now()))
+                    (str(root / "gone"), "orchestra/run-1", db.now()))
                 parent = con.execute("SELECT * FROM runs WHERE id=?",
                                      (cur.lastrowid,)).fetchone()
                 self.assertFalse(Path(parent["workdir"]).exists())

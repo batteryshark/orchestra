@@ -15,12 +15,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import config, db, dispatch, merge, project
+from orchestra import config, db, dispatch, merge, project
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.fake_work import FakeWork
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
-BRANCH = "dromond/run-1"
+BRANCH = "orchestra/run-1"
 
 CONFIG = """\
 [settings]
@@ -36,7 +36,7 @@ secrets_file = "{secrets}"
 
 [work]
 enabled = true
-agent_identity = "dromond"
+agent_identity = "orchestra"
 profile = "stub"
 """
 
@@ -82,11 +82,11 @@ class LandingTestCase(unittest.TestCase):
             CONFIG.format(secrets=self.tmp_path / "nod-secrets.env")
             + f'api_url = "{self.work_url}"\n')
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.global_config),
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_NOD_BASE_URL": self.nod_url,
-            "DROMOND_NOD_DECISIONS_CHANNEL": DECISIONS_CHANNEL,
-            "DROMOND_NOD_DECISIONS_TOKEN": DECISIONS_TOKEN,
+            "ORCHESTRA_CONFIG": str(self.global_config),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_NOD_BASE_URL": self.nod_url,
+            "ORCHESTRA_NOD_DECISIONS_CHANNEL": DECISIONS_CHANNEL,
+            "ORCHESTRA_NOD_DECISIONS_TOKEN": DECISIONS_TOKEN,
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -188,7 +188,7 @@ class LandingTestCase(unittest.TestCase):
         self.run_branch({"app.py": "print('branch')\n"})
         self.commit_on_main("app.py", "print('main')\n")
         run = self.add_run()
-        with mock.patch("dromond.resolver.dispatch_resolver", return_value=42):
+        with mock.patch("orchestra.resolver.dispatch_resolver", return_value=42):
             note = merge.at_completion(self.con, self.cfg, run, "done")
         self.assertEqual({}, self.nod.requests, "no card while a move exists")
         self.assertIn("Resolver run 42 dispatched automatically", note)
@@ -204,7 +204,7 @@ class LandingTestCase(unittest.TestCase):
         self.cfg = config.load(PROJECT_ID)
         self.run_branch({"feature.py": "x = 1\n"})
         run = self.add_run()
-        with mock.patch("dromond.resolver.dispatch_resolver", return_value=77):
+        with mock.patch("orchestra.resolver.dispatch_resolver", return_value=77):
             note = merge.at_completion(self.con, self.cfg, run, "done")
         self.assertEqual({}, self.nod.requests, "no card while a move exists")
         self.assertIn("Resolver run 77 dispatched automatically", note)
@@ -214,7 +214,7 @@ class LandingTestCase(unittest.TestCase):
         self.run_branch({"app.py": "print('branch')\n"})
         self.commit_on_main("app.py", "print('main')\n")
         run = dict(self.add_run())
-        run["title"] = "Resolve the landing of dromond/run-99"
+        run["title"] = "Resolve the landing of orchestra/run-99"
         merge.at_completion(self.con, self.cfg, run, "done")
         self.assertEqual(1, len(self.nod.requests),
                          "the resolver's failure is a real card")
@@ -232,7 +232,7 @@ class LandingTestCase(unittest.TestCase):
         self.assertEqual("blocked", self.work.tasks["W-0001"]["status"])
         log = self.item_log()
         self.assertIn("conflicted files: `app.py`", log)
-        self.assertIn(f"dromond merge {BRANCH}", log)
+        self.assertIn(f"orchestra merge {BRANCH}", log)
         # A needs-you event: one decision card. A rebase conflict offers the
         # resolver, not a retry — retrying re-runs the same rebase into the
         # same conflict, so offering it reads as a way out when it is not.

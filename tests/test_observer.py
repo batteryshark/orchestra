@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import config, db, observer
+from orchestra import config, db, observer
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -42,8 +42,8 @@ class ObserverCase(unittest.TestCase):
         self.config_path = self.tmp_path / "config.toml"
         self.config_path.write_text(CONFIG)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_CONFIG": str(self.config_path)})
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.config_path)})
         self.env.start()
         self.con = db.connect()
 
@@ -353,7 +353,7 @@ class CadenceTests(ObserverCase):
 
 class CheckOnDemandTests(ObserverCase):
     def test_check_runs_the_same_turn_now(self) -> None:
-        from dromond import http
+        from orchestra import http
         run_id = self.make_run(log_path=str(self.tmp_path / "run.jsonl"))
         Path(self.tmp_path / "run.jsonl").write_text("{}\n")
         self.add_transcript(run_id)
@@ -365,7 +365,7 @@ class CheckOnDemandTests(ObserverCase):
         self.assertEqual(len(turn.calls), 1)
 
     def test_a_run_with_no_transcript_yet_costs_nothing(self) -> None:
-        from dromond import http
+        from orchestra import http
         run_id = self.make_run()
         with mock.patch.object(observer, "model_turn") as never:
             result = http.check_run(self.con, run_id)
@@ -373,7 +373,7 @@ class CheckOnDemandTests(ObserverCase):
         self.assertIn("nothing in the trace", result["observer"]["skipped"])
 
     def test_mechanical_only_never_calls_a_model(self) -> None:
-        from dromond import http
+        from orchestra import http
         run_id = self.make_run()
         with mock.patch.object(observer, "model_turn") as never:
             result = http.check_run(self.con, run_id, observe=False)
@@ -382,7 +382,7 @@ class CheckOnDemandTests(ObserverCase):
         self.assertIn("mechanical", result["observer"]["skipped"])
 
     def test_an_unconfigured_observer_degrades_to_the_mechanical_verdict(self) -> None:
-        from dromond import http
+        from orchestra import http
         self.config_path.write_text('[profiles.worker]\nbackend = "opencode"\n')
         run_id = self.make_run()
         self.add_transcript(run_id)
@@ -393,7 +393,7 @@ class CheckOnDemandTests(ObserverCase):
 
 class RetryTests(ObserverCase):
     def _brief(self, run_id: int, text: str = "the original mission") -> None:
-        from dromond import paths
+        from orchestra import paths
         path = paths.briefs_dir() / f"run-{run_id}.md"
         path.write_text(text)
         self.con.execute("UPDATE runs SET brief_path=? WHERE id=?",
@@ -465,7 +465,7 @@ class RetryTests(ObserverCase):
             observer.after_terminal(self.con, run_id)["action"], "none")
 
     def test_a_paused_dispatch_defers_the_retry(self) -> None:
-        from dromond import dispatch
+        from orchestra import dispatch
         run_id = self.make_run(status="failed")
         self._brief(run_id)
         dispatch.pause(self.con, "maintenance")
@@ -497,7 +497,7 @@ class RetryTests(ObserverCase):
         FileNotFoundError — the same death as run 9, through another door."""
         import subprocess
 
-        from dromond import project
+        from orchestra import project
 
         checkout = self.tmp_path / "workspace" / "demo"
         checkout.mkdir(parents=True)
@@ -516,7 +516,7 @@ class RetryTests(ObserverCase):
 
         released = checkout / "worktrees" / "run-1"  # given back at finalization
         run_id = self.make_run(status="failed", work_item="W-0028",
-                               workdir=str(released), branch="dromond/run-1")
+                               workdir=str(released), branch="orchestra/run-1")
         self._brief(run_id)
         self.assertFalse(released.exists())
 
@@ -529,20 +529,20 @@ class RetryTests(ObserverCase):
         self.assertNotEqual(retry["workdir"], str(released))
         self.assertTrue(Path(retry["workdir"]).exists(),
                         "a retry must have somewhere to stand")
-        self.assertNotEqual(retry["branch"], "dromond/run-1",
+        self.assertNotEqual(retry["branch"], "orchestra/run-1",
                             "the deleted branch is not reused")
         self.assertEqual(launched, [(checkout, result["run"])])
 
     def test_a_retry_keeps_a_workdir_that_is_still_there(self) -> None:
         run_id = self.make_run(status="failed", workdir=str(self.tmp_path),
-                               branch="dromond/run-1")
+                               branch="orchestra/run-1")
         self._brief(run_id)
         retry_id = observer.after_terminal(
             self.con, run_id, launcher=lambda root, rid: None)["run"]
         retry = self.con.execute("SELECT workdir, branch FROM runs WHERE id=?",
                                  (retry_id,)).fetchone()
         self.assertEqual(retry["workdir"], str(self.tmp_path))
-        self.assertEqual(retry["branch"], "dromond/run-1")
+        self.assertEqual(retry["branch"], "orchestra/run-1")
 
 
 class PlannerSeamTests(ObserverCase):
@@ -706,7 +706,7 @@ class SupervisedRunTests(unittest.TestCase):
     backend binary. No model is dispatched anywhere in here."""
 
     def setUp(self) -> None:
-        from dromond import project
+        from orchestra import project
         self.tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp.name).resolve()
         self.root = self.tmp_path / "workspace" / "demo"
@@ -721,9 +721,9 @@ class SupervisedRunTests(unittest.TestCase):
         stub.write_text(STUB)
         stub.chmod(0o755)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.config_path),
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_ROOT": str(self.root),
+            "ORCHESTRA_CONFIG": str(self.config_path),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_ROOT": str(self.root),
             "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
             "STUB_EXIT": "0"})
         self.env.start()
@@ -739,7 +739,7 @@ class SupervisedRunTests(unittest.TestCase):
 
     def _dispatch(self):
         from argparse import Namespace
-        from dromond import cli, supervise
+        from orchestra import cli, supervise
         ns = Namespace(mission=["do the thing"], to="stub", after=None,
                        brief_file=None, context=None, title=None, worktree=False,
                        sync=False)
@@ -751,7 +751,7 @@ class SupervisedRunTests(unittest.TestCase):
         return run_id
 
     def test_a_short_successful_run_costs_the_observer_nothing(self) -> None:
-        from dromond import supervise
+        from orchestra import supervise
         run_id = self._dispatch()
         with mock.patch.object(observer, "model_turn") as never:
             supervise.supervise(self.root, run_id)
@@ -768,7 +768,7 @@ class SupervisedRunTests(unittest.TestCase):
         """W-0189, the whole path: the supervisor CONSTRUCTS the watcher,
         POLLS it, and a run that crosses the first look gets an observer turn
         with its transcript in the prompt. Fails if any link is missing."""
-        from dromond import supervise
+        from orchestra import supervise
         stub = self.tmp_path / "stub-bin" / "opencode"
         stub.write_text(WANDERING_STUB)
         stub.chmod(0o755)
@@ -794,7 +794,7 @@ class SupervisedRunTests(unittest.TestCase):
         self.assertIn("tool calls so far", seen[0])
 
     def test_the_supervisor_retries_an_infrastructure_failure_once(self) -> None:
-        from dromond import supervise
+        from orchestra import supervise
         os.environ["STUB_EXIT"] = "3"
         run_id = self._dispatch()
         with mock.patch.object(supervise, "spawn_supervisor") as spawned, \

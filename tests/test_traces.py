@@ -1,7 +1,7 @@
 """Normalized traces (DESIGN §7, W-0165).
 
 Fixtures are hand-written JSONL samples, one per backend — never a real
-transcript, and never the developer's ~/.dromond (see tests/__init__.py).
+transcript, and never the developer's ~/.orchestra (see tests/__init__.py).
 """
 import json
 import os
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from dromond import cli, db, traces
+from orchestra import cli, db, traces
 
 # --- fixture transcripts ----------------------------------------------------
 
@@ -112,7 +112,7 @@ class TraceTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ,
-                                   {"DROMOND_HOME": str(self.dir / "home")})
+                                   {"ORCHESTRA_HOME": str(self.dir / "home")})
         self.env.start()
         self.con = db.connect()
 
@@ -448,7 +448,7 @@ class MessageTests(TraceTestCase):
         run_id = self.make_run("claude", self.dir / "none.jsonl")
         answered = self.add(run_id, "human", "use uv", "interrupt",
                             delivered=db.now())
-        self.add(run_id, "dromond", "run 1 finished: done", "completion")
+        self.add(run_id, "orchestra", "run 1 finished: done", "completion")
         delivered = self.add(run_id, "human", "and rebase", "interrupt",
                              delivered=db.now())
         queued = self.add(run_id, "human", "later", "interrupt", offset=4096)
@@ -502,7 +502,7 @@ class SseTests(TraceTestCase):
 
     def test_daemon_log_stream_is_append_only(self) -> None:
         out = self.dir / "daemon.out.log"
-        out.write_text("dromond daemon: pid 1, every 60s\n")
+        out.write_text("orchestra daemon: pid 1, every 60s\n")
         stop = threading.Event()
         stream = traces.stream_daemon_log({out.name: 0}, stop=stop, files=[out],
                                           poll=0)
@@ -511,7 +511,7 @@ class SseTests(TraceTestCase):
         self.assertIn("event: daemon", first)
         self.assertIn("pid 1", first)
         with open(out, "a") as handle:
-            handle.write("dromond daemon: swept: [{'action': 'claim'}]\n")
+            handle.write("orchestra daemon: swept: [{'action': 'claim'}]\n")
         frames = []
         for frame in stream:
             frames.append(frame)
@@ -533,7 +533,7 @@ class GlyphCoverageTests(unittest.TestCase):
     are pinned to each other here rather than drifting apart silently."""
 
     def test_every_event_kind_has_a_glyph(self) -> None:
-        from dromond.http import DASHBOARD
+        from orchestra.http import DASHBOARD
         source = DASHBOARD.read_text(encoding="utf-8")
         block = source.split("const GLYPH = {", 1)[1].split("};", 1)[0]
         mapped = set(re.findall(r"^\s*(\w+):", block, re.MULTILINE))
@@ -542,7 +542,7 @@ class GlyphCoverageTests(unittest.TestCase):
         self.assertIn("const UNKNOWN_GLYPH =", source)
 
     def test_short_reasoning_starts_expanded(self) -> None:
-        from dromond.http import DASHBOARD
+        from orchestra.http import DASHBOARD
         source = DASHBOARD.read_text(encoding="utf-8")
         self.assertIn("const SHORT_REASONING_CHARS = 512;", source)
         self.assertIn("d.open = open;", source)

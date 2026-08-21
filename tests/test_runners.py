@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dromond import runners
+from orchestra import runners
 
 
 class BuildCmdTests(unittest.TestCase):
@@ -187,7 +187,7 @@ class ParseLogTests(unittest.TestCase):
 
 class ParseUsageTests(unittest.TestCase):
     """DESIGN §11 token/cost capture. Every fixture below is the shape of a
-    real transcript (reasonix + codex: dromond's own logs; claude: `claude -p
+    real transcript (reasonix + codex: orchestra's own logs; claude: `claude -p
     --output-format stream-json`; opencode: an orchestra worker log)."""
 
     def _usage(self, backend: str, lines: list) -> dict:
@@ -331,7 +331,7 @@ class QuotaLaneTests(unittest.TestCase):
             self.assertIsNone(runners.quota_exhausted(str(log)))
 
     def test_the_trace_names_the_lane(self) -> None:
-        from dromond import traces
+        from orchestra import traces
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "run.jsonl"
             log.write_text("")

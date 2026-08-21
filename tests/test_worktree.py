@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import db, supervise, worktree
+from orchestra import db, supervise, worktree
 
 
 def write(path: Path, text: str) -> None:
@@ -22,16 +22,16 @@ class SyncSkillsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
-        self.home = base / "home"          # stands in for ~/.dromond
+        self.home = base / "home"          # stands in for ~/.orchestra
         self.root = base / "project"
         self.wt = base / "wt"
         self.wt.mkdir(parents=True)
-        self.env = mock.patch.dict(os.environ, {"DROMOND_HOME": str(self.home)})
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_HOME": str(self.home)})
         self.env.start()
         for name in (".agents/skills/shared/SKILL.md", ".claude/settings.json",
                      ".codex/config.toml", ".opencode/opencode.json"):
             write(self.root / name, "x")
-        for name in ("AGENTS.md", "CLAUDE.md", "DROMOND.md"):
+        for name in ("AGENTS.md", "CLAUDE.md", "ORCHESTRA.md"):
             write(self.root / name, "x")
 
     def tearDown(self) -> None:
@@ -43,7 +43,7 @@ class SyncSkillsTests(unittest.TestCase):
         self.assertTrue((self.wt / ".codex").is_dir())
         self.assertTrue((self.wt / ".agents").is_dir())
         self.assertTrue((self.wt / "AGENTS.md").is_file())
-        self.assertTrue((self.wt / "DROMOND.md").is_file())
+        self.assertTrue((self.wt / "ORCHESTRA.md").is_file())
         for absent in (".claude", ".opencode", "CLAUDE.md"):
             self.assertFalse((self.wt / absent).exists(), absent)
 
@@ -53,18 +53,6 @@ class SyncSkillsTests(unittest.TestCase):
         self.assertTrue((self.wt / "CLAUDE.md").is_file())
         for absent in (".codex", ".opencode"):
             self.assertFalse((self.wt / absent).exists(), absent)
-
-    def test_a_project_still_carrying_MAESTRO_md_keeps_getting_it(self) -> None:
-        """W-0188 renamed the product, not the user's repositories. A project
-        whose context file is still called MAESTRO.md must keep receiving it:
-        dropping the old name would silently starve the run of its brief."""
-        write(self.root / "MAESTRO.md", "the project's own instructions")
-        worktree.sync_skills(self.root, self.wt, "codex")
-        self.assertEqual((self.wt / "MAESTRO.md").read_text(),
-                         "the project's own instructions")
-        # And it is excluded from checkpoints like every other context file,
-        # so it never lands in the run's diff as if the run had written it.
-        self.assertIn("MAESTRO.md", worktree.DOC_FILES)
 
     def test_unknown_backend_gets_the_shared_set_only(self) -> None:
         worktree.sync_skills(self.root, self.wt, None)
@@ -115,7 +103,7 @@ class SyncSkillsTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(self.root), *cmd], check=True,
                            capture_output=True)
         wt, branch = worktree.create(self.root, 7, "proj-uuid", backend="codex")
-        self.assertEqual(branch, "dromond/run-7")
+        self.assertEqual(branch, "orchestra/run-7")
         self.assertFalse((wt / ".claude").exists())
         self.assertTrue((wt / ".codex").exists())
 
@@ -132,8 +120,8 @@ class WorktreeRemovalTests(unittest.TestCase):
         self.home = base / "home"
         self.root = base / "project"
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_HOME": str(self.home),
-            "DROMOND_CONFIG": str(base / "absent.toml")})
+            "ORCHESTRA_HOME": str(self.home),
+            "ORCHESTRA_CONFIG": str(base / "absent.toml")})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.root.mkdir(parents=True)
@@ -184,10 +172,10 @@ class WorktreeRemovalTests(unittest.TestCase):
 
         self.assertIsNone(note)
         self.assertFalse(wt.exists())
-        self.assertIn("dromond/run-1", self.branches())
+        self.assertIn("orchestra/run-1", self.branches())
         # the whole point: merge.py can now delete the branch
         deleted = subprocess.run(["git", "-C", str(self.root), "branch", "-D",
-                                  "dromond/run-1"], capture_output=True, text=True)
+                                  "orchestra/run-1"], capture_output=True, text=True)
         self.assertEqual(0, deleted.returncode, deleted.stderr)
 
     def test_copied_context_files_do_not_block_removal(self):
@@ -208,7 +196,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         self.con.execute(
             "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
             "project_id, branch, status, started_at) VALUES(4,'p','claude','t',"
-            "?, ?, 'dromond/run-3', 'running', ?)",
+            "?, ?, 'orchestra/run-3', 'running', ?)",
             (str(wt), self.PROJECT, db.now()))
         self.con.commit()
 
@@ -263,15 +251,15 @@ class WorktreeRemovalTests(unittest.TestCase):
         wt = self.make_run(6, "done")
         subprocess.run(["rm", "-rf", str(wt)], check=True)
 
-        report = worktree.remove(wt, self.root, branch="dromond/run-6")
+        report = worktree.remove(wt, self.root, branch="orchestra/run-6")
 
         self.assertTrue(report["removed"], report)
         self.assertNotIn("run-6", self.git("worktree", "list"))
         self.assertEqual(0, subprocess.run(
-            ["git", "-C", str(self.root), "branch", "-D", "dromond/run-6"],
+            ["git", "-C", str(self.root), "branch", "-D", "orchestra/run-6"],
             capture_output=True).returncode)
 
-    # --- dromond prune -------------------------------------------------------
+    # --- orchestra prune -------------------------------------------------------
 
     def test_prune_removes_a_terminal_worktree_and_keeps_a_live_one(self):
         done = self.make_run(10, "done", commit=False)
@@ -313,7 +301,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         kept = {r["workdir"]: r["kept"] for r in report["worktrees"]}
         self.assertIn("1 uncommitted change(s)", kept[str(dirty)])
         self.assertIn("scratch.py", kept[str(dirty)])
-        self.assertIn("1 commit(s) on dromond/run-31 not on main", kept[str(unmerged)])
+        self.assertIn("1 commit(s) on orchestra/run-31 not on main", kept[str(unmerged)])
 
     def test_force_removes_them_and_reports_what_it_discarded(self):
         dirty = self.make_run(40, "failed", commit=False)

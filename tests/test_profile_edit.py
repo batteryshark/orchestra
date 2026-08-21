@@ -1,7 +1,7 @@
 """Managed profile edits (DESIGN §5, W-0173).
 
-Every test writes to a throwaway ``DROMOND_CONFIG`` inside a temp directory.
-Nothing here reads the developer's real ``~/.config/dromond/config.toml`` —
+Every test writes to a throwaway ``ORCHESTRA_CONFIG`` inside a temp directory.
+Nothing here reads the developer's real ``~/.config/orchestra/config.toml`` —
 it holds live credentials and ten real profiles — and no test shells out to
 a harness CLI: discovery is fed from the same fixture text ``test_profiles``
 parses.
@@ -16,8 +16,8 @@ from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
 
-from dromond import auth, config, db, profile_edit, profiles
-from dromond import http as mhttp
+from orchestra import auth, config, db, profile_edit, profiles
+from orchestra import http as mhttp
 
 # The same shapes the harnesses really print (see tests/test_profiles.py).
 OPENCODE = "opencode/big-pickle\ndeepseek/deepseek-v4-pro\n"
@@ -37,7 +37,7 @@ supported_efforts = ["high", "max"]
 """
 
 CONFIG = """\
-# Dromond profiles + settings. Hand-editable, and full of the comments that
+# Orchestra profiles + settings. Hand-editable, and full of the comments that
 # make it readable.
 
 [settings]
@@ -79,8 +79,8 @@ class EditCase(unittest.TestCase):
         self.path.write_text(CONFIG)
         os.chmod(self.path, 0o600)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.path),
-            "DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            "ORCHESTRA_CONFIG": str(self.path),
+            "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         self.options = fixture_options()
 
@@ -133,7 +133,7 @@ class CommentPreservationTests(EditCase):
         result = self.save("thinker", {"effort": "max"})
         self.assertTrue(result["applied"], result)
         after = self.path.read_text()
-        for comment in ("# Dromond profiles + settings.",
+        for comment in ("# Orchestra profiles + settings.",
                         "# --- profiles ----",
                         "# the expensive one",
                         "# delegation allowlist below; keep it short",
@@ -349,7 +349,7 @@ class EnabledSetWriteTests(EditCase):
         self.assertTrue(result["applied"], result)
         after = self.path.read_text()
         self.assertEqual(self.project_table()["enabled_profiles"], ["cheap"])
-        for comment in ("# Dromond profiles + settings.",
+        for comment in ("# Orchestra profiles + settings.",
                         "# --- profiles ----",
                         "# the expensive one",
                         "# delegation allowlist below; keep it short"):
@@ -407,8 +407,8 @@ class HttpProfileRouteTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "config.toml"
         self.path.write_text(CONFIG)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.path),
-            "DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            "ORCHESTRA_CONFIG": str(self.path),
+            "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         os.environ.pop(mhttp.KEY_ENV, None)
         # Warm the discovery cache from fixtures: no harness CLI is run, and
@@ -551,11 +551,11 @@ class CliParityTests(EditCase):
         import contextlib
         import io
 
-        from dromond import cli as mcli
+        from orchestra import cli as mcli
         out = io.StringIO()
         with mock.patch.object(mcli.profile_edit, "discovery_options",
                                lambda force=False: self.options), \
-             mock.patch.object(mcli.sys, "argv", ["dromond"] + argv), \
+             mock.patch.object(mcli.sys, "argv", ["orchestra"] + argv), \
              contextlib.redirect_stdout(out):
             mcli.main()
         return out.getvalue()
@@ -590,10 +590,10 @@ class CliParityTests(EditCase):
         self.assertNotIn("[profiles.cheap]", self.path.read_text())
 
     def test_the_run_environment_is_the_agent_path(self) -> None:
-        """A worker's shell carries DROMOND_RUN_ID, so the CLI enforces the
+        """A worker's shell carries ORCHESTRA_RUN_ID, so the CLI enforces the
         same split the HTTP surface does."""
         work = AuthorityTests.FakeWork()
-        with mock.patch.dict(os.environ, {"DROMOND_RUN_ID": "12"}), \
+        with mock.patch.dict(os.environ, {"ORCHESTRA_RUN_ID": "12"}), \
              mock.patch.object(profile_edit.work_client, "from_cfg",
                                return_value=work):
             text = self.cli(["profiles", "set", "thinker",
@@ -613,16 +613,16 @@ class CliParityTests(EditCase):
 
 class SuiteIsolationTests(unittest.TestCase):
     """The suite is often run BY a supervised run, whose shell exports its own
-    identity. cli._authority reads DROMOND_RUN_ID, so those four CliParityTests
+    identity. cli._authority reads ORCHESTRA_RUN_ID, so those four CliParityTests
     failures were decided by the shell the suite was launched from rather than
     by anything under test (I-0008, I-0009)."""
 
     def test_a_runs_identity_never_reaches_the_suite(self) -> None:
-        for name in ("DROMOND_RUN_ID", "DROMOND_RUN_TOKEN", "DROMOND_ROOT"):
+        for name in ("ORCHESTRA_RUN_ID", "ORCHESTRA_RUN_TOKEN", "ORCHESTRA_ROOT"):
             self.assertIsNone(os.environ.get(name), name)
 
     def test_authority_is_human_inside_the_suite(self) -> None:
-        from dromond import cli
+        from orchestra import cli
         self.assertEqual("human", cli._authority())
 
 

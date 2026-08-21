@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from dromond import proc
+from orchestra import proc
 
 
 class WhichTests(unittest.TestCase):

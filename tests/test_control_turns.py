@@ -4,7 +4,7 @@ A control turn — router staffing, merge judge, observer, conductor — is
 recorded as a terminal runs row with ``layer`` set, its transcript retained
 and normalized through ``traces.ingest``. These tests patch
 ``subprocess.run``: no test here starts a real backend process.
-``DROMOND_HOME`` is sandboxed, so the real database and logs are untouched.
+``ORCHESTRA_HOME`` is sandboxed, so the real database and logs are untouched.
 """
 import json
 import os
@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dromond import db, http, observer, router, traces
+from orchestra import db, http, observer, router, traces
 
 PROFILE = {"name": "stub", "backend": "opencode"}
 
@@ -57,7 +57,7 @@ class ControlTurnTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(os.environ,
-                                   {"DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+                                   {"ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         self.con = db.connect()
 
@@ -168,7 +168,7 @@ class ControlTurnTestCase(unittest.TestCase):
                          "and is therefore pinned on that project's board")
 
     def test_a_merge_judge_turn_is_recorded_through_the_merge(self) -> None:
-        from dromond import merge
+        from orchestra import merge
         cfg = {"settings": {"observer_profile": "stub"},
                "profiles": dict(CFG["profiles"])}
         with mock.patch.object(observer.subprocess, "run",
@@ -305,7 +305,7 @@ class ControlTurnTestCase(unittest.TestCase):
                                             con=self.con)["limit"], 1)
 
     def test_statistics_and_the_performance_review_skip_turns(self) -> None:
-        from dromond import review
+        from orchestra import review
         observer.record_turn(self.con, "merge", PROFILE,
                              _write(self.tmp.name), True, "escalate")
         stats = http.snapshot(self.con)["statistics"]

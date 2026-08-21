@@ -6,10 +6,10 @@ Switchyard snapshot: `2bef154970d23cacf9c83b4fe9c1cd90212623e8`
 
 ## Recommendation
 
-Do not make Switchyard a Dromond dependency or replace Dromond's profile/run
+Do not make Switchyard a Orchestra dependency or replace Orchestra's profile/run
 routing with it. The two systems route at different levels:
 
-- **Dromond routes work to an agent harness process.** It owns Work intake,
+- **Orchestra routes work to an agent harness process.** It owns Work intake,
   profiles, worktrees, supervision, budgets, approvals, messages, resumes, and
   durable run state.
 - **Switchyard routes LLM API calls made by that process.** It is a proxy and
@@ -17,10 +17,10 @@ routing with it. The two systems route at different levels:
   providers. It owns model selection, provider-protocol translation, fallback,
   and request-level telemetry.
 
-Switchyard is therefore complementary, not a substitute. If Dromond later
+Switchyard is therefore complementary, not a substitute. If Orchestra later
 wants dynamic model selection *inside* a run, prefer an opt-in Switchyard
 deployment over recreating its classifier, stage, escalation, translation, and
-metrics machinery. Keep the boundary at the HTTP proxy and keep static Dromond
+metrics machinery. Keep the boundary at the HTTP proxy and keep static Orchestra
 profiles as the default.
 
 Do not ship that integration yet. Switchyard calls itself pre-alpha,
@@ -51,11 +51,11 @@ The shipped route types are:
 | `llm_classifier` / escalation | Run the efficient model first, then have a judge inspect its completed turn; after repeated escalation verdicts, latch the session to the capable model. This adds weak + judge latency on unlatched turns and weak + judge + strong cost on the turn that triggers escalation. |
 | `llm_classifier` / custom | Validate a judge's structured output and select among two or more named targets. |
 
-Useful implementation details for Dromond:
+Useful implementation details for Orchestra:
 
 - The server recognizes native Codex and Claude Code session/subagent headers,
   as well as explicit `x-switchyard-*` headers. Stateful routes therefore do
-  not require Dromond to infer conversation identity.
+  not require Orchestra to infer conversation identity.
 - The launchers already know how to point Codex at an OpenAI Responses proxy
   and Claude Code at an Anthropic proxy. Cross-provider serving is a first-class
   use case.
@@ -82,7 +82,7 @@ software:
 
 ## Evidence quality
 
-The published results are promising but not a Dromond adoption result:
+The published results are promising but not a Orchestra adoption result:
 
 - NVIDIA reports that LangChain ran 145 internal multi-turn tasks five times.
   Escalation routing between Nemotron 3.5 Lightning and Claude Opus 4.8 sent 7%
@@ -99,7 +99,7 @@ The published results are promising but not a Dromond adoption result:
 
 These figures are vendor/partner-reported on other agents, model pairs, tasks,
 and pricing. They establish that a local experiment is worthwhile, not that a
-quality/cost trade-off transfers to Dromond.
+quality/cost trade-off transfers to Orchestra.
 
 The project has real early traction (505 stars, 66 forks, and 214 commits when
 checked), but maturity is the controlling signal. The inspected README says
@@ -112,33 +112,33 @@ checked), but maturity is the controlling signal. The inspected README says
 - tool-bearing Codex requests failing against upstreams with incompatible tool
   names or schemas.
 
-Those touch Dromond's cancellation, attribution, and reliable-supervision
+Those touch Orchestra's cancellation, attribution, and reliable-supervision
 requirements directly.
 
-## Fit with Dromond
+## Fit with Orchestra
 
-| Concern | Dromond | Switchyard | Conclusion |
+| Concern | Orchestra | Switchyard | Conclusion |
 |---|---|---|---|
 | Unit routed | Work item / complete agent run | One model API request or conversation turn | Complementary layers |
 | Destinations | Codex, Claude Code, OpenCode, Reasonix profiles | Model/provider targets behind a compatible API | Does not replace `runners.py` |
-| Durable intent/state | Work + SQLite + briefs/logs | Process-local routing state; optional routing log | Dromond remains owner |
+| Durable intent/state | Work + SQLite + briefs/logs | Process-local routing state; optional routing log | Orchestra remains owner |
 | Safety/control | Approval, budget, timeout, stall, worktree | Target policy, fallback, context fit | Neither subsumes the other |
-| Cost control | Run/provider grants (planned D2) | Per-call tier selection and accounting | Switchyard can operate inside a Dromond grant |
+| Cost control | Run/provider grants (planned D2) | Per-call tier selection and accounting | Switchyard can operate inside a Orchestra grant |
 | Protocol | CLI exec/JSONL or ACP | OpenAI/Anthropic HTTP APIs | HTTP proxy is the correct seam |
 | Dependency posture | Stdlib Python, no runtime dependencies | Rust server or Python 3.12 + PyO3 package | Keep optional and external |
 
-Dromond should continue recording the configured route ID as `runs.model`.
+Orchestra should continue recording the configured route ID as `runs.model`.
 Selected-model and router-overhead detail belongs in Switchyard telemetry; it
-can later be linked to `DROMOND_RUN_ID` through an explicit correlation header
-if the harness/proxy path permits one. Dromond should not copy Switchyard's
+can later be linked to `ORCHESTRA_RUN_ID` through an explicit correlation header
+if the harness/proxy path permits one. Orchestra should not copy Switchyard's
 per-call stats into its run schema until an actual UI or budget consumer needs
 them.
 
 ## Proposed experiment (separate work item)
 
-Pin `v0.2.0`; do not follow `main`. Operate a standalone server outside Dromond
-rather than embedding Rust or nesting `switchyard launch` under Dromond's
-supervisor. A standalone proxy preserves Dromond's direct ownership of the
+Pin `v0.2.0`; do not follow `main`. Operate a standalone server outside Orchestra
+rather than embedding Rust or nesting `switchyard launch` under Orchestra's
+supervisor. A standalone proxy preserves Orchestra's direct ownership of the
 Codex/Claude process and its JSONL output, and it makes proxy failure explicit.
 
 1. Select one capable/efficient model pair available through the same billing
@@ -160,7 +160,7 @@ Codex/Claude process and its JSONL output, and it makes proxy failure explicit.
    than 10% median wall time, and introduces no cancellation/accounting defect.
    These are proposed decision thresholds, not NVIDIA claims.
 
-The smallest future Dromond change should be generic per-profile environment
+The smallest future Orchestra change should be generic per-profile environment
 overrides plus documented proxy arguments. Do not add a Switchyard backend: the
 agent backend is still Codex or Claude, while Switchyard is the selected model
 provider. Do not add an algorithm/plugin framework or embed `libsy` in this

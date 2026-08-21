@@ -103,7 +103,7 @@ class FakeWork:
                     alias_paths=()):
         """A Work project as /api/projects serves it: ``id`` is the human
         path-ish key an item's ``projectPath`` carries, ``projectId`` is the
-        immutable UUID Dromond keys on. ``path`` is workspace-relative."""
+        immutable UUID Orchestra keys on. ``path`` is workspace-relative."""
         entry = {"id": work_id, "projectId": project_id,
                  "name": name or work_id, "path": path or work_id,
                  "aliasPaths": list(alias_paths)}
@@ -220,7 +220,7 @@ class FakeWork:
         task["updatedAt"] = ts
         self._rederive_task(task)
 
-    def agent_claim(self, task_id, run=1, agent="dromond"):
+    def agent_claim(self, task_id, run=1, agent="orchestra"):
         """A run opening its window on a task the test did not sweep."""
         task = self.tasks[task_id]
         ts = self.now()

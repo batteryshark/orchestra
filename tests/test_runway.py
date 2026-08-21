@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from dromond import db, runway
+from orchestra import db, runway
 
 # Every adapter that needs a credential is pointed at this: an auth.json that
 # is not there, so the lookup falls through to an environment variable the
@@ -459,7 +459,7 @@ class XaiResetTests(unittest.TestCase):
 
 
 class XaiTokenTests(unittest.TestCase):
-    """Dromond writes into ANOTHER application's credential store. These pin
+    """Orchestra writes into ANOTHER application's credential store. These pin
     the promises that makes: only near expiry, atomically, everything else
     preserved, and nothing written at all when any step fails."""
 
@@ -828,17 +828,17 @@ class CodexTests(unittest.TestCase):
 class StorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        # central state (DESIGN §2): the database path comes from DROMOND_HOME
-        self._home = os.environ.get("DROMOND_HOME")
-        os.environ["DROMOND_HOME"] = self.tmp.name
+        # central state (DESIGN §2): the database path comes from ORCHESTRA_HOME
+        self._home = os.environ.get("ORCHESTRA_HOME")
+        os.environ["ORCHESTRA_HOME"] = self.tmp.name
         self.con = db.connect()
 
     def tearDown(self) -> None:
         self.con.close()
         if self._home is None:
-            os.environ.pop("DROMOND_HOME", None)
+            os.environ.pop("ORCHESTRA_HOME", None)
         else:
-            os.environ["DROMOND_HOME"] = self._home
+            os.environ["ORCHESTRA_HOME"] = self._home
         self.tmp.cleanup()
 
     def test_known_and_unknown_polls_are_both_stored(self) -> None:

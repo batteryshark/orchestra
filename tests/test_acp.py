@@ -16,7 +16,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from dromond import acp, cli, db, messaging, project, supervise, traces
+from orchestra import acp, cli, db, messaging, project, supervise, traces
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 FAKE_ACP = Path(__file__).resolve().parent / "fake_acp.py"
@@ -107,7 +107,7 @@ class SupervisorLifecycleTest(unittest.TestCase):
         proc.wait.side_effect = waited.set
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(supervise.paths, "logs_dir", return_value=Path(tmp)), \
-                mock.patch.object(supervise.shutil, "which", return_value="dromond"), \
+                mock.patch.object(supervise.shutil, "which", return_value="orchestra"), \
                 mock.patch.object(supervise.subprocess, "Popen", return_value=proc):
             supervise.spawn_supervisor(Path(tmp), 7)
 
@@ -163,7 +163,7 @@ class AcpTraceParsingTest(unittest.TestCase):
         self.assertEqual((events[0]["kind"], events[0]["name"]),
                          ("permission_request", "write x"))
 
-    def test_what_dromond_sends_in_is_a_human_injection(self) -> None:
+    def test_what_orchestra_sends_in_is_a_human_injection(self) -> None:
         for method in ("session/prompt", "_reasonix.io/session/steer"):
             events = self.parse('{"jsonrpc":"2.0","_dir":"out","id":3,"method":"'
                                 + method + '","params":{"prompt":'
@@ -208,7 +208,7 @@ class AcpDeliveryStateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.env = mock.patch.dict(
-            os.environ, {"DROMOND_HOME": str(Path(self.tmp.name) / "home")})
+            os.environ, {"ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
         self.con = db.connect()
         self.con.execute(
@@ -257,9 +257,9 @@ class AcpEndToEndTest(unittest.TestCase):
             shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_ACP}" "$@"\n')
             shim.chmod(0o755)
         self.env = mock.patch.dict(os.environ, {
-            "DROMOND_CONFIG": str(self.global_config),
-            "DROMOND_HOME": str(self.tmp_path / "home"),
-            "DROMOND_ROOT": str(self.root),
+            "ORCHESTRA_CONFIG": str(self.global_config),
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_ROOT": str(self.root),
             "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
             "STUB_ACP_TURN": "0.2",
             "STUB_ACP_PERMISSION": "0",
@@ -313,7 +313,7 @@ class AcpEndToEndTest(unittest.TestCase):
         return None
 
     def _sent(self, run_id: int, method: str) -> int:
-        """How many times Dromond sent this method, read off the raw log."""
+        """How many times Orchestra sent this method, read off the raw log."""
         path = self.tmp_path / "home" / "logs" / f"run-{run_id}.jsonl"
         count = 0
         for line in path.read_text(errors="replace").splitlines():
@@ -374,7 +374,7 @@ class AcpEndToEndTest(unittest.TestCase):
             (self.tmp_path / "home" / "logs" / f"run-{run_id}.jsonl").stat().st_size)
 
     def test_a_permission_request_surfaces(self) -> None:
-        """DESIGN §6: over ACP the ask is a protocol message Dromond answers,
+        """DESIGN §6: over ACP the ask is a protocol message Orchestra answers,
         not a TTY prompt nobody is watching. The stub's turn does not finish
         until the answer arrives, so completing at all proves it."""
         os.environ["STUB_ACP_PERMISSION"] = "1"
