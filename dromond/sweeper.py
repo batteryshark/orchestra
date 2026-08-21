@@ -3,8 +3,8 @@
 Deterministic code only (DESIGN principle 6) — one pass:
 
 - **Report**: a finished run posts an attributed comment and transitions its
-  item (success → review/resolved; anything else → blocked/needs_human).
-  Never done/closed — the human closes (CONTRACT §3 verb 2).
+  item (success → review; anything else → blocked/needs_human). A verification
+  run may then earn ``done`` (W-0269); worker identities never set it.
 - **Claim**: an item a human marked ``delegated`` (CONTRACT §2; a legacy
   ``agents`` list is history and never counts as delegation) that sits
   in ``ready`` (task) / ``queued`` (issue) with no live run gets one: a
@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from dromond import (brief, config, db, dispatch, names, paths, project,
-                         router, runners, supervise)
+                         router, runners, supervise, verify)
 from dromond.work_client import WorkClient, WorkError, from_cfg
 
 CURSOR_KEYS = {"task": "work_cursor_tasks", "issue": "work_cursor_issues"}
@@ -559,6 +559,7 @@ def sweep(cfg: dict, client: WorkClient,
     con = db.connect()
     try:
         ok = _report(con, client, actions)
+        verify.after_report(con, cfg, client, actions)
         _progress(con, cfg, client, actions)
         fetched: list = []
         cursors: dict[str, str | None] = {}
