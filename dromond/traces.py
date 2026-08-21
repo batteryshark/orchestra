@@ -341,6 +341,70 @@ def parse_line(backend: str, line: str) -> list[dict] | None:
     return events
 
 
+# --- progress ---------------------------------------------------------------
+
+# A tool's most identifying argument. `command` is often argv rather than a
+# string, which is why runners._find_command reads it and _dig reads the rest.
+ARG_KEYS = {"filePath", "file_path", "path", "pattern", "query", "url"}
+
+
+def progress(log_path: str, backend: str) -> str | None:
+    """One line describing what a live run has been doing, read from the
+    trace at call time.
+
+    Current fields carry current facts: a progress line that repeats a
+    stale count makes a healthy run indistinguishable from a hung one
+    (I-0121). Counted through ``parse_line`` so every tool the backend
+    reports is one -- counting shell commands alone froze run 234 at "1
+    tool call" for 40 minutes while it made 84.
+
+    Deterministic transcript reading, never a question put to the worker --
+    a status report costs a model turn, this costs a file read.
+    """
+    calls = results = 0
+    last_call = last_result = said = None
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                for event in parse_line(backend, line) or ():
+                    kind = event["kind"]
+                    if kind == "tool_call":
+                        calls += 1
+                        last_call = (event["name"], line)
+                    elif kind == "tool_result":
+                        results += 1
+                        last_result = (event["name"], line)
+                    elif kind == "assistant_text" and event["payload"].strip():
+                        said = event["payload"].strip().splitlines()[0]
+    except (OSError, TypeError):   # a run claimed before its log path is set
+        return None
+    # Finished tools are the one count every backend agrees on: opencode
+    # logs only the completed part, and Reasonix streams `tool_dispatch`
+    # twice per tool (`partial`), so counting calls would double it. Calls
+    # stand in only before the first tool has returned.
+    actions = results or calls
+    if not actions and not said:
+        return None
+    parts = [f"{actions} tool call{'s' if actions != 1 else ''}"] if actions else []
+    last = last_call or last_result
+    if last:
+        parts.append(f"last: {_action_label(*last)}")
+    elif said:
+        parts.append(f"last said: {said[:120]}")
+    return "; ".join(parts)[:400]
+
+
+def _action_label(name: str | None, line: str) -> str:
+    """A tool's name plus its argument, best-effort — each backend buries
+    the argument at a different depth, and Reasonix carries none at all."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return name or "tool"
+    arg = runners._find_command(obj) or next(iter(runners._dig(obj, ARG_KEYS)), "")
+    return f"{name or 'tool'} {arg}".strip()[:120]
+
+
 # --- ingest -----------------------------------------------------------------
 
 def cursor(con, run_id: int):

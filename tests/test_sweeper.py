@@ -5,6 +5,7 @@ each item's project from Work, and writes to one database under
 ``DROMOND_HOME``. The fixture therefore builds a workspace with a project
 directory in it, not a project with a state directory.
 """
+import json
 import os
 import subprocess
 import tempfile
@@ -31,6 +32,14 @@ agent_identity = "dromond"
 profile = "stub"
 poll_interval = 7
 """
+
+
+def tool_line(tool: str, **args) -> str:
+    """One finished tool in the fixture profile's backend (opencode) — the
+    shape the progress heartbeat counts."""
+    return json.dumps({"type": "message.part.updated", "part": {
+        "type": "tool", "tool": tool,
+        "state": {"status": "completed", "input": args, "output": "ok"}}}) + "\n"
 
 
 class SweeperFixture:
@@ -81,6 +90,17 @@ class SweeperFixture:
             "UPDATE runs SET status=?, summary=?, finished_at=?, "
             "session_ref=COALESCE(?, session_ref) WHERE id=?",
             (status, summary, db.now(), session_ref, run_id))
+        con.commit()
+        con.close()
+
+    def item_log(self, item_id="W-0001") -> str:
+        return " ".join(str(e) for e in self.work.tasks[item_id].get("log", []))
+
+    def age_progress(self, run_id) -> None:
+        """Let the next sweep past the progress rate limit."""
+        con = db.connect()
+        con.execute("UPDATE runs SET work_progress_at='2000-01-01T00:00:00Z' "
+                    "WHERE id=?", (run_id,))
         con.commit()
         con.close()
 
@@ -361,29 +381,48 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.work.add_task("W-0001", "long job", delegated=True)
         self.sweep()
         run = self.db_run()
-        Path(run["log_path"]).write_text(
-            '{"type":"item","item":{"command":["pytest","-q"]}}\n')
+        Path(run["log_path"]).write_text(tool_line("bash", command="pytest -q"))
 
         self.sweep()  # first pass after activity: heartbeat posts
-        notes = " ".join(str(e) for e in self.work.tasks["W-0001"].get("log", []))
+        notes = self.item_log()
         self.assertIn("still working", notes)
         self.assertIn("pytest -q", notes)
         before = notes.count("still working")
 
         self.sweep()  # immediately again: rate-limited, no second heartbeat
-        notes = " ".join(str(e) for e in self.work.tasks["W-0001"].get("log", []))
-        self.assertEqual(notes.count("still working"), before)
+        self.assertEqual(self.item_log().count("still working"), before)
+
+    def test_progress_count_advances_as_the_trace_grows(self) -> None:
+        """Current fields carry current facts: a frozen progress line makes a
+        healthy run indistinguishable from a hung one (I-0121). Run 234 held
+        at "1 tool call" for 40 minutes because only shell commands counted,
+        while it went on reading and grepping 80-odd times."""
+        self.work.add_task("W-0001", "long job", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        log = Path(run["log_path"])
+        log.write_text(tool_line("bash", command="pytest -q"))
+        self.sweep()
+        self.assertIn("1 tool call;", self.item_log())
+
+        with log.open("a") as handle:  # more tools, none of them a shell command
+            handle.write(tool_line("read", filePath="/src/db.py"))
+            handle.write(tool_line("grep", pattern="def main"))
+        self.age_progress(run["id"])
+        self.sweep()
+
+        notes = self.item_log()
+        self.assertIn("3 tool calls;", notes)
+        self.assertIn("last: grep def main", notes)
 
     def test_progress_heartbeat_skips_terminal_runs(self) -> None:
         self.work.add_task("W-0001", "quick job", delegated=True)
         self.sweep()
         run = self.db_run()
-        Path(run["log_path"]).write_text(
-            '{"type":"item","item":{"command":["ls"]}}\n')
+        Path(run["log_path"]).write_text(tool_line("bash", command="ls"))
         self.finish_run(run["id"], "done", "finished")
         self.sweep()
-        notes = " ".join(str(e) for e in self.work.tasks["W-0001"].get("log", []))
-        self.assertNotIn("still working", notes)
+        self.assertNotIn("still working", self.item_log())
 
     def test_issue_outcomes_closed_and_needs_human(self) -> None:
         self.work.add_issue("issue_good", "resolves", delegated=True)
