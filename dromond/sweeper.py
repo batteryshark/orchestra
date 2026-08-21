@@ -2,9 +2,10 @@
 
 Deterministic code only (DESIGN principle 6) — one pass:
 
-- **Report**: a finished run posts an attributed comment and transitions its
-  item (success → review; anything else → blocked/needs_human). A verification
-  run may then earn ``done`` (W-0269); worker identities never set it.
+- **Report**: a finished run posts an attributed comment and appends its
+  fact — ``landed`` / ``halted`` / ``failed``, or ``resolved`` /
+  ``needs_human`` on an issue. A run never writes status (CONTRACT 0.8);
+  Work derives the board from the facts and the human's own move.
 - **Claim**: an item a human marked ``delegated`` (CONTRACT §2; a legacy
   ``agents`` list is history and never counts as delegation) that sits
   in ``ready`` (task) / ``queued`` (issue) with no live run gets one: a
@@ -23,7 +24,7 @@ from pathlib import Path
 
 from dromond import (brief, config, db, dispatch, names, paths, project,
                          router, supervise, traces, verify)
-from dromond.work_client import WorkClient, WorkError, from_cfg
+from dromond.work_client import WorkClient, WorkError, fact_line, from_cfg
 
 CURSOR_KEYS = {"task": "work_cursor_tasks", "issue": "work_cursor_issues"}
 
@@ -219,15 +220,15 @@ def _headline(run, summary: str) -> str:
 def _decline_unaccounted(client: WorkClient, item_id: str, run, tag: str) -> int:
     """Answer, on the run's behalf, every criterion the run left open.
 
-    Work refuses a move to review or blocked while any requirement or
-    acceptance criterion is neither ticked nor declined, so that nothing is
-    abandoned silently. The worker owns that answer and is told to give it. A
-    run that dies, is killed, or simply ignores the protocol gives none — and
-    the item would then be stuck outside every state it could move to.
+    CONTRACT §3 verb 2: no task leaves an agent's hands with a criterion
+    unanswered. The worker owns that answer and is told to give it. A run that
+    dies, is killed, or simply ignores the protocol gives none, so the sweeper
+    answers the only way it honestly can: it declines what is left, saying who
+    did not account for it. It never ticks anything; a tick is a claim that
+    work was verified, and the sweeper verified nothing.
 
-    So the sweeper answers the only way it honestly can: it declines what is
-    left, saying who did not account for it. It never ticks anything; a tick
-    is a claim that work was verified, and the sweeper verified nothing.
+    This runs before the run's terminal fact, not after a refusal — the fact
+    is an append, and an append is never refereed.
     """
     task = client.task(item_id)
     if task is None:
@@ -260,65 +261,54 @@ def _report(con, client: WorkClient, actions: list) -> bool:
         comment = (f"{tag} run {run['id']} finished: {run['status']}\n\n"
                    f"{summary}")[:19000]
         try:
-            posted = (client.log_task(item_id, comment) if kind == "task"
-                      else client.reply_issue(item_id, comment))
-            if posted is None:
-                ok = False
-                continue
             if kind == "task":
                 target = "review" if success else "blocked"
-                try:
-                    # The transition note is the line the human reads on the
-                    # board, so it carries the reason, not just a run id.
-                    moved = client.move_task(item_id, target,
-                                             note=f"{tag} {_headline(run, summary)}")
-                except WorkError as exc:
-                    if exc.code != "review_checklist_incomplete":
-                        raise
-                    if target == "review":
-                        # The run said it succeeded but left criteria open, so
-                        # its own claim is unverified. That is the human's to
-                        # judge: park it rather than declining on its behalf.
-                        target = "blocked"
-                        note = f"{tag} could not enter review: {exc.code}"
-                    else:
-                        note = f"{tag} {_headline(run, summary)}"
+                posted = client.log_task(item_id, comment)
+                if posted is not None:
                     _decline_unaccounted(client, item_id, run, tag)
-                    moved = client.move_task(item_id, "blocked", note=note)
-            elif success:
-                # Work collapsed "resolved" into "closed" (2026-08-14): a run
-                # closes its claimed issue with a summary; humans can reopen.
-                target = "closed"
-                moved = client.set_issue_state(item_id, "closed",
-                                               resolution_summary=summary)
+                    # `halted` is the run saying it stopped and needs the
+                    # human; `failed` is it saying it died. The reason is the
+                    # line the human reads on the board, so it says what
+                    # happened. A landing has no reason to give; merge.py owns
+                    # the sha when there is one.
+                    posted = client.log_task(item_id, fact_line(
+                        tag, "landed" if success else
+                        "halted" if run["status"] == "halted" else "failed",
+                        reason=None if success else _headline(run, summary)))
             else:
-                target = "needs_human"
-                moved = client.set_issue_state(item_id, "needs_human",
-                                               reason=f"{tag} {summary}"[:19000])
-            if moved is None:  # Work went away mid-pass; retry next pass
+                # Work collapsed "resolved" into "closed" (2026-08-14): a
+                # resolved fact reads closed with its summary; humans reopen.
+                target = "closed" if success else "needs_human"
+                posted = client.reply_issue(item_id, comment)
+                if posted is not None:
+                    posted = client.reply_issue(item_id, fact_line(
+                        tag, "resolved" if success else "needs_human",
+                        **({"summary": summary} if success
+                           else {"reason": summary})))
+            if posted is None:  # Work went away mid-pass; retry next pass
                 ok = False
                 continue
         except WorkError as exc:
-            if getattr(exc, "code", None) == "issue_closed":
-                # Terminal refusal: a human already closed the issue, so the
-                # outcome the report wanted is settled. Mark it reported —
-                # retrying forever turned two closed issues into permanent
-                # sweep noise (2026-08-20). Only transient failures retry.
-                print(f"dromond sweep: report {item_id} superseded by a "
-                      f"human close — marked reported")
-                con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
-                            (db.now(), run["id"]))
-                con.commit()
-                continue
-            print(f"dromond sweep: report {item_id} rejected: {exc}")
-            ok = False
+            # Terminal: Work refused the append on its own authority (a human
+            # closed the issue, the id is not a work item). The outcome is
+            # settled without us, so the report stamps reported and never
+            # retries — retrying forever turned two closed issues into
+            # permanent sweep noise (2026-08-20).
+            print(f"dromond sweep: report {item_id} refused ({exc}) — "
+                  f"marked reported")
+            _mark_reported(con, run)
             continue
-        con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
-                    (db.now(), run["id"]))
-        con.commit()
+        _mark_reported(con, run)
         actions.append({"action": "report", "item": item_id,
                         "run": run["id"], "to": target})
     return ok
+
+
+def _mark_reported(con, run) -> None:
+    """Once only, however it ended (DESIGN: a report is never posted twice)."""
+    con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
+                (db.now(), run["id"]))
+    con.commit()
 
 
 def _dep_lookup(client: WorkClient):
@@ -400,17 +390,13 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             continue
         routed = None
         try:
-            # Transition first: a claim the server refuses must not spawn.
-            if kind == "issue":
-                if client.claim_issue(item_id) is None:
-                    ok = False
-                    continue
-            else:
-                if client.move_task(
-                        item_id, "in_progress",
-                        note=f"[{client.identity}] claimed") is None:
-                    ok = False
-                    continue
+            # An issue claim is OWNERSHIP, not status: Work's reply gate runs
+            # off it, so a claim the server refuses must not spawn. A task
+            # carries no ownership field — its claim is a fact, appended below
+            # beside the dispatch note, once the run has an id to name.
+            if kind == "issue" and client.claim_issue(item_id) is None:
+                ok = False
+                continue
             prior = _last_session_run(con, item_id)
             if prior:
                 news = _new_human_comments(item, kind, prior["work_seen_ts"],
@@ -466,22 +452,17 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             if routed:
                 note += f"\nstaffing: {routed}"
             if kind == "task":
+                # The claim fact opens this run's window: every fact it
+                # reports later counts only while this claim outranks the
+                # human's last move (CONTRACT 0.8).
+                client.log_task(item_id, fact_line(tag, "claimed", run=run_id))
                 client.log_task(item_id, note)
             else:
-                client.reply_issue(item_id, note)
+                client.reply_issue(item_id, note)  # claim_issue wrote the fact
             launcher(root, run_id)
             actions.append({"action": "dispatch", "item": item_id, "run": run_id,
                             "resumed": bool(prior)})
         except WorkError as exc:
-            if getattr(exc, "code", None) == "parent_is_container":
-                # Terminal refusal, same law as issue_closed: an epic with
-                # children is never claimable — its slices are. Work is the
-                # authority (409); retrying every pass would be the report-
-                # retry noise loop reborn (runs 76/155, then run 202's whole
-                # dispatch burned discovering this the expensive way).
-                print(f"dromond sweep: {item_id} is a container — skipped; "
-                      f"delegate its children")
-                continue
             print(f"dromond sweep: claim {item_id} rejected: {exc}")
             ok = False
     return ok

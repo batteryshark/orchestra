@@ -125,18 +125,18 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("## Work item snapshot", text)
         self.assertIn("Make CI green again.", text)
 
-    def test_a_parent_with_children_is_skipped_not_retried(self) -> None:
-        """Work refuses a parent claim (409 parent_is_container); the sweeper
-        treats that as terminal — skip and say why — never a retry loop.
-        Same law as issue_closed; run 202 burned a dispatch learning it."""
-        self.work.add_task("W-0100", "The epic", delegated=True)
+    def test_a_parent_with_children_is_ordinary_work(self) -> None:
+        """The container refusal is gone from both sides: Work made a task
+        with subtasks workable everywhere and moved epics to their own E-####
+        kind, and a claim is now an append, which nothing referees. So the
+        sweeper has no container case left to skip."""
+        self.work.add_task("W-0100", "The parent", delegated=True)
         self.work.add_task("W-0101", "The slice", delegated=True,
                            parent_id="W-0100")
         actions = self.sweep()
         dispatched = [a for a in actions if a.get("action") == "dispatch"]
-        self.assertEqual([a["item"] for a in dispatched], ["W-0101"])
-        self.assertEqual(self.work.tasks["W-0100"]["status"], "ready",
-                         "the parent is never claimed")
+        self.assertEqual(sorted(a["item"] for a in dispatched),
+                         ["W-0100", "W-0101"])
 
     def test_claims_assigned_queued_issue(self) -> None:
         self.work.add_issue("issue_auth_timeout", "Auth times out",
@@ -237,7 +237,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
     # --- report -------------------------------------------------------------
 
-    def test_completed_run_reports_and_moves_task_to_review(self) -> None:
+    def test_completed_run_reports_a_landed_fact_and_writes_no_status(self) -> None:
         self.work.add_task("W-0001", "finishes well", delegated=True)
         self.sweep()
         run = self.db_run()
@@ -247,21 +247,26 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                        "to": "review"}, actions)
         task = self.work.tasks["W-0001"]
         self.assertEqual(task["status"], "review")
+        # Derived, never written: the human's own status never moved.
+        self.assertEqual(task["storedStatus"], "ready")
         log = "\n".join(e["message"] for e in task["log"])
+        self.assertIn(f"fact: claimed run={run['id']}", log)
+        self.assertIn("fact: landed", log)
         self.assertIn("finished: done", log)
         self.assertIn("Shipped the fix; tests pass.", log)
         self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
 
-    def test_failed_run_moves_task_to_blocked(self) -> None:
+    def test_failed_run_reports_a_failed_fact_and_reads_blocked(self) -> None:
         self.work.add_task("W-0001", "goes badly", delegated=True)
         self.sweep()
         run = self.db_run()
         self.finish_run(run["id"], "failed", "Cannot find the config file.")
         self.sweep()
         self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
-        # The board shows transition notes, so the reason must ride along --
+        # The board shows the fact's reason, so it must ride along --
         # "blocked" with no cause tells the human nothing.
         notes = " ".join(str(entry) for entry in self.work.tasks["W-0001"].get("log", []))
+        self.assertIn("fact: failed reason=", notes)
         self.assertIn("Cannot find the config file.", notes)
 
     def test_the_brief_tells_a_task_run_to_account_for_every_criterion(self) -> None:
@@ -279,10 +284,10 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.sweep()
         self.assertNotIn("work check", Path(self.db_run()["brief_path"]).read_text())
 
-    def test_a_run_that_leaves_criteria_open_cannot_strand_the_item(self) -> None:
-        # Work refuses BOTH review and blocked while any criterion is
-        # unaccounted for. A run that dies without ticking or declining
-        # anything would otherwise have no state left to move to.
+    def test_a_run_that_leaves_criteria_open_is_accounted_for_anyway(self) -> None:
+        # CONTRACT §3 verb 2: nothing leaves the run's hands unanswered. A run
+        # that dies without ticking or declining anything answers for none of
+        # them, so the sweeper declines what is left before reporting its fact.
         self.work.add_task("W-0001", "dies mid-flight", delegated=True,
                            acceptance=("proves it", "and the other thing"))
         self.sweep()
@@ -314,10 +319,11 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual((items[0]["checked"], items[0]["declined"]), (True, False))
         self.assertTrue(items[1]["declined"])
 
-    def test_a_success_that_skipped_its_criteria_is_parked_not_declined(self) -> None:
-        # A run claiming success while its criteria sit open has an unverified
-        # claim. That is the human's to judge, so the item is parked in blocked
-        # with the reason -- the sweeper does not answer for the run here.
+    def test_a_success_that_skipped_its_criteria_lands_and_is_accounted_for(self) -> None:
+        # The referee is gone: the run says it landed, and the sweeper no
+        # longer downgrades that claim to blocked on its behalf. It answers
+        # for the criteria the run left silent -- declined, naming the run --
+        # and the human reads both on the board.
         self.work.add_task("W-0001", "claims success", delegated=True,
                            acceptance=("proves it",))
         self.sweep()
@@ -326,9 +332,11 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.sweep()
 
         task = self.work.tasks["W-0001"]
-        self.assertEqual(task["status"], "blocked")
-        log = "\n".join(e["message"] for e in task["log"])
-        self.assertIn("could not enter review: review_checklist_incomplete", log)
+        self.assertEqual(task["status"], "review")
+        criterion = task["acceptanceCriteria"][0]
+        self.assertEqual((criterion["checked"], criterion["declined"]),
+                         (False, True))
+        self.assertIn(f"run {run['id']}", criterion["reason"])
 
     def test_a_dispatched_brief_names_what_recently_landed(self) -> None:
         # End to end: real repository, real git log, real brief on disk.
@@ -444,19 +452,73 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         entries = self.client.needs_you()
         self.assertEqual([e["id"] for e in entries], ["issue_bad"])
 
-    def test_agent_can_never_set_done_and_closing_needs_a_summary(self) -> None:
-        self.work.add_task("W-0001", "forbidden", delegated=True)
-        self.work.add_issue("issue_x", "forbidden", delegated=True)
+    def test_a_legacy_transition_is_bridged_into_its_fact(self) -> None:
+        """Orchestra sends facts now, but Work still accepts the old move
+        call and records it as the fact it meant — the wire shape stays
+        compatible, and neither side needs a lockstep deploy (CONTRACT 0.8).
+        Nothing an agent sends writes stored status; done is still refused."""
+        self.work.add_task("W-0001", "legacy caller", delegated=True)
+        move = "/api/tasks/W-0001/move"
+        self.client._call("POST", move,
+                          {"status": "in_progress", "note": "run 7 dispatched"})
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+        self.assertEqual(self.client._call("POST", move,
+                                           {"status": "review"})["status"],
+                         "review")
+        self.assertEqual(self.work.tasks["W-0001"]["storedStatus"], "ready")
+        log = "\n".join(e["message"] for e in self.work.tasks["W-0001"]["log"])
+        self.assertIn("fact: claimed run=7", log)
+        self.assertIn("fact: landed", log)
         with self.assertRaises(WorkError) as ctx:
-            self.client.move_task("W-0001", "done")
+            self.client._call("POST", move, {"status": "done"})
         self.assertEqual(ctx.exception.code, "task_status_forbidden")
-        # Issues are the exception since the resolved/closed collapse: an agent
-        # may close its claimed issue, but never silently — a summary is the
-        # price of the transition.
-        self.client.claim_issue("issue_x")
-        with self.assertRaises(WorkError) as ctx:
-            self.client.set_issue_state("issue_x", "closed")
-        self.assertEqual(ctx.exception.code, "invalid_input")
+
+    # --- ghosts: a report against a human-moved item is history --------------
+
+    def test_a_report_after_a_human_move_changes_nothing_but_history(self) -> None:
+        """Runs 234/238/240/242/249: the human closed the item, the run was
+        killed, and its late report reopened what the human had settled. A
+        human move dismisses every earlier run's narrative, so the report
+        lands as history — the board does not move, and nothing waits."""
+        self.work.add_task("W-0001", "settled by hand", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.work.human_move("W-0001", "done")          # the human settles it
+        self.finish_run(run["id"], "killed", "stopped mid-flight")
+        actions = self.sweep()
+
+        task = self.work.tasks["W-0001"]
+        self.assertEqual(task["status"], "done", "the ghost cannot reopen it")
+        self.assertEqual(task["storedStatus"], "done")
+        log = "\n".join(e["message"] for e in task["log"])
+        self.assertIn("fact: failed", log, "the report is recorded, not refused")
+        self.assertIn({"action": "report", "item": "W-0001", "run": run["id"],
+                       "to": "blocked"}, actions)
+        self.assertEqual([e["id"] for e in self.client.needs_you()], [])
+        # Once only: the report never runs again, and nothing dispatches.
+        self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
+        self.assertEqual(self.sweep(), [])
+
+    def test_a_report_on_a_human_closed_issue_is_refused_once_not_forever(self) -> None:
+        """The issue half of the same ghost. Work refuses a reply to an issue
+        the human closed, and a refused append is terminal: stamp it reported
+        and never retry (two closed issues once became permanent sweep noise,
+        2026-08-20)."""
+        self.work.add_issue("issue_x", "settled by hand", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.work.human_close_issue("issue_x", summary="I did it myself")
+        self.finish_run(run["id"], "done", "Root cause fixed.")
+        actions = self.sweep()
+
+        issue = self.work.issues["issue_x"]
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue["resolutionSummary"], "I did it myself")
+        self.assertEqual([a for a in actions if a["action"] == "report"], [])
+        self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
+        before = self.work.mutation_count()
+        self.sweep()
+        self.assertEqual(self.work.mutation_count(), before, "no retry loop")
 
     # --- the §4 step-5 loop: human answers, session resumes ------------------
 

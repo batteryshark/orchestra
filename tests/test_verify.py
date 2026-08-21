@@ -2,7 +2,6 @@
 import unittest
 
 from dromond import db
-from dromond.work_client import WorkError
 from tests.test_sweeper import SweeperFixture
 
 
@@ -59,14 +58,19 @@ class VerifyTests(SweeperFixture, unittest.TestCase):
         self.assertIn("the seed is there — read missing.txt", log)
         self.assertIn("failed verification", log)
 
-    def test_a_worker_identity_setting_done_is_still_refused(self) -> None:
-        self.work.add_task("W-0001", "forbidden")
-        with self.assertRaises(WorkError) as ctx:
-            self.client.move_task("W-0001", "done")
-        self.assertEqual(ctx.exception.code, "task_status_forbidden")
-        self.work.human_move("W-0001", "done")
-        self.work.human_move("W-0001", "ready")
+    def test_a_bare_verified_fact_earns_nothing(self) -> None:
+        """Sign-off means done only on top of a landing, and only inside a
+        live claim. Without either, `verified` is noise the human outranks."""
+        self.work.add_task("W-0001", "not landed", delegated=True)
+        self.client.log_task("W-0001", "[verify/quiet_owl] fact: verified")
         self.assertEqual(self.work.tasks["W-0001"]["status"], "ready")
+        self.work.agent_claim("W-0001", run=1)
+        self.client.log_task("W-0001", "[verify/quiet_owl] fact: verified")
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+        self.client.log_task("W-0001", "[dromond/x] fact: landed")
+        self.client.log_task("W-0001", "[verify/quiet_owl] fact: verified")
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "done")
+        self.assertEqual(self.work.tasks["W-0001"]["storedStatus"], "ready")
 
     def test_a_depends_on_chain_completes_once_verification_signs_off(self) -> None:
         (self.root / "seed.txt").write_text("ok\n")

@@ -98,10 +98,6 @@ class WorkClient:
 
     # --- writeback: the five contract verbs (CONTRACT §3) ------------------
 
-    def move_task(self, task_id: str, status: str, note: str | None = None):
-        body = {"status": status, **({"note": note} if note else {})}
-        return self._call("POST", f"/api/tasks/{task_id}/move", body)
-
     def check_task_item(self, task_id: str, section: str, index: int, *,
                         checked: bool = True, reason: str | None = None):
         """Tick, untick, or decline one requirement or acceptance criterion."""
@@ -119,15 +115,6 @@ class WorkClient:
     def reply_issue(self, issue_id: str, body: str):
         return self._call("POST", f"/api/agent/issues/{issue_id}/replies",
                           {"body": body})
-
-    def set_issue_state(self, issue_id: str, state: str, reason: str | None = None,
-                        resolution_summary: str | None = None):
-        body = {"state": state}
-        if reason is not None:
-            body["reason"] = reason
-        if resolution_summary is not None:
-            body["resolutionSummary"] = resolution_summary
-        return self._call("POST", f"/api/agent/issues/{issue_id}/state", body)
 
     def create_issue(self, body: str, title: str | None = None,
                      project_path: str | None = None):
@@ -187,11 +174,29 @@ class WorkClient:
         return self._call("POST", "/api/decisions", payload)
 
 
-def verifier_identity(slug: str) -> str:
-    """X-Work-Agent name Work's done-guard keys on (W-0269).
+def fact_line(tag: str, verb: str, **fields) -> str:
+    """One run fact for a task's log or an issue's thread (CONTRACT §3 verb 1,
+    Work docs/ARTIFACT-SCHEMA.md "Run facts").
 
-    Prefix ``verify/``, then the run slug — never the worker's identity.
+    ``tag`` is the bracketed run identity; empty fields are dropped, and the
+    last field's value runs to the end of the line, so pass free text last.
+
+    ponytail: every value is flattened to one line. A task's progress log is
+    line-oriented and a broken fact reads as prose, while an issue's
+    ``summary=`` may legally span lines — the full text is in the report
+    comment beside it either way. Split the flatten per-kind if a board ever
+    wants the paragraphs back.
     """
+    pairs = "".join(f" {key}={' '.join(str(value).split())}"
+                    for key, value in fields.items()
+                    if value is not None and str(value).strip())
+    return f"{tag} fact: {verb}{pairs}"
+
+
+def verifier_identity(slug: str) -> str:
+    """Attribution for a sign-off run (W-0269): ``verify/`` then the run slug,
+    never the worker's identity. A fact carries it as a prefix; Work reads the
+    prefix as attribution, not authority."""
     return f"verify/{slug}"
 
 

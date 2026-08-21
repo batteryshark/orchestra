@@ -120,6 +120,10 @@ class LandingTestCase(unittest.TestCase):
             "VALUES(1,'brave_otter','stub','opencode','work',?,?,?,?,'running',?)",
             (str(self.root), PROJECT_ID, work_item, branch, db.now()))
         self.con.commit()
+        if work_item and work_item.startswith("W-"):
+            # A swept run claims before it works, and its claim is what makes
+            # the facts it reports later count (CONTRACT 0.8).
+            self.work.agent_claim(work_item, run=1)
         return dict(self.con.execute("SELECT * FROM runs WHERE id=1").fetchone())
 
     def thread(self) -> str:
@@ -149,7 +153,11 @@ class LandingTestCase(unittest.TestCase):
         self.assertNotIn(BRANCH, self.branches())
         # The item carries the commit, the files, the checks and the revert.
         self.assertEqual("review", self.work.tasks["W-0001"]["status"])
+        # Derived from the fact, never written: this is the one place that
+        # knows the sha, so it is the one fact that can name one.
+        self.assertEqual("in_progress", self.work.tasks["W-0001"]["storedStatus"])
         log = self.item_log()
+        self.assertIn(f"fact: landed sha={head} revert=git ", log)
         self.assertIn(head, log)
         self.assertIn("feature.py", log)
         self.assertIn("checks: none declared", log)

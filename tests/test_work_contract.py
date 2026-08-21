@@ -28,7 +28,7 @@ import urllib.request
 from pathlib import Path
 
 from dromond import sweeper
-from dromond.work_client import WorkClient, WorkError
+from dromond.work_client import WorkClient, WorkError, fact_line
 
 NODE = shutil.which("node")
 
@@ -36,6 +36,9 @@ NODE = shutil.which("node")
 def _find_work_checkout() -> Path | None:
     candidates = [
         os.environ.get("WORK_CHECKOUT"),
+        # Work's checkout moved out of work-management; both names are tried,
+        # because a skip here reads as green while testing nothing.
+        Path(__file__).resolve().parents[2] / "work",
         Path(__file__).resolve().parents[2] / "work-management" / "project-manager-thing",
     ]
     for candidate in candidates:
@@ -64,14 +67,12 @@ CLIENT_CALLS = [
     # CONTRACT §3 verb 1 — comment.
     ("tasks.log", "POST", "/api/tasks/{id}/log", [{"message"}]),
     ("issues.reply", "POST", "/api/agent/issues/{id}/replies", [{"body"}]),
-    # Verb 2 — transition.
-    ("tasks.move", "POST", "/api/tasks/{id}/move",
-     [{"status"}, {"status", "note"}]),
+    # Lifecycle: an issue claim is ownership. A run's own lifecycle events are
+    # facts on the two comment routes above (CONTRACT 0.8) — it never
+    # transitions an item, so tasks.move and issues.update-state are not
+    # client calls any more.
     ("issues.claim", "POST", "/api/agent/issues/{id}/claim", [set()]),
-    ("issues.update-state", "POST", "/api/agent/issues/{id}/state",
-     [{"state"}, {"state", "reason"}, {"state", "resolutionSummary"},
-      {"state", "reason", "resolutionSummary"}]),
-    # Verb 3 — account for checklist items.
+    # Verb 2 — account for checklist items.
     ("tasks.checklist", "POST", "/api/tasks/{id}/checklist",
      [{"section", "index", "checked"},
       {"section", "index", "declined", "reason"}]),
@@ -258,15 +259,59 @@ class WorkContract(unittest.TestCase):
                                 f"schema rejects (additionalProperties false)")
 
     def test_catalog_vocabulary_covers_what_the_sweeper_sends(self):
-        _, state_op = self.human("GET",
-                                 "/api/agent/operations/issues.update-state")
-        states = state_op["operation"]["inputSchema"]["properties"]["state"]
-        self.assertLessEqual({"in_progress", "needs_human", "closed"},
-                             set(states["enum"]))
         _, check_op = self.human("GET", "/api/agent/operations/tasks.checklist")
         sections = check_op["operation"]["inputSchema"]["properties"]["section"]
         self.assertLessEqual({"requirements", "acceptance"},
                              set(sections["enum"]))
+
+    # --- CONTRACT 0.8: facts derive the board, and never write status --------
+
+    def test_the_facts_the_sweeper_appends_derive_the_board(self):
+        """Exactly the lines dromond now emits, against the real deriver."""
+        task = self.new_task("Fact grammar", delegated=True, status="ready")
+        item, tag = task["id"], "[dromond/brisk_otter]"
+
+        self.client.log_task(item, fact_line(tag, "claimed", run=41))
+        self.assertEqual(self.client.task(item)["status"], "in_progress")
+        self.client.log_task(item, fact_line(
+            tag, "landed", sha="9c1f2ab", revert="git revert -m 1 9c1f2ab"))
+        landed = self.client.task(item)
+        self.assertEqual(landed["status"], "review")
+        self.assertEqual(landed["storedStatus"], "ready")
+        self.client.log_task(item, fact_line("[verify/quiet_owl]", "verified"))
+        self.assertEqual(self.client.task(item)["status"], "done")
+
+        # The human takes it back, and every earlier fact becomes history.
+        self.human("POST", f"/api/tasks/{item}/move", {"status": "blocked"})
+        self.client.log_task(item, fact_line(tag, "landed"))
+        settled = self.client.task(item)
+        self.assertEqual((settled["status"], settled["storedStatus"]),
+                         ("blocked", "blocked"))
+
+    def test_a_halt_reason_reaches_the_board(self):
+        task = self.new_task("Halting", delegated=True, status="ready")
+        item, tag = task["id"], "[dromond/brisk_otter]"
+        self.client.log_task(item, fact_line(tag, "claimed", run=42))
+        self.client.log_task(item, fact_line(tag, "halted",
+                                             reason="the staging box is down"))
+        halted = self.client.task(item)
+        self.assertEqual(halted["status"], "blocked")
+        self.assertEqual(halted["blockedReason"], "the staging box is down")
+        self.assertIn(item, [entry["id"] for entry in self.client.needs_you()])
+
+    def test_the_log_route_gates_nothing_so_orchestra_accounts_first(self):
+        """The checklist gate lives on the legacy move bridge, not on the log
+        route a fact is appended through. Work therefore does NOT refuse a
+        `landed` fact with criteria open — dromond/sweeper.py declines them on
+        the run's behalf BEFORE appending the fact, and that ordering is the
+        only thing keeping CONTRACT §3 verb 2 true."""
+        task = self.new_task("Ungated append", delegated=True, status="ready",
+                             acceptanceCriteria=["tests pass"])
+        item, tag = task["id"], "[dromond/brisk_otter]"
+        self.client.log_task(item, fact_line(tag, "claimed", run=43))
+        self.client.log_task(item, fact_line(tag, "landed"))
+        self.assertEqual(self.client.task(item)["status"], "review")
+        self.assertFalse(self.client.task(item)["acceptanceCriteria"][0]["checked"])
 
     # --- verb 5 and its gate --------------------------------------------------
 
@@ -305,24 +350,24 @@ class WorkContract(unittest.TestCase):
         self.assertEqual(issue["state"], "queued")
         issue_id = issue["id"]
 
+        # Claiming is ownership AND the run's first fact; everything after it
+        # is a fact in the thread (CONTRACT 0.8).
         self.assertEqual(self.client.claim_issue(issue_id)["state"],
                          "in_progress")
+        tag = "[dromond/brisk_otter]"
         self.assertEqual(
-            self.client.set_issue_state(issue_id, "needs_human",
-                                        reason="which fix?")["state"],
+            self.client.reply_issue(issue_id, fact_line(
+                tag, "needs_human", reason="which fix?"))["state"],
             "needs_human")
-        with self.assertRaises(WorkError) as caught:
-            self.client.set_issue_state(issue_id, "closed")
-        self.assertEqual(caught.exception.status, 400)  # summary required
-        # "resolved" is the legacy alias old clients still send; it stores
-        # "closed" (Work collapsed the two on 2026-08-14).
-        closed = self.client.set_issue_state(issue_id, "resolved",
-                                             resolution_summary="plugged it")
+        closed = self.client.reply_issue(issue_id, fact_line(
+            tag, "resolved", summary="plugged it"))
         self.assertEqual(closed["state"], "closed")
         self.assertEqual(closed["resolutionSummary"], "plugged it")
+        self.assertEqual(closed["storedState"], "queued")
+        # A run cannot talk its way past the close it derived, human or not.
         with self.assertRaises(WorkError) as caught:
-            self.client.set_issue_state(issue_id, "in_progress")
-        self.assertEqual(caught.exception.code, "issue_reopen_forbidden")
+            self.client.reply_issue(issue_id, "one more thing")
+        self.assertEqual(caught.exception.code, "issue_closed")
 
     def test_agent_filed_issue_starts_queued_and_not_delegated(self):
         created = self.client.create_issue("retry loop leaks connections",
@@ -348,20 +393,11 @@ class WorkContract(unittest.TestCase):
 
     # --- checklist gate ---------------------------------------------------------
 
-    def test_checklist_gate_holds_review_until_accounted(self):
+    def test_declining_is_always_available_and_only_silence_is_refused(self):
         task = self.new_task("Gated goal", delegated=True, status="ready",
                              requirements=["keep the API stable"],
                              acceptanceCriteria=["tests pass", "docs updated"])
         item_id = task["id"]
-        self.assertEqual(self.client.move_task(item_id, "in_progress")["status"],
-                         "in_progress")
-        with self.assertRaises(WorkError) as caught:
-            self.client.move_task(item_id, "review")
-        self.assertEqual((caught.exception.status, caught.exception.code),
-                         (409, "review_checklist_incomplete"))
-        with self.assertRaises(WorkError) as caught:
-            self.client.move_task(item_id, "done")
-        self.assertEqual(caught.exception.code, "task_status_forbidden")
 
         # A decline without a reason is refused, not silently accounted for.
         with self.assertRaises(WorkError):
@@ -369,11 +405,9 @@ class WorkContract(unittest.TestCase):
 
         self.client.check_task_item(item_id, "requirements", 0, checked=True)
         self.client.check_task_item(item_id, "acceptance", 0, checked=True)
-        self.client.check_task_item(item_id, "acceptance", 1,
-                                    reason="blocked on the docs freeze")
-        moved = self.client.move_task(item_id, "review", note="run finished")
-        self.assertEqual(moved["status"], "review")
-        declined = moved["acceptanceCriteria"][1]
+        accounted = self.client.check_task_item(
+            item_id, "acceptance", 1, reason="blocked on the docs freeze")
+        declined = accounted["acceptanceCriteria"][1]
         self.assertEqual((declined["declined"], declined["reason"]),
                          (True, "blocked on the docs freeze"))
 

@@ -820,26 +820,33 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
 
 
 def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> None:
-    """Thread comment, then the transition: ``review`` landed, ``blocked`` not."""
+    """Thread comment, then the run's fact: ``landed`` with the sha that
+    reverts it, or ``halted`` with the escalation. This is the only place that
+    knows the sha, so it is the only fact that can name one."""
     item = run.get("work_item")
     if not messaging.mirror_to_work(cfg, item, report):
         return  # no item, Work off, or Work down — the run thread still has it
     if not item.startswith("W-"):
-        # ponytail: an issue has no `review` state, and its resolution is the
-        # sweeper's own report. The merge outcome is in its thread either way.
+        # ponytail: an issue's outcome is the sweeper's own report fact. The
+        # merge outcome is in its thread either way.
         return
     client = work_client.from_cfg(cfg)
-    target = "review" if result["ok"] else "blocked"
+    tag = f"[{client.identity}/{run.get('slug') or run['id']}]"
+    fact = (work_client.fact_line(tag, "landed", sha=result["commit"],
+                                  revert=result["revert_command"])
+            if result["ok"] else
+            work_client.fact_line(tag, "halted",
+                                  reason=_note(run, result, None)[:300]))
     try:
-        moved = client.move_task(item, target, note=_note(run, result, None)[:300])
+        posted = client.log_task(item, fact)
     except WorkError as exc:
-        print(f"dromond: run {run['id']} could not move {item} to {target}: {exc}",
+        print(f"dromond: run {run['id']} fact for {item} refused: {exc}",
               file=sys.stderr)
         return
-    if moved is not None and not result["ok"]:
+    if posted is not None and not result["ok"]:
         # The run itself succeeded, so the sweeper's completion report would
-        # move this item to `review` and undo the escalation. Claim the
-        # writeback here: this comment IS the report for that run.
+        # append `landed` and bury the escalation. Claim the writeback here:
+        # this comment IS the report for that run.
         con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
                     (db.now(), run["id"]))
         con.commit()
