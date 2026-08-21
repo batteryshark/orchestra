@@ -1224,5 +1224,36 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertEqual({"five_hour": 2.0}, runway.parse_claude_screen(noisy))
 
 
+class ExhaustionTests(unittest.TestCase):
+    """Per-profile burn (W-0249): a live zero is a wall; unknown and stale are not."""
+
+    def test_a_live_zero_is_exhausted(self) -> None:
+        reason = runway.exhaustion(
+            {"remaining": 0, "unit": "percent", "resets_at": None, "as_of": None})
+        self.assertIsNotNone(reason)
+        self.assertIn("0% left", reason)
+
+    def test_unknown_and_headroom_are_available(self) -> None:
+        self.assertIsNone(runway.exhaustion(None))
+        self.assertIsNone(runway.exhaustion({"remaining": None, "reason": "down"}))
+        self.assertIsNone(runway.exhaustion({"remaining": 12, "unit": "percent"}))
+
+    def test_stale_or_expired_zero_is_available(self) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self.assertIsNone(runway.exhaustion(
+            {"remaining": 0, "unit": "percent", "as_of": old}))
+        self.assertIsNone(runway.exhaustion(
+            {"remaining": 0, "unit": "percent", "resets_at": past}))
+
+    def test_profile_burns_records_the_provider_wall(self) -> None:
+        burns = runway.profile_burns(
+            {"big": {"backend": "opencode", "model": "anthropic/opus"},
+             "stub": {"backend": "opencode"}},
+            {"anthropic": {"remaining": 0.0, "unit": "percent"}})
+        self.assertEqual(list(burns), ["big"])
+        self.assertIn("0% left", burns["big"])
+
+
 if __name__ == "__main__":
     unittest.main()
