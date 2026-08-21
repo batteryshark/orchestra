@@ -45,7 +45,7 @@ Human-first: the person delegates, approves, and closes; Dromond executes.
 Work (system of record)
   goal / task, ticked `delegated` by a human
         │  sweeper claims                              ▲
-        ▼                                              │ comments, transitions,
+        ▼                                              │ comments, facts,
 Dromond daemon (LaunchAgent, Mac, ~/.dromond)          │ artifacts, issues,
   dispatch → worktree run → supervise → complete ──────┘ proposals
         │           │            │
@@ -69,11 +69,11 @@ that needs Work directly uses the `work` CLI, which carries the same identity
 and exposes its own capability catalog (`work agent operations`,
 `work agent instructions <op>`).
 
-Every write is made by Dromond's code: the sweeper claims and transitions, the
+Every write is made by Dromond's code: the sweeper claims and reports facts, the
 supervisor files findings and proposals, merge posts its comment, the conductor
 logs planner turns. What remains for a run is occasional context reading.
 
-**Five verbs**: comment, transition, attach, file-issue, and **propose
+**Five verbs**: comment, check, attach, file-issue, and **propose
 follow-on work** — create a task always parented to a delegated goal item,
 always `delegated: false`, never top-level, attributed to the run. Work enforces
 the last one with a gate rejecting agent-created tasks that lack a goal parent.
@@ -192,9 +192,9 @@ field by design, so the board's order *is* the priority signal: reordering the
 lane from the phone changes what runs next. Explicit `--after` dependencies
 between runs are also honored.
 
-**Queue state stays honest**: an item transitions to `in_progress` only at
-actual dispatch, never on entering the queue, and anything waiting shows its
-reason. A board that claims something is running while it waits stops being
+**Queue state stays honest**: an item reads `in_progress` only from a claim
+fact appended at actual dispatch, never on entering the queue, and anything
+waiting shows its reason. A board that claims something is running while it waits stops being
 trusted.
 
 **A pause-dispatch switch** stops new runs starting without touching those in
@@ -581,8 +581,9 @@ run's stale snapshot goes. A conflict in anything the base *does* track is
 untouched and still reaches the human, which is the only kind of conflict worth
 their attention.
 
-The Work item transitions to `review`, and the thread comment carries the merge
-commit, files changed, check results, and **the revert command**.
+The run appends `fact: landed sha=… revert=…`, so the item reads `review`, and
+the thread comment carries the merge commit, files changed, check results, and
+**the revert command**.
 
 **Sign-off is a run (W-0269).** When a swept item reaches `review` and
 `[work] verify` is on, the runner records a verification run on
