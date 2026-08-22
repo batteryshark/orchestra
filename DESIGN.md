@@ -785,6 +785,8 @@ A containment profile bounds what a run may reach at the process level.
 Every section above is built. Full reasoning for each decision, including the
 options rejected, lives in the Work item's log, which is not public. This
 document is the settled result; the rows below say which item settled what.
+The items were archived with the 2026-08-21 reset: they resolve under
+`~/Projects/.archive/work-trees-2026-08-21/Projects/`, not in the live store.
 
 | Ticket | Decision |
 |---|---|
