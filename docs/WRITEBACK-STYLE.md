@@ -34,4 +34,4 @@ Give estimates in concrete units. Do not write "some work" or "a while".
 
 ### Scope
 
-This style governs the text of all five contract verbs: comments, resolution summaries, filed issues, proposed tasks, and recommendation reasons.
+This style governs every run handoff and any optional adapter writeback.

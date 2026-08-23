@@ -1,11 +1,9 @@
 """The two messaging verbs (DESIGN §6): ``tell`` and ``ask``.
 
-``tell`` is non-blocking and lands at a safe boundary. Its row kind stays
-``interrupt`` because that IS the delivery machinery the supervisor already
-runs (pending offset -> stop at a completed action boundary -> resume the
-same backend session with the body embedded). ``orchestra tell`` is the
-DESIGN name for scheduling one; ``orchestra interrupt --now`` is the
-emergency variant of the same row.
+``tell`` is non-blocking. Exec runs receive it at a completed action boundary
+after stop and resume. ACP runs use their live protocol channel. Its row kind
+stays ``interrupt`` because both transports share the same delivery record.
+``orchestra interrupt --now`` is the emergency variant.
 
 ``ask`` is blocking with a declared fallback. The worker files a question,
 ends its turn, and the harness's Stop hook (``orchestra hook``) holds the
@@ -23,15 +21,16 @@ delivery is marked with a reason and surfaced (``orchestra show``,
 run: a correction handed to a run that never saw the context it referred to
 is worse than no correction.
 
-Scope (DESIGN §6): human-to-run and parent-to-child. Arbitrary run-to-run
-messaging is out, and ``ask`` targets the human only.
+Scope (DESIGN §6): human-to-run and run-to-human. Arbitrary run-to-run
+messaging is out, child launch is not implemented, and ``ask`` targets the
+human only.
 """
 import os
 import sqlite3
 
 from orchestra import db, nod, traces, work_client
 
-DELIVERY_KIND = "interrupt"   # a queued tell, delivered at a safe boundary
+DELIVERY_KIND = "interrupt"   # a tell, delivered by exec boundary or live ACP
 ASK_KIND = "ask"              # the run's question (outbound)
 ANSWER_KIND = "answer"        # the human's answer (inbound, injected)
 

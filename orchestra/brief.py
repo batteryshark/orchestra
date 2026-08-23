@@ -11,11 +11,11 @@ PROTOCOL_CARD = """\
 ## Protocol
 
 - Keep file changes inside the working directory.
-- Never run git write commands. The host checkpoints and lands this worktree.
-- Sandbox: worktree yes, .git no (EPERM), /tmp yes. Leave files; do not work around it.
+- Never run git write commands. Orchestra checkpoints isolated runs and may land their branches.
+- Sandbox: working directory yes, .git host-owned, /tmp yes. Leave files; do not work around it.
 - Operator messages may arrive between actions; apply them, then continue the mission.
 - Your final message is the handoff: what changed, how you verified it, what remains.
-- End it with a ```json block: {"findings": [], "proposals": []} — both keys required, [] is fine. "halt": "reason" stops the run until a human moves the item to ready.
+- End it with a ```json block: {"findings": [], "proposals": []} — both keys required, [] is fine. "halt": "reason" marks the run halted.
 - finding: {claim, where, confidence: observed|suspected, why_not_fixed}. proposal: {title, why}.
 """
 
@@ -46,13 +46,8 @@ def writeback_section() -> str:
 
 
 def _protocol_card(profile: dict) -> str:
-    """D11: mention spawning ONLY when this profile may delegate, then name
-    the permitted profiles — a worker is never taught a forbidden verb."""
-    spawn = profile.get("spawn_profiles") or []
-    if not spawn:
-        return PROTOCOL_CARD
-    return PROTOCOL_CARD + \
-        f"- You may delegate child runs, only to these profiles: {', '.join(spawn)}.\n"
+    """Return the fixed protocol. Child launch is not implemented."""
+    return PROTOCOL_CARD
 
 
 def compose(*, run_id: int, slug: str | None, profile: dict, mission: str,

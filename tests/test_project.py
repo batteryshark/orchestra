@@ -1,4 +1,4 @@
-"""Central paths and the directory -> Work projectId mapping (DESIGN §2)."""
+"""Central paths and local or Work-backed project resolution (DESIGN §2)."""
 import os
 import tempfile
 import unittest
@@ -117,7 +117,8 @@ class ProjectResolutionTests(unittest.TestCase):
         self.seed()
         with self.assertRaises(SystemExit) as ctx:
             self.resolve(self.tmp_path)
-        self.assertIn("not inside a known Work project", str(ctx.exception))
+        self.assertIn("not inside a registered project", str(ctx.exception))
+        self.assertIn("orchestra project add .", str(ctx.exception))
 
     def test_offline_resolution_uses_the_cache(self) -> None:
         """Work unreachable: the CLI still resolves from the cached mapping."""

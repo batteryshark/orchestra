@@ -1,12 +1,8 @@
-"""Resolve a directory to a Work project (DESIGN §2).
+"""Resolve a directory through Orchestra's central project registry.
 
-The CLI no longer walks up for a state directory — there is none. It asks
-Work which projects exist and matches the deepest one containing the
-current directory. Everything downstream keys on Work's immutable
-``projectId``, so renaming a project folder loses no settings.
-
-The mapping is cached in the central database: an offline CLI still
-resolves, and only a miss costs a refresh.
+Projects may be adopted locally or cached from Work. The deepest registered
+path containing the current directory wins. Everything downstream uses the
+stored project id, so renaming a Work-backed project folder loses no settings.
 """
 import os
 import uuid
@@ -15,9 +11,9 @@ from pathlib import Path
 from orchestra import paths, work_client
 
 MISS_HINT = """\
-orchestra: {path} is not inside a known Work project.
-Create the project in Work (a `.work/project.json` marker), or point
-[work] api_url at the right server, then retry."""
+orchestra: {path} is not inside a registered project.
+Run `orchestra project add .`, or enable [work] and point api_url at a Work
+server that knows this directory, then retry."""
 
 
 class Project:

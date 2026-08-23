@@ -2,9 +2,9 @@
 
 Merge order: built-in defaults <- ~/.config/orchestra/config.toml <-
 that file's [project."<projectId>"] table (shallow, per table). Per-project
-settings key on Work's immutable projectId and live in Orchestra's own config
-— never in the project directory, which gets no state at all (DESIGN §2),
-and never in .work/, which the contract forbids.
+settings key on the central registry id. Work-backed projects use Work's
+immutable projectId. Settings live in Orchestra's config, never in the project
+directory or in .work/ (DESIGN §2).
 
 **Profiles are GLOBAL presets (W-0187).** A project does not change what a
 profile IS; it chooses WHICH of them it may staff, with one key:
@@ -18,11 +18,10 @@ that already has ten of them. An explicit list means only those, and
 still carries one fails loudly (``LEGACY_PROJECT_PROFILES_ERROR``) rather
 than reading as "no overrides".
 
-Enablement binds at exactly two moments and nowhere else: when a run is
-STAFFED (``staff_profile`` below) and when a running agent DELEGATES
-(``spawn.check_target``). A run already in flight is NEVER revalidated —
-``profile_cfg`` is the unchecked read the relaunch/continuation paths use,
-and an existing run trying a stale preset is the owner's accepted cost.
+Enablement binds when a run is staffed (``staff_profile`` below). The
+reserved child-run validator also checks it, although child launch is not
+implemented. A run already in flight is not revalidated: ``profile_cfg`` is
+the unchecked read used by relaunch and continuation paths.
 
 Profiles are launch templates ONLY (DESIGN D4/D10): any number of
 concurrent runs may share one, and nothing addresses a run by its profile
@@ -38,9 +37,8 @@ from orchestra import paths
 
 DEFAULT_RUN_TIMEOUT_SECONDS = 36000
 DEFAULT_STALL_TIMEOUT_SECONDS = 1800
-# Spawn bounds (DESIGN §5). Deliberately NOT concurrency caps (§4 has none):
-# these bound the spawn *tree*, the only way run count grows without a human
-# ticking something.
+# Reserved child-run bounds (DESIGN §5). They are not concurrency caps, and no
+# production path launches a child today.
 DEFAULT_MAX_SPAWN_DEPTH = 3
 DEFAULT_MAX_CHILDREN_PER_RUN = 5
 
@@ -88,9 +86,10 @@ def priority_of(profile: dict) -> int:
 DEFAULT_CONFIG = f"""\
 # Orchestra profiles + settings. The only file: ~/.config/orchestra/config.toml
 #
-# Per-project overrides go in a [project."<projectId>"] table in THIS file,
-# keyed on Work's immutable projectId (.work/project.json "id"). Settings
-# tables have the same shape as the top level and merge over it:
+# Per-project overrides go in a [project."<projectId>"] table in THIS file.
+# Use the id shown by `orchestra project list`; Work-backed projects retain
+# Work's immutable projectId. Settings tables have the same shape as the top
+# level and merge over it:
 #
 #   [project."53efe3c3-6def-4797-8560-3dce073d7d63".settings]
 #   timeout = 7200
@@ -105,23 +104,22 @@ DEFAULT_CONFIG = f"""\
 timeout = {DEFAULT_RUN_TIMEOUT_SECONDS}           # hard cap for a runaway worker (10 hours)
 stall_timeout = {DEFAULT_STALL_TIMEOUT_SECONDS}   # kill after no worker output (30 minutes); 0 disables
 default_requester = "human"
-# Read-only directories a run may reach outside its worktree, passed to the
-# backend as --add-dir (DESIGN §12). Declared, never discovered: usually in a
-# [project."<projectId>".settings] table. A profile may override the list.
-# OpenCode has no --add-dir: a declaration is ignored there, with a warning.
+# Additional directories passed through the harness's native access flag
+# (DESIGN §12). Permissions vary by harness and may include writes. Declare
+# them explicitly, usually in a [project."<projectId>".settings] table. A
+# profile may override the list. OpenCode ignores this setting with a warning.
 # add_dirs = ["~/Projects/reference-repo"]
 # Raw backend JSONL ages out after this many days, for TERMINAL runs only
 # (DESIGN §7). Normalized trace events are kept indefinitely; pruning only
 # loses expand-in-place detail. Run it with `orchestra traces prune`.
 raw_log_retention_days = 30
-# Spawn-tree bounds (DESIGN §5): how deep delegation may nest, and how many
-# children one run may spawn. These are the only bound on run count growing
-# on its own — there is no concurrency cap anywhere in Orchestra (§4).
+# Reserved child-launch bounds. Orchestra validates these legacy settings but
+# does not yet create or launch child runs.
 max_spawn_depth = {DEFAULT_MAX_SPAWN_DEPTH}
 max_children_per_run = {DEFAULT_MAX_CHILDREN_PER_RUN}
-# The spin observer (DESIGN §7). There are NO budgets and no run ceilings: a
+# Optional observer policy. There are no budgets and no run ceilings: a
 # long run is a good run, and this is what catches a feral one instead.
-# observer_profile picks the cheap model that judges transcripts out of band;
+# observer_profile picks the model that judges transcripts out of band;
 # with none set, the one profile marked tier = 1 (workhorse) is used, and with
 # neither the observer says so and stays off. Set it per project in a
 # [project."<projectId>".settings] table to give that project's goals their
@@ -133,7 +131,7 @@ max_children_per_run = {DEFAULT_MAX_CHILDREN_PER_RUN}
 # row, and how many consecutive edits to one file, count as spinning.
 # loop_repeats = 6
 # loop_file_repeats = 8
-# The conductor (DESIGN §10). A goal is a Work task tagged `goal` and ticked
+# Optional Work conductor policy. A goal is a Work task tagged `goal` and ticked
 # delegated; planner_profile picks the mid-tier model that takes its planner
 # turns. With none set, the one profile marked tier = 2 (generalist) is used,
 # and with neither the conductor says exactly what to add and takes no turn.
@@ -145,7 +143,7 @@ max_children_per_run = {DEFAULT_MAX_CHILDREN_PER_RUN}
 # {{root}} expands to the project root.
 [worker_env]
 
-# --- Work integration (CONTRACT.md; the sweeper) --------------------------
+# --- Optional Work intent/ledger adapter ----------------------------------
 # Off unless enabled. agent_identity is the X-Work-Agent name Orchestra posts
 # as. A human hands an item to automation by ticking its `delegated` flag
 # (CONTRACT v0.2 §2). profile picks the launch template used for swept
@@ -178,7 +176,7 @@ worktree = true
 verify = false
 # verify_profile = "judge"
 
-# --- Nod: the human loop (DESIGN §8) --------------------------------------
+# --- Optional Nod notification adapter -----------------------------------
 # Escalations are delivered as Nod request cards. Off unless enabled.
 # A Nod issuer token is scoped to exactly ONE channel, so Orchestra holds two
 # (decisions, alerts). Neither token, the base url, nor the channel ids live
@@ -228,8 +226,7 @@ expires_after = 86400
 # lane:    claude only. "quota" unsets ANTHROPIC_API_KEY so `-p` uses the
 #          Max subscription. "api" keeps the key. Spent quota retries once
 #          on the api lane when a key is present. The trace names the lane.
-# spawn_profiles: profiles this one may delegate to (D11); absent/empty =
-#                 may not delegate at all
+# spawn_profiles: reserved compatibility field; child launch is not implemented
 # note / note_at: freeform headroom note + when it was written (D10);
 #                 `orchestra profiles note NAME "..."` sets both
 
