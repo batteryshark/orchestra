@@ -18,11 +18,10 @@ Deterministic code only (DESIGN principle 6) — one pass:
   advance after a fully successful pass.
 """
 import datetime
-import sqlite3
 import time
 from pathlib import Path
 
-from orchestra import (brief, config, db, dispatch, names, paths, project,
+from orchestra import (brief, config, db, dispatch, paths, project,
                          router, supervise, traces, verify)
 from orchestra.work_client import WorkClient, WorkError, fact_line, from_cfg
 
@@ -163,24 +162,15 @@ def _last_session_run(con, item_id: str):
 
 
 def _insert_run(con, proj, profile_name: str, profile: dict, title: str,
-                item_id: str, seen_ts: str | None) -> tuple[int, str]:
-    """Fresh run row mapped to a Work item (same slug-mint loop as dispatch)."""
-    for _ in range(names.MAX_ATTEMPTS + 4):
-        slug = names.assign_slug(con)
-        try:
-            cur = con.execute(
-                "INSERT INTO runs(slug, profile, backend, model, title, "
-                "requested_by, workdir, project_id, status, started_at, work_item, "
-                "work_seen_ts) VALUES(?,?,?,?,?,?,?,?, 'spawning', ?,?,?)",
-                (slug, profile_name, profile["backend"], profile.get("model"),
-                 title, "work", str(proj.path), proj.project_id, db.now(),
-                 item_id, seen_ts))
-            return int(cur.lastrowid), slug
-        except sqlite3.IntegrityError as exc:
-            if not names.is_unique_violation(exc):
-                raise
-            names.reset_memory_cache()
-    raise RuntimeError("orchestra: could not mint a unique run slug")
+                item_id: str, seen_ts: str | None,
+                routed_reason: str | None = None):
+    """Reserve one fresh Work run through the common admission boundary."""
+    return supervise.create_run(
+        con, profile=profile_name, backend=profile["backend"],
+        model=profile.get("model"), title=title, requested_by="work",
+        workdir=str(proj.path), project_id=proj.project_id,
+        work_item=item_id, work_seen_ts=seen_ts,
+        routed_reason=routed_reason)
 
 
 # --- seams (W-0099, the conductor) ------------------------------------------
@@ -372,22 +362,30 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
         try:
             prior = _last_session_run(con, item_id)
             if prior:
-                late_pause = dispatch.pause_state(con)
-                if late_pause is not None:
-                    if dispatch.hold(con, item_id, kind, _lane, "paused",
-                                     late_pause.get("note")):
-                        actions.append({"action": "hold", "item": item_id,
-                                        "reason": "paused",
-                                        "detail": late_pause.get("note")})
+                run, blocked = supervise.reserve_followup(
+                    con, root, prior, "work", title=prior["title"])
+                if run is None:
+                    if blocked == "paused":
+                        late_pause = dispatch.pause_state(con) or {}
+                        if dispatch.hold(con, item_id, kind, _lane, "paused",
+                                         late_pause.get("note")):
+                            actions.append({"action": "hold", "item": item_id,
+                                            "reason": "paused",
+                                            "detail": late_pause.get("note")})
                     continue
-                # An issue claim is ownership and must precede a reply. It is
-                # deliberately adjacent to setup so a late pause cannot claim
-                # work that will not start.
-                prior_tag = f"[{client.identity}/{prior['slug'] or prior['id']}]"
-                claimed = (client.claim_issue(item_id) if kind == "issue" else
-                           client.log_task(item_id, fact_line(
-                               prior_tag, "claimed", run=int(prior["id"]))))
+                run_id, slug = int(run["id"]), run["slug"]
+                tag = f"[{client.identity}/{slug}]"
+                try:
+                    claimed = (client.claim_issue(item_id) if kind == "issue" else
+                               client.log_task(item_id, fact_line(
+                                   tag, "claimed", run=run_id)))
+                except WorkError:
+                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+                    con.commit()
+                    raise
                 if claimed is None:
+                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+                    con.commit()
                     ok = False
                     continue
                 news = _new_human_comments(item, kind, prior["work_seen_ts"],
@@ -395,18 +393,16 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                 text = _comments_text(news, item_id) or \
                     f"Work {kind} {item_id} was handed back; continue the mission."
                 try:
-                    run_id = supervise.create_followup(
-                        con, root, dict(prior), "work", text, title=prior["title"])
+                    supervise.prepare_followup(con, root, prior, run, text)
                 except (Exception, SystemExit) as exc:
                     error = str(exc)[:1000] or exc.__class__.__name__
                     print(f"orchestra sweep: {item_id} launch setup failed: {error}")
                     actions.append({"action": "launch_failed", "item": item_id,
-                                    "reason": error})
+                                    "run": run_id, "reason": error})
                     if not _report(con, client, actions):
                         ok = False
                     ok = False
                     continue
-                slug = None
             else:
                 # SEAM (W-0183): the staffing turn. A fresh dispatch is the
                 # one moment a profile is CHOSEN — a continuation above keeps
@@ -426,10 +422,20 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                 # row (`work_item`) and at the head of the brief, so repeating
                 # "Work issue issue_abc123:" here only eats the width the
                 # board has for saying what the run is about.
-                run_id, slug = _insert_run(con, proj, profile_name, profile,
-                                           (item.get("title") or item_id)[:80],
-                                           item_id, None)
-                run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+                run, blocked = _insert_run(
+                    con, proj, profile_name, profile,
+                    (item.get("title") or item_id)[:80], item_id,
+                    item.get("updatedAt"), routed)
+                if run is None:
+                    if blocked == "paused":
+                        late_pause = dispatch.pause_state(con) or {}
+                        if dispatch.hold(con, item_id, kind, _lane, "paused",
+                                         late_pause.get("note")):
+                            actions.append({"action": "hold", "item": item_id,
+                                            "reason": "paused",
+                                            "detail": late_pause.get("note")})
+                    continue
+                run_id, slug = int(run["id"]), run["slug"]
                 tag = f"[{client.identity}/{slug}]"
                 try:
                     claimed = (client.log_task(
@@ -466,7 +472,7 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                     ok = False
                     continue
             con.execute("UPDATE runs SET work_item=?, work_seen_ts=?, "
-                        "routed_reason=? WHERE id=?",
+                        "routed_reason=COALESCE(routed_reason, ?) WHERE id=?",
                         (item_id, item.get("updatedAt") or db.now(), routed, run_id))
             con.commit()
             tag = f"[{client.identity}/{slug or run_id}]"

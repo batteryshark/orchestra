@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import daemon, db, dispatch, proc, service, runway
+from orchestra import daemon, db, dispatch, proc, service, supervise, runway
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -52,14 +52,66 @@ class DaemonTests(unittest.TestCase):
         # PID 1 exists (launchd) and is not ours -> alive; a free high pid is not.
         dead = self._run(supervisor_pid=_free_pid())
         alive = self._run(supervisor_pid=os.getpid())
+        stale = self._run(status="spawning")
+        fresh = self._run(status="spawning")
+        malformed = self._run(status="spawning")
+        self.con.execute("UPDATE runs SET started_at='2000-01-01T00:00:00+00:00' "
+                         "WHERE id=?", (stale,))
+        self.con.execute("UPDATE runs SET started_at='not-a-time' WHERE id=?",
+                         (malformed,))
         self.con.commit()
         report = daemon.tick()
-        self.assertEqual(report["reaped"], [dead])
+        self.assertEqual(report["reaped"], [dead, stale, malformed])
         rows = {r["id"]: r for r in self.con.execute("SELECT * FROM runs")}
         self.assertEqual(rows[dead]["status"], "failed")
         self.assertIn("vanished", rows[dead]["summary"])
         self.assertIsNotNone(rows[dead]["finished_at"])
         self.assertEqual(rows[alive]["status"], "running")
+        self.assertEqual(rows[stale]["status"], "failed")
+        self.assertTrue(supervise.never_started(rows[stale]))
+        self.assertIn("no supervisor claimed", rows[stale]["summary"])
+        self.assertEqual(supervise.supervise(Path("/p"), stale), 1,
+                         "a delayed child must lose the terminal CAS")
+        self.assertEqual(rows[fresh]["status"], "spawning",
+                         "the handoff grace protects a child that may be starting")
+        self.assertTrue(supervise.never_started(rows[malformed]))
+
+        # Preparation can finish after the stale scan but before the reaper's
+        # write lock. Its refreshed launch clock must win that race.
+        self.con.execute("UPDATE runs SET status='killed' WHERE id=?", (fresh,))
+        raced = self._run(status="spawning")
+        self.con.execute("UPDATE runs SET started_at='1999-01-01T00:00:00+00:00' "
+                         "WHERE id=?", (raced,))
+        self.con.commit()
+        preparation = db.connect()
+        real_datetime = daemon.datetime
+        refreshed = []
+
+        class RefreshDuringScan:
+            @staticmethod
+            def now(tz=None):
+                return real_datetime.now(tz)
+
+            @staticmethod
+            def fromisoformat(value):
+                parsed = real_datetime.fromisoformat(value)
+                if not refreshed:
+                    preparation.execute("UPDATE runs SET started_at=? WHERE id=?",
+                                        (db.now(), raced))
+                    preparation.commit()
+                    refreshed.append(True)
+                return parsed
+
+        try:
+            with mock.patch.object(daemon, "datetime", RefreshDuringScan):
+                self.assertEqual(daemon._reap_orphans(self.con), [])
+        finally:
+            preparation.close()
+        raced_row = self.con.execute(
+            "SELECT * FROM runs WHERE id=?", (raced,)).fetchone()
+        self.assertEqual(raced_row["status"], "spawning")
+        self.assertNotEqual(raced_row["started_at"],
+                            "1999-01-01T00:00:00+00:00")
 
     def test_tick_leaves_a_finished_run_alone(self) -> None:
         done = self._run(status="done", supervisor_pid=_free_pid())

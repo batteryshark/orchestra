@@ -16,10 +16,9 @@ insert the run row, ``supervise.prepare_launch``, spawn the supervisor. The
 deferred path ('pending' rows the daemon releases) exists for dependency-gated
 dispatches, and a resolver has none — its parent is already terminal.
 """
-import sqlite3
 import sys
 
-from orchestra import config, db, dispatch, merge, names, paths, project, supervise
+from orchestra import config, db, dispatch, merge, paths, project, supervise
 
 # Seam for tests: a test never launches a real harness.
 launcher = supervise.spawn_supervisor
@@ -124,31 +123,20 @@ def resolver_profile(cfg: dict) -> tuple[str, dict] | None:
     return heavy[0][0], config.profile_cfg(cfg, heavy[0][0])
 
 
-def _insert(con, failed, root, profile_name: str, profile: dict) -> int:
+def _insert(con, failed, root, profile_name: str, profile: dict):
     """A run row with lineage: ``parent_run`` is the failed run and
     ``work_item`` carries over, so the sweeper's writeback and the dashboard's
-    lineage rendering keep working. Same slug-mint loop as dispatch."""
+    lineage rendering keep working."""
     title = f"Resolve the landing of {failed['branch']}"[:80]
-    for _ in range(names.MAX_ATTEMPTS + 4):
-        slug = names.assign_slug(con)
-        try:
-            cur = con.execute(
-                "INSERT INTO runs(slug, profile, backend, model, title, "
-                "requested_by, workdir, project_id, status, started_at, "
-                "work_item, parent_run) VALUES(?,?,?,?,?,'nod',?,?,'spawning',?,?,?)",
-                (slug, profile_name, profile["backend"], profile.get("model"),
-                 title, str(root), failed["project_id"], db.now(),
-                 failed["work_item"], int(failed["id"])))
-            con.commit()
-            return int(cur.lastrowid)
-        except sqlite3.IntegrityError as exc:
-            if not names.is_unique_violation(exc):
-                raise
-            names.reset_memory_cache()
-    raise RuntimeError("orchestra: could not mint a unique run slug")
+    return supervise.create_run(
+        con, profile=profile_name, backend=profile["backend"],
+        model=profile.get("model"), title=title, requested_by="nod",
+        workdir=str(root), project_id=failed["project_id"],
+        work_item=failed["work_item"], parent_run=int(failed["id"]))
 
 
-def dispatch_resolver(con, cfg: dict, run_id: int, reason: str) -> int | None:
+def dispatch_resolver_result(con, cfg: dict, run_id: int,
+                             reason: str) -> tuple[int | None, str | None]:
     """Spawn a resolver run for ``run_id``'s kept branch.
 
     Returns the new run id, or None with the reason on stderr when it cannot.
@@ -160,33 +148,40 @@ def dispatch_resolver(con, cfg: dict, run_id: int, reason: str) -> int | None:
                              (int(run_id),)).fetchone()
         if failed is None:
             _refuse(f"run {run_id} does not exist")
-            return None
+            return None, None
         branch = failed["branch"]
         if not branch:
             _refuse(f"run {run_id} ran in the shared checkout; "
                     "there is no branch to resolve")
-            return None
+            return None, None
         if dispatch.paused(con):
             # The pause switch is the one gate on a new run (DESIGN §4),
             # and a card answer does not get around it.
             _refuse("dispatch is paused; `orchestra resume`, then "
                     f"`orchestra merge {branch}` or a fresh card answer")
-            return None
+            return None, "paused"
         root = project.root_for(con, failed)
         if not _branch_exists(root, branch):
             _refuse(f"branch {branch} is gone from {root}")
-            return None
+            return None, None
         picked = resolver_profile(cfg)
         if picked is None:
-            return None
+            return None, None
         profile_name, profile = picked
         base = merge.merge_cfg(cfg)["base"] or \
             merge._out(["symbolic-ref", "--short", "HEAD"], root)
-        new_id = _insert(con, failed, root, profile_name, profile)
+        run, blocked = _insert(con, failed, root, profile_name, profile)
+        if run is None:
+            if blocked == "paused":
+                _refuse("dispatch is paused; `orchestra resume`, then "
+                        f"`orchestra merge {branch}` or a fresh card answer")
+            else:
+                _refuse("an equivalent resolver run is already in flight")
+            return None, blocked
+        new_id = int(run["id"])
         mission = RESOLVER_MISSION.format(
             run_id=int(failed["id"]), branch=branch, base=base,
             reason=(reason or "").strip() or "the landing escalated")
-        run = con.execute("SELECT * FROM runs WHERE id=?", (new_id,)).fetchone()
         try:
             supervise.prepare_launch(con, root, cfg, run, mission=mission,
                                      use_worktree=True)
@@ -196,14 +191,19 @@ def dispatch_resolver(con, cfg: dict, run_id: int, reason: str) -> int | None:
             # owner's own checkout is worse than no resolver.
             supervise.fail_launch(con, root, new_id, exc)
             _refuse(f"launch setup for run {new_id} failed: {exc}")
-            return None
+            return None, None
         try:
             launcher(root, new_id)
         except BaseException as exc:
             supervise.fail_launch(con, root, new_id, exc)
             _refuse(f"supervisor for run {new_id} did not start: {exc}")
-            return None
-        return new_id
+            return None, None
+        return new_id, None
     except Exception as exc:
         _refuse(str(exc))
-        return None
+        return None, None
+
+
+def dispatch_resolver(con, cfg: dict, run_id: int, reason: str) -> int | None:
+    """Compatibility seam for callers interested only in the new run id."""
+    return dispatch_resolver_result(con, cfg, run_id, reason)[0]

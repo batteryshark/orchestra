@@ -881,7 +881,17 @@ def infra_streak(con, run) -> int:
     return streak
 
 
-def _retry_row(con, run, root) -> int:
+def _repoint_dependents(con, previous: int, replacement: int) -> None:
+    """Make every waiter follow the run that now owns the attempt."""
+    con.execute(
+        "INSERT OR IGNORE INTO dispatch_dependencies(run_id, depends_on_run, kind) "
+        "SELECT run_id, ?, kind FROM dispatch_dependencies WHERE depends_on_run=?",
+        (replacement, previous))
+    con.execute("DELETE FROM dispatch_dependencies WHERE depends_on_run=?",
+                (previous,))
+
+
+def _retry_row(con, run, root) -> tuple[int | None, str | None]:
     """A fresh run of the SAME brief. Not a resume: a new process, new log.
 
     The failed run's workdir may already be gone — a terminal run gives its
@@ -894,14 +904,47 @@ def _retry_row(con, run, root) -> int:
     only the brief itself still has.
     """
     from orchestra import supervise  # supervise imports this module
-    run_id = int(con.execute(
-        "INSERT INTO runs(profile, backend, model, title, requested_by, workdir, "
-        "project_id, work_item, retry_of, status, started_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?, 'spawning', ?)",
-        (run["profile"], run["backend"], run["model"], run["title"],
-         run["requested_by"], str(root), run["project_id"], run["work_item"],
-         run["id"], db.now())).lastrowid)
-    con.commit()
+    retry, blocked = supervise.create_run(
+        con, profile=run["profile"], backend=run["backend"],
+        model=run["model"], title=run["title"],
+        requested_by=run["requested_by"], workdir=str(root),
+        project_id=run["project_id"], work_item=run["work_item"],
+        work_seen_ts=run["work_seen_ts"], retry_of=int(run["id"]),
+        routed_reason=run["routed_reason"], commit=False)
+    if retry is None:
+        if blocked and blocked.startswith("work_item:"):
+            winner = int(blocked.partition(":")[2])
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                still_winning = con.execute(
+                    f"SELECT 1 FROM runs WHERE id=? AND work_item=? "
+                    f"AND project_id IS ? AND layer IS NULL",
+                    (winner, run["work_item"], run["project_id"])).fetchone()
+                if still_winning is None:
+                    con.rollback()
+                    return None, blocked
+                _repoint_dependents(con, int(run["id"]), winner)
+                record(con, int(run["id"]), "retry", "superseded",
+                       f"run {winner} already owns {run['work_item']}; retry skipped",
+                       {"winning_run": winner})
+                con.commit()
+            except BaseException:
+                con.rollback()
+                raise
+        return None, blocked
+    run_id = int(retry["id"])
+    try:
+        # The retry row, the dependency replacement, and the observation are
+        # one durable decision. No finalizer can see the failed prerequisite
+        # without also seeing what replaced it.
+        _repoint_dependents(con, int(run["id"]), run_id)
+        record(con, int(run["id"]), "retry", "retry",
+               f"retrying run {run['id']} ({run['status']}) once, same brief",
+               {"retry_run": run_id})
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
     brief = paths.briefs_dir() / f"run-{run_id}.md"
     log = paths.logs_dir() / f"run-{run_id}.jsonl"
     workdir, branch, base_commit, created = str(root), None, None, False
@@ -915,10 +958,12 @@ def _retry_row(con, run, root) -> int:
             text = run["title"] or "Continue the original mission."
         brief.write_text(text, encoding="utf-8")
         log.touch()
-        con.execute(
+        prepared = con.execute(
             "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=? WHERE id=?",
-            (str(brief), str(log), workdir, branch, base_commit, run_id))
+            "base_commit=?, started_at=? WHERE id=? AND status='spawning'",
+            (str(brief), str(log), workdir, branch, base_commit, db.now(), run_id))
+        if prepared.rowcount != 1:
+            raise RuntimeError("run admission expired during retry setup")
         con.commit()
     except BaseException as exc:
         for artifact in (brief, log):
@@ -930,7 +975,7 @@ def _retry_row(con, run, root) -> int:
             con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
                         (workdir, branch, base_commit, run_id))
         supervise.fail_launch(con, root, run_id, exc, prefix="Retry launch failed")
-    return run_id
+    return run_id, None
 
 
 def after_terminal(con, run_id: int, *, cfg: dict | None = None,
@@ -959,10 +1004,6 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
                                             "infrastructure-shaped"}
     if _stopped_deliberately(con, run_id):
         return {"action": "none", "reason": "the run was stopped on judgement"}
-    if dispatch.paused(con):
-        record(con, run_id, "retry", "deferred", "dispatch is paused")
-        con.commit()
-        return {"action": "none", "reason": "dispatch is paused"}
     cfg = config.load(run["project_id"]) if cfg is None else cfg
     streak = infra_streak(con, run)
     if streak >= 2:
@@ -979,9 +1020,20 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
                    f"{(run['summary'] or '(no summary)')[:1000]}\n\n"
                    "Orchestra will not retry a third time.", cfg=cfg)
         return result
+    if dispatch.paused(con):
+        record(con, run_id, "retry", "deferred", "dispatch is paused")
+        con.commit()
+        return {"action": "none", "reason": "dispatch is paused"}
     from orchestra import project
     root = project.root_for(con, run)
-    retry_id = _retry_row(con, run, root)
+    retry_id, blocked = _retry_row(con, run, root)
+    if retry_id is None:
+        if blocked == "paused":
+            record(con, run_id, "retry", "deferred", "dispatch is paused")
+            con.commit()
+            return {"action": "none", "reason": "dispatch is paused"}
+        return {"action": "none", "reason":
+                f"automatic retry was already admitted ({blocked})"}
     retry = con.execute("SELECT * FROM runs WHERE id=?", (retry_id,)).fetchone()
     if retry["status"] == "failed":
         record(con, run_id, "retry", "failed",
@@ -989,15 +1041,9 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
                {"retry_run": retry_id})
         con.commit()
         return after_terminal(con, retry_id, cfg=cfg, launcher=launcher)
-    # Anything waiting on the failed run waits on its retry instead —
-    # otherwise the dependency release declines the whole chain a second
-    # later, while the retry that may well succeed is still starting.
-    con.execute("UPDATE OR IGNORE dispatch_dependencies SET depends_on_run=? "
-                "WHERE depends_on_run=?", (retry_id, run_id))
-    record(con, run_id, "retry", "retry",
-           f"retrying run {run_id} ({run['status']}) once, same brief",
-           {"retry_run": retry_id})
-    con.commit()
+    if retry["status"] != "spawning":
+        return {"action": "none", "reason":
+                f"retry run {retry_id} became {retry['status']} before launch"}
     if launcher is None:
         from orchestra import supervise  # supervise imports this module
         launcher = supervise.spawn_supervisor

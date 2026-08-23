@@ -18,6 +18,7 @@ DESIGN D3, simplified from Orchestra's 1,388-LOC counterpart:
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -27,14 +28,139 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from orchestra import (acp, auth, brief, config, db, dispatch, findings,
-                         merge, messaging, observer, paths, project, runners,
-                         traces, worktree)
+                         merge, messaging, names, observer, paths, project,
+                         runners, traces, worktree)
 from orchestra.proc import enrich_path, resolve_cmd, session_kwargs, terminate_group
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 POLL_INTERVAL = 0.5
 LAUNCH_FAILURE_PREFIXES = (
     "Launch setup failed:", "Deferred launch failed:", "Retry launch failed:")
+
+
+def create_run(con, *, profile: str, backend: str, requested_by: str,
+               workdir: str, model: str | None = None,
+               title: str | None = None, project_id: str | None = None,
+               status: str = "spawning", work_item: str | None = None,
+               work_seen_ts: str | None = None, parent_run: int | None = None,
+               session_ref: str | None = None, retry_of: int | None = None,
+               routed_reason: str | None = None, pause_gate: bool = True,
+               commit: bool = True) -> tuple[sqlite3.Row | None, str | None]:
+    """Atomically reserve and create one worker run.
+
+    Admission starts with SQLite's write lock, then reads the pause switch and
+    live reservations. That ordering is the contract: two sweepers, replies,
+    or retry finalizers may race, but only one can commit the same work,
+    session, parent, or retry lineage. Callers enter with a clean connection;
+    ``commit=False`` intentionally leaves the transaction this function opened
+    available so related local rows can be attached atomically.
+
+    A policy refusal is data, not an exception: ``(None, reason)``. Database
+    and programming errors still raise.
+    """
+    if status not in {"pending", "spawning", "running"}:
+        raise ValueError(f"worker run cannot start in status {status!r}")
+    if con.in_transaction:
+        raise RuntimeError("run admission requires a clean database transaction")
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        blocked = None
+        if pause_gate and dispatch.paused(con):
+            blocked = "paused"
+        elif work_item:
+            active = con.execute(
+                f"SELECT id FROM runs WHERE work_item=? AND layer IS NULL "
+                f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
+                (work_item,)).fetchone()
+            if active is not None:
+                blocked = f"work_item:{active['id']}"
+        if blocked is None and session_ref:
+            active = con.execute(
+                f"SELECT id FROM runs WHERE session_ref=? AND layer IS NULL "
+                f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
+                (session_ref,)).fetchone()
+            if active is not None:
+                blocked = f"session:{active['id']}"
+        if blocked is None and parent_run is not None:
+            active = con.execute(
+                f"SELECT id FROM runs WHERE parent_run=? AND layer IS NULL "
+                f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
+                (int(parent_run),)).fetchone()
+            if active is not None:
+                blocked = f"parent:{active['id']}"
+        if blocked is None and retry_of is not None:
+            prior = con.execute(
+                "SELECT id FROM runs WHERE retry_of=? AND layer IS NULL "
+                "ORDER BY id LIMIT 1", (int(retry_of),)).fetchone()
+            if prior is not None:
+                blocked = f"retry:{prior['id']}"
+        if blocked is not None:
+            con.rollback()
+            return None, blocked
+
+        run_id = None
+        for _ in range(names.MAX_ATTEMPTS + 4):
+            slug = names.assign_slug(con)
+            try:
+                cur = con.execute(
+                    "INSERT INTO runs(slug, profile, backend, model, title, "
+                    "requested_by, workdir, project_id, status, started_at, "
+                    "work_item, work_seen_ts, parent_run, session_ref, retry_of, "
+                    "routed_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (slug, profile, backend, model, title, requested_by,
+                     str(workdir), project_id, status, db.now(), work_item,
+                     work_seen_ts, parent_run, session_ref, retry_of,
+                     routed_reason))
+                run_id = int(cur.lastrowid)
+                break
+            except sqlite3.IntegrityError as exc:
+                if not names.is_unique_violation(exc):
+                    raise
+                names.reset_memory_cache()
+        if run_id is None:
+            raise RuntimeError("orchestra: could not mint a unique run slug")
+        row = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if commit:
+            con.commit()
+        return row, None
+    except BaseException:
+        con.rollback()
+        raise
+
+
+def admit_pending(con, run_id: int) -> tuple[sqlite3.Row | None, str | None]:
+    """Atomically move one dependency-ready request into launch preparation."""
+    if con.in_transaction:
+        raise RuntimeError("deferred admission requires a clean database transaction")
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        if dispatch.paused(con):
+            con.rollback()
+            return None, "paused"
+        req = con.execute(
+            "SELECT d.run_id, d.mission, d.context, d.use_worktree "
+            "FROM deferred_dispatches d JOIN runs r ON r.id=d.run_id "
+            "WHERE d.run_id=? AND d.status='pending' AND r.status='pending' "
+            "AND NOT EXISTS (SELECT 1 FROM dispatch_dependencies e "
+            "JOIN runs p ON p.id=e.depends_on_run WHERE e.run_id=d.run_id "
+            "AND p.status!='done')", (int(run_id),)).fetchone()
+        if req is None:
+            con.rollback()
+            return None, "not_ready"
+        claimed = con.execute(
+            "UPDATE deferred_dispatches SET status='processing' "
+            "WHERE run_id=? AND status='pending'", (int(run_id),))
+        admitted = con.execute(
+            "UPDATE runs SET status='spawning', started_at=? "
+            "WHERE id=? AND status='pending'", (db.now(), int(run_id)))
+        if claimed.rowcount != 1 or admitted.rowcount != 1:
+            con.rollback()
+            return None, "not_ready"
+        con.commit()
+        return req, None
+    except BaseException:
+        con.rollback()
+        raise
 
 
 def never_started(run) -> bool:
@@ -122,11 +248,13 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
             recent_commits=worktree.recent_commits(Path(workdir)))
         bp.write_text(text, encoding="utf-8")
         lp.touch()
-        con.execute(
+        prepared = con.execute(
             "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=? WHERE id=?",
-            (str(bp), str(lp), workdir, branch, base_commit, run_id),
+            "base_commit=?, started_at=? WHERE id=? AND status='spawning'",
+            (str(bp), str(lp), workdir, branch, base_commit, db.now(), run_id),
         )
+        if prepared.rowcount != 1:
+            raise RuntimeError("run admission expired during launch preparation")
     except BaseException:
         for artifact in (bp, lp):
             try:
@@ -156,7 +284,8 @@ def fail_launch(con, root: Path, run_id: int, error: BaseException | str,
     workdir = run["workdir"] if run is not None else str(root)
     branch = run["branch"] if run is not None else None
     base_commit = run["base_commit"] if run is not None else None
-    owns_checkout = (run is not None and branch == f"orchestra/run-{run_id}"
+    owns_checkout = (run is not None and run["supervisor_pid"] is None
+                     and branch == f"orchestra/run-{run_id}"
                      and Path(workdir).name == f"run-{run_id}")
     if owns_checkout:
         try:
@@ -170,10 +299,12 @@ def fail_launch(con, root: Path, run_id: int, error: BaseException | str,
             branch = None
             base_commit = None
     reason = str(error)[:1000] or error.__class__.__name__
+    con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
+                (workdir, branch, base_commit, run_id))
     con.execute(
-        "UPDATE runs SET status='failed', summary=?, finished_at=?, workdir=?, "
-        "branch=?, base_commit=? WHERE id=?",
-        (f"{prefix}: {reason}", db.now(), workdir, branch, base_commit, run_id))
+        "UPDATE runs SET status='failed', summary=?, finished_at=? WHERE id=? "
+        f"AND status NOT IN {db.TERMINAL_SQL}",
+        (f"{prefix}: {reason}", db.now(), run_id))
     con.commit()
     return cleanup or {"removed": False, "branch_deleted": False, "error": None}
 
@@ -225,19 +356,22 @@ def rehome(con, root: Path, previous, run_id: int) \
     return str(workdir), branch, base_commit, created
 
 
-def create_followup(con, root: Path, parent, requester: str, text: str,
-                    title: str | None = None) -> int:
-    """New run row that resumes the parent's backend session with ``text``."""
-    cur = con.execute(
-        "INSERT INTO runs(profile, backend, model, title, requested_by, workdir, "
-        "project_id, parent_run, session_ref, status, started_at, work_item, "
-        "work_seen_ts) VALUES(?,?,?,?,?,?,?,?,?, 'spawning', ?,?,?)",
-        (parent["profile"], parent["backend"], parent["model"],
-         title or f"continuation of run {parent['id']}", requester,
-         str(root), parent["project_id"], parent["id"], parent["session_ref"],
-         db.now(), parent["work_item"], parent["work_seen_ts"]))
-    run_id = int(cur.lastrowid)
-    con.commit()
+def reserve_followup(con, root: Path, parent, requester: str,
+                     title: str | None = None):
+    """Reserve a continuation before any Work claim or filesystem setup."""
+    return create_run(
+        con, profile=parent["profile"], backend=parent["backend"],
+        model=parent["model"],
+        title=title or f"continuation of run {parent['id']}",
+        requested_by=requester, workdir=str(root),
+        project_id=parent["project_id"], parent_run=int(parent["id"]),
+        session_ref=parent["session_ref"], work_item=parent["work_item"],
+        work_seen_ts=parent["work_seen_ts"])
+
+
+def prepare_followup(con, root: Path, parent, run, text: str) -> int:
+    """Freeze and re-home an already reserved continuation."""
+    run_id = int(run["id"])
     bp = paths.briefs_dir() / f"run-{run_id}.md"
     lp = paths.logs_dir() / f"run-{run_id}.jsonl"
     workdir, branch, base_commit, created = str(root), None, None, False
@@ -251,10 +385,12 @@ def create_followup(con, root: Path, parent, requester: str, text: str,
                 run_id=run_id, parent_run=parent["id"], instructions=text,
                 landed=landed), encoding="utf-8")
         lp.touch()
-        con.execute(
+        prepared = con.execute(
             "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=? WHERE id=?",
-            (str(bp), str(lp), workdir, branch, base_commit, run_id))
+            "base_commit=?, started_at=? WHERE id=? AND status='spawning'",
+            (str(bp), str(lp), workdir, branch, base_commit, db.now(), run_id))
+        if prepared.rowcount != 1:
+            raise RuntimeError("run admission expired during continuation setup")
         con.commit()
         return run_id
     except BaseException as exc:
@@ -268,6 +404,15 @@ def create_followup(con, root: Path, parent, requester: str, text: str,
                         (workdir, branch, base_commit, run_id))
         fail_launch(con, root, run_id, exc, prefix="Deferred launch failed")
         raise
+
+
+def create_followup(con, root: Path, parent, requester: str, text: str,
+                    title: str | None = None) -> int | None:
+    """Reserve and prepare a run that resumes the parent's backend session."""
+    run, _blocked = reserve_followup(con, root, parent, requester, title)
+    if run is None:
+        return None
+    return prepare_followup(con, root, parent, run, text)
 
 
 # --- safe-boundary message delivery ----------------------------------------
@@ -573,27 +718,35 @@ def process_ready(con, launcher) -> list[dict]:
     # ponytail: wait_for edges are schema-reserved; implement their release
     # rule when something can create them.
     while True:
-        broken = [int(r["run_id"]) for r in con.execute(
-            "SELECT DISTINCT d.run_id FROM deferred_dispatches d "
-            "JOIN dispatch_dependencies e ON e.run_id=d.run_id "
-            "JOIN runs p ON p.id=e.depends_on_run "
-            "WHERE d.status='pending' AND e.kind='requires_success' "
-            f"AND p.status IN {db.TERMINAL_SQL} AND p.status != 'done'")]
-        if not broken:
-            break
-        ts = db.now()
-        for rid in broken:
-            con.execute("UPDATE deferred_dispatches SET status='declined', "
-                        "processed_at=? WHERE run_id=?", (ts, rid))
-            con.execute("UPDATE runs SET status='failed', finished_at=?, "
-                        "summary='Declined: a prerequisite run did not succeed' "
-                        "WHERE id=? AND status='pending'", (ts, rid))
-            results.append({"run_id": rid, "status": "declined"})
-        con.commit()
-    if dispatch.paused(con):
-        return results  # settlement continues; only new admission stops
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            broken = [int(r["run_id"]) for r in con.execute(
+                "SELECT DISTINCT d.run_id FROM deferred_dispatches d "
+                "JOIN dispatch_dependencies e ON e.run_id=d.run_id "
+                "JOIN runs p ON p.id=e.depends_on_run "
+                "WHERE d.status='pending' AND e.kind='requires_success' "
+                f"AND p.status IN {db.TERMINAL_SQL} AND p.status != 'done' "
+                "AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.run_id=p.id "
+                "AND o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
+                "SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
+                "AND newer.layer='retry' AND newer.id>o.id))")]
+            if not broken:
+                con.commit()
+                break
+            ts = db.now()
+            for rid in broken:
+                con.execute("UPDATE deferred_dispatches SET status='declined', "
+                            "processed_at=? WHERE run_id=?", (ts, rid))
+                con.execute("UPDATE runs SET status='failed', finished_at=?, "
+                            "summary='Declined: a prerequisite run did not succeed' "
+                            "WHERE id=? AND status='pending'", (ts, rid))
+                results.append({"run_id": rid, "status": "declined"})
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
     ready = list(con.execute(
-        "SELECT d.run_id, d.mission, d.context, d.use_worktree "
+        "SELECT d.run_id "
         "FROM deferred_dispatches d JOIN runs r ON r.id=d.run_id "
         "WHERE d.status='pending' AND r.status='pending' AND NOT EXISTS ("
         "  SELECT 1 FROM dispatch_dependencies e "
@@ -601,34 +754,19 @@ def process_ready(con, launcher) -> list[dict]:
         "  WHERE e.run_id=d.run_id AND p.status!='done') "
         "ORDER BY d.run_id"))
     for req in ready:
-        if dispatch.paused(con):
-            break  # the switch may have changed since the ready query
         run_id = int(req["run_id"])
-        claimed = con.execute(
-            "UPDATE deferred_dispatches SET status='processing' "
-            "WHERE run_id=? AND status='pending'", (run_id,))
-        if claimed.rowcount != 1:
-            con.rollback()
-            continue  # a concurrent finalizer claimed it first
-        admitted = con.execute(
-            "UPDATE runs SET status='spawning', started_at=? "
-            "WHERE id=? AND status='pending'", (db.now(), run_id))
-        if admitted.rowcount != 1:
-            con.execute(
-                "UPDATE deferred_dispatches SET status='failed', processed_at=?, "
-                "error='run is no longer pending' WHERE run_id=?",
-                (db.now(), run_id))
-            con.commit()
-            results.append({"run_id": run_id, "status": "skipped",
-                            "error": "run is no longer pending"})
+        admitted, blocked = admit_pending(con, run_id)
+        if admitted is None:
+            if blocked == "paused":
+                break
             continue
-        con.commit()
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         root = project.root_for(con, run)
         try:
             prepare_launch(con, root, config.load(run["project_id"]), run,
-                           mission=req["mission"], context=req["context"],
-                           use_worktree=bool(req["use_worktree"]))
+                           mission=admitted["mission"],
+                           context=admitted["context"],
+                           use_worktree=bool(admitted["use_worktree"]))
             con.execute("UPDATE deferred_dispatches SET status='fired', "
                         "processed_at=? WHERE run_id=?", (db.now(), run_id))
             con.commit()
@@ -653,8 +791,14 @@ def supervise(root: Path, run_id: int) -> int:
         raise SystemExit(f"orchestra: run {run_id} not found")
     # Claim the run for THIS supervisor process so a supervisor that dies
     # before the completion UPDATE leaves a detectable orphan.
-    con.execute("UPDATE runs SET supervisor_pid=? WHERE id=?", (os.getpid(), run_id))
+    supervisor_pid = os.getpid()
+    claimed = con.execute(
+        "UPDATE runs SET supervisor_pid=? WHERE id=? AND status='spawning' "
+        "AND supervisor_pid IS NULL", (supervisor_pid, run_id))
     con.commit()
+    if claimed.rowcount != 1:
+        con.close()
+        return 1  # recovery or another supervisor won; never launch the worker
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cfg = config.load(run["project_id"])
     profile = config.profile_cfg(cfg, run["profile"])

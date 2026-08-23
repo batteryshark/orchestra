@@ -400,6 +400,16 @@ class FollowupAfterCleanupTests(unittest.TestCase):
     that was gone, and the run sat in `spawning` until the reaper caught it.
     """
 
+    def setUp(self) -> None:
+        self.state = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(
+            os.environ, {"ORCHESTRA_HOME": str(Path(self.state.name) / "home")})
+        self.env.start()
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self.state.cleanup()
+
     def test_a_gone_worktree_is_replaced_not_inherited(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -422,6 +432,7 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                     (str(root / "gone"), "orchestra/run-1", db.now()))
                 parent = con.execute("SELECT * FROM runs WHERE id=?",
                                      (cur.lastrowid,)).fetchone()
+                con.commit()
                 self.assertFalse(Path(parent["workdir"]).exists())
 
                 run_id = supervise.create_followup(
@@ -429,6 +440,7 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                 child = con.execute("SELECT * FROM runs WHERE id=?",
                                     (run_id,)).fetchone()
                 self.assertNotEqual(child["workdir"], parent["workdir"])
+                self.assertEqual(child["branch"], f"orchestra/run-{run_id}")
                 self.assertTrue(Path(child["workdir"]).exists(),
                                 "a follow-up must have somewhere to stand")
                 self.assertEqual(child["session_ref"], parent["session_ref"],
@@ -475,6 +487,14 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                     ["git", "-C", str(root), "worktree", "list", "--porcelain"],
                     check=True, capture_output=True, text=True).stdout
                 self.assertNotIn("/run-", worktrees)
+                con.execute("UPDATE runs SET status='killed', summary='owner stop', "
+                            "finished_at=? WHERE id=?", (db.now(), run["id"]))
+                con.commit()
+                supervise.fail_launch(con, root, run["id"], "late setup error")
+                stopped = con.execute("SELECT * FROM runs WHERE id=?",
+                                      (run["id"],)).fetchone()
+                self.assertEqual((stopped["status"], stopped["summary"]),
+                                 ("killed", "owner stop"))
             finally:
                 con.close()
 
@@ -497,6 +517,7 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                     (str(root / "gone"), "orchestra/run-1", db.now()))
                 parent = con.execute("SELECT * FROM runs WHERE id=?",
                                      (cur.lastrowid,)).fetchone()
+                con.commit()
                 before = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
                 with mock.patch.object(worktree, "create",
                                        side_effect=SystemExit("cannot isolate")), \

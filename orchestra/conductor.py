@@ -625,10 +625,14 @@ def _dispatch(con, cfg: dict, client, goal: dict, board: dict, decision: dict,
     if dispatch.paused(con):
         return {"action": "skipped", "item": item_id,
                 "reason": "dispatch is paused"}
-    run_id, run_slug = sweeper.insert_run(con, proj, worker, profile,
-                                          (item.get("title") or item_id)[:80],
-                                          item_id, item.get("updatedAt"))
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    run, blocked = sweeper.insert_run(
+        con, proj, worker, profile, (item.get("title") or item_id)[:80],
+        item_id, item.get("updatedAt"))
+    if run is None:
+        reason = ("dispatch is paused" if blocked == "paused" else
+                  "a run for this item is already in flight")
+        return {"action": "skipped", "item": item_id, "reason": reason}
+    run_id, run_slug = int(run["id"]), run["slug"]
     run_tag = f"[{client.identity}/{run_slug}]"
     try:
         claimed = client.log_task(

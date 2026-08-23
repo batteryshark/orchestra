@@ -216,9 +216,36 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
         dispatch.pause(con, "quota")
         with self.assertRaises(SystemExit) as caught:
             cli._gate_dispatch(con, self.cfg, "human")
+        dispatch.resume(con)
         con.close()
         self.assertIn("paused", str(caught.exception))
         self.assertIn("orchestra resume", str(caught.exception))
+
+        # The pause wins while this admission is waiting on SQLite's write
+        # lock. Checking before BEGIN would read the old unpaused value and
+        # incorrectly insert after the pause commits.
+        def admit(worker):
+            return supervise.create_run(
+                worker, profile="stub", backend="opencode",
+                requested_by="human", workdir=str(self.root),
+                project_id=PROJECT_ID)
+
+        outcome, = self.race_admissions(
+            [admit], locked_write=lambda blocker: db.meta_set(
+                blocker, dispatch.PAUSE_KEY, "1"))
+        self.assertEqual(outcome, (None, "paused"))
+        self.assertIsNone(self.db_run())
+
+        # Admission never takes ownership of a caller's transaction. The old
+        # duplicated inserts committed implicitly; the common boundary must
+        # refuse instead of making unrelated writes durable.
+        con = db.connect()
+        db.meta_set(con, "unrelated_admission_write", "still provisional")
+        with self.assertRaisesRegex(RuntimeError, "clean database transaction"):
+            admit(con)
+        con.rollback()
+        self.assertIsNone(db.meta_get(con, "unrelated_admission_write"))
+        con.close()
 
     def test_manual_reply_obeys_pause_and_records_async_spawn_failure(self) -> None:
         self.work.add_task("W-0001", "finished conversation", delegated=True)
@@ -275,16 +302,20 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
         con.execute("INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
                     "created_at) VALUES(2, 'go', 1, ?)", (db.now(),))
         con.commit()
-        dispatch.pause(con, "hold the line")
+        con.close()
         launched: list[int] = []
 
         def fail_spawn(_root, run_id):
             launched.append(run_id)
             raise RuntimeError("supervisor absent")
 
-        self.assertEqual(
-            supervise.process_ready(con, fail_spawn), [])
+        outcome, = self.race_admissions(
+            [lambda worker: supervise.admit_pending(worker, 2)],
+            locked_write=lambda blocker: db.meta_set(
+                blocker, dispatch.PAUSE_KEY, "1"))
+        self.assertEqual(outcome, (None, "paused"))
         self.assertEqual(launched, [])
+        con = db.connect()
         self.assertEqual(
             con.execute("SELECT status FROM runs WHERE id=2").fetchone()["status"],
             "pending")  # still pending, still honest

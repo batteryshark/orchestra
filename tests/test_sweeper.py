@@ -7,13 +7,15 @@ directory in it, not a project with a state directory.
 """
 import json
 import os
+import queue
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import brief, config, db, project, sweeper
+from orchestra import brief, config, db, project, supervise, sweeper
 from orchestra.work_client import WorkClient, WorkError
 from tests.fake_work import FakeWork
 
@@ -77,6 +79,71 @@ class SweeperFixture:
 
     def sweep(self):
         return sweeper.sweep(self.cfg, self.client, launcher=self.launcher)
+
+    def race_admissions(self, calls, locked_write=None):
+        """Run admissions after every contender has reached its first BEGIN.
+
+        The blocker forces a stale check-then-write implementation to read
+        before either contender can insert. A correct BEGIN-then-check path
+        serializes them and lets the loser observe the winner's reservation.
+        Connections open before the blocker because ``db.connect`` itself
+        refreshes schema metadata.
+        """
+        ready = threading.Barrier(len(calls) + 1)
+        start = threading.Event()
+        began = [threading.Event() for _ in calls]
+        results = queue.Queue()
+
+        def worker(index, call):
+            con = db.connect()
+            traced_begin = False
+
+            def trace(statement):
+                nonlocal traced_begin
+                if not traced_begin and statement.lstrip().upper().startswith("BEGIN"):
+                    traced_begin = True
+                    began[index].set()
+
+            con.set_trace_callback(trace)
+            try:
+                ready.wait(timeout=10)
+                if not start.wait(timeout=10):
+                    raise TimeoutError("admission race never started")
+                results.put((index, call(con), None))
+            except BaseException as exc:
+                results.put((index, None, exc))
+            finally:
+                con.close()
+
+        threads = [threading.Thread(target=worker, args=(i, call))
+                   for i, call in enumerate(calls)]
+        for thread in threads:
+            thread.start()
+        blocker = None
+        try:
+            ready.wait(timeout=10)
+            blocker = db.connect()
+            blocker.execute("BEGIN IMMEDIATE")
+            if locked_write is not None:
+                locked_write(blocker)
+            start.set()
+            for event in began:
+                self.assertTrue(event.wait(timeout=10),
+                                "contender never reached database admission")
+            blocker.commit()
+        finally:
+            start.set()
+            if blocker is not None:
+                if blocker.in_transaction:
+                    blocker.rollback()
+                blocker.close()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "admission contender did not finish")
+        ordered = sorted((results.get_nowait() for _ in calls), key=lambda item: item[0])
+        for _, _, error in ordered:
+            self.assertIsNone(error, repr(error))
+        return [value for _, value, _ in ordered]
 
     def db_run(self, run_id=None):
         con = db.connect()
@@ -173,7 +240,18 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
     def test_no_double_dispatch_while_run_is_live(self) -> None:
         self.work.add_task("W-0001", "one run only", delegated=True)
-        self.sweep()
+
+        def admit(con):
+            return supervise.create_run(
+                con, profile="stub", backend="opencode", requested_by="work",
+                workdir=str(self.root), project_id=PROJECT_ID,
+                work_item="W-0001")
+
+        outcomes = self.race_admissions([admit, admit])
+        admitted = [row for row, reason in outcomes if row is not None]
+        refused = [reason for row, reason in outcomes if row is None]
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(refused, [f"work_item:{admitted[0]['id']}"])
         # Even if the item somehow reads ready again, a live run blocks it.
         self.work.human_move("W-0001", "ready")
         actions = self.sweep()
@@ -381,7 +459,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         run = self.db_run()
         self.assertNotEqual(run["workdir"], str(self.root),
                             "a swept run must not share the human's checkout")
-        self.assertTrue(run["branch"])
+        self.assertEqual(run["branch"], f"orchestra/run-{run['id']}")
 
         self.launcher = mock.Mock(side_effect=RuntimeError("supervisor absent"))
         self.work.add_task("W-0002", "failed isolated job", delegated=True)
@@ -579,6 +657,33 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("Use the Okta provider.",
                       Path(followup["brief_path"]).read_text())
         self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+
+        # A backend session is single-writer even without a Work item. Force
+        # two continuations to read the same terminal parent before either can
+        # reserve its child; only one may be admitted.
+        con = db.connect()
+        con.execute("UPDATE runs SET status='done', finished_at=?, work_item=NULL "
+                    "WHERE id=?", (db.now(), followup["id"]))
+        con.commit()
+        parent = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (followup["id"],)).fetchone())
+        con.close()
+
+        def reserve(con):
+            return supervise.reserve_followup(
+                con, self.root, parent, "human", "one continuation")
+
+        outcomes = self.race_admissions([reserve, reserve])
+        admitted = [row for row, reason in outcomes if row is not None]
+        refused = [reason for row, reason in outcomes if row is None]
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(refused, [f"session:{admitted[0]['id']}"])
+        con = db.connect()
+        children = con.execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE parent_run=?",
+            (followup["id"],)).fetchone()["n"]
+        con.close()
+        self.assertEqual(children, 1)
 
     def test_failed_issue_continuation_releases_ownership_to_the_human(self) -> None:
         self.work.add_issue("issue_x", "needs an answer", delegated=True)
