@@ -1,9 +1,9 @@
 """The one long-lived process (DESIGN §2).
 
-Foreground loop, launchd-supervised: each tick runs one sweeper pass, then
-releases any dependency-ready dispatch, then reaps runs whose supervisor
-process died. SIGTERM/SIGINT stop it between ticks, so launchd's stop
-signal never lands mid-pass.
+Foreground loop, launchd-supervised: each tick recovers abandoned admissions,
+resumes held policy work, releases dependency-ready runs, and then checks Work.
+SIGTERM/SIGINT stop it between ticks, so launchd's stop signal never lands
+mid-pass.
 
 The HTTP surface and dashboard (§3) attach at ``serve_http`` below: one
 process, one port, the same database. The dashboard's "sweep now" button
@@ -15,12 +15,14 @@ import sys
 import threading
 import traceback
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from orchestra import (conductor, config, db, http, nod, observer, proc, project,
-                         supervise, runway, sweeper, work_client)
+                         supervise, runway, sweeper, work_client, worktree)
 
 DEFAULT_INTERVAL = 60
+SUPERVISOR_HANDOFF_GRACE_SECONDS = 300
 
 
 def serve_http(stop: threading.Event, wake: threading.Event | None = None,
@@ -51,6 +53,14 @@ def _alive(pid: int) -> bool:
     return proc.alive(pid)
 
 
+def _launch_started_at(value: str | None) -> datetime | None:
+    try:
+        started = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return started.replace(tzinfo=timezone.utc) if started.tzinfo is None else started
+
+
 def _reap_orphans(con) -> list[int]:
     """A supervisor that died without writing a terminal status leaves a run
     that nothing will ever finish. Mark it, so the board stops lying."""
@@ -61,15 +71,63 @@ def _reap_orphans(con) -> list[int]:
     for row in list(rows):
         if _alive(int(row["supervisor_pid"])):
             continue
-        con.execute(
+        changed = con.execute(
             "UPDATE runs SET status='failed', finished_at=?, "
             "summary=COALESCE(summary || char(10), '') || ? "
             f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
             (db.now(), f"Supervisor process {row['supervisor_pid']} vanished.",
              row["id"]))
-        reaped.append(int(row["id"]))
-    if reaped:
+        if changed.rowcount == 1:
+            reaped.append(int(row["id"]))
+    con.commit()  # a lost CAS still opened a write transaction
+
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=SUPERVISOR_HANDOFF_GRACE_SECONDS)
+    candidates = list(con.execute(
+        "SELECT * FROM runs WHERE status='spawning' "
+        "AND supervisor_pid IS NULL ORDER BY id"))
+    for candidate in candidates:
+        started = _launch_started_at(candidate["started_at"])
+        if started is not None and started > cutoff:
+            continue
+        # Either the child claim or this terminal compare-and-swap wins. A
+        # delayed child that loses exits before it reads the brief or starts a
+        # worker. Preparation may also refresh started_at after the scan, so
+        # freshness is judged again while holding the write lock.
+        con.execute("BEGIN IMMEDIATE")
+        current = con.execute(
+            "SELECT started_at FROM runs WHERE id=? AND status='spawning' "
+            "AND supervisor_pid IS NULL", (int(candidate["id"]),)).fetchone()
+        if current is None:
+            con.rollback()
+            continue
+        started = _launch_started_at(current["started_at"])
+        if started is not None and started > cutoff:
+            con.rollback()
+            continue
+        reason = (f"no supervisor claimed run within "
+                  f"{SUPERVISOR_HANDOFF_GRACE_SECONDS}s" if started is not None
+                  else "invalid start time and no supervisor claimed run")
+        claimed = con.execute(
+            "UPDATE runs SET status='failed', finished_at=?, summary=? "
+            "WHERE id=? AND status='spawning' AND supervisor_pid IS NULL",
+            (db.now(), f"Launch setup failed: {reason}", int(candidate["id"])))
+        if claimed.rowcount == 1:
+            con.execute(
+                "UPDATE deferred_dispatches SET status='failed', processed_at=?, "
+                "error=? WHERE run_id=? AND status IN ('pending','processing','fired')",
+                (db.now(), reason, int(candidate["id"])))
         con.commit()
+        if claimed.rowcount != 1:
+            continue
+        run_id = int(candidate["id"])
+        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        root = project.root_for(con, run)
+        if run["branch"]:
+            root = worktree.main_root(Path(run["workdir"])) or root
+        supervise.fail_launch(
+            con, root, run_id, reason)
+        reaped.append(run_id)
     return reaped
 
 
@@ -130,13 +188,16 @@ def tick() -> dict:
         _harvest_children()
         report["reaped"] = _reap_orphans(con)
         report["paused"] = http.dispatch_paused(con)
-        report["released"] = supervise.process_ready(
-            con, supervise.spawn_supervisor)
         if not report["paused"]:
             report["resumed_retries"] = observer.resume_deferred_retries(
                 con, launcher=supervise.spawn_supervisor)
             report["resumed_judgments"] = conductor.resume_deferred_judgments(
                 con, launcher=supervise.spawn_supervisor)
+        # Retry reservations repoint dependency edges before settlement. This
+        # ordering prevents a paused-then-resumed retry from losing its waiting
+        # dependents to the failed original run.
+        report["released"] = supervise.process_ready(
+            con, supervise.spawn_supervisor)
         report["runway"] = _poll_runway(con)
         report["nod_answers"] = _act_on_nod_answers(con, cfg)
         # ponytail: one project-list fetch per tick keeps the cache warm at the

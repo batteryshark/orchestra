@@ -14,12 +14,11 @@ ponytail: stated methods are mechanical (command / grep / test / read), so
 code runs them. A model turn waits until a criterion needs judgment.
 """
 import shlex
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-from orchestra import config, db, names, project
+from orchestra import config, db, project, supervise
 from orchestra.work_client import WorkClient, fact_line, verifier_identity
 
 METHOD_TIMEOUT = 60
@@ -65,7 +64,10 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
         print(f"orchestra verify: {item_id} not staffed: {exc}")
         return
     root = project.root_for(con, worker)
-    run_id, slug = _insert(con, worker, root, profile_name, profile, item_id)
+    run, _blocked = _insert(con, worker, root, profile_name, profile, item_id)
+    if run is None:
+        return
+    run_id, slug = int(run["id"]), run["slug"]
     verifier = WorkClient(client.api_url, identity=verifier_identity(slug),
                           timeout=client.timeout)
     try:
@@ -185,26 +187,13 @@ def _writeback(client: WorkClient, item_id: str, run_id: int,
 
 
 def _insert(con, worker, root: Path, profile_name: str, profile: dict,
-            item_id: str) -> tuple[int, str]:
+            item_id: str):
     title = f"Verify {item_id}"[:80]
-    for _ in range(names.MAX_ATTEMPTS + 4):
-        slug = names.assign_slug(con)
-        try:
-            cur = con.execute(
-                "INSERT INTO runs(slug, profile, backend, model, title, "
-                "requested_by, workdir, project_id, status, started_at, "
-                "work_item, parent_run) "
-                "VALUES(?,?,?,?,?,?,?,?, 'running', ?,?,?)",
-                (slug, profile_name, profile["backend"], profile.get("model"),
-                 title, REQUESTED_BY, str(root), worker["project_id"], db.now(),
-                 item_id, int(worker["id"])))
-            con.commit()
-            return int(cur.lastrowid), slug
-        except sqlite3.IntegrityError as exc:
-            if not names.is_unique_violation(exc):
-                raise
-            names.reset_memory_cache()
-    raise RuntimeError("orchestra: could not mint a unique verify-run slug")
+    return supervise.create_run(
+        con, profile=profile_name, backend=profile["backend"],
+        model=profile.get("model"), title=title, requested_by=REQUESTED_BY,
+        workdir=str(root), project_id=worker["project_id"], status="running",
+        work_item=item_id, parent_run=int(worker["id"]), pause_gate=False)
 
 
 def _finalize(con, run_id: int, status: str, summary: str) -> None:

@@ -544,8 +544,10 @@ def act_on_answers(con: sqlite3.Connection, cfg: dict) -> list[dict]:
             decision = view.get("decision") or {}
         if decision.get("option_id") == "resolver" and dispatch.paused(con):
             continue  # admission waits; completion retries still run
-        acted.append({"request_id": rid,
-                      **_act_on_merge_decision(con, cfg, row, status, decision)})
+        outcome = _act_on_merge_decision(con, cfg, row, status, decision)
+        if outcome.pop("admission_blocked", None) == "paused":
+            continue  # a pause race leaves the paid-for answer available
+        acted.append({"request_id": rid, **outcome})
         con.execute("UPDATE nod_requests SET acted_at=? WHERE request_id=?",
                     (_now(), rid))
         con.commit()
@@ -566,10 +568,16 @@ def _act_on_merge_decision(con, cfg: dict, row, status: str,
         from orchestra import resolver
         reason = (decision.get("text") or "").strip() or \
             f"the owner answered run {run_id}'s merge card: dispatch a resolver"
-        new_id = resolver.dispatch_resolver(con, cfg, run_id, reason)
+        detailed = getattr(resolver, "dispatch_resolver_result", None)
+        if detailed is None:  # compatibility with a test seam or older adapter
+            new_id, blocked = resolver.dispatch_resolver(
+                con, cfg, run_id, reason), None
+        else:
+            new_id, blocked = detailed(con, cfg, run_id, reason)
         return {"action": "resolver",
                 "outcome": (f"dispatched run {new_id}" if new_id is not None
-                            else "not dispatched")}
+                            else "not dispatched"),
+                "admission_blocked": blocked}
     # "leave", a dismissed card, or cancelled/expired: recorded, nothing runs
     return {"action": "leave", "outcome": f"left ({status})"}
 

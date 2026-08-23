@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, observer
+from orchestra import config, db, observer, supervise
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -416,6 +416,7 @@ class RetryTests(ObserverCase):
         self.assertEqual(launched, [result["run"]])
 
     def test_a_second_consecutive_failure_escalates_instead(self) -> None:
+        from orchestra import dispatch
         first = self.make_run(status="failed", work_item="W-0002")
         self._brief(first)
         retry_id = observer.after_terminal(
@@ -423,6 +424,7 @@ class RetryTests(ObserverCase):
         self.con.execute("UPDATE runs SET status='timeout', summary='died again' "
                          "WHERE id=?", (retry_id,))
         self.con.commit()
+        dispatch.pause(self.con, "admission only")
         launched = []
         result = observer.after_terminal(self.con, retry_id,
                                          launcher=lambda root, rid: launched.append(rid))
@@ -468,17 +470,100 @@ class RetryTests(ObserverCase):
         from orchestra import dispatch
         run_id = self.make_run(status="failed")
         self._brief(run_id)
+        dependent = self.make_run(status="pending")
+        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+                         "VALUES(?,?)", (dependent, run_id))
+        self.con.execute(
+            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
+            "created_at) VALUES(?, 'continue after retry', 0, ?)",
+            (dependent, db.now()))
+        self.con.commit()
         dispatch.pause(self.con, "maintenance")
         result = observer.after_terminal(self.con, run_id,
                                          launcher=lambda root, rid: 1 / 0)
         self.assertEqual(result["action"], "none")
         self.assertIn("paused", result["reason"])
+        self.assertEqual(supervise.process_ready(
+            self.con, launcher=lambda root, rid: 1 / 0), [])
+        waiting = self.con.execute(
+            "SELECT r.status, d.status AS deferred_status, e.depends_on_run "
+            "FROM runs r JOIN deferred_dispatches d ON d.run_id=r.id "
+            "JOIN dispatch_dependencies e ON e.run_id=r.id WHERE r.id=?",
+            (dependent,)).fetchone()
+        self.assertEqual((waiting["status"], waiting["deferred_status"],
+                          waiting["depends_on_run"]),
+                         ("pending", "pending", run_id))
         dispatch.resume(self.con)
         launched = []
         resumed = observer.resume_deferred_retries(
             self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid))
         self.assertEqual(resumed[0]["action"], "retry")
         self.assertEqual(launched, [resumed[0]["run"]])
+        retry_id = resumed[0]["run"]
+        edge = self.con.execute(
+            "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
+            (dependent,)).fetchone()
+        self.assertEqual(edge["depends_on_run"], retry_id)
+        self.con.execute("UPDATE runs SET status='done', finished_at=? WHERE id=?",
+                         (db.now(), retry_id))
+        self.con.commit()
+        released = []
+        self.assertEqual(supervise.process_ready(
+            self.con, launcher=lambda root, rid: released.append(rid)),
+            [{"run_id": dependent, "status": "fired"}])
+        self.assertEqual(released, [dependent])
+        self.assertEqual(observer.resume_deferred_retries(
+            self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid)), [])
+
+        # Another dispatcher can claim the item after the pause lifts but
+        # before the daemon replays its deferred retry. The waiter must follow
+        # that winning run; the old retry decision must not replay forever.
+        launched.clear()
+        failed = self.make_run(status="failed", work_item="W-COMPETING")
+        self._brief(failed)
+        dependent = self.make_run(status="pending")
+        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+                         "VALUES(?,?)", (dependent, failed))
+        self.con.execute(
+            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
+            "created_at) VALUES(?, 'follow the winner', 0, ?)",
+            (dependent, db.now()))
+        self.con.commit()
+        dispatch.pause(self.con, "maintenance")
+        observer.after_terminal(self.con, failed,
+                                launcher=lambda root, rid: launched.append(rid))
+        dispatch.resume(self.con)
+        winner, blocked = supervise.create_run(
+            self.con, profile="worker", backend="opencode",
+            requested_by="human", workdir=str(self.tmp_path),
+            project_id=PROJECT_ID, status="running", work_item="W-COMPETING")
+        self.assertIsNone(blocked)
+
+        resumed = observer.resume_deferred_retries(
+            self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid))
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(resumed[0]["action"], "none")
+        self.assertIn(f"work_item:{winner['id']}", resumed[0]["reason"])
+        self.assertEqual(launched, [])
+        self.assertEqual(self.con.execute(
+            "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
+            (dependent,)).fetchone()["depends_on_run"], winner["id"])
+        retry_notes = observer.observations(self.con, failed, layer="retry")
+        self.assertEqual([note["action"] for note in retry_notes],
+                         ["deferred", "superseded"])
+        self.assertEqual(json.loads(retry_notes[-1]["detail"])["winning_run"],
+                         winner["id"])
+        self.assertIsNone(self.con.execute(
+            "SELECT id FROM runs WHERE retry_of=?", (failed,)).fetchone())
+
+        self.con.execute("UPDATE runs SET status='done', finished_at=? WHERE id=?",
+                         (db.now(), winner["id"]))
+        self.con.commit()
+        released = []
+        self.assertEqual(supervise.process_ready(
+            self.con, launcher=lambda root, rid: released.append(rid)),
+            [{"run_id": dependent, "status": "fired"}])
+        self.assertEqual(released, [dependent])
         self.assertEqual(observer.resume_deferred_retries(
             self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid)), [])
 
@@ -537,8 +622,8 @@ class RetryTests(ObserverCase):
         self.assertNotEqual(retry["workdir"], str(released))
         self.assertTrue(Path(retry["workdir"]).exists(),
                         "a retry must have somewhere to stand")
-        self.assertNotEqual(retry["branch"], "orchestra/run-1",
-                            "the deleted branch is not reused")
+        self.assertEqual(retry["branch"], f"orchestra/run-{result['run']}",
+                         "the actual retry id owns the replacement branch")
         self.assertEqual(launched, [(checkout, result["run"])])
 
     def test_a_retry_keeps_a_workdir_that_is_still_there(self) -> None:

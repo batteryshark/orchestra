@@ -3,13 +3,12 @@ import argparse
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 from orchestra import (acp, auth, conductor, config, daemon, db, dispatch,
-                         harnesses, hooks, http, merge, messaging, names, nod,
+                         harnesses, hooks, http, merge, messaging, nod,
                          observer, paths, proc, profile_edit, profiles, project,
                          review, runway, service, supervise, sweeper, traces,
                          worktree)
@@ -134,27 +133,19 @@ def cmd_dispatch(args):
         if rid not in after_ids:
             after_ids.append(rid)
     initial_status = "pending" if after_ids else "spawning"
-    run_id, slug = None, None
     _gate_dispatch(con, cfg, requester)
-    # The in-Python collision check is best-effort; the DB UNIQUE constraint
-    # is the real guard — on violation, regenerate the slug and retry.
-    for _ in range(names.MAX_ATTEMPTS + 4):
-        slug = names.assign_slug(con)
-        try:
-            cur = con.execute(
-                "INSERT INTO runs(slug, profile, backend, model, title, requested_by, "
-                "workdir, project_id, status, started_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (slug, args.to, profile["backend"], profile.get("model"), title,
-                 requester, str(root), proj.project_id, initial_status, db.now()))
-            run_id = int(cur.lastrowid)
-            break
-        except sqlite3.IntegrityError as exc:
-            if not names.is_unique_violation(exc):
-                raise
-            names.reset_memory_cache()
-    if run_id is None:
+    run, blocked = supervise.create_run(
+        con, profile=args.to, backend=profile["backend"],
+        model=profile.get("model"), title=title, requested_by=requester,
+        workdir=str(root), project_id=proj.project_id, status=initial_status,
+        commit=not after_ids)
+    if run is None:
         con.close()
-        raise SystemExit("orchestra: could not mint a unique run slug — retry dispatch")
+        if blocked == "paused":
+            raise SystemExit("orchestra: dispatch was paused before admission; "
+                             "run `orchestra resume` to start new runs again")
+        raise SystemExit(f"orchestra: run not admitted ({blocked})")
+    run_id, slug = int(run["id"]), run["slug"]
 
     if after_ids:
         for rid in after_ids:
@@ -173,7 +164,6 @@ def cmd_dispatch(args):
         con.close()
         return
 
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     try:
         supervise.prepare_launch(con, root, cfg, run, mission=mission,
                                  context=args.context, use_worktree=args.worktree)
@@ -366,6 +356,20 @@ def cmd_reply(args):
     _gate_dispatch(con, cfg, _requester(cfg))
     run_id = supervise.create_followup(
         con, root, dict(parent), _requester(cfg), " ".join(args.message))
+    if run_id is None:
+        paused = dispatch.pause_state(con)
+        active = con.execute(
+            f"SELECT id, status FROM runs WHERE session_ref=? "
+            f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id DESC LIMIT 1",
+            (parent["session_ref"],)).fetchone()
+        con.close()
+        if paused is not None:
+            raise SystemExit("orchestra: dispatch was paused before admission; "
+                             "run `orchestra resume` to continue this session")
+        if active is not None:
+            raise SystemExit(f"orchestra: this session is already active as run "
+                             f"{active['id']} ({active['status']})")
+        raise SystemExit("orchestra: continuation was not admitted")
     con.close()
     requested_note = (f" (requested from run {args.run_id})"
                       if parent["id"] != args.run_id else "")
