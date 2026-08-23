@@ -410,7 +410,7 @@ class MergeTestCase(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["checks"][0]["ok"])
 
-    def test_review_runs_only_when_criteria_exist(self):
+    def test_review_is_injectable_but_cli_criteria_are_rejected(self):
         seen = []
 
         def review(diff, criteria):
@@ -433,6 +433,11 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual(1, len(seen))
         self.assertTrue(result["ok"], result)
         self.assertIsNone(result["review"])
+
+        from types import SimpleNamespace
+        from orchestra import cli
+        with self.assertRaisesRegex(SystemExit, "review is not implemented"):
+            cli.cmd_merge(SimpleNamespace(criteria_file="criteria.md"))
 
     def test_merge_leaves_the_dirty_working_tree_untouched(self):
         """The requirement that matters: the owner keeps their uncommitted work.

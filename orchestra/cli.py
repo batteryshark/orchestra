@@ -18,7 +18,7 @@ from orchestra import (acp, auth, conductor, config, daemon, db, dispatch,
 def _here(con) -> tuple:
     """(project, merged config) for the current directory.
 
-    The project is None outside any Work project: listing runs or profiles
+    The project is None outside any registered project: listing runs or profiles
     must still work from an arbitrary directory now that state is central.
     """
     proj = project.try_resolve(con, config.load())
@@ -108,8 +108,8 @@ def cmd_init(args):
             said = ", ".join(enabled) or "NONE — nothing can be staffed here"
         print(f"  profiles:      {said}")
     else:
-        print(f"  project:       {root} is not a known Work project — create it in "
-              "Work, then re-run")
+        print(f"  project:       {root} is not registered — run "
+              "`orchestra project add .`, or enable Work, then re-run")
 
 
 def cmd_dispatch(args):
@@ -239,7 +239,8 @@ def cmd_resume(args):
 def cmd_status(args):
     con = db.connect()
     proj, _ = _here(con)
-    here = f"{proj.name or proj.work_id} ({proj.path})" if proj else "no Work project"
+    here = (f"{proj.name or proj.work_id} ({proj.path})"
+            if proj else "no registered project")
     # Central state, so this is the whole workspace, not one project.
     print(f"orchestra @ {paths.home()} — here: {here}\n")
     _print_dispatch(dispatch.state(con))
@@ -434,7 +435,7 @@ def cmd_ask(args):
     if args.target not in ("human", "me", "owner"):
         raise SystemExit(
             f"orchestra: ask can only target the human, not '{args.target}'. "
-            "v1 peer-to-peer scope is human-to-run and parent-to-child; use "
+            "the current peer scope is one human and one run; use "
             "`orchestra tell <run> \"...\"` to send a run a message.")
     run_id = args.run_id or paths.env("ORCHESTRA_RUN_ID") or None
     if not run_id:
@@ -723,17 +724,15 @@ def cmd_profiles(args):
     # Routing order (W-0181): priority first, `nice`-style — lower is more
     # preferred — then name. The same order the dashboard and the planner see.
     print(f"{'name':<12} {'harness':<9} {'model':<24} {'effort':<7} "
-          f"{'pri':<4} {'tier':<13} spawn")
+          f"{'pri':<4} tier")
     for name in sorted(entries, key=lambda n: (config.priority_of(entries[n]), n)):
         p = entries[name]
-        spawn_list = p.get("spawn_profiles") or []
         tier = config.tier_of(p.get("tier"))
         print(f"{name:<12} {p.get('backend', 'opencode'):<9} "
               f"{p.get('model') or '(harness default)':<24} "
               f"{p.get('effort') or '-':<7} "
               f"{config.priority_of(p):<4} "
-              f"{(f'{tier} {config.TIERS[tier]}' if tier else '-'):<13} "
-              f"{', '.join(spawn_list) if spawn_list else '(no delegation)'}")
+              f"{f'{tier} {config.TIERS[tier]}' if tier else '-'}")
         age = profiles.note_age(p.get("note_at"))
         if p.get("note"):
             print(f"{'':<12} note: {p['note']}" + (f" ({age})" if age else ""))
@@ -752,7 +751,7 @@ def cmd_doctor(args):
     con = db.connect()
     print(f"  database:     {paths.db_path()}")
     proj, cfg = _here(con)
-    print(f"  here:         {proj if proj else 'not inside a known Work project'}")
+    print(f"  here:         {proj if proj else 'not inside a registered project'}")
     total = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
     active = con.execute(
         f"SELECT COUNT(*) AS n FROM runs WHERE status NOT IN {db.TERMINAL_SQL}"
@@ -934,7 +933,11 @@ def cmd_review(args):
 
 
 def cmd_merge(args):
-    criteria = Path(args.criteria_file).read_text(encoding="utf-8") if args.criteria_file else ""
+    if args.criteria_file:
+        raise SystemExit(
+            "orchestra: --criteria-file is unavailable because acceptance "
+            "review is not implemented")
+    criteria = ""
     con = db.connect()
     proj = project.resolve(con, config.load())
     # The by-hand retry judges tripwires against the same mission the
@@ -992,7 +995,8 @@ def cmd_project(args):
             width = max(len(str(r.path)) for r in rows)
             for r in rows:
                 source = "work" if r.work_id else "local"
-                print(f"{str(r.path):<{width}}  {source:<5}  {r.name or ''}")
+                print(f"{str(r.path):<{width}}  {source:<5}  "
+                      f"{r.project_id}  {r.name or ''}")
             return
         if args.action == "forget":
             target = Path(args.path or ".").expanduser().resolve()
@@ -1120,12 +1124,13 @@ def main():
     _win_stdio()
     p = argparse.ArgumentParser(
         prog="orchestra",
-        description="Local control plane: dispatch codex/claude/opencode/reasonix "
-                    "workers, supervise them to completion, tell/ask/reply/kill.")
+        description="Local execution plane for Codex, Claude Code, OpenCode, "
+                    "and Reasonix: run missions behind one durable lifecycle, "
+                    "trace, control, and result surface.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init", help="prepare the central ~/.orchestra home and "
-                                    "report this directory's Work project")
+                                    "report this directory's registered project")
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("dispatch", help="dispatch a mission to a worker profile, async")
@@ -1145,8 +1150,9 @@ def main():
                                       "live run count, waiting items, runs")
     s.set_defaults(fn=cmd_status)
 
-    s = sub.add_parser("pause", help="stop new runs starting; in-flight runs "
-                                     "are untouched (DESIGN §4)")
+    s = sub.add_parser("pause", help="stop new runs starting; worker processes "
+                                     "continue, but some daemon policy passes "
+                                     "also pause today (DESIGN §4)")
     s.add_argument("note", nargs="*", help="why, shown wherever the pause is")
     s.set_defaults(fn=cmd_pause)
 
@@ -1173,15 +1179,16 @@ def main():
     # `tell` and `interrupt` write the SAME row: tell is DESIGN §6's name for
     # the non-blocking, safe-boundary delivery, interrupt --now is the
     # emergency stop variant of it.
-    s = sub.add_parser("tell", help="send a running worker a message, delivered "
-                                    "at its next safe boundary (DESIGN §6)")
+    s = sub.add_parser("tell", help="send a running worker a message through "
+                                    "live ACP or the next exec boundary "
+                                    "(DESIGN §6)")
     s.add_argument("run_id", type=int)
     s.add_argument("message", nargs="*")
     s.add_argument("--file", dest="message_file", help="read the message from a file")
     s.set_defaults(fn=cmd_interrupt, now=False)
 
     s = sub.add_parser("ask", help="ask the human a blocking question; the run's "
-                                   "session is held open until Nod answers")
+                                   "session waits for Nod or its declared fallback")
     s.add_argument("target", help="who to ask — 'human'")
     s.add_argument("question", nargs="+")
     s.add_argument("--run", dest="run_id", type=int,
@@ -1205,21 +1212,22 @@ def main():
     s.add_argument("message", nargs="*")
     s.add_argument("--file", dest="message_file", help="read the message from a file")
     s.add_argument("--now", action="store_true",
-                   help="stop immediately instead of at the next safe boundary")
+                   help="interrupt the active turn instead of normal delivery")
     s.set_defaults(fn=cmd_interrupt)
 
     s = sub.add_parser("kill", help="stop a run")
     s.add_argument("run_id", type=int)
     s.set_defaults(fn=cmd_kill)
 
-    s = sub.add_parser("check", help="judge a run now: stall, loop, and a cheap "
-                                     "out-of-band observer turn (DESIGN §7)")
+    s = sub.add_parser("check", help="judge a run now: stall, loop, and an "
+                                     "optional configured observer turn "
+                                     "(DESIGN §7)")
     s.add_argument("run_id", type=int)
     s.add_argument("--mechanical", action="store_true",
                    help="skip the observer turn; liveness and loop shape only")
     s.set_defaults(fn=cmd_check)
 
-    s = sub.add_parser("sweep", help="one Work intervention pass (CONTRACT §4)")
+    s = sub.add_parser("sweep", help="run one optional Work intake pass")
     s.add_argument("--watch", action="store_true", help="keep sweeping")
     s.add_argument("--interval", type=int,
                    help="watch heartbeat in seconds (fallback signal only)")
@@ -1255,9 +1263,9 @@ def main():
                     help="0-99, like a linux nice value: LOWER is more "
                          "preferred. Orders profiles of the same tier (default 50)")
     ps.add_argument("--sandbox", help="codex execution sandbox")
-    ps.add_argument("--spawn", metavar="A,B",
-                    help="delegation allowlist; every name must already exist "
-                         "(empty string clears it)")
+    # Parsed for configuration compatibility, but hidden until child launch
+    # creates and supervises a real run.
+    ps.add_argument("--spawn", metavar="A,B", help=argparse.SUPPRESS)
     ps.add_argument("--note", help="headroom note; its age is stamped now")
 
     pr = psub.add_parser("rm", help="remove a profile from the config file")
@@ -1277,10 +1285,13 @@ def main():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_review)
 
-    s = sub.add_parser("merge", help="verify a run branch and land it on the base (DESIGN §9)")
+    s = sub.add_parser("merge", help="run declared checks and tripwires, then "
+                                    "land a run branch on the base")
     s.add_argument("branch", help="run branch, e.g. orchestra/run-7")
     s.add_argument("--item", help="Work item id, for the merge commit message")
-    s.add_argument("--criteria-file", help="acceptance criteria file for the agent review")
+    # Retain parsing for callers that already pass it. The default review seam
+    # is unwired, so advertising this as an acceptance gate would be false.
+    s.add_argument("--criteria-file", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_merge)
 
     s = sub.add_parser("prune", help="remove run worktrees nobody owns and the "
@@ -1306,8 +1317,7 @@ def main():
     s = sub.add_parser("doctor", help="check tools and config health")
     s.set_defaults(fn=cmd_doctor)
 
-    s = sub.add_parser("daemon", help="run the control plane in the foreground "
-                                      "(sweeper + supervision, DESIGN §2)")
+    s = sub.add_parser("daemon", help="run the Orchestra daemon in the foreground")
     s.add_argument("--interval", type=int, help="seconds between ticks")
     s.add_argument("--once", action="store_true", help="one tick, then exit")
     s.set_defaults(fn=cmd_daemon)
@@ -1320,14 +1330,14 @@ def main():
                    help="also load and start it now (install only)")
     s.set_defaults(fn=cmd_service)
 
-    s = sub.add_parser("project", help="register a directory Orchestra may "
-                                       "dispatch into, without Work")
+    s = sub.add_parser("project", help="register a local directory Orchestra "
+                                       "may dispatch into")
     s.set_defaults(fn=cmd_project, action="add", path=None, name=None)
     psub = s.add_subparsers(dest="action")
     pa = psub.add_parser("add", help="adopt a directory as a project")
     pa.add_argument("path", nargs="?", help="default: the current directory")
     pa.add_argument("--name", help="default: the directory's own name")
-    pl = psub.add_parser("list", help="every project, from Work or adopted here")
+    pl = psub.add_parser("list", help="every registered project, local or Work-backed")
     pl.set_defaults(path=None, name=None)
     pf = psub.add_parser("forget", help="drop a locally adopted project")
     pf.add_argument("path", nargs="?", help="default: the current directory")

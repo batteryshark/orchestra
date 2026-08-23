@@ -12,7 +12,7 @@ come from an iPhone 17 Pro Max simulator, downscaled to 660 px wide.
 | --- | --- | --- |
 | `dashboard-runs.png` | RUNS view | Every run the daemon has dispatched, with its id, slug, status, profile, harness and Work item — and the selected run's transcript beside it. |
 | `run-detail.png` | RUNS view, trace tab | One run's trace: the model's own reasoning, the tool calls it made, and the token accounting, in the order they happened. |
-| `profiles.png` | PROFILES view | Eleven profiles across four harnesses. Each names a model, an effort, a priority, a tier, and which profiles it is allowed to spawn. |
+| `profiles.png` | Historical PROFILES view | Eleven profiles across four harnesses. The final delegation column is retained scaffolding in this capture; Orchestra does not implement child launch. |
 | `statistics.png` | RUNS view, statistics popup | What the fleet has cost: worker time, tokens and money, totalled and broken out per profile. |
 | `runway.png` | RUNWAY view | How much quota is left at each provider, per rolling window, so the dispatcher knows what it can still afford to run. |
 

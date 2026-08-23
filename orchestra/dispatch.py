@@ -1,12 +1,10 @@
 """Dispatch policy (DESIGN §4): order, honest queue state, the pause switch.
 
-**There are no concurrency caps here** — not global, not per project, not
-per profile, and none may be added. Ten to fifteen concurrent runs, several
-inside one project, is normal and correct: every run has its own worktree so
-concurrent runs never interfere, merges are sequential and rebase on their
-own, and provider rate limits are the harnesses' problem. What replaces a
-ceiling is the pair below: a pause switch you can hit, next to a live run
-count you can see.
+There are no concurrency caps here: not global, per project, or per profile.
+Concurrent mutation is safe only when each run has an isolated worktree;
+shared-checkout runs can interfere. Merges are sequential and rebase before
+landing. The operator controls admission with the pause switch and can see the
+live run count.
 
 Three things live here, and the HTTP surface (§3, W-0100) imports the same
 functions rather than reimplementing them:

@@ -28,7 +28,7 @@ class BriefBudgetTests(unittest.TestCase):
         lines = [l for l in brief.PROTOCOL_CARD.splitlines() if l.strip()]
         self.assertLessEqual(len(lines), 10)
 
-    def test_spawn_enabled_brief_stays_inside_the_budget(self) -> None:
+    def test_legacy_spawn_setting_does_not_expand_the_brief(self) -> None:
         text = brief.compose(
             run_id=1, slug="calm_otter",
             profile={"name": "lead", "spawn_profiles": ["worker", "cheap"]},
@@ -57,16 +57,16 @@ class BriefContentTests(unittest.TestCase):
         self.assertIn("## Work item snapshot", text)
         self.assertNotIn("s" * (brief.WORK_SNAPSHOT_MAX_CHARS + 1), text)
 
-    def test_spawn_mentioned_only_when_permitted(self) -> None:
-        """D11: a worker is never taught a verb it is forbidden to use."""
+    def test_spawn_is_never_advertised(self) -> None:
+        """The legacy setting remains readable but child launch does not exist."""
         silent = _compose(mission="m")
         self.assertNotIn("delegate", silent.lower())
         allowed = brief.compose(
             run_id=1, slug="calm_otter",
             profile={"name": "lead", "spawn_profiles": ["worker", "cheap"]},
             mission="m", requester="human", root=Path("/p"), workdir="/p")
-        self.assertIn("delegate", allowed.lower())
-        self.assertIn("worker, cheap", allowed)
+        self.assertNotIn("delegate", allowed.lower())
+        self.assertNotIn("worker, cheap", allowed)
         empty_list = brief.compose(
             run_id=1, slug="calm_otter",
             profile={"name": "lead", "spawn_profiles": []},
@@ -101,8 +101,8 @@ class BriefContentTests(unittest.TestCase):
         self.assertIn("## Writeback", text)
         self.assertIn(style.strip(), text)
         self.assertIn("human operator", text)
-        self.assertIn("comments, resolution summaries, filed issues, "
-                      "proposed tasks, and recommendation reasons", text)
+        self.assertIn("every run handoff and any optional adapter writeback",
+                      text)
 
     def test_style_doc_is_referenced_by_path(self) -> None:
         """An edit to the doc is an edit to the brief. brief.py holds no copy."""
@@ -115,17 +115,16 @@ class BriefContentTests(unittest.TestCase):
         self.assertIn("One idea per sentence",
                       brief.WRITEBACK_STYLE.read_text(encoding="utf-8"))
 
-    def test_two_profiles_both_carry_the_git_law(self) -> None:
-        """W-0259: every harness gets the same write path — files, host commits."""
+    def test_two_profiles_both_carry_the_git_boundary(self) -> None:
+        """Every harness reserves git writes for Orchestra."""
         for name in ("codex", "claude"):
             text = brief.compose(
                 run_id=1, slug="calm_otter", profile={"name": name},
                 mission="m", requester="human", root=Path("/p"), workdir="/p")
             self.assertIn("Never run git write commands", text, name)
-            self.assertIn("host checkpoints", text, name)
-            self.assertIn("EPERM", text, name)
-            self.assertIn("worktree yes", text, name)
-            self.assertIn(".git no", text, name)
+            self.assertIn("Orchestra checkpoints isolated runs", text, name)
+            self.assertIn("working directory yes", text, name)
+            self.assertIn(".git host-owned", text, name)
             self.assertIn("/tmp yes", text, name)
             self.assertNotIn("Commit your git changes", text, name)
 

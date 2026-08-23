@@ -1,109 +1,109 @@
 ---
 name: orchestra
-description: Dispatch and supervise autonomous coding agents through Orchestra — run work in isolated git worktrees, watch traces, send corrections, and land verified branches. Use when asked to delegate coding work, run several agents at once, check on a running agent, or merge an agent's branch.
+description: Use Orchestra to dispatch and supervise an already-formed coding or research mission through Codex, Claude Code, OpenCode, or Reasonix. Use when asked to delegate work, inspect a run, send a correction, or land an isolated branch.
 ---
 
 # Orchestra
 
-Orchestra runs coding agents in isolated git worktrees and lands their work on
-your base branch after verification. You drive it with the `orchestra` CLI.
+Orchestra runs missions through Codex, Claude Code, OpenCode, or Reasonix behind
+one lifecycle, trace, control, and result surface. Work is an optional intent
+and ledger adapter. A locally registered project needs no Work server.
 
-Check it is alive before anything else:
+Check the installation before dispatching:
 
-```
+```sh
 orchestra doctor
 ```
 
-That prints which harnesses are installed, where state lives, and whether the
-daemon is running. If a harness shows as missing, runs on that profile will
-fail — say so rather than dispatching into it.
+This reports installed harnesses, state paths, configuration problems, and
+whether a managed daemon service is installed. Do not send a run to a missing
+harness.
 
-## Register the project once
+## Register the project
 
-Orchestra can only dispatch into a directory it knows:
+Orchestra dispatches only into registered directories:
 
-```
+```sh
 orchestra project add .
 orchestra project list
 ```
 
-`list` marks each project `work` or `local`. A `local` project is one adopted
-here; Orchestra owns it outright and nothing else needs to be running.
+`project list` labels each entry as local or Work-backed. Local registration
+is enough for direct dispatch.
 
 ## Dispatch
 
-```
-orchestra profiles                                   # what you may dispatch to
+```sh
+orchestra profiles
 orchestra dispatch --to <profile> --worktree "<mission>"
 ```
 
-`--worktree` gives the run its own checkout and branch (`orchestra/run-N`). Use it
-whenever the run will write files. Without it the run works in the current
-checkout, which is right only for read-only research and is unsafe while
-anything else is editing.
+Use `--worktree` whenever the run will edit files. Without it, the run uses the
+registered checkout. Shared execution is appropriate for read-only research but
+unsafe while another process is editing the same files.
 
-Write the mission as a complete instruction. The run does not see this
-conversation, cannot ask a follow-up before it starts, and gets exactly what
-you type. State what to change, what "done" means, and how to verify it.
+Write a self-contained mission. The run does not see the conversation that led
+to it. State what to change, what done means, and how to verify it.
 
-Dispatch returns immediately with a run id.
+Dispatch returns a run id when the run starts, not when it succeeds.
 
 ## Watch
 
-```
-orchestra runs                # every run, newest first
-orchestra runs --active       # just what is in flight
-orchestra show <id>           # status, summary, tokens, branch, workdir
+```sh
+orchestra runs
+orchestra runs --active
+orchestra show <id>
 ```
 
-`show` is the one to read after a run finishes: it carries the run's own handoff
-summary, which is where the agent says what it did and what it left undone.
+`show` carries the run's final status, handoff summary, token usage, branch,
+and working directory.
 
 ## Intervene
 
-```
-orchestra tell <id> "<correction>"    # queued; delivered at the run's next safe point
-orchestra check <id>                  # ask the observer whether it is still working
-orchestra kill <id>                   # stop it
+```sh
+orchestra tell <id> "<correction>"
+orchestra check <id>
+orchestra kill <id>
 ```
 
-`tell` does not interrupt mid-tool-call. `check` costs a model turn, so use it
-when a run looks stalled rather than as a status poll — `runs --active` is free.
+`tell` uses the live ACP channel when one exists. Exec runs receive it at the
+next safe action boundary. `check` may use an out-of-band model turn, so
+inspect status and trace first.
 
-## Land the work
+## Land an isolated branch
 
-```
+A successful isolated run automatically attempts landing. If its branch remains
+after a pause or landing failure, retry it with:
+
+```sh
 orchestra merge <branch>
 ```
 
-Verification runs in order and stops at the first failure: the repository's
-declared checks, then mechanical tripwires (files outside the project,
-deletions, oversized diffs), then a diff review against acceptance criteria when
-there are any. The merge happens in a scratch worktree and the base ref moves by
-compare-and-swap, so a base that moved underneath refuses rather than
-overwriting.
+Landing rebases in a scratch worktree, runs the repository's declared checks
+and mechanical tripwires, then updates the base ref by compare-and-swap. It does
+not review the diff against acceptance criteria. A tripped limit may use an
+available observer profile to judge whether the change matches the mission.
 
-It refuses while the base checkout is dirty. Commit or stash first — that is a
-guard against landing under someone mid-edit, not a bug.
+Without declared checks, landing relies on that tripwire policy. Configure test,
+lint, or build commands in `[merge.checks]` before trusting it.
 
-A repository that declares no checks lands on tripwires alone. If you are
-dispatching into a repo with a test command, declare it in the project's
-`[merge.checks]` before trusting an automatic landing.
+After landing, Orchestra refreshes an owner checkout sitting on the base branch
+only when Git can preserve local edits. If refresh would overwrite an edit, the
+checkout keeps its pre-merge tree and the result reports what happened.
+`require_clean = true` instead refuses landing when edits overlap it.
 
-## What to tell the person
+## Report the outcome
 
-Report the run id and what it actually did, from `show <id>`. If a run failed,
-give the reason from its summary rather than only its status. If you dispatched
-several, say which landed and which did not.
+Report the run id and the outcome shown by `orchestra show <id>`. If the run
+failed, include its recorded reason. For several runs, say which completed,
+landed, failed, or remain active.
 
-Do not claim a run succeeded because dispatch returned — dispatch returning
-means it started.
+Never claim success because dispatch returned.
 
 ## Boundaries
 
-- One mission per run. A run given three unrelated jobs does the first well.
-- Do not dispatch a run whose mission is to dispatch more runs unless the
-  profile's `spawn_profiles` allows it; the depth limit exists so an unattended
-  fleet cannot grow itself.
-- Do not `kill` a run that is merely slow. Read its trace first — a run writing
-  files is working, and a killed run's session is never resumed.
+- Give one coherent mission to each run.
+- Use an isolated worktree for mutation.
+- Read the trace before killing a run that may simply be slow.
+- Do not instruct a run to create child runs. Orchestra does not implement child
+  launch yet.

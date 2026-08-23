@@ -5,9 +5,9 @@ runs landing at once; ``SWAP_ATTEMPTS`` says how many times to rebase onto the
 new base and try again before it stops being self-correcting and becomes the
 human's problem.
 
-Verification runs in authority order — declared checks, mechanical tripwires,
-then a cheap agent review — and stops at the first failure. The merge itself
-happens in a THROWAWAY WORKTREE: the base branch ref is updated with
+Verification currently enforces declared checks followed by mechanical
+tripwires. The retained agent-review seam is unwired and non-blocking. The merge
+itself happens in a THROWAWAY WORKTREE: the base branch ref is updated with
 ``git update-ref``, so the owner's checkout, which routinely holds
 uncommitted work, is never touched.
 
@@ -254,16 +254,10 @@ def judge_tripwires(cfg: dict | None, mission: str, fired: list[str],
 
 
 def agent_review(diff: str, criteria: str) -> dict:
-    """Stage 3 SEAM: cheap agent review of the diff against acceptance criteria.
+    """Reserved acceptance-review seam; the default implementation is unwired.
 
-    Wire this to a short-lived cheap run (dispatch is being restructured in
-    parallel) and keep the returned shape: ``ok`` gates the merge, ``verdict``
-    is one of pass | fail | unwired, ``notes`` is the human-readable reason
-    that goes into the Work comment.
-
-    ponytail: stub verdict, no model call — a non-blocking pass, so a merge
-    never depends on an unwired stage. The caller can inject its own
-    reviewer via merge_run(review=...).
+    An injected reviewer may still gate ``merge_run`` in tests or internal
+    callers. The CLI rejects criteria files until a real default exists.
     """
     return {"ok": True, "verdict": "unwired",
             "notes": "agent review not wired to dispatch yet"}
