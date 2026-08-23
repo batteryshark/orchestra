@@ -19,18 +19,37 @@ def env(name: str, default: str = "") -> str:
 
 
 def home() -> Path:
-    return Path(env("ORCHESTRA_HOME", "~/.orchestra")).expanduser()
+    configured = env("ORCHESTRA_HOME", "~/.orchestra")
+    if not configured:
+        raise SystemExit("orchestra: ORCHESTRA_HOME must not be empty")
+    candidate = Path(configured).expanduser()
+    resolved = candidate.resolve()
+    if resolved == Path.cwd().resolve() or resolved == Path(resolved.anchor):
+        raise SystemExit("orchestra: ORCHESTRA_HOME must name a dedicated state "
+                         "directory, not the current directory or filesystem root")
+    return candidate
+
+
+def _owner_dir(path: Path) -> Path:
+    """Create a state directory and keep it private to the current user.
+
+    The directory is the security boundary for every artifact beneath it,
+    including files created by SQLite and launchd whose own modes follow the
+    process umask. Windows relies on the user's profile ACLs; its chmod only
+    controls the read-only bit and cannot express this POSIX invariant.
+    """
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix":
+        path.chmod(0o700)
+    return path
 
 
 def _sub(name: str) -> Path:
-    d = home() / name
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return _owner_dir(_owner_dir(home()) / name)
 
 
 def db_path() -> Path:
-    home().mkdir(parents=True, exist_ok=True)
-    return home() / "orchestra.db"
+    return _owner_dir(home()) / "orchestra.db"
 
 
 def logs_dir() -> Path:
@@ -49,9 +68,7 @@ def slugify(raw: str) -> str:
 def worktrees_dir(project_id: str) -> Path:
     """Keyed by Work's immutable projectId, never by the Work id: the id is
     mutable, so a renamed project would strand its worktree directory."""
-    d = home() / "worktrees" / slugify(project_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return _owner_dir(_sub("worktrees") / slugify(project_id))
 
 
 def hooks_dir() -> Path:

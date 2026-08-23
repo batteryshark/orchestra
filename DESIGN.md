@@ -55,7 +55,8 @@ stated method against landed main, and writes the result to Work.
 
 SQLite state, briefs, raw logs, and worktrees live under `~/.orchestra/`.
 Configuration lives at `~/.config/orchestra/config.toml`. Projects do not need
-a local Orchestra state directory.
+a local Orchestra state directory. On POSIX systems, the state root and its
+managed containers are owner-only (`0700`) traversal boundaries.
 
 A direct run follows this path:
 
@@ -167,6 +168,11 @@ The supervisor enforces configurable hard and stall timeouts and runs
 mechanical loop checks. A manual `check` can add an out-of-band model judgment
 when an observer profile is available. Neither replaces deterministic
 timeouts.
+
+A transient infrastructure failure gets one automatic retry of the same
+brief. A recognized non-refreshable authentication failure does not: Orchestra
+escalates it until the operator reauthenticates, then the work must be
+dispatched afresh.
 
 ## 8. Optional human loop
 

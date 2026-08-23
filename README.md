@@ -164,6 +164,9 @@ ln -sfn "$PWD/skills/orchestra" ~/.claude/skills/orchestra
 | Environment overrides | `ORCHESTRA_*` |
 | Work agent identity | `orchestra` |
 
+On POSIX systems, the state root and its managed container directories are
+owner-only (`0700`) traversal boundaries.
+
 ## The repository
 
 | Path | What |

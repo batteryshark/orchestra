@@ -24,12 +24,13 @@ human loop is on. Nothing here may silently kill a run.
 Also on demand: ``orchestra check <run>`` / ``POST /api/runs/N/check`` run the
 same judgement immediately, through ``check()``.
 
-**Retry**: an infrastructure-shaped terminal state is retried ONCE,
-automatically, reusing the same brief. Two consecutive infrastructure
-failures on the same item stop and escalate; nothing spends a third. A run
-that FINISHED but produced bad work is a judgment failure, not an
-infrastructure one: it goes to a planner turn, whose seam is
-``planner_review`` at the bottom of this file.
+**Retry**: a transient infrastructure-shaped terminal state is retried ONCE,
+automatically, reusing the same brief. A recognized persistent authentication
+failure is escalated until the credential changes instead of repeating the
+same doomed attempt. Two consecutive infrastructure failures on the same item
+stop and escalate; nothing spends a third. A run that FINISHED but produced bad
+work is a judgment failure, not an infrastructure one: it goes to a planner
+turn, whose seam is ``planner_review`` at the bottom of this file.
 """
 import json
 import os
@@ -695,12 +696,14 @@ def apply_verdict(con, run_id: int, verdict: dict, cfg: dict | None = None, *,
     return result
 
 
-def escalate(con, run, *, title: str, detail: str, cfg: dict | None = None) -> dict:
+def escalate(con, run, *, title: str, detail: str, cfg: dict | None = None,
+             alert_only: bool = False) -> dict:
     """Put the reasoning where a human sees it: the run's message thread
     always, plus a Nod card when the human loop is configured.
 
-    Always a ``failure`` card (Retry / Abandon) — every escalation from this
-    module is "this run stopped and a human has to choose what happens now".
+    Most calls file a ``failure`` card (Retry / Abandon). ``alert_only`` is
+    for a blocked external precondition such as expired authentication: Nod
+    cannot repair it, so offering an immediate Retry would be a lie.
 
     Never raises. An escalation that cannot be delivered still has to be
     recorded, or the run stops for no visible reason.
@@ -718,8 +721,9 @@ def escalate(con, run, *, title: str, detail: str, cfg: dict | None = None) -> d
         if target is None:
             out["nod_error"] = "the human loop is off; escalation recorded only"
             return out
-        filed = nod.failure(target, detail, title=title, con=con, run_id=run_id,
-                            work_item=run["work_item"] if run is not None else None)
+        file_card = nod.alert if alert_only else nod.failure
+        filed = file_card(target, detail, title=title, con=con, run_id=run_id,
+                          work_item=run["work_item"] if run is not None else None)
         out["nod"] = filed.get("request_id")
     except Exception as exc:  # a dead Nod must not swallow the reasoning
         out["nod_error"] = f"{exc.__class__.__name__}: {exc}"
@@ -857,23 +861,38 @@ def _stopped_deliberately(con, run_id: int) -> bool:
         _last(con, run_id, "mechanical", "stop") is not None
 
 
+def _automatic_retry_blocker(run) -> str | None:
+    """A failed precondition that another identical attempt cannot change.
+
+    Keep this deliberately narrow. The Claude event that produced live runs
+    7 and 8 carries ``error=authentication_failed`` and this durable summary;
+    ordinary task text mentioning credentials must retain the normal retry.
+    """
+    summary = str(run["summary"] or "").strip().casefold()
+    if run["backend"] == "claude" and summary.startswith("failed to authenticate:"):
+        return "Claude authentication failed; reauthenticate Claude before " \
+               "dispatching the work again"
+    return None
+
+
 def infra_streak(con, run) -> int:
     """Consecutive infrastructure-shaped failures on the same item, this one
     included. The item is the Work item when there is one, else the retry
     lineage — a run dispatched by hand is still 'the same item' to itself."""
     if run["work_item"]:
         rows = con.execute(
-            f"SELECT status FROM runs WHERE work_item=? AND id<=? "
+            f"SELECT status, backend, summary FROM runs WHERE work_item=? AND id<=? "
             f"AND status IN {db.TERMINAL_SQL} ORDER BY id DESC",
             (run["work_item"], run["id"]))
         streak = 0
         for row in rows:
-            if row["status"] not in INFRA_TERMINAL:
+            if row["status"] not in INFRA_TERMINAL or _automatic_retry_blocker(row):
                 break
             streak += 1
         return streak
     streak, current = 0, run
-    while current is not None and current["status"] in INFRA_TERMINAL:
+    while current is not None and current["status"] in INFRA_TERMINAL \
+            and not _automatic_retry_blocker(current):
         streak += 1
         previous = current["retry_of"]
         current = con.execute("SELECT * FROM runs WHERE id=?",
@@ -982,11 +1001,12 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
                    launcher=None) -> dict:
     """SEAM (W-0166): the supervisor calls this once, after finalization.
 
-    Applies the §7 retry rule and nothing else. Retry ONCE for an
-    infrastructure-shaped terminal state, reusing the same brief; a second
-    consecutive one on the same item stops and escalates. A run that
-    finished is never retried here — bad work is a judgment failure and goes
-    to ``planner_review``.
+    Applies the §7 retry rule and nothing else. Retry ONCE for a transient
+    infrastructure-shaped terminal state, reusing the same brief; a failed
+    precondition that an identical attempt cannot change escalates directly.
+    A second consecutive transient failure on the same item stops and
+    escalates. A run that finished is never retried here — bad work is a
+    judgment failure and goes to ``planner_review``.
     """
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if run is None:
@@ -1005,6 +1025,23 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     if _stopped_deliberately(con, run_id):
         return {"action": "none", "reason": "the run was stopped on judgement"}
     cfg = config.load(run["project_id"]) if cfg is None else cfg
+    blocker = _automatic_retry_blocker(run)
+    if blocker:
+        record(con, run_id, "retry", "escalate", blocker,
+               {"precondition": "reauthenticate", "backend": run["backend"]})
+        con.commit()
+        result = {"action": "escalate", "reason": blocker,
+                  "precondition": "reauthenticate"}
+        result["escalation"] = escalate(
+            con, run, title=f"Run {run_id} needs Claude authentication",
+            detail=f"Run {run_id} failed because its Claude authentication "
+                   "could not be refreshed.\n\n"
+                   f"{(run['summary'] or '(no summary)')[:1000]}\n\n"
+                   "Orchestra did not repeat the same brief with the same "
+                   "expired credential. Reauthenticate Claude, then dispatch "
+                   "the work again.",
+            cfg=cfg, alert_only=True)
+        return result
     streak = infra_streak(con, run)
     if streak >= 2:
         reason = (f"{streak} consecutive infrastructure failures on "

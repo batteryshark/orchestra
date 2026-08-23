@@ -1,5 +1,6 @@
 """Central paths and local or Work-backed project resolution (DESIGN §2)."""
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,53 @@ class PathsTests(unittest.TestCase):
         self.assertEqual(paths.logs_dir(), self.home / "logs")
         self.assertEqual(paths.worktrees_dir("demo"),
                          self.home / "worktrees" / "demo")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX mode bits")
+    def test_state_directories_are_owner_only_and_existing_modes_are_repaired(self) -> None:
+        logs = self.home / "logs"
+        logs.mkdir(parents=True, mode=0o755)
+        self.home.chmod(0o755)
+        logs.chmod(0o755)
+
+        logs = paths.logs_dir()
+        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(logs.stat().st_mode), 0o700)
+        touched = [paths.db_path().parent, paths.briefs_dir(), logs,
+                   paths.hooks_dir(), paths.worktrees_dir("demo").parent,
+                   paths.worktrees_dir("demo")]
+
+        for path in touched:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700, path)
+
+    def test_an_empty_home_is_rejected_without_touching_the_current_directory(self) -> None:
+        current = Path.cwd()
+        scratch = Path(self.tmp.name) / "cwd"
+        scratch.mkdir(mode=0o755)
+        before = stat.S_IMODE(scratch.stat().st_mode)
+        os.chdir(scratch)
+        try:
+            with mock.patch.dict(os.environ, {"ORCHESTRA_HOME": ""}):
+                with self.assertRaisesRegex(SystemExit, "must not be empty"):
+                    paths.db_path()
+        finally:
+            os.chdir(current)
+        self.assertEqual(stat.S_IMODE(scratch.stat().st_mode), before)
+
+    def test_a_broad_home_is_rejected_before_permissions_change(self) -> None:
+        current = Path.cwd()
+        scratch = Path(self.tmp.name) / "cwd"
+        scratch.mkdir(mode=0o755)
+        before = stat.S_IMODE(scratch.stat().st_mode)
+        os.chdir(scratch)
+        try:
+            for configured in (".", "nested/..", scratch.anchor):
+                with self.subTest(configured=configured), \
+                        mock.patch.dict(os.environ, {"ORCHESTRA_HOME": configured}):
+                    with self.assertRaisesRegex(SystemExit, "dedicated state directory"):
+                        paths.db_path()
+        finally:
+            os.chdir(current)
+        self.assertEqual(stat.S_IMODE(scratch.stat().st_mode), before)
 
     def test_worktree_dir_is_keyed_by_the_immutable_project_id(self) -> None:
         """The Work id is mutable, so renaming a project would strand its
