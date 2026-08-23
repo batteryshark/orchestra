@@ -6,6 +6,8 @@ items in one project dispatch in ONE pass, with no cap and no stagger. The
 rest cover what only matters for items that must wait.
 """
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -145,7 +147,7 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
                          [("dispatch", "W-0003"), ("hold", "W-0002")])
 
 
-class PauseSwitchTests(SweeperFixture, unittest.TestCase):
+class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
     def restart(self) -> bool:
         """A daemon restart holds nothing in memory, so the switch has to
         come back out of the database on a fresh connection."""
@@ -218,7 +220,47 @@ class PauseSwitchTests(SweeperFixture, unittest.TestCase):
         self.assertIn("paused", str(caught.exception))
         self.assertIn("orchestra resume", str(caught.exception))
 
-    def test_deferred_dependency_release_is_held_by_the_pause(self) -> None:
+    def test_manual_reply_obeys_pause_and_records_async_spawn_failure(self) -> None:
+        self.work.add_task("W-0001", "finished conversation", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.finish_run(run["id"], session_ref="session-1")
+        con = db.connect()
+        dispatch.pause(con, "hold continuations")
+        before = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
+        con.close()
+        with self.assertRaises(SystemExit) as caught, \
+                mock.patch.object(supervise, "spawn_supervisor"):
+            cli.cmd_reply(mock.Mock(run_id=run["id"], message=["continue"],
+                                    sync=False))
+        con = db.connect()
+        after = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
+        con.close()
+        self.assertEqual(before, after)
+        self.assertIn("paused", str(caught.exception))
+
+        con = db.connect()
+        dispatch.resume(con)
+        con.close()
+        with mock.patch.object(supervise, "spawn_supervisor",
+                               side_effect=RuntimeError("supervisor absent")), \
+                self.assertRaisesRegex(RuntimeError, "supervisor absent"):
+            cli.cmd_reply(mock.Mock(run_id=run["id"], message=["continue"],
+                                    sync=False))
+        failed = self.db_run()
+        self.assertNotEqual(failed["id"], run["id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("supervisor absent", failed["summary"])
+
+    def test_deferred_release_waits_for_resume_and_cleans_failed_launch(self) -> None:
+        for args in (("init", "-q"),
+                     ("config", "user.email", "t@example.com"),
+                     ("config", "user.name", "t")):
+            subprocess.run(["git", *args], cwd=self.root, check=True)
+        (self.root / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "seed.txt"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "seed"], cwd=self.root,
+                       check=True)
         con = db.connect()
         con.execute(
             "INSERT INTO runs(id, profile, backend, title, requested_by, workdir, "
@@ -230,22 +272,68 @@ class PauseSwitchTests(SweeperFixture, unittest.TestCase):
             "'human',?,?, 'pending', ?)", (str(self.root), PROJECT_ID, db.now()))
         con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
                     "VALUES(2, 1)")
-        con.execute("INSERT INTO deferred_dispatches(run_id, mission, created_at) "
-                    "VALUES(2, 'go', ?)", (db.now(),))
+        con.execute("INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
+                    "created_at) VALUES(2, 'go', 1, ?)", (db.now(),))
         con.commit()
         dispatch.pause(con, "hold the line")
-        launched: list = []
+        launched: list[int] = []
+
+        def fail_spawn(_root, run_id):
+            launched.append(run_id)
+            raise RuntimeError("supervisor absent")
+
         self.assertEqual(
-            supervise.process_ready(con, lambda root, rid: launched.append(rid)), [])
+            supervise.process_ready(con, fail_spawn), [])
         self.assertEqual(launched, [])
         self.assertEqual(
             con.execute("SELECT status FROM runs WHERE id=2").fetchone()["status"],
             "pending")  # still pending, still honest
         dispatch.resume(con)
-        released = supervise.process_ready(con, lambda root, rid: launched.append(rid))
+        released = supervise.process_ready(con, fail_spawn)
+        run = con.execute("SELECT * FROM runs WHERE id=2").fetchone()
+        deferred = con.execute(
+            "SELECT * FROM deferred_dispatches WHERE run_id=2").fetchone()
         con.close()
-        self.assertEqual([r["status"] for r in released], ["fired"])
+        self.assertEqual([r["status"] for r in released], ["failed"])
         self.assertEqual(launched, [2])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["workdir"], str(self.root))
+        self.assertIsNone(run["branch"])
+        self.assertIn("supervisor absent", run["summary"])
+        self.assertEqual(deferred["status"], "failed")
+        branches = subprocess.run(
+            ["git", "branch", "--list", "orchestra/run-2"], cwd=self.root,
+            check=True, capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=self.root,
+            check=True, capture_output=True, text=True).stdout
+        self.assertNotIn("/run-2", worktrees)
+
+    def test_pause_still_settles_a_broken_dependency_chain(self) -> None:
+        con = db.connect()
+        con.execute(
+            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
+            "status, started_at) VALUES(1,'stub','opencode','human',?,"
+            "'failed',?)", (str(self.root), db.now()))
+        con.execute(
+            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
+            "status, started_at) VALUES(2,'stub','opencode','human',?,"
+            "'pending',?)", (str(self.root), db.now()))
+        con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+                    "VALUES(2, 1)")
+        con.execute("INSERT INTO deferred_dispatches(run_id, mission, created_at) "
+                    "VALUES(2, 'go', ?)", (db.now(),))
+        con.commit()
+        dispatch.pause(con, "no new work")
+        launched = []
+        settled = supervise.process_ready(con, lambda root, rid: launched.append(rid))
+        self.assertEqual(settled, [{"run_id": 2, "status": "declined"}])
+        self.assertEqual(launched, [])
+        self.assertEqual(
+            con.execute("SELECT status FROM runs WHERE id=2").fetchone()["status"],
+            "failed")
+        con.close()
 
 
 class StateReportTests(SweeperFixture, unittest.TestCase):
@@ -263,6 +351,22 @@ class StateReportTests(SweeperFixture, unittest.TestCase):
         self.assertFalse(state["paused"])
         self.assertEqual([(w["item_id"], w["reason"]) for w in state["waiting"]],
                          [("W-0003", "dependency")])
+
+
+class ManualIsolationTests(unittest.TestCase):
+    def parsed_worktree(self, *extra: str) -> bool:
+        seen = []
+        with mock.patch.object(sys, "argv", ["orchestra", "dispatch", "--to",
+                                             "stub", *extra, "inspect"]), \
+                mock.patch.object(cli, "cmd_dispatch",
+                                  side_effect=lambda args: seen.append(args.worktree)):
+            cli.main()
+        return seen[0]
+
+    def test_manual_dispatch_defaults_isolated_with_an_explicit_shared_mode(self) -> None:
+        self.assertTrue(self.parsed_worktree())
+        self.assertTrue(self.parsed_worktree("--worktree"))
+        self.assertFalse(self.parsed_worktree("--shared"))
 
 
 class PauseSwitchTests(unittest.TestCase):

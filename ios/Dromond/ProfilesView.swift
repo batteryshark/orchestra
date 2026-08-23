@@ -43,7 +43,7 @@ struct ProfilesView: View {
             .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
             .refreshable { await state.refresh() }
             .sheet(item: $editing) { profile in
-                ProfileEditor(profile: profile, options: options, others: otherNames(profile))
+                ProfileEditor(profile: profile, options: options)
             }
             .task { await loadOptions() }
             .task(id: state.selectedProjectID) { await loadEnabled() }
@@ -146,9 +146,6 @@ struct ProfilesView: View {
             .sorted { ($0.tier == 0 ? 99 : $0.tier) < ($1.tier == 0 ? 99 : $1.tier) }
     }
 
-    private func otherNames(_ profile: Profile) -> [String] {
-        state.profiles.map(\.name).filter { $0 != profile.name }.sorted()
-    }
 }
 
 private struct ProfileRow: View {
@@ -179,11 +176,6 @@ private struct ProfileRow: View {
             if let role = profile.role, !role.isEmpty {
                 Text(role).font(.caption).foregroundStyle(.secondary)
             }
-            Text(profile.spawnProfiles.isEmpty
-                 ? "Delegates to: nothing"
-                 : "Delegates to: " + profile.spawnProfiles.joined(separator: ", "))
-                .font(.caption2)
-                .foregroundStyle(.secondary)
             if let note = profile.note, !note.isEmpty {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "note.text").font(.caption2).foregroundStyle(.orange)
@@ -224,14 +216,12 @@ private struct ProfileEditor: View {
     @Environment(\.dismiss) private var dismiss
     let profile: Profile
     let options: [String: HarnessOptions]
-    let others: [String]
 
     @State private var harness = ""
     @State private var model = ""
     @State private var effort = ""
     @State private var tier = 2
     @State private var priority = 10
-    @State private var spawn: Set<String> = []
     @State private var saving = false
     @State private var error: String?
 
@@ -306,24 +296,6 @@ private struct ProfileEditor: View {
                     Stepper("Priority \(priority)", value: $priority, in: 0...99)
                 }
 
-                Section {
-                    if others.isEmpty {
-                        Text("No other profiles to delegate to.").foregroundStyle(.secondary)
-                    }
-                    ForEach(others, id: \.self) { name in
-                        Toggle(name, isOn: Binding(
-                            get: { spawn.contains(name) },
-                            set: { on in
-                                if on { spawn.insert(name) } else { spawn.remove(name) }
-                            }
-                        ))
-                    }
-                } header: {
-                    Text("May delegate to")
-                } footer: {
-                    Text("Nothing selected means this profile spawns no runs of its own.")
-                }
-
                 if let error {
                     Section { Text(error).foregroundStyle(.red) }
                 }
@@ -359,7 +331,6 @@ private struct ProfileEditor: View {
         effort = profile.effort ?? ""
         tier = profile.tier ?? 2
         priority = profile.priority ?? 10
-        spawn = Set(profile.spawnProfiles)
     }
 
     /// Only what the owner actually changed. Sending an untouched field would
@@ -372,7 +343,6 @@ private struct ProfileEditor: View {
         if effort != (profile.effort ?? "") { edit.effort = effort }
         if tier != profile.tier { edit.tier = tier }
         if priority != profile.priority { edit.priority = priority }
-        if spawn != Set(profile.spawnProfiles) { edit.spawnProfiles = spawn.sorted() }
         return edit
     }
 

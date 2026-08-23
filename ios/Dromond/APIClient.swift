@@ -336,7 +336,6 @@ struct ProfileEdit: Sendable {
     var variant: String?
     var tier: Int?
     var priority: Int?
-    var spawnProfiles: [String]?
     var note: String?
 
     var payload: [String: Any] {
@@ -347,7 +346,6 @@ struct ProfileEdit: Sendable {
         if let variant { out["variant"] = variant }
         if let tier { out["tier"] = tier }
         if let priority { out["priority"] = priority }
-        if let spawnProfiles { out["spawn_profiles"] = spawnProfiles }
         if let note { out["note"] = note }
         return out
     }

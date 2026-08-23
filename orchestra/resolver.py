@@ -194,13 +194,15 @@ def dispatch_resolver(con, cfg: dict, run_id: int, reason: str) -> int | None:
         except (Exception, SystemExit) as exc:
             # No shared-checkout fallback here on purpose: a resolver in the
             # owner's own checkout is worse than no resolver.
-            con.execute("UPDATE runs SET status='failed', summary=?, "
-                        "finished_at=? WHERE id=?",
-                        (f"Launch setup failed: {exc}", db.now(), new_id))
-            con.commit()
+            supervise.fail_launch(con, root, new_id, exc)
             _refuse(f"launch setup for run {new_id} failed: {exc}")
             return None
-        launcher(root, new_id)
+        try:
+            launcher(root, new_id)
+        except BaseException as exc:
+            supervise.fail_launch(con, root, new_id, exc)
+            _refuse(f"supervisor for run {new_id} did not start: {exc}")
+            return None
         return new_id
     except Exception as exc:
         _refuse(str(exc))

@@ -35,12 +35,11 @@ is enough for direct dispatch.
 
 ```sh
 orchestra profiles
-orchestra dispatch --to <profile> --worktree "<mission>"
+orchestra dispatch --to <profile> "<mission>"
 ```
 
-Use `--worktree` whenever the run will edit files. Without it, the run uses the
-registered checkout. Shared execution is appropriate for read-only research but
-unsafe while another process is editing the same files.
+Dispatch is isolated by default. Use `--shared` only for read-only research or
+another case where using the registered checkout is explicitly safe.
 
 Write a self-contained mission. The run does not see the conversation that led
 to it. State what to change, what done means, and how to verify it.
@@ -103,7 +102,6 @@ Never claim success because dispatch returned.
 ## Boundaries
 
 - Give one coherent mission to each run.
-- Use an isolated worktree for mutation.
+- Keep the default isolated worktree for mutation; use `--shared` deliberately.
 - Read the trace before killing a run that may simply be slow.
-- Do not instruct a run to create child runs. Orchestra does not implement child
-  launch yet.
+- Do not instruct a run to create child runs. Orchestra has no child launcher.

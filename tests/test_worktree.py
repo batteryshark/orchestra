@@ -107,6 +107,16 @@ class SyncSkillsTests(unittest.TestCase):
         self.assertFalse((wt / ".claude").exists())
         self.assertTrue((wt / ".codex").exists())
 
+        with mock.patch.object(worktree, "sync_skills",
+                               side_effect=OSError("context copy failed")), \
+                self.assertRaisesRegex(OSError, "context copy failed"):
+            worktree.create(self.root, 8, "proj-uuid", backend="codex")
+        self.assertFalse((self.home / "worktrees/proj-uuid/run-8").exists())
+        branches = subprocess.run(
+            ["git", "-C", str(self.root), "branch", "--list", "orchestra/run-8"],
+            check=True, capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+
 
 class WorktreeRemovalTests(unittest.TestCase):
     """W-0172: a terminal run's checkout goes; a live run's checkout stays."""

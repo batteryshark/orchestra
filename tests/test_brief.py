@@ -28,16 +28,6 @@ class BriefBudgetTests(unittest.TestCase):
         lines = [l for l in brief.PROTOCOL_CARD.splitlines() if l.strip()]
         self.assertLessEqual(len(lines), 10)
 
-    def test_legacy_spawn_setting_does_not_expand_the_brief(self) -> None:
-        text = brief.compose(
-            run_id=1, slug="calm_otter",
-            profile={"name": "lead", "spawn_profiles": ["worker", "cheap"]},
-            mission="", requester="human", root=Path("/p"), workdir="/p")
-        self.assertLessEqual(len(_without_writeback(text)), FIXED_CHAR_CEILING)
-        card_lines = [l for l in brief._protocol_card(
-            {"spawn_profiles": ["worker", "cheap"]}).splitlines() if l.strip()]
-        self.assertLessEqual(len(card_lines), 10)
-
     def test_continuation_wrapper_budget(self) -> None:
         text = brief.compose_continuation(run_id=2, parent_run=1, instructions="")
         self.assertLessEqual(len(text), CONTINUATION_CHAR_CEILING)
@@ -58,20 +48,9 @@ class BriefContentTests(unittest.TestCase):
         self.assertNotIn("s" * (brief.WORK_SNAPSHOT_MAX_CHARS + 1), text)
 
     def test_spawn_is_never_advertised(self) -> None:
-        """The legacy setting remains readable but child launch does not exist."""
-        silent = _compose(mission="m")
-        self.assertNotIn("delegate", silent.lower())
-        allowed = brief.compose(
-            run_id=1, slug="calm_otter",
-            profile={"name": "lead", "spawn_profiles": ["worker", "cheap"]},
-            mission="m", requester="human", root=Path("/p"), workdir="/p")
-        self.assertNotIn("delegate", allowed.lower())
-        self.assertNotIn("worker, cheap", allowed)
-        empty_list = brief.compose(
-            run_id=1, slug="calm_otter",
-            profile={"name": "lead", "spawn_profiles": []},
-            mission="m", requester="human", root=Path("/p"), workdir="/p")
-        self.assertNotIn("delegate", empty_list.lower())
+        text = _compose(mission="m")
+        self.assertNotIn("delegate", text.lower())
+        self.assertNotIn("child run", text.lower())
 
     def test_continuation_carries_instructions(self) -> None:
         text = brief.compose_continuation(run_id=5, parent_run=3,

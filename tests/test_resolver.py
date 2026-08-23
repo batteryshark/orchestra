@@ -192,12 +192,23 @@ class DispatchTestCase(ResolverFixture):
         self.assertIn(f"Do not delete `{BRANCH}`", brief)
         self.assertIn(f"orchestra merge {BRANCH}", brief)
 
-    def test_a_configured_resolver_profile_wins(self) -> None:
+    def test_configured_resolver_cleans_up_when_supervisor_never_starts(self) -> None:
         self.run_branch({"app.py": "print('branch')\n"})
         self.add_run()
         cfg = {"profiles": PROFILES, "merge": {"resolver_profile": "cheap"}}
-        new_id, _ = self.dispatch(cfg)
-        self.assertEqual("cheap", self.db_run(new_id)["profile"])
+        with mock.patch.object(resolver, "launcher",
+                               side_effect=RuntimeError("supervisor absent")):
+            new_id, err = self.dispatch(cfg)
+        self.assertIsNone(new_id)
+        failed = self.db_run(2)
+        self.assertEqual("cheap", failed["profile"])
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual(str(self.root), failed["workdir"])
+        self.assertIsNone(failed["branch"])
+        self.assertIn("supervisor absent", failed["summary"])
+        self.assertIn("did not start", err)
+        self.assertEqual("", git(self.root, "branch", "--list", "orchestra/run-2"))
+        self.assertNotIn("/run-2", git(self.root, "worktree", "list", "--porcelain"))
 
     def test_without_one_the_top_tier_2_profile_is_staffed(self) -> None:
         # Tier 2 (owner, 2026-08-18): what reaches a resolver is the residue

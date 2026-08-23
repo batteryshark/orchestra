@@ -271,19 +271,20 @@ class LandingTestCase(unittest.TestCase):
 
     # --- the pause switch -----------------------------------------------------
 
-    def test_a_paused_daemon_lands_nothing(self) -> None:
+    def test_pause_does_not_block_completion_landing(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
         before = git(self.root, "rev-parse", "main")
         dispatch.pause(self.con, note="hands off")
 
         note = merge.at_completion(self.con, self.cfg, self.add_run(), "done")
 
-        self.assertIn("dispatch is paused", note)
-        self.assertEqual(before, git(self.root, "rev-parse", "main"))
-        self.assertIn(BRANCH, self.branches())
-        self.assertEqual("in_progress", self.work.tasks["W-0001"]["status"])
+        after = git(self.root, "rev-parse", "main")
+        self.assertIn(f"Merged {BRANCH} into main", note)
+        self.assertNotEqual(before, after)
+        self.assertNotIn(BRANCH, self.branches())
+        self.assertEqual("review", self.work.tasks["W-0001"]["status"])
         self.assertEqual({}, self.nod.requests)
-        self.assertIn("dispatch is paused", self.thread())
+        self.assertIn(after, self.thread())
 
     # --- what never merges ----------------------------------------------------
 

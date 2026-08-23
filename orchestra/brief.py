@@ -45,8 +45,8 @@ def writeback_section() -> str:
     return WRITEBACK_STYLE.read_text(encoding="utf-8").rstrip() + "\n"
 
 
-def _protocol_card(profile: dict) -> str:
-    """Return the fixed protocol. Child launch is not implemented."""
+def _protocol_card() -> str:
+    """Return the fixed protocol."""
     return PROTOCOL_CARD
 
 
@@ -87,7 +87,7 @@ Project: `{root}` · Working directory: `{workdir}`.
     if extra_context:
         parts.append(f"## Additional context\n\n{extra_context}\n")
     parts.append(writeback_section())
-    parts.append(_protocol_card(profile))
+    parts.append(_protocol_card())
     return "\n".join(parts)
 
 

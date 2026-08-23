@@ -45,7 +45,7 @@ import math
 import time
 from datetime import datetime
 
-from orchestra import (config, db, findings, names, nod, observer, paths,
+from orchestra import (config, db, dispatch, findings, names, nod, observer, paths,
                          profiles as profiles_mod, project, runway as runway_mod,
                          supervise, sweeper, work_client)
 from orchestra.work_client import WorkError
@@ -597,6 +597,9 @@ def _dispatch(con, cfg: dict, client, goal: dict, board: dict, decision: dict,
     if item["id"] != goal["id"] and item.get("parentId") != goal["id"]:
         item = goal  # a planner may only dispatch its own goal or its children
     item_id = item["id"]
+    if dispatch.paused(con):
+        return {"action": "skipped", "item": item_id,
+                "reason": "dispatch is paused"}
     if con.execute(f"SELECT 1 FROM runs WHERE work_item=? AND status NOT IN "
                    f"{db.TERMINAL_SQL} LIMIT 1", (item_id,)).fetchone():
         return {"action": "skipped", "item": item_id,
@@ -619,27 +622,54 @@ def _dispatch(con, cfg: dict, client, goal: dict, board: dict, decision: dict,
     mission = decision.get("mission") or (
         f"Work task {item_id}: {item.get('title', '')}\n\n"
         "The Work item snapshot below carries the details.")
+    if dispatch.paused(con):
+        return {"action": "skipped", "item": item_id,
+                "reason": "dispatch is paused"}
     run_id, run_slug = sweeper.insert_run(con, proj, worker, profile,
                                           (item.get("title") or item_id)[:80],
                                           item_id, item.get("updatedAt"))
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    run_tag = f"[{client.identity}/{run_slug}]"
+    try:
+        claimed = client.log_task(
+            item_id, sweeper.fact_line(run_tag, "claimed", run=run_id))
+    except WorkError as exc:
+        con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        con.commit()
+        return {"action": "rejected", "item": item_id, "stage": "claim",
+                "reason": str(exc)}
+    if claimed is None:
+        con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        con.commit()
+        return {"action": "deferred", "item": item_id, "stage": "claim",
+                "reason": "Work claim returned no response",
+                "retry_trigger": True}
     isolate = bool(sweeper.work_cfg(pcfg).get("worktree", True))
     snapshot = sweeper.render_snapshot(item, "task")
     try:
         supervise.prepare_launch(con, proj.path, pcfg, run, mission=mission,
                                  use_worktree=isolate, work_snapshot=snapshot)
     except (Exception, SystemExit) as exc:
-        # ponytail: the same shared-checkout fallback the sweeper does, said
-        # twice. Fold both into one helper when supervise.py is free to edit.
-        if not isolate:
-            raise
-        print(f"orchestra conductor: shared checkout for run {run_id} ({exc})")
-        supervise.prepare_launch(con, proj.path, pcfg, run, mission=mission,
-                                 use_worktree=False, work_snapshot=snapshot)
+        error = str(exc)[:1000] or exc.__class__.__name__
+        supervise.fail_launch(con, proj.path, run_id, error)
+        sweeper._report(con, client, [])
+        _post(client, goal["id"], f"{_tag(client, slug)} could not dispatch "
+                                  f"{item_id}: {error}")
+        return {"action": "launch_failed", "item": item_id, "run": run_id,
+                "reason": error}
     con.commit()
+    try:
+        launcher(proj.path, run_id)
+    except BaseException as exc:
+        error = str(exc)[:1000] or exc.__class__.__name__
+        supervise.fail_launch(con, proj.path, run_id, error)
+        sweeper._report(con, client, [])
+        _post(client, goal["id"], f"{_tag(client, slug)} could not start run "
+                                  f"{run_id} on {item_id}: {error}")
+        return {"action": "launch_failed", "item": item_id, "run": run_id,
+                "reason": error}
     _post(client, goal["id"], f"{_tag(client, slug)} dispatched run {run_id} "
                               f"on {item_id} — {decision.get('rationale', '')}")
-    launcher(proj.path, run_id)
     return {"action": "dispatch", "item": item_id, "run": run_id,
             "run_slug": run_slug}
 
@@ -658,7 +688,8 @@ def _propose(client, goal: dict, decision: dict, slug: str) -> dict:
         print(f"orchestra conductor: proposal on {goal['id']} rejected: {exc}")
         return {"action": "rejected", "stage": "create_task", "error": exc.code}
     if created is None:
-        return {"action": "deferred", "stage": "create_task"}
+        return {"action": "deferred", "stage": "create_task",
+                "retry_trigger": True}
     child_id = created.get("id") if isinstance(created, dict) else None
     _post(client, goal["id"], f"{tag} proposed child {child_id or ''} — {title}\n\n"
                               f"{decision.get('rationale', '')}")
@@ -685,18 +716,24 @@ def _ask_human(con, cfg: dict, client, goal: dict, decision: dict,
     except Exception as exc:  # a dead Nod must not swallow the question
         out["nod_error"] = f"{exc.__class__.__name__}: {exc}"
         print(f"orchestra conductor: could not file a Nod card for {goal['id']}: {exc!r}")
-    _post(client, goal["id"], f"{tag} needs you: {question}\n\n"
-                              f"{decision.get('rationale', '')}"
-                              + (f"\n\n(Nod card {out['nod']})" if out["nod"] else ""))
+    posted = _post(client, goal["id"], f"{tag} needs you: {question}\n\n"
+                                     f"{decision.get('rationale', '')}"
+                                     + (f"\n\n(Nod card {out['nod']})"
+                                        if out["nod"] else ""))
+    if not posted and not out["nod"]:
+        return {"action": "deferred", "stage": "ask_human",
+                "retry_trigger": True}
     return out
 
 
 def _done(client, goal: dict, decision: dict, slug: str) -> dict:
     """Says so; never closes. The human closes (CONTRACT §3 verb 2)."""
-    _post(client, goal["id"],
-          f"{_tag(client, slug)} believes {goal['id']} is met — "
-          f"{decision.get('rationale', '')}\n\nOrchestra never closes a goal; "
-          "close it yourself when you agree.")
+    if not _post(client, goal["id"],
+                 f"{_tag(client, slug)} believes {goal['id']} is met — "
+                 f"{decision.get('rationale', '')}\n\nOrchestra never closes a goal; "
+                 "close it yourself when you agree."):
+        return {"action": "deferred", "stage": "done",
+                "retry_trigger": True}
     return {"action": "done"}
 
 
@@ -748,6 +785,10 @@ def conduct_goal(con, cfg: dict, client, goal: dict, board: dict, issues: list,
                  floor: int = TURN_FLOOR_SECONDS) -> dict | None:
     """Zero or one planner turn for one goal. ``None`` means nothing fired —
     which is the common case, and it costs nothing."""
+    # A turn may choose dispatch, so do not spend it or consume its trigger
+    # while admission is closed. The same event remains available on resume.
+    if dispatch.paused(con):
+        return None
     goal_id = goal["id"]
     children = children_of(board.values(), goal_id)
     item_ids = [goal_id] + [c["id"] for c in children]
@@ -789,6 +830,13 @@ def conduct_goal(con, cfg: dict, client, goal: dict, board: dict, issues: list,
                        wait_event=wait_event_for(decision), comment_ts=comment_ts,
                        packet_tokens=est_tokens(packet))
     result = apply_decision(con, cfg, client, goal, board, decision, slug, launcher)
+    retry_trigger = bool(result.pop("retry_trigger", False))
+    if retry_trigger:
+        con.execute("DELETE FROM conductor_turns WHERE id=?", (turn_id,))
+        con.commit()
+        return {"goal": goal_id, "trigger": picked["trigger"], "key": picked["key"],
+                "turn": None, "slug": slug, "packet_tokens": est_tokens(packet),
+                **result}
     set_detail(con, turn_id, result)
     return {"goal": goal_id, "trigger": picked["trigger"], "key": picked["key"],
             "turn": turn_id, "slug": slug, "packet_tokens": est_tokens(packet),
@@ -886,6 +934,21 @@ def alignment_planner(*, goal: dict, proposal: dict, run, cfg: dict | None = Non
 _DEFERRED_REVIEW = observer.planner_review
 
 
+def _queue_judgment(con, run_id: int, reason: str, detail: str | None,
+                    *, decision: dict | None = None,
+                    goal_id: str | None = None, slug: str | None = None,
+                    turn_id: int | None = None) -> dict:
+    """Keep a judgment admission durable without spending another turn."""
+    payload = {"detail": detail}
+    if decision is not None:
+        payload.update({"decision": decision, "goal": goal_id, "slug": slug,
+                        "turn": turn_id})
+    observer.record(con, run_id, "judgment", "deferred", reason, payload)
+    con.commit()
+    return {"action": "deferred", "run": None,
+            "reason": "judgment admission is deferred", "queued": True}
+
+
 def judgment_turn(con, run_id: int, reason: str, *, detail: str | None = None,
                   cfg: dict | None = None, turn=None,
                   launcher=supervise.spawn_supervisor) -> dict:
@@ -899,6 +962,8 @@ def judgment_turn(con, run_id: int, reason: str, *, detail: str | None = None,
     """
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cfg = config.load(run["project_id"]) if (cfg is None and run is not None) else cfg
+    if dispatch.paused(con):
+        return _queue_judgment(con, run_id, reason, detail)
     client = work_client.from_cfg(cfg or {})
     goal = None
     board: dict = {}
@@ -943,9 +1008,84 @@ def judgment_turn(con, run_id: int, reason: str, *, detail: str | None = None,
                        packet_tokens=est_tokens(packet))
     result = apply_decision(con, cfg, client, goal, board, decision, slug, launcher)
     set_detail(con, turn_id, result)
-    return {"action": decision["action"], "run": result.get("run"),
-            "reason": decision.get("rationale", reason), "goal": goal["id"],
-            "turn": turn_id}
+    retry_trigger = bool(result.pop("retry_trigger", False))
+    paused_admission = (result.get("action") == "skipped"
+                        and result.get("reason") == "dispatch is paused")
+    if retry_trigger or paused_admission:
+        queued = _queue_judgment(
+            con, run_id, reason, detail, decision=decision,
+            goal_id=goal["id"], slug=slug, turn_id=turn_id)
+        return {**queued, "goal": goal["id"], "turn": turn_id}
+    return {"reason": decision.get("rationale", reason), "goal": goal["id"],
+            "turn": turn_id, **result}
+
+
+def _resume_judgment_decision(con, row, payload: dict, launcher) -> dict:
+    """Retry admission for a planner decision already paid for and logged."""
+    run_id = int(row["run_id"])
+    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    cfg = config.load(run["project_id"]) if run is not None else None
+    client = work_client.from_cfg(cfg or {})
+    tasks = client.tasks() if client is not None else None
+    if client is not None and tasks is None:
+        return {"action": "deferred", "run": None,
+                "reason": "Work is unavailable", "queued": True}
+    board = {item["id"]: item for item in (tasks or [])}
+    goal = board.get(payload.get("goal"))
+    decision = payload.get("decision")
+    if run is None or client is None or goal is None or not isinstance(decision, dict):
+        return _DEFERRED_REVIEW(
+            con, run_id, row["reason"], detail=payload.get("detail"), cfg=cfg)
+    slug = payload.get("slug") or names.generate_slug()
+    result = apply_decision(con, cfg, client, goal, board, decision, slug, launcher)
+    retry_trigger = bool(result.pop("retry_trigger", False))
+    paused_admission = (result.get("action") == "skipped"
+                        and result.get("reason") == "dispatch is paused")
+    turn_id = payload.get("turn")
+    if turn_id is not None:
+        set_detail(con, int(turn_id), result)
+    if retry_trigger or paused_admission:
+        queued = dict(result)
+        queued.update({"action": "deferred", "run": None, "queued": True})
+        return queued
+    return {"reason": decision.get("rationale", row["reason"]),
+            "goal": goal["id"], "turn": turn_id, **result}
+
+
+def resume_deferred_judgments(con, *, turn=None,
+                              launcher=supervise.spawn_supervisor) -> list[dict]:
+    """Resume paused judgments, or their already-decided admission, once."""
+    if dispatch.paused(con):
+        return []
+    rows = list(con.execute(
+        "SELECT o.* FROM observations o WHERE o.layer='judgment' "
+        "AND o.action='deferred' AND NOT EXISTS ("
+        " SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
+        " AND newer.layer='judgment' AND newer.id>o.id) ORDER BY o.id"))
+    resumed = []
+    for row in rows:
+        try:
+            payload = json.loads(row["detail"] or "{}")
+            if not isinstance(payload, dict):
+                payload = {"detail": row["detail"]}
+        except (TypeError, json.JSONDecodeError):
+            payload = {"detail": row["detail"]}
+        try:
+            if isinstance(payload.get("decision"), dict):
+                result = _resume_judgment_decision(con, row, payload, launcher)
+            else:
+                result = judgment_turn(
+                    con, int(row["run_id"]), row["reason"],
+                    detail=payload.get("detail"), turn=turn, launcher=launcher)
+        except WorkError as exc:
+            result = {"action": "deferred", "run": None,
+                      "reason": str(exc), "queued": True}
+        if not result.get("queued"):
+            observer.record(con, int(row["run_id"]), "judgment", "resumed",
+                            result.get("reason", result.get("action", "resumed")))
+            con.commit()
+        resumed.append({k: v for k, v in result.items() if k != "queued"})
+    return resumed
 
 
 def attach() -> None:

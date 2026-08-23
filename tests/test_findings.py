@@ -170,12 +170,6 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(again["findings"][0]["occurrences"], 2)
         self.assertEqual(again["findings"][0]["comment_skipped"], "issue_not_claimed")
 
-    def test_suspected_finding_is_a_confirm_pass_candidate(self) -> None:
-        suspected = FINDING.replace('"observed"', '"suspected"')
-        result = self.run_at_completion(HANDOFF % (suspected, ""))
-        self.assertEqual(result["confirm_candidates"],
-                         [result["findings"][0]["fingerprint"]])
-
     def test_missing_field_is_recorded_on_the_run_not_silently_passed(self) -> None:
         self.run_at_completion("done, no block here")
         con = db.connect()

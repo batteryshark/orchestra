@@ -237,14 +237,32 @@ class SnapshotTests(ServerCase):
         self.assertEqual(
             set(payload),
             {"version", "generated_at", "home", "runs", "live_runs", "dispatch",
-             "projects", "profiles", "runway", "statistics", "findings",
-             "proposals", "daemon", "pinned_turns"})
-        self.assertEqual(payload["findings"], [])   # DESIGN §9 tables absent
-        self.assertEqual(payload["proposals"], [])
+             "projects", "profiles", "runway", "statistics", "daemon",
+             "pinned_turns"})
         self.assertEqual(payload["dispatch"], {"paused": False, "since": None})
         # There are no default profiles (DESIGN §5), so the snapshot lists
         # exactly what is configured — here, the one this case declares.
         self.assertEqual([p["name"] for p in payload["profiles"]], ["probe"])
+        self.assertNotIn("spawn_profiles", payload["profiles"][0])
+
+    def test_runs_report_effective_isolation_without_guessing_from_branch(self) -> None:
+        isolated = self.make_run(status="done", branch="orchestra/run-1",
+                                 finished_at=db.now())
+        shared = self.make_run(status="done", finished_at=db.now())
+        failed = self.make_run(
+            status="failed", finished_at=db.now(),
+            summary="Launch setup failed: cannot create worktree")
+        failed_retry = self.make_run(
+            status="failed", finished_at=db.now(),
+            summary="Retry launch failed: process could not start")
+        _, payload = self.json_request()
+        modes = {r["id"]: r["isolation"] for r in payload["runs"]}
+        self.assertEqual(modes[isolated], "isolated")
+        self.assertEqual(modes[shared], "shared")
+        self.assertEqual(modes[failed], "not_started")
+        self.assertEqual(modes[failed_retry], "not_started")
+        self.assertEqual(mhttp.run_diff(self.con, failed)["message"],
+                         "no branch — execution never started")
 
     def test_the_run_window_holds_hundreds(self) -> None:
         """W-0187: limiting PROJECTS is the point, limiting runs is not — a
@@ -906,15 +924,15 @@ class PauseTests(ServerCase):
         self.assertTrue(payload["dispatch"]["paused"])
         self.assertTrue(mhttp.dispatch_paused(self.con))
 
-    def test_a_paused_daemon_tick_starts_nothing(self) -> None:
+    def test_a_paused_daemon_tick_still_runs_dependency_settlement(self) -> None:
         from orchestra import daemon, supervise
         mhttp.set_dispatch_paused(self.con, True)
-        with mock.patch.object(supervise, "process_ready") as ready:
+        with mock.patch.object(supervise, "process_ready", return_value=[]) as ready:
             report = daemon.tick()
         self.assertTrue(report["paused"])
         self.assertEqual(report["released"], [])
-        ready.assert_not_called()
-        # …and health says so, rather than reporting a sweep that never ran.
+        ready.assert_called_once()
+        # Health names the admission state even though maintenance still ran.
         mhttp.record_health(report, con=self.con)
         self.assertEqual(mhttp.health(self.con)["outcome"], "paused")
 

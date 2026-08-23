@@ -473,6 +473,14 @@ class RetryTests(ObserverCase):
                                          launcher=lambda root, rid: 1 / 0)
         self.assertEqual(result["action"], "none")
         self.assertIn("paused", result["reason"])
+        dispatch.resume(self.con)
+        launched = []
+        resumed = observer.resume_deferred_retries(
+            self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid))
+        self.assertEqual(resumed[0]["action"], "retry")
+        self.assertEqual(launched, [resumed[0]["run"]])
+        self.assertEqual(observer.resume_deferred_retries(
+            self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid)), [])
 
     def test_dependents_wait_on_the_retry_instead_of_being_declined(self) -> None:
         first = self.make_run(status="failed")

@@ -894,25 +894,42 @@ def _retry_row(con, run, root) -> int:
     only the brief itself still has.
     """
     from orchestra import supervise  # supervise imports this module
-    workdir, branch, base_commit = supervise.rehome(con, root, run)
     run_id = int(con.execute(
         "INSERT INTO runs(profile, backend, model, title, requested_by, workdir, "
-        "project_id, branch, base_commit, work_item, retry_of, status, started_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+        "project_id, work_item, retry_of, status, started_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?, 'spawning', ?)",
         (run["profile"], run["backend"], run["model"], run["title"],
-         run["requested_by"], workdir, run["project_id"], branch,
-         base_commit, run["work_item"], run["id"], db.now())).lastrowid)
-    brief = paths.briefs_dir() / f"run-{run_id}.md"
-    try:
-        text = Path(run["brief_path"]).read_text(encoding="utf-8", errors="replace")
-    except (OSError, TypeError):
-        text = run["title"] or "Continue the original mission."
-    brief.write_text(text, encoding="utf-8")
-    log = paths.logs_dir() / f"run-{run_id}.jsonl"
-    log.touch()
-    con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",
-                (str(brief), str(log), run_id))
+         run["requested_by"], str(root), run["project_id"], run["work_item"],
+         run["id"], db.now())).lastrowid)
     con.commit()
+    brief = paths.briefs_dir() / f"run-{run_id}.md"
+    log = paths.logs_dir() / f"run-{run_id}.jsonl"
+    workdir, branch, base_commit, created = str(root), None, None, False
+    try:
+        workdir, branch, base_commit, created = supervise.rehome(
+            con, root, run, run_id)
+        try:
+            text = Path(run["brief_path"]).read_text(
+                encoding="utf-8", errors="replace")
+        except (OSError, TypeError):
+            text = run["title"] or "Continue the original mission."
+        brief.write_text(text, encoding="utf-8")
+        log.touch()
+        con.execute(
+            "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
+            "base_commit=? WHERE id=?",
+            (str(brief), str(log), workdir, branch, base_commit, run_id))
+        con.commit()
+    except BaseException as exc:
+        for artifact in (brief, log):
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if created and branch:
+            con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
+                        (workdir, branch, base_commit, run_id))
+        supervise.fail_launch(con, root, run_id, exc, prefix="Retry launch failed")
     return run_id
 
 
@@ -965,6 +982,13 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     from orchestra import project
     root = project.root_for(con, run)
     retry_id = _retry_row(con, run, root)
+    retry = con.execute("SELECT * FROM runs WHERE id=?", (retry_id,)).fetchone()
+    if retry["status"] == "failed":
+        record(con, run_id, "retry", "failed",
+               f"retry launch setup failed: {retry['summary']}",
+               {"retry_run": retry_id})
+        con.commit()
+        return after_terminal(con, retry_id, cfg=cfg, launcher=launcher)
     # Anything waiting on the failed run waits on its retry instead —
     # otherwise the dependency release declines the whole chain a second
     # later, while the retry that may well succeed is still starting.
@@ -977,9 +1001,29 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     if launcher is None:
         from orchestra import supervise  # supervise imports this module
         launcher = supervise.spawn_supervisor
-    launcher(root, retry_id)
+    try:
+        launcher(root, retry_id)
+    except BaseException as exc:
+        from orchestra import supervise
+        supervise.fail_launch(con, root, retry_id, exc,
+                              prefix="Retry launch failed")
+        return after_terminal(con, retry_id, cfg=cfg, launcher=launcher)
     return {"action": "retry", "run": retry_id, "reason": f"run {run_id} "
             f"ended {run['status']}; retried once with the same brief"}
+
+
+def resume_deferred_retries(con, cfg: dict | None = None,
+                            launcher=None) -> list[dict]:
+    """Replay one-shot infrastructure retries held by the pause switch."""
+    if dispatch.paused(con):
+        return []
+    rows = list(con.execute(
+        "SELECT o.run_id FROM observations o "
+        "WHERE o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
+        " SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
+        " AND newer.layer='retry' AND newer.id>o.id) ORDER BY o.id"))
+    return [after_terminal(con, int(row["run_id"]), cfg=cfg, launcher=launcher)
+            for row in rows]
 
 
 # --- the planner seam --------------------------------------------------------
@@ -990,7 +1034,8 @@ def planner_review(con, run_id: int, reason: str, *, detail: str | None = None,
 
     Code must not retry this: the same brief through the same model produces
     the same bad work, which is why DESIGN §7 sends it to a planner turn
-    instead. That turn does not exist yet (DESIGN §10, the conductor).
+    instead. ``conductor.attach`` replaces this fallback when a supervisor
+    process starts.
 
     A planner turn attaching here is expected to:
       * receive ``(run_id, reason)`` plus, from the database, the run row,
@@ -1000,8 +1045,8 @@ def planner_review(con, run_id: int, reason: str, *, detail: str | None = None,
       * dispatch whatever it decided itself, and return
         ``{"action": ..., "run": <new run id or None>, "reason": ...}``.
 
-    Until then this records the request and escalates, so a judgment failure
-    is visible instead of silently absorbed.
+    When no conductor is attached, this records the request and escalates, so
+    a judgment failure is visible instead of silently absorbed.
     """
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     record(con, run_id, "planner", "deferred", reason, {"detail": detail})
@@ -1011,6 +1056,6 @@ def planner_review(con, run_id: int, reason: str, *, detail: str | None = None,
         con, run, title=f"Run {run_id} finished but the work is not right",
         detail=f"{reason}\n\n{detail or ''}\n\nThis is a judgment failure, not "
                "an infrastructure one, so it is NOT retried automatically. "
-               "The planner turn that would re-brief it does not exist yet "
-               "(DESIGN §10).", cfg=cfg)
+               "No configured conductor turn could re-brief it, so human "
+               "attention is required.", cfg=cfg)
     return out

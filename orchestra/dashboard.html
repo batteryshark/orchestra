@@ -5,7 +5,7 @@
      Five views, one concern each, reached by the tabs: RUNS (master-detail,
      the default), PROFILES, SETTINGS, RUNWAY, HEALTH. The selected run's detail has a
      second tab strip of its own (W-0180) — trace, thread, brief, facts,
-     summary, merge, findings — under a header that never scrolls.
+     summary, merge — under a header that never scrolls.
 
      Every view OWNS THE VIEWPORT (W-0186): the page itself does not scroll,
      each view fills the height under the header, and the scrolling happens
@@ -157,9 +157,9 @@
   .runitem.sel { background: var(--sel); border-left-color: var(--live); }
   /* lineage, exactly as the run row records it: a spawned child, or the one
      automatic retry of an earlier attempt. */
-  .runitem.child { border-left-color: #3d6ea8; }
+  .runitem.related { border-left-color: #3d6ea8; }
   .runitem.continuation { border-left-color: #4b8a5a; }
-  .runitem.sel.child, .runitem.sel.continuation { border-left-color: var(--live); }
+  .runitem.sel.related, .runitem.sel.continuation { border-left-color: var(--live); }
   .runitem .top { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; }
   .runitem .title { margin-top: .25rem; font-size: 12.5px; font-weight: 600;
                     overflow: hidden; display: -webkit-box; line-clamp: 2;
@@ -716,7 +716,7 @@ function renderRunList(s) {
   const ids = new Set(runs.map((r) => r.id));
   box.replaceChildren(...runs.map((r) => {
     const lineage = (r.retry_of && ids.has(r.retry_of)) ? " continuation"
-                  : (r.parent_run && ids.has(r.parent_run)) ? " child" : "";
+                  : (r.parent_run && ids.has(r.parent_run)) ? " related" : "";
     const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
     const top = el("div", "top");
     top.append(el("span", "mono", "#" + r.id));
@@ -730,7 +730,7 @@ function renderRunList(s) {
     item.append(el("div", "meta", [
       r.profile, r.backend, r.work_item, r.project,
       r.retry_of ? "retry of #" + r.retry_of : "",
-      r.parent_run ? "child of #" + r.parent_run : "",
+      r.parent_run ? "parent #" + r.parent_run : "",
     ].filter(Boolean).join(" · ")));
     item.onclick = () => selectRun(r.id);
     return item;
@@ -790,21 +790,6 @@ function messageItem(m) {
   return item;
 }
 
-function forRun(rows, runId) {
-  // Findings and proposals have no tables yet (http._recent returns []), so
-  // this filters whatever shape does appear rather than assuming one.
-  return (rows || []).filter((row) => Number(row.run_id || row.run) === runId);
-}
-
-function recordTable(rows) {
-  const keys = Object.keys(rows[0]);
-  return table(keys, rows.map((r) => keys.map((k) => {
-    const v = r[k];
-    return (v === null || v === undefined) ? null
-         : (typeof v === "object") ? JSON.stringify(v) : String(v);
-  })));
-}
-
 // A brief is written once at dispatch and never changes, so it is fetched
 // once per run and kept — the 4s poll re-renders this pane constantly, and
 // re-reading the file on every tick is what the route exists to avoid.
@@ -860,7 +845,6 @@ const TABS = [
   ["facts", "facts"],
   ["summary", "summary"],
   ["merge", "merge"],
-  ["findings", "findings"],
 ];
 // Remembered per run for as long as the page is open: come back to a run and
 // it is on the tab you left it on. Nothing is persisted across a reload.
@@ -932,6 +916,7 @@ const PANES = {
   facts: (s, r) => kv([
     ["profile", r.profile],
     ["harness", r.backend + (r.model ? " · " + r.model : "")],
+    ["isolation", r.isolation],
     ["project", r.project || r.project_id],
     ["work item", r.work_item],
     ["branch", r.branch],
@@ -970,7 +955,9 @@ const PANES = {
     const merges = (r.messages || []).filter((m) => m.kind === "merge");
     box.append(block("report", merges.length ? wrap(merges.map(messageItem))
       : el("p", "dim", r.branch ? "nothing landed yet"
-                                : "no branch — this run worked in the shared tree")));
+                                : r.isolation === "not_started"
+                                  ? "no branch — execution never started"
+                                  : "no branch — this run worked in the shared tree")));
     const changes = el("div");
     const d = DIFFS.get(r.id);
     if (d !== undefined && r.branch) {
@@ -992,17 +979,6 @@ const PANES = {
     return box;
   },
 
-  // Proposals are folded in here: both are things a run filed for a human.
-  findings: (s, r) => {
-    const box = el("div");
-    const findings = forRun(s.findings, r.id);
-    box.append(block("findings", findings.length ? recordTable(findings)
-      : el("p", "dim", "none filed by this run")));
-    const proposals = forRun(s.proposals, r.id);
-    box.append(block("proposals", proposals.length ? recordTable(proposals)
-      : el("p", "dim", "none filed by this run")));
-    return box;
-  },
 };
 
 function tracePane() {
@@ -1064,7 +1040,7 @@ function lineageNode(s, r) {
     b.onclick = () => selectRun(id);
     return b;
   };
-  if (r.parent_run) box.append(link("child of #" + r.parent_run, r.parent_run), " ");
+  if (r.parent_run) box.append(link("parent #" + r.parent_run, r.parent_run), " ");
   if (r.retry_of) box.append(link("retry of #" + r.retry_of, r.retry_of), " ");
   const kids = s.runs.filter((x) => x.parent_run === r.id || x.retry_of === r.id);
   kids.forEach((k) => box.append(link("→ #" + k.id, k.id), " "));
@@ -1257,13 +1233,14 @@ function closeLog() {
 // claude, which publishes no model listing. OpenCode has no --effort flag at
 // all, so the effort control disables itself there instead of quietly
 // accepting a value the launch would drop.
-const BACKENDS = ["opencode", "codex", "claude", "reasonix"];
 let OPTIONS = null, PROFILES = [], EDITING = null, DRAFT = {};
+
+function backends() { return Object.keys(OPTIONS || {}); }
 
 async function loadOptions(refreshNow) {
   try {
     OPTIONS = await api("/api/profiles/options" + (refreshNow ? "?refresh=1" : ""));
-    const broken = BACKENDS.filter((b) => OPTIONS[b] && OPTIONS[b].error &&
+    const broken = backends().filter((b) => OPTIONS[b] && OPTIONS[b].error &&
                                           !(OPTIONS[b].models || []).length);
     $("discovery").textContent = broken.length
       ? "discovery: no models from " + broken.join(", ")
@@ -1361,14 +1338,13 @@ function renderProfiles(s) {
     return;
   }
   const head = ["name", "harness", "model", "effort", "pri", "tier",
-                "may spawn", "note", ""];
+                "note", ""];
   if (scoped) head.unshift("on");
   $("profiles").replaceChildren(table(head,
     PROFILES.map((p) => {
       const row = [
         p.name, p.backend, p.model || "(default)", p.effort,
         p.priority, tierCell(p),
-        (p.spawn_profiles || []).join(", ") || "–",
         {node: noteCell(p), cls: "grow"},
         editButton(p.name),
       ];
@@ -1424,7 +1400,7 @@ function drawEditor() {
   const nameIn = input("name");
   nameIn.disabled = !!EDITING;
   add("name", nameIn);
-  add("harness", select("backend", BACKENDS, false));
+  add("harness", select("backend", backends(), false));
 
   // model and effort share one line: they are one decision, and the effort a
   // model declares only means anything next to the model it came from.
@@ -1470,21 +1446,6 @@ function drawEditor() {
       "0–99, like a linux process nice value: LOWER is more preferred. " +
       "Orders profiles of the same tier against each other. Default 50.");
 
-  const list = el("div", "checklist");
-  PROFILES.filter((p) => p.name !== EDITING).forEach((p) => {
-    const l = el("label"), cb = el("input");
-    cb.type = "checkbox";
-    cb.checked = (DRAFT.spawn_profiles || []).indexOf(p.name) >= 0;
-    cb.onchange = () => {
-      const have = (DRAFT.spawn_profiles || []).filter((n) => n !== p.name);
-      if (cb.checked) have.push(p.name);
-      DRAFT.spawn_profiles = have;
-    };
-    l.append(cb, el("span", null, p.name));
-    list.appendChild(l);
-  });
-  if (!list.childElementCount) list.appendChild(el("span", "dim", "no other profiles"));
-  add("may spawn", list, "a delegation allowlist can only name profiles that exist");
   add("note", input("note"),
       "the headroom note, authoritative over measured runway. This is the " +
       "only place it is typed; the list shows it.");
@@ -1499,7 +1460,6 @@ function drawEditor() {
      "note"].forEach((k) => {
       if (DRAFT[k] !== undefined) body[k] = DRAFT[k];
     });
-    body.spawn_profiles = DRAFT.spawn_profiles || [];
     saveProfile(name, body);
   };
   const cancel = el("button", null, "cancel");

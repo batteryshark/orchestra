@@ -50,8 +50,6 @@ timeout = 36000        # hard cap for a runaway worker
 backend = "codex"      # the expensive one
 model = "gpt-5.6-sol"
 effort = "high"
-# delegation allowlist below; keep it short
-spawn_profiles = ["cheap"]
 
 [profiles.cheap]
 backend = "opencode"
@@ -136,7 +134,6 @@ class CommentPreservationTests(EditCase):
         for comment in ("# Orchestra profiles + settings.",
                         "# --- profiles ----",
                         "# the expensive one",
-                        "# delegation allowlist below; keep it short",
                         "timeout = 36000        # hard cap for a runaway worker"):
             self.assertIn(comment, after)
         changed = [(a, b) for a, b in zip(before.splitlines(), after.splitlines())
@@ -171,18 +168,12 @@ class CommentPreservationTests(EditCase):
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
     def test_removing_a_profile_removes_only_its_lines(self) -> None:
-        self.save("thinker", {"spawn_profiles": []})
         result = self.save("cheap", {}, delete=True)
         self.assertTrue(result["applied"], result)
         after = self.path.read_text()
         self.assertNotIn("[profiles.cheap]", after)
         self.assertIn("# the expensive one", after)
         self.assertIn("# --- profiles ----", after)
-
-    def test_a_profile_someone_still_delegates_to_is_not_silently_removed(self) -> None:
-        result = self.save("cheap", {}, delete=True)
-        self.assertIn("spawn_profiles of thinker", result["error"])
-        self.assertIn("[profiles.cheap]", self.path.read_text())
 
     def test_the_write_is_atomic_and_stays_0600(self) -> None:
         self.save("thinker", {"note": "10% weekly left, resets Sunday 18:00"})
@@ -191,31 +182,6 @@ class CommentPreservationTests(EditCase):
         self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()),
                          ["config.toml"])  # no temp file left behind
         self.assertTrue(self.table("thinker")["note_at"].endswith("Z"))
-
-    def test_a_multiline_array_is_refused_not_mangled(self) -> None:
-        """ponytail ceiling: the surgery is line-based, so a key spread over
-        several lines is rejected with the reason rather than half-rewritten."""
-        self.path.write_text(
-            '[profiles.cheap]\nbackend = "codex"\nmodel = "gpt-5.6-sol"\n\n'
-            '[profiles.wide]\nbackend = "codex"\nmodel = "gpt-5.6-sol"\n'
-            'spawn_profiles = [\n  "cheap",\n]\n')
-        result = self.save("wide", {"spawn_profiles": []})
-        self.assertIn("would not parse", result["error"])
-        self.assertIn('"cheap",', self.path.read_text())
-
-
-class SpawnChecklistTests(EditCase):
-    def test_an_allowlist_naming_a_profile_that_does_not_exist_is_rejected(self) -> None:
-        result = self.save("cheap", {"spawn_profiles": ["ghost"]})
-        self.assertIn("'ghost'", result["error"])
-        self.assertIn("not a configured profile", result["error"])
-        self.assertNotIn("spawn_profiles", self.table("cheap"))
-
-    def test_an_allowlist_of_existing_names_is_written(self) -> None:
-        result = self.save("cheap", {"spawn_profiles": ["thinker"]})
-        self.assertTrue(result["applied"], result)
-        self.assertEqual(self.table("cheap")["spawn_profiles"], ["thinker"])
-
 
 class RoutingMetadataTests(EditCase):
     """tier + priority (W-0181): what a planner routes on."""
@@ -351,8 +317,7 @@ class EnabledSetWriteTests(EditCase):
         self.assertEqual(self.project_table()["enabled_profiles"], ["cheap"])
         for comment in ("# Orchestra profiles + settings.",
                         "# --- profiles ----",
-                        "# the expensive one",
-                        "# delegation allowlist below; keep it short"):
+                        "# the expensive one"):
             self.assertIn(comment, after)
         # only lines were ADDED; nothing that existed changed
         self.assertEqual([l for l in before.splitlines()
@@ -487,11 +452,11 @@ class HttpProfileRouteTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("takes no reasoning effort", result["error"])
 
-    def test_a_spawn_entry_naming_a_missing_profile_cannot_be_saved(self) -> None:
+    def test_the_removed_spawn_field_cannot_be_saved(self) -> None:
         status, result = self.call("POST", "/api/profiles/cheap",
                                    {"profile": {"spawn_profiles": ["ghost"]}})
         self.assertEqual(status, 400)
-        self.assertIn("not a configured profile", result["error"])
+        self.assertIn("not an editable profile key", result["error"])
 
     def test_the_snapshot_carries_routing_metadata_in_routing_order(self) -> None:
         """W-0181: a planner reads tier and priority off the same snapshot the
@@ -540,7 +505,6 @@ class HttpProfileRouteTests(unittest.TestCase):
         self.assertTrue(result["applied"], result)
 
     def test_removing_a_profile_over_http(self) -> None:
-        self.call("POST", "/api/profiles/thinker", {"profile": {"spawn_profiles": []}})
         status, result = self.call("POST", "/api/profiles/cheap", {"delete": True})
         self.assertEqual(status, 200, result)
         self.assertNotIn("[profiles.cheap]", self.path.read_text())
@@ -585,7 +549,6 @@ class CliParityTests(EditCase):
         self.assertEqual(self.table("thinker")["model"], "gpt-5.6-luna")
 
     def test_rm_removes_it(self) -> None:
-        self.cli(["profiles", "set", "thinker", "--spawn", ""])
         self.cli(["profiles", "rm", "cheap"])
         self.assertNotIn("[profiles.cheap]", self.path.read_text())
 

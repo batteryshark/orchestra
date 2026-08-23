@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, nod
+from orchestra import config, db, dispatch, nod
 from tests.fake_nod import (ALERTS_CHANNEL, ALERTS_TOKEN, DECISIONS_CHANNEL,
                             DECISIONS_TOKEN, FakeNod)
 
@@ -574,6 +574,7 @@ class AnswersPassTests(ActingTestCase):
     def test_an_answered_retry_card_acts_once_and_never_again(self) -> None:
         rid = self._merge_card(run_id=7)
         self.nod.resolve(rid, option_id="retry", kind="custom")
+        dispatch.pause(self.con)
         acted = nod.act_on_answers(self.con, {})
         self.assertEqual(acted, [{"request_id": rid, "action": "retry",
                                   "outcome": "landed on retry"}])
@@ -592,6 +593,12 @@ class AnswersPassTests(ActingTestCase):
         rid = self._merge_card(run_id=8)
         self.nod.resolve(rid, option_id="resolver", kind="custom",
                          text="mind the schema migration")
+        dispatch.pause(self.con)
+        self.assertEqual(nod.act_on_answers(self.con, {}), [])
+        self.assertEqual(self._row(rid)["status"], "resolved")
+        self.assertIsNone(self._row(rid)["acted_at"])
+        self.assertEqual(self.resolver.calls, [])
+        dispatch.resume(self.con)
         acted = nod.act_on_answers(self.con, {})
         self.assertEqual(acted[0]["action"], "resolver")
         self.assertEqual(acted[0]["outcome"], "dispatched run 99")

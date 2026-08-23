@@ -154,14 +154,6 @@ final class AppState: ObservableObject {
         projects.first { $0.projectID == selectedProjectID }
     }
 
-    /// The badge on the Findings tab: things a person has to look at.
-    var attentionCount: Int {
-        (snapshot?.findings.count ?? 0) + (snapshot?.proposals.count ?? 0)
-    }
-
-    /// Runs stopped somewhere a human has to answer.
-    var blockedRuns: [Run] { runs.filter { !$0.blockedOn.isEmpty && !$0.isTerminal } }
-
     // --- actions the views call; each refreshes so the UI cannot drift -----
 
     func perform(_ body: @escaping (DromondAPI) async throws -> Void) async -> String? {

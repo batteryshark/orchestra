@@ -1,4 +1,4 @@
-"""Normalized traces: one events table, four backend parsers, SSE, retention.
+"""Normalized traces: one events table, four supported harness parsers.
 
 DESIGN §7. The supervisor already tails each backend's JSONL, so ingest maps
 every line into ONE shape — assistant text, reasoning, tool call, tool

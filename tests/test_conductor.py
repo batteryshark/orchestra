@@ -16,12 +16,13 @@ The load-bearing claims:
 """
 import json
 import os
+import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from orchestra import conductor, config, db, findings, observer
+from orchestra import conductor, config, db, dispatch, findings, observer
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.test_sweeper import PROJECT_ID, SweeperFixture
 
@@ -395,6 +396,61 @@ class ActionTests(ConductorFixture, unittest.TestCase):
         self.assertRegex(self.goal_log(),
                          r"\[orchestra/\w+_\w+\] dispatched run \d+ on W-0100")
 
+    def test_pause_preserves_the_event_for_resume(self) -> None:
+        self.add_goal()
+        con = db.connect()
+        dispatch.pause(con, "hold launches")
+        con.close()
+        decision = {"action": "dispatch", "rationale": "start it",
+                    "item": "W-0100", "mission": "Build it."}
+        self.assertEqual(self.conduct(decision), [])
+        self.assertEqual(self.turns(), [], "pause must not consume the trigger")
+        self.assertEqual(self.prompts, [], "pause must not spend a planner turn")
+        self.assertEqual(self.launched, [])
+        self.assertIsNone(self.db_run())
+
+        con = db.connect()
+        dispatch.resume(con)
+        con.close()
+        took = self.conduct(decision)
+        self.assertEqual((took[0]["trigger"], took[0]["key"]), ("idle", "idle:0"))
+        self.assertEqual(took[0]["action"], "dispatch")
+        self.assertEqual(len(self.turns()), 1)
+        self.assertEqual(len(self.launched), 1)
+
+    def test_dispatch_cleans_isolation_when_supervisor_never_starts(self) -> None:
+        self.global_config.write_text(
+            self.global_config.read_text().replace("worktree = false",
+                                                   "worktree = true"))
+        self.cfg = config.load()
+        for args in (("init", "-q"),
+                     ("config", "user.email", "t@example.com"),
+                     ("config", "user.name", "t")):
+            subprocess.run(["git", *args], cwd=self.root, check=True)
+        (self.root / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "seed.txt"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "seed"], cwd=self.root,
+                       check=True)
+        self.launcher = mock.Mock(side_effect=RuntimeError("supervisor absent"))
+        self.add_goal()
+        took = self.conduct({"action": "dispatch", "rationale": "start it",
+                             "item": "W-0100", "mission": "Build it."})
+        run = self.db_run()
+        self.assertEqual(took[0]["action"], "launch_failed")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["workdir"], str(self.root))
+        self.assertIsNone(run["branch"])
+        self.assertIn("supervisor absent", run["summary"])
+        self.launcher.assert_called_once_with(self.root, run["id"])
+        branches = subprocess.run(
+            ["git", "branch", "--list", f"orchestra/run-{run['id']}"],
+            cwd=self.root, check=True, capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=self.root,
+            check=True, capture_output=True, text=True).stdout
+        self.assertNotIn(f"/run-{run['id']}", worktrees)
+
     def test_dispatch_can_target_an_open_child(self) -> None:
         self.add_goal()
         self.work.add_task("W-0101", "the API half", parent_id="W-0100")
@@ -438,8 +494,14 @@ class ActionTests(ConductorFixture, unittest.TestCase):
 
     def test_propose_files_a_child_under_the_goal(self) -> None:
         self.add_goal()
-        self.conduct({"action": "propose", "rationale": "the docs need their own item",
-                      "title": "Write the docs"})
+        decision = {"action": "propose",
+                    "rationale": "the docs need their own item",
+                    "title": "Write the docs"}
+        with mock.patch.object(self.client, "create_task", return_value=None):
+            deferred = self.conduct(decision)
+        self.assertEqual(deferred[0]["action"], "deferred")
+        self.assertEqual(self.turns(), [], "an unapplied proposal must retry")
+        self.conduct(decision)
         child = [t for t in self.work.tasks.values() if t["parentId"] == "W-0100"]
         self.assertEqual(len(child), 1)
         self.assertEqual(child[0]["title"], "Write the docs")
@@ -448,15 +510,25 @@ class ActionTests(ConductorFixture, unittest.TestCase):
 
     def test_done_says_so_and_never_closes(self) -> None:
         self.add_goal()
-        self.conduct({"action": "done", "rationale": "every criterion is met"})
+        decision = {"action": "done", "rationale": "every criterion is met"}
+        with mock.patch.object(self.client, "log_task", return_value=None):
+            deferred = self.conduct(decision)
+        self.assertEqual(deferred[0]["action"], "deferred")
+        self.assertEqual(self.turns(), [], "an unreported decision must retry")
+        self.conduct(decision)
         self.assertEqual(self.work.tasks["W-0100"]["status"], "ready")
         self.assertIn("every criterion is met", self.goal_log())
         self.assertEqual(self.turns()[0]["wait_event"], "comment")
 
     def test_ask_human_without_nod_still_reaches_the_thread(self) -> None:
         self.add_goal()
-        took = self.conduct({"action": "ask_human", "rationale": "two ways to do it",
-                             "question": "Postgres or SQLite?"})
+        decision = {"action": "ask_human", "rationale": "two ways to do it",
+                    "question": "Postgres or SQLite?"}
+        with mock.patch.object(self.client, "log_task", return_value=None):
+            deferred = self.conduct(decision)
+        self.assertEqual(deferred[0]["action"], "deferred")
+        self.assertEqual(self.turns(), [], "an undelivered question must retry")
+        took = self.conduct(decision)
         self.assertIsNone(took[0]["nod"])
         self.assertIn("the human loop is off", took[0]["nod_error"])
         self.assertIn("Postgres or SQLite?", self.goal_log())
@@ -633,12 +705,31 @@ class JudgmentSeamTests(ConductorFixture, unittest.TestCase):
         self.replies = [{"action": "dispatch", "rationale": "re-brief it",
                          "item": "W-0100", "mission": "Fix the tests properly."}]
         con = db.connect()
-        result = observer.planner_review(
+        dispatch.pause(con, "hold admissions")
+        queued = observer.planner_review(
             con, run_id, "the tests were deleted, not fixed",
             cfg=self.cfg, turn=self.turn, launcher=self.launcher)
+        self.assertEqual(queued["action"], "deferred")
+        self.assertEqual(self.prompts, [], "pause must not spend the planner turn")
+        dispatch.resume(con)
+        with mock.patch.object(conductor.work_client, "from_cfg",
+                               return_value=self.client), \
+                mock.patch.object(self.client, "log_task", return_value=None):
+            held = conductor.resume_deferred_judgments(
+                con, turn=self.turn, launcher=self.launcher)[0]
+        self.assertEqual(held["action"], "deferred")
+        self.assertEqual(len(self.prompts), 1,
+                         "the paid decision is retained while Work is unavailable")
+        with mock.patch.object(conductor.work_client, "from_cfg",
+                               return_value=self.client):
+            result = conductor.resume_deferred_judgments(
+                con, turn=self.turn, launcher=self.launcher)[0]
+        self.assertEqual(conductor.resume_deferred_judgments(
+            con, turn=self.turn, launcher=self.launcher), [])
         con.close()
         self.assertEqual(result["action"], "dispatch")
         self.assertIsNotNone(result["run"])
+        self.assertEqual(len(self.prompts), 1)
         self.assertIn("the tests were deleted", self.prompts[0])
         self.assertEqual(self.db_run()["id"], result["run"])
         self.assertIn("Fix the tests properly.",

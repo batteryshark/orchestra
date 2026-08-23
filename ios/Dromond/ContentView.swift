@@ -22,7 +22,7 @@ struct ContentView: View {
     }
 }
 
-/// Five tabs, one concern each — the same division the web dashboard makes,
+/// Four tabs, one concern each — the same division the web dashboard makes,
 /// because a person moving between the two should not have to relearn where
 /// anything lives.
 private struct DashboardTabs: View {
@@ -34,13 +34,12 @@ private struct DashboardTabs: View {
     /// `simctl launch` reaches it — which is the difference between a screen
     /// that can be verified headlessly and one that needs a granted device.
     enum Tab: Hashable {
-        case runs, findings, runway, profiles, health
+        case runs, runway, profiles, health
 
         init(argument: [String]) {
             guard let at = argument.firstIndex(of: "-startTab"),
                   let name = argument[safe: at + 1] else { self = .runs; return }
             switch name {
-            case "findings": self = .findings
             case "runway": self = .runway
             case "profiles": self = .profiles
             case "health": self = .health
@@ -55,11 +54,6 @@ private struct DashboardTabs: View {
                 .tabItem { Label("Runs", systemImage: "list.bullet.rectangle") }
                 .tag(Tab.runs)
                 .badge(state.liveRuns.count)
-
-            FindingsView()
-                .tabItem { Label("Findings", systemImage: "tray.full") }
-                .tag(Tab.findings)
-                .badge(state.attentionCount)
 
             RunwayView()
                 .tabItem { Label("Runway", systemImage: "gauge.with.dots.needle.50percent") }

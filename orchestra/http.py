@@ -77,7 +77,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from orchestra import (auth, config, db, dispatch, paths, proc, profile_edit,
-                         profiles, project, runway, traces)
+                         profiles, project, runway, supervise, traces)
 
 # Bumped by ANY change to the snapshot payload (DESIGN §3 acceptance).
 # v3 (W-0178): the run rows carry what the dashboard's detail pane shows —
@@ -97,7 +97,10 @@ from orchestra import (auth, config, db, dispatch, paths, proc, profile_edit,
 # v7 (W-0189): ``daemon.observer`` — whether the spin observer can run at
 # all, its profile and its first-look cadence, or the exact fix when it
 # cannot. Health that looks fine while nothing is watching is the bug.
-SNAPSHOT_VERSION = 10
+# v11 (W-0291): removed the always-empty findings/proposals arrays and the
+# inert delegation field on profiles.
+# v12 (W-0292): every run reports its effective isolation state explicitly.
+SNAPSHOT_VERSION = 12
 
 DEFAULT_PORT = 3011
 KEY_ENV = "ORCHESTRA_KEY"
@@ -144,7 +147,6 @@ DASHBOARD = Path(__file__).with_name("dashboard.html")
 # fetch it when a run is selected, which roughly halves the payload and drops
 # the per-run query in ``_messages`` with it.
 RECENT_RUNS = 1000
-RECENT_FINDINGS = 20
 SUMMARY_CHARS = 600
 # A merge report is the longest thing in a run's thread and the detail pane
 # shows it whole; the trace pane's own payloads come over SSE, not from here.
@@ -406,12 +408,6 @@ def record_health(report: dict, error: str | None = None, con=None) -> dict:
 
 # --- the snapshot -----------------------------------------------------------
 
-def _table_exists(con, name: str) -> bool:
-    return con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (name,)).fetchone() is not None
-
-
 def _epoch(stamp: str | None) -> float | None:
     try:
         return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -451,6 +447,7 @@ def _run_payload(con, r, blocked: dict) -> dict:
         "project": r["project_work_id"] or r["project_name"],
         "workdir": r["workdir"],
         "branch": r["branch"],
+        "isolation": run_isolation(r),
         "parent_run": r["parent_run"],
         "requested_by": r["requested_by"],
         "started_at": r["started_at"],
@@ -478,6 +475,15 @@ def _run_payload(con, r, blocked: dict) -> dict:
         "usage_source": r["usage_source"],
         "messages": _messages(con, r["id"]),
     }
+
+
+def run_isolation(run) -> str:
+    """The execution mode a run actually reached, not merely requested."""
+    if run["layer"]:
+        return "control"
+    if run["status"] in ("pending", "spawning") or supervise.never_started(run):
+        return "not_started"
+    return "isolated" if run["branch"] else "shared"
 
 
 def _runs(con) -> list[dict]:
@@ -583,7 +589,6 @@ def _profiles(cfg: dict) -> list[dict]:
             "tier": config.tier_of(p.get("tier")),
             "tier_name": config.TIERS.get(config.tier_of(p.get("tier"))),
             "priority": config.priority_of(p),
-            "spawn_profiles": list(p.get("spawn_profiles") or []),
             "note": p.get("note"),
             "note_at": p.get("note_at"),
             "note_age": profiles.note_age(p.get("note_at")),
@@ -756,16 +761,6 @@ def _statistics(con, project_id: str | None = None) -> dict:
     }
 
 
-def _recent(con, table: str) -> list[dict]:
-    """Findings and proposals (DESIGN §9) do not have tables yet. Absent is
-    an empty list, not an error — the dashboard renders whichever it gets."""
-    if not _table_exists(con, table):
-        return []
-    rows = con.execute(
-        f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (RECENT_FINDINGS,))
-    return [{k: r[k] for k in r.keys()} for r in rows]
-
-
 def runway_now(force: bool = False, con=None) -> dict:
     """``GET /api/runway`` (W-0182). ``force`` polls every provider first.
 
@@ -892,8 +887,6 @@ def snapshot(con=None) -> dict:
             "profiles": _profiles(cfg),
             "runway": _runway(con),
             "statistics": _statistics(con),
-            "findings": _recent(con, "findings"),
-            "proposals": _recent(con, "proposals"),
             "daemon": health(con),
         }
     finally:
@@ -944,8 +937,11 @@ def run_diff(con, run_id: int) -> dict:
     if r is None:
         return {"error": f"no run {run_id}"}
     if not r["branch"]:
+        mode = run_isolation(r)
         return {"run": run_id, "text": None,
-                "message": "no branch — this run worked in the shared tree"}
+                "message": ("no branch — execution never started"
+                            if mode == "not_started" else
+                            "no branch — this run worked in the shared tree")}
     # A run that committed its own work leaves nothing for the checkpoint to
     # record, so the branch name was the only pointer — and merging deletes it.
     # merge_run anchors the head at refs/orchestra/run-N before that, so the
