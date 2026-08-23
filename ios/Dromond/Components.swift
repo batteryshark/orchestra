@@ -24,7 +24,7 @@ struct DromondMark: View {
             .frame(width: side, height: side)
         }
         .aspectRatio(1, contentMode: .fit)
-        .accessibilityLabel("Dromond")
+        .accessibilityLabel("Orchestra")
     }
 
     private func hull(_ s: CGFloat, x: CGFloat, y: CGFloat, fill: Color) -> some View {

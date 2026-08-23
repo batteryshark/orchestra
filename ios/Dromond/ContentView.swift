@@ -121,7 +121,7 @@ struct ConnectView: View {
                 } header: {
                     Text("Connection")
                 } footer: {
-                    Text("The daemon prints its URL and key at startup: `dromond doctor`.")
+                    Text("The daemon prints its URL and key at startup: `orchestra doctor`.")
                 }
 
                 if let error {
@@ -132,7 +132,7 @@ struct ConnectView: View {
                     Button("Connect", action: connect).disabled(!canConnect)
                 }
             }
-            .navigationTitle("Dromond")
+            .navigationTitle("Orchestra")
             .toolbar {
                 // Without this the keyboard has no exit on a field that submits.
                 ToolbarItemGroup(placement: .keyboard) {
@@ -200,7 +200,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Servers")
                 } footer: {
-                    Text("One Dromond daemon each. Switching changes which "
+                    Text("One Orchestra daemon each. Switching changes which "
                          + "machine every screen is reading.")
                 }
 

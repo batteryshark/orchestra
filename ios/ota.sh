@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Dromond on a phone that is on the tailnet but not on this network.
+# Install Orchestra on a phone that is on the tailnet but not on this network.
 #
 #   ./ios/ota.sh          # build, publish, print the link
 #   ./ios/ota.sh --off    # stop serving and remove the tailnet path
@@ -13,12 +13,12 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-TEAM="${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
-  | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}"
-PORT="${DROMOND_OTA_PORT:-8791}"
+TEAM="${ORCHESTRA_TEAM:-${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+  | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}}"
+PORT="${ORCHESTRA_OTA_PORT:-${DROMOND_OTA_PORT:-8791}}"
 # Every app installs from one namespace, one app per leaf, so publishing one
 # never unmounts another and the tailnet has a single obvious place to look.
-WEBPATH="${DROMOND_OTA_PATH:-/ios-installer/dromond}"
+WEBPATH="${ORCHESTRA_OTA_PATH:-${DROMOND_OTA_PATH:-/ios-installer/dromond}}"
 OUT="${TMPDIR:-/tmp}/dromond-ota"
 HOST="$(tailscale status --json 2>/dev/null \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
@@ -31,7 +31,7 @@ if [ "${1:-}" = "--off" ]; then
 fi
 
 [ -n "$HOST" ] || { echo "ota: tailscale is not reporting a hostname" >&2; exit 1; }
-[ -n "$TEAM" ] || { echo "ota: no Apple Development certificate; set DROMOND_TEAM" >&2; exit 1; }
+[ -n "$TEAM" ] || { echo "ota: no Apple Development certificate; set ORCHESTRA_TEAM" >&2; exit 1; }
 
 rm -rf "$OUT"; mkdir -p "$OUT/serve"
 echo "ota: archiving…"
@@ -72,7 +72,7 @@ cat > "$OUT/serve/manifest.plist" <<PLIST
     <key>bundle-identifier</key><string>com.batteryshark.dromond</string>
     <key>bundle-version</key><string>$VER</string>
     <key>kind</key><string>software</string>
-    <key>title</key><string>Dromond</string>
+    <key>title</key><string>Orchestra</string>
   </dict>
 </dict></array></dict></plist>
 PLIST
@@ -80,7 +80,7 @@ plutil -lint "$OUT/serve/manifest.plist" > /dev/null
 
 cat > "$OUT/serve/index.html" <<HTML
 <!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Install Dromond</title>
+<title>Install Orchestra</title>
 <style>body{font:17px -apple-system,system-ui;margin:0;min-height:100vh;display:grid;
 place-items:center;background:#161B23;color:#DFE3EA}
 a{display:block;padding:18px 34px;background:#61A5E8;color:#0b0f14;text-decoration:none;
@@ -91,8 +91,8 @@ p{color:#8b95a5;font-size:14px;text-align:center;max-width:22rem;line-height:1.5
 <path transform="translate(78,96)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
 <path transform="translate(118,214)" fill="#61A5E8" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
 <path transform="translate(78,332)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/></svg>
-<a href="itms-services://?action=download-manifest&url=https://$HOST$WEBPATH/manifest.plist">Install Dromond $VER ($BUILD)</a>
-<p>Tap install, then find Dromond on the home screen. The phone has to be on the tailnet.</p>
+<a href="itms-services://?action=download-manifest&url=https://$HOST$WEBPATH/manifest.plist">Install Orchestra $VER ($BUILD)</a>
+<p>Tap install, then find Orchestra on the home screen. The phone has to be on the tailnet.</p>
 </div>
 HTML
 
@@ -104,5 +104,5 @@ tailscale serve --bg --set-path "$WEBPATH" "http://127.0.0.1:$PORT" >/dev/null
 
 echo
 echo "  Open this on the phone:  https://$HOST$WEBPATH/"
-echo "  Dromond $VER ($BUILD) · $(du -h "$OUT/serve/Dromond.ipa" | cut -f1)"
+echo "  Orchestra $VER ($BUILD) · $(du -h "$OUT/serve/Dromond.ipa" | cut -f1)"
 echo "  Stop serving with:       ./ios/ota.sh --off"

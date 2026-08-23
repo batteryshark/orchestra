@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build, sign, and install Dromond on a paired iPhone. No Xcode window.
+# Build, sign, and install Orchestra on a paired iPhone. No Xcode window.
 #
 #   ./ios/deploy.sh                 # first paired iPhone
 #   ./ios/deploy.sh --list          # what is paired
@@ -7,7 +7,8 @@
 #
 # The team id is read from the Apple Development certificate in the keychain,
 # so nothing about the developer account is committed here. Override with
-# DROMOND_TEAM=... if the machine holds more than one.
+# ORCHESTRA_TEAM=... if the machine holds more than one. DROMOND_TEAM remains a
+# compatibility fallback for existing automation.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -24,11 +25,11 @@ if [ -z "$DEVICE" ]; then
   exit 1
 fi
 
-TEAM="${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
-  | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}"
+TEAM="${ORCHESTRA_TEAM:-${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+  | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}}"
 if [ -z "$TEAM" ]; then
   echo "deploy: no Apple Development certificate in the keychain." >&2
-  echo "deploy: open Xcode once and sign in, or set DROMOND_TEAM=<team-id>." >&2
+  echo "deploy: open Xcode once and sign in, or set ORCHESTRA_TEAM=<team-id>." >&2
   exit 1
 fi
 
@@ -50,4 +51,4 @@ xcrun devicectl device install app --device "$DEVICE" "$APP" | grep -E "App inst
 xcrun devicectl device process launch --device "$DEVICE" com.batteryshark.dromond 2>/dev/null \
   | grep -qE "launched|running" \
   && echo "deploy: launched" \
-  || echo "deploy: installed. Unlock the phone and tap Dromond."
+  || echo "deploy: installed. Unlock the phone and tap Orchestra."

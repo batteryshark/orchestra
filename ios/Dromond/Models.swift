@@ -1,6 +1,6 @@
 import Foundation
 
-/// One daemon this phone can talk to. The owner runs Dromond on a mac and on a
+/// One daemon this phone can talk to. The owner runs Orchestra on a mac and on a
 /// Windows box; switching between them beats merging them, because every action
 /// -- kill, tell, merge -- has to know which daemon it is talking to, and a
 /// merged fleet view would have to answer that on every tap.

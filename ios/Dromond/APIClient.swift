@@ -396,9 +396,9 @@ enum APIError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL: "The Dromond URL is invalid."
-        case .invalidResponse: "Dromond returned an invalid response."
-        case let .http(code, reason): "Dromond returned \(code): \(reason)"
+        case .invalidURL: "The Orchestra URL is invalid."
+        case .invalidResponse: "Orchestra returned an invalid response."
+        case let .http(code, reason): "Orchestra returned \(code): \(reason)"
         }
     }
 }
