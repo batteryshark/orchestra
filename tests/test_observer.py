@@ -415,6 +415,106 @@ class RetryTests(ObserverCase):
         self.assertEqual(Path(retry["brief_path"]).read_text(), "the original mission")
         self.assertEqual(launched, [result["run"]])
 
+    def test_expired_authentication_requires_a_changed_precondition(self) -> None:
+        run_id = self.make_run(
+            status="failed", backend="claude", work_item="W-auth",
+            summary="Failed to authenticate: OAuth session expired and could not be refreshed")
+        self._brief(run_id)
+        dependent = self.make_run(status="pending")
+        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+                         "VALUES(?,?)", (dependent, run_id))
+        self.con.execute(
+            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
+            "created_at) VALUES(?, 'continue after auth', 0, ?)",
+            (dependent, db.now()))
+        self.con.commit()
+        launched = []
+
+        with mock.patch.object(observer.nod, "from_cfg", return_value=object()), \
+                mock.patch.object(observer.nod, "alert",
+                                  return_value={"request_id": "auth-alert"}) as alert, \
+                mock.patch.object(observer.nod, "failure") as failure:
+            result = observer.after_terminal(
+                self.con, run_id, launcher=lambda root, rid: launched.append(rid))
+
+        self.assertEqual(result["action"], "escalate")
+        self.assertEqual(result["precondition"], "reauthenticate")
+        self.assertEqual(result["escalation"]["nod"], "auth-alert")
+        alert.assert_called_once()
+        failure.assert_not_called()
+        self.assertEqual(launched, [])
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE retry_of=?", (run_id,)
+        ).fetchone()["n"], 0)
+        observation = observer.observations(self.con, run_id, layer="retry")[0]
+        self.assertEqual(observation["action"], "escalate")
+        self.assertIn("reauthenticate Claude", observation["reason"])
+        message = self.con.execute(
+            "SELECT body FROM messages WHERE run_id=? AND kind='escalation'",
+            (run_id,)).fetchone()["body"]
+        self.assertIn("Reauthenticate Claude", message)
+        self.assertNotIn("choose Retry", message)
+        self.assertEqual(supervise.process_ready(
+            self.con, launcher=lambda root, rid: launched.append(rid)),
+            [{"run_id": dependent, "status": "declined"}])
+        self.assertEqual(launched, [])
+
+    def test_auth_history_does_not_spend_a_later_transient_retry(self) -> None:
+        auth = self.make_run(
+            status="failed", backend="claude", work_item="W-auth-history",
+            summary="Failed to authenticate: OAuth session expired and could not be refreshed")
+        self._brief(auth)
+        observer.after_terminal(self.con, auth, launcher=lambda root, rid: None)
+
+        later = self.make_run(
+            status="failed", backend="claude", work_item="W-auth-history",
+            summary="connection reset")
+        self._brief(later)
+        launched = []
+        result = observer.after_terminal(
+            self.con, later, launcher=lambda root, rid: launched.append(rid))
+
+        self.assertEqual(result["action"], "retry")
+        self.assertEqual(launched, [result["run"]])
+
+    def test_auth_on_a_retry_escalates_before_the_two_failure_rule(self) -> None:
+        first = self.make_run(
+            status="failed", backend="claude", summary="connection reset")
+        self._brief(first)
+        retry_id = observer.after_terminal(
+            self.con, first, launcher=lambda root, rid: None)["run"]
+        self.con.execute(
+            "UPDATE runs SET status='failed', summary=? WHERE id=?",
+            ("Failed to authenticate: OAuth session expired and could not be refreshed",
+             retry_id))
+        self.con.commit()
+
+        with mock.patch.object(observer.nod, "from_cfg", return_value=object()), \
+                mock.patch.object(observer.nod, "alert",
+                                  return_value={"request_id": "auth-alert"}) as alert, \
+                mock.patch.object(observer.nod, "failure") as failure:
+            result = observer.after_terminal(
+                self.con, retry_id, launcher=lambda root, rid: self.fail("launched"))
+
+        self.assertEqual(result["precondition"], "reauthenticate")
+        alert.assert_called_once()
+        failure.assert_not_called()
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE retry_of=?", (retry_id,)
+        ).fetchone()["n"], 0)
+
+    def test_ordinary_credential_language_keeps_the_transient_retry(self) -> None:
+        run_id = self.make_run(
+            status="failed", backend="claude", summary="Need credentials.")
+        self._brief(run_id)
+        launched = []
+
+        result = observer.after_terminal(
+            self.con, run_id, launcher=lambda root, rid: launched.append(rid))
+
+        self.assertEqual(result["action"], "retry")
+        self.assertEqual(launched, [result["run"]])
+
     def test_a_second_consecutive_failure_escalates_instead(self) -> None:
         from orchestra import dispatch
         first = self.make_run(status="failed", work_item="W-0002")
