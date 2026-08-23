@@ -13,12 +13,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from orchestra import db, paths
+from orchestra import db, harnesses, paths
 
 SHARED_DIRS = [".agents"]
 SHARED_FILES = ["AGENTS.md", "ORCHESTRA.md"]
-BACKEND_DIRS = {"claude": ".claude", "codex": ".codex",
-                "opencode": ".opencode", "reasonix": ".reasonix"}
+BACKEND_DIRS = {name: f".{name}" for name in harnesses.SUPPORTED}
 BACKEND_FILES = {"claude": ["CLAUDE.md"]}
 
 # Union of everything sync_skills may ever write: untracked_context_paths
@@ -163,7 +162,16 @@ def create(root: Path, run_id: int, project_id: str,
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise SystemExit(f"orchestra: git worktree failed: {res.stderr.strip()}")
-    sync_skills(root, wt, backend)
+    try:
+        sync_skills(root, wt, backend)
+    except BaseException:
+        # The linked checkout and branch already exist at this point. A
+        # context-copy failure must not leave an ownerless run-N behind.
+        try:
+            discard_created(wt, root, branch)
+        except Exception:
+            pass  # cleanup failure must not hide the context-copy failure
+        raise
     return wt, branch
 
 
@@ -288,6 +296,24 @@ def remove(workdir, root: Path | None = None, branch: str | None = None,
             report["error"] = (forced.stderr or r.stderr).strip()
             return report
     report["removed"] = True
+    return report
+
+
+def discard_created(workdir: Path, root: Path, branch: str) -> dict:
+    """Undo a worktree that failed before its run could start.
+
+    ``create`` just made this branch and no worker has run in it, so removing
+    both checkout and branch cannot discard user work. The report lets the
+    caller retain the association on the run row if cleanup itself fails.
+    """
+    report = remove(workdir, root, branch=branch, force=True)
+    report["branch_deleted"] = False
+    if not report["removed"]:
+        return report
+    deleted = _git(root, ["branch", "-D", branch])
+    report["branch_deleted"] = deleted.returncode == 0
+    if deleted.returncode != 0:
+        report["error"] = deleted.stderr.strip() or f"could not delete {branch}"
     return report
 
 

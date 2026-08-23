@@ -123,20 +123,20 @@ def tick() -> dict:
     """One pass. Returns a small report; never raises for a Work-side fault."""
     cfg = config.load()
     report = {"swept": [], "conducted": [], "released": [], "reaped": [],
+              "resumed_retries": [], "resumed_judgments": [],
               "paused": False, "runway": 0, "nod_answers": []}
     con = db.connect()
     try:
         _harvest_children()
         report["reaped"] = _reap_orphans(con)
         report["paused"] = http.dispatch_paused(con)
-        if report["paused"]:
-            # DESIGN §4: the pause switch stops new runs starting and leaves
-            # those in flight alone. Reaping still runs — a dead supervisor
-            # is not a new run. ponytail: this gates the whole sweep, so
-            # Work writeback pauses too; move the gate into the sweeper's
-            # claim step when that file is free to edit.
-            return report
-        report["released"] = supervise.process_ready(con, supervise.spawn_supervisor)
+        report["released"] = supervise.process_ready(
+            con, supervise.spawn_supervisor)
+        if not report["paused"]:
+            report["resumed_retries"] = observer.resume_deferred_retries(
+                con, launcher=supervise.spawn_supervisor)
+            report["resumed_judgments"] = conductor.resume_deferred_judgments(
+                con, launcher=supervise.spawn_supervisor)
         report["runway"] = _poll_runway(con)
         report["nod_answers"] = _act_on_nod_answers(con, cfg)
         # ponytail: one project-list fetch per tick keeps the cache warm at the

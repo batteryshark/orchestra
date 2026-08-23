@@ -37,6 +37,19 @@ final class SnapshotDecoderTests: XCTestCase {
         XCTAssertNotNil(snapshot.runs.first?.status)
     }
 
+    func testCurrentSnapshotNeedsNoRemovedPhantomFields() throws {
+        let data = Data(#"""
+        {"version": 12, "generated_at": "now", "live_runs": 0,
+         "runs": [{"id": 1, "status": "failed", "profile": "fast",
+                   "backend": "codex", "live": false,
+                   "isolation": "not_started"}],
+         "profiles": [{"name": "fast", "backend": "codex"}]}
+        """#.utf8)
+        let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
+        XCTAssertEqual(snapshot.runs.first?.isolation, "not_started")
+        XCTAssertEqual(snapshot.profiles.first?.name, "fast")
+    }
+
     func testOlderSnapshotIsRefusedWithAReadableReason() throws {
         let data = try XCTUnwrap(#"""
         {"version": 5, "generated_at": "x", "runs": [], "live_runs": 0}

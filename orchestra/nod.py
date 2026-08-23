@@ -44,7 +44,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import paths
+from orchestra import dispatch, paths
 
 DECISIONS = "decisions"  # channel roles. The channel *ids* are configured;
 ALERTS = "alerts"        # a token only ever works for one of them.
@@ -542,6 +542,8 @@ def act_on_answers(con: sqlite3.Connection, cfg: dict) -> list[dict]:
                 continue  # still unanswered: untouched, unmarked
             save_decision(con, rid, view)
             decision = view.get("decision") or {}
+        if decision.get("option_id") == "resolver" and dispatch.paused(con):
+            continue  # admission waits; completion retries still run
         acted.append({"request_id": rid,
                       **_act_on_merge_decision(con, cfg, row, status, decision)})
         con.execute("UPDATE nod_requests SET acted_at=? WHERE request_id=?",

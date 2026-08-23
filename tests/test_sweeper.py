@@ -31,6 +31,9 @@ enabled = true
 agent_identity = "orchestra"
 profile = "stub"
 poll_interval = 7
+# Most sweeper tests exercise Work behavior in a directory with no repository.
+# Shared mode is explicit here; isolation and its failure mode have focused tests.
+worktree = false
 """
 
 
@@ -361,7 +364,10 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertNotIn("Recently landed",
                          Path(self.db_run()["brief_path"]).read_text())
 
-    def test_swept_run_isolates_in_a_worktree(self) -> None:
+    def test_swept_run_isolates_and_cleans_up_if_supervisor_never_starts(self) -> None:
+        self.global_config.write_text(
+            self.global_config.read_text().replace("worktree = false",
+                                                   "worktree = true"))
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.email", "t@example.com"],
                        cwd=self.root, check=True)
@@ -377,13 +383,45 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                             "a swept run must not share the human's checkout")
         self.assertTrue(run["branch"])
 
-    def test_swept_run_falls_back_when_worktree_impossible(self) -> None:
-        # The fixture root is not a git repo; the dispatch must still happen.
+        self.launcher = mock.Mock(side_effect=RuntimeError("supervisor absent"))
+        self.work.add_task("W-0002", "failed isolated job", delegated=True)
+        actions = self.sweep()
+        failed = self.db_run()
+        self.assertEqual([a["action"] for a in actions],
+                         ["launch_failed", "report"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["workdir"], str(self.root))
+        self.assertIsNone(failed["branch"])
+        self.assertIn("supervisor absent", failed["summary"])
+        branches = subprocess.run(
+            ["git", "branch", "--list", f"orchestra/run-{failed['id']}"],
+            cwd=self.root, check=True, capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=self.root,
+            check=True, capture_output=True, text=True).stdout
+        self.assertNotIn(f"/run-{failed['id']}", worktrees)
+
+    def test_swept_run_fails_closed_when_worktree_is_impossible(self) -> None:
+        self.global_config.write_text(
+            self.global_config.read_text().replace("worktree = false",
+                                                   "worktree = true"))
+        # The fixture root is not a git repo. It must not silently become a
+        # shared-checkout run.
         self.work.add_task("W-0001", "no repo here", delegated=True)
-        self.sweep()
+        actions = self.sweep()
         run = self.db_run()
+        self.assertEqual(actions[0]["action"], "launch_failed")
+        self.assertEqual(actions[1]["action"], "report")
         self.assertEqual(run["workdir"], str(self.root))
-        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("--worktree needs", run["summary"])
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
+        self.assertEqual(self.launched, [])
+        self.assertEqual(self.sweep(), [])
+        con = db.connect()
+        self.assertEqual(con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"], 1)
+        con.close()
 
     def test_progress_heartbeat_posts_then_rate_limits(self) -> None:
         self.work.add_task("W-0001", "long job", delegated=True)
@@ -541,6 +579,28 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("Use the Okta provider.",
                       Path(followup["brief_path"]).read_text())
         self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+
+    def test_failed_issue_continuation_releases_ownership_to_the_human(self) -> None:
+        self.work.add_issue("issue_x", "needs an answer", delegated=True)
+        self.sweep()
+        first = self.db_run()
+        self.finish_run(first["id"], "failed", "Which provider?",
+                        session_ref="sess-42")
+        self.sweep()
+        self.work.human_reply("issue_x", "Use Okta.")
+        before = first["id"]
+        with mock.patch.object(sweeper.supervise.brief, "compose_continuation",
+                               side_effect=SystemExit("cannot compose")):
+            actions = self.sweep()
+        self.assertEqual(actions[0]["action"], "launch_failed")
+        self.assertEqual(self.work.issues["issue_x"]["state"], "needs_human")
+        failed = self.db_run()
+        self.assertGreater(failed["id"], before)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["work_item"], "issue_x")
+        self.assertIn("cannot compose", failed["summary"])
+        self.assertIsNotNone(failed["work_reported_at"])
+        self.assertEqual(self.sweep(), [])
 
     def test_a_halted_run_blocks_the_item_with_its_reason(self) -> None:
         self.work.add_task("W-0001", "doomed", delegated=True)

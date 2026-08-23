@@ -49,6 +49,7 @@ agent_identity = "orchestra"
 profile = "stub"
 router = "cheap"
 poll_interval = 7
+worktree = false
 """
 
 

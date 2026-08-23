@@ -1,6 +1,6 @@
 """Profile discovery and display helpers (DESIGN D10).
 
-Model/effort lists come from the harnesses themselves — a profile is
+Model/effort lists come from the supported harnesses themselves — a profile is
 assembled from real lists, never typed and hoped. Discovery fails soft per
 backend: a missing or broken CLI reports why and the others still print.
 

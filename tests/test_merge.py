@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from orchestra import merge
+from orchestra import db, dispatch, merge
 
 BRANCH = "orchestra/run-1"
 
@@ -410,35 +410,6 @@ class MergeTestCase(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["checks"][0]["ok"])
 
-    def test_review_is_injectable_but_cli_criteria_are_rejected(self):
-        seen = []
-
-        def review(diff, criteria):
-            seen.append((diff, criteria))
-            return {"ok": False, "verdict": "fail", "notes": "criterion 2 unmet"}
-
-        self.run_branch({"feature.py": "x = 1\n"})
-        result = merge.merge_run(self.root, BRANCH, criteria="- does X",
-                                 review=review, settings=self.settings)
-        self.assertEqual(1, len(seen))
-        self.assertIn("feature.py", seen[0][0])
-        self.assertEqual("- does X", seen[0][1])
-        self.assertFalse(result["ok"])
-        self.assertEqual("review", result["stage"])
-        self.assertEqual("criterion 2 unmet", result["escalation"])
-        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
-
-        # no acceptance criteria, no review
-        result = merge.merge_run(self.root, BRANCH, criteria="  ", review=review, settings=self.settings)
-        self.assertEqual(1, len(seen))
-        self.assertTrue(result["ok"], result)
-        self.assertIsNone(result["review"])
-
-        from types import SimpleNamespace
-        from orchestra import cli
-        with self.assertRaisesRegex(SystemExit, "review is not implemented"):
-            cli.cmd_merge(SimpleNamespace(criteria_file="criteria.md"))
-
     def test_merge_leaves_the_dirty_working_tree_untouched(self):
         """The requirement that matters: the owner keeps their uncommitted work.
 
@@ -591,6 +562,44 @@ class MergeTestCase(unittest.TestCase):
         self.assertIn("nothing to merge", report)
         self.assertIn("nothing to merge", note)
         self.assertIn("merge commit: none", report)
+
+    def test_the_report_names_only_checks_that_ran(self):
+        not_run = merge.blank_result("main", BRANCH, checks_skipped=False)
+        self.assertIn("- checks: not run",
+                      merge._report_text({"id": 64}, not_run, None))
+        undeclared = merge.blank_result("main", BRANCH, checks_skipped=True)
+        self.assertIn("- checks: none declared",
+                      merge._report_text({"id": 64}, undeclared, None))
+        result = merge.blank_result("main", BRANCH, checks_skipped=False)
+        result["checks"] = [
+            {"name": "test", "ok": True, "exit_code": 0},
+            {"name": "lint", "ok": False, "exit_code": 2},
+        ]
+        report = merge._report_text({"id": 65}, result, None)
+        self.assertIn("- checks: test ok; lint FAILED (exit 2)", report)
+        self.assertNotIn("review", report)
+
+    def test_pause_does_not_block_completion_landing(self):
+        result = merge.blank_result("main", BRANCH)
+        result.update(ok=True, stage="merged", commit="abc123", files_changed=[],
+                      branch_deleted=True, refresh={"why": "already current"},
+                      revert_command="git revert -m 1 abc123")
+        con = db.connect()
+        dispatch.pause(con, "hold admissions")
+        try:
+            run = {"id": 7, "branch": BRANCH, "requested_by": "human",
+                   "title": "done", "work_item": None, "brief_path": None}
+            with mock.patch.object(merge, "merge_run", return_value=result) as land, \
+                    mock.patch.object(merge.project, "root_for", return_value=self.root), \
+                    mock.patch.object(merge.nod, "withdraw_merge_cards"), \
+                    mock.patch.object(merge, "_thread"), \
+                    mock.patch.object(merge, "_post_to_work"):
+                note = merge._land(con, {}, run, "done")
+            land.assert_called_once()
+            self.assertIn("Merged", note)
+        finally:
+            dispatch.resume(con)
+            con.close()
 
 
 if __name__ == "__main__":

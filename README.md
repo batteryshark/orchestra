@@ -22,9 +22,9 @@ Work's automated sign-off verifier is disabled by default.
 
 ## Runs, isolation, and landing
 
-A manual dispatch uses the registered project checkout unless `--worktree` is
-passed. Use a worktree for a run that will edit files; shared-checkout dispatch
-is best kept for research and inspection.
+A manual dispatch uses an isolated worktree by default. Pass `--shared` only
+for work that can safely use the registered checkout, such as read-only
+research or inspection.
 
 A successful isolated run has a branch named `orchestra/run-N`, which
 Orchestra automatically attempts to land. It rebases in a scratch worktree,
@@ -38,20 +38,18 @@ checks, it relies on tripwires and their optional mission-alignment judge, so
 configure a real test, lint, or build command before trusting automatic landing.
 
 When Work automation is enabled, its sweeper claims delegated items and requests
-isolated runs by default. It currently falls back to the shared checkout if
-worktree creation fails.
+isolated runs by default. An isolation failure records a failed launch and sends
+the item back for human attention; unattended execution never falls back to the
+owner's checkout. A project can explicitly set `worktree = false` under `[work]`
+for shared execution.
 
 ## What it looks like
 
 Captions and the full set: [`docs/screenshots/`](docs/screenshots/README.md).
 
-![The runs board: id, slug, status, profile, harness and Work item down the left, the selected run's trace on the right](docs/screenshots/dashboard-runs.png)
-
-![One run's trace: reasoning summaries, tool calls, and token accounting in execution order](docs/screenshots/run-detail.png)
-
 ![Statistics: worker time, tokens and cost, totalled and per profile](docs/screenshots/statistics.png)
 
-![The optional iOS client, reading the same daemon over the tailnet](docs/screenshots/ios-runs.png)
+![Runway: remaining quota by provider and rolling window](docs/screenshots/runway.png)
 
 ## What you need
 
@@ -94,7 +92,7 @@ Discover models, add a profile, and dispatch an isolated run:
 ```sh
 uv run orchestra profiles discover
 uv run orchestra profiles set fast --backend --model --effort --tier 1
-uv run orchestra dispatch --to fast --worktree "Fix the failing auth test"
+uv run orchestra dispatch --to fast "Fix the failing auth test"
 ```
 
 Dispatch returns a run id as soon as the run starts. It does not mean the run
@@ -126,9 +124,9 @@ uv run orchestra check 7
 uv run orchestra kill 7
 ```
 
-Pausing prevents new dispatch. At present it also suspends some daemon policy
-passes, including Work writeback and conductor processing, until resumed.
-Running worker processes continue.
+Pausing prevents new runs from being admitted. Running workers, completion and
+Work reporting, completion-only Nod actions, and health maintenance continue.
+The conductor waits without consuming its next planning trigger.
 
 ## Install it as a command
 

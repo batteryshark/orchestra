@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import daemon, db, proc, service, runway
+from orchestra import daemon, db, dispatch, proc, service, runway
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -91,6 +91,36 @@ class DaemonTests(unittest.TestCase):
                                side_effect=RuntimeError("nod exploded")):
             report = daemon.tick()  # must not raise
         self.assertEqual(report["nod_answers"], [])
+
+    def test_paused_tick_runs_every_non_admission_pass(self) -> None:
+        dead = self._run(supervisor_pid=_free_pid())
+        self.con.commit()
+        dispatch.pause(self.con, "maintenance")
+        client = object()
+        with mock.patch.object(daemon.supervise, "process_ready") as ready, \
+                mock.patch.object(daemon, "_poll_runway", return_value=2) as runway_, \
+                mock.patch.object(daemon, "_act_on_nod_answers",
+                                  return_value=[{"answer": 1}]) as nod_, \
+                mock.patch.object(daemon.project, "refresh", return_value=True) as refresh, \
+                mock.patch.object(daemon.work_client, "from_cfg",
+                                  return_value=client), \
+                mock.patch.object(daemon.sweeper, "sweep",
+                                  return_value=[{"action": "report"}]) as swept, \
+                mock.patch.object(daemon.conductor, "pass_once",
+                                  return_value=[{"action": "wait"}]) as conducted:
+            report = daemon.tick()
+        self.assertTrue(report["paused"])
+        self.assertEqual(report["reaped"], [dead])
+        self.assertEqual(report["runway"], 2)
+        self.assertEqual(report["nod_answers"], [{"answer": 1}])
+        self.assertEqual(report["swept"], [{"action": "report"}])
+        self.assertEqual(report["conducted"], [{"action": "wait"}])
+        ready.assert_called_once()
+        runway_.assert_called_once()
+        nod_.assert_called_once()
+        refresh.assert_called_once()
+        swept.assert_called_once()
+        conducted.assert_called_once()
 
     def test_a_failing_tick_does_not_end_the_daemon(self) -> None:
         with mock.patch.object(daemon, "tick", side_effect=RuntimeError("boom")):

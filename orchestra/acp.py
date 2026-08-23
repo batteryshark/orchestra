@@ -37,12 +37,12 @@ import subprocess
 import threading
 import time
 
-from orchestra import config, db, messaging, observer, runners, traces
+from orchestra import config, db, harnesses, messaging, observer, runners, traces
 from orchestra.proc import resolve_cmd, session_kwargs
 
 # Verified live (2026-08): `reasonix acp` and `opencode acp` both answer
 # initialize + session/new with loadSession: true.
-ACP_BACKENDS = ("reasonix", "opencode")
+ACP_BACKENDS = harnesses.supporting("transport", "acp")
 PROTOCOL_VERSION = 1
 STEER_METHOD = "_reasonix.io/session/steer"
 

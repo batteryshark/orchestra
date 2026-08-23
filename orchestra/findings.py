@@ -365,18 +365,6 @@ def file_proposals(con, client, run, entries: list[dict], project_path: str | No
     return results
 
 
-# --- the confirm pass seam (DESIGN §9, per-goal opt-in) ----------------------
-
-def confirm_candidates(filed: list[dict]) -> list[str]:
-    """Fingerprints a confirm pass would take: newly filed `suspected`
-    findings. Dispatch is deliberately not built — the seam is the shape a
-    caller needs: for each fingerprint, a cheap short-lived run whose only
-    mission is confirm-or-deny with evidence, gated on the goal opting in,
-    reporting back by commenting on the finding's issue."""
-    return [f["fingerprint"] for f in filed
-            if f["action"] == "filed" and f.get("confidence") == "suspected"]
-
-
 # --- the completion seam -----------------------------------------------------
 
 def _record_problems(con, run_id: int, problems: list[str]) -> None:
@@ -421,5 +409,4 @@ def at_completion(con, cfg: dict, run, final_text: str | None,
                                               DEFAULT_CHILD_CEILING))
     result["proposals"] = file_proposals(con, client, run, handoff["proposals"],
                                          project_path, ceiling=ceiling)
-    result["confirm_candidates"] = confirm_candidates(result["findings"])
     return result

@@ -33,6 +33,29 @@ from orchestra.proc import enrich_path, resolve_cmd, session_kwargs, terminate_g
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 POLL_INTERVAL = 0.5
+LAUNCH_FAILURE_PREFIXES = (
+    "Launch setup failed:", "Deferred launch failed:", "Retry launch failed:")
+
+
+def never_started(run) -> bool:
+    """True when a durable run row never reached a supervisor process."""
+    return (run is not None and run["status"] == "failed"
+            and str(run["summary"] or "").startswith(LAUNCH_FAILURE_PREFIXES))
+
+
+def _lineage_was_isolated(con, run) -> bool:
+    """Recover isolation intent through failed continuation/retry rows."""
+    current, seen = run, set()
+    while current is not None and int(current["id"]) not in seen:
+        seen.add(int(current["id"]))
+        if current["branch"]:
+            return True
+        if not never_started(current):
+            return False
+        previous_id = current["parent_run"] or current["retry_of"]
+        current = con.execute("SELECT * FROM runs WHERE id=?", (previous_id,)).fetchone() \
+            if previous_id else None
+    return False
 
 
 def spawn_supervisor(root: Path, run_id: int) -> None:
@@ -47,13 +70,18 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
         handle = open(err, "ab")
     except OSError:
         handle = subprocess.DEVNULL
-    proc = subprocess.Popen(resolve_cmd(cmd), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=handle,
-                            **session_kwargs(detached=True))
-    if handle is not subprocess.DEVNULL:
-        handle.close()
+    try:
+        proc = subprocess.Popen(resolve_cmd(cmd), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=handle,
+                                **session_kwargs(detached=True))
+    finally:
+        if handle is not subprocess.DEVNULL:
+            handle.close()
     # Keep Popen alive and reap the detached child without delaying dispatch.
-    threading.Thread(target=proc.wait, daemon=True).start()
+    try:
+        threading.Thread(target=proc.wait, daemon=True).start()
+    except RuntimeError:
+        pass  # the detached child is already running; reaping is best-effort
 
 
 # --- launch preparation (shared by dispatch and deferred release) ----------
@@ -65,42 +93,95 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
     run_id = int(run["id"])
     profile = config.profile_cfg(cfg, run["profile"])
     workdir, branch = str(root), None
-    if use_worktree:
-        wt, branch = worktree.create(root, run_id, project.dir_key_for(con, run),
-                                     backend=profile["backend"])
-        workdir = str(wt)
     base_commit = None
-    if (Path(workdir) / ".git").exists():
-        try:
-            base_commit = worktree.head(Path(workdir))
-        except RuntimeError:
-            base_commit = None  # fresh repository with no commits yet
-    # The Work snapshot is frozen here, at dispatch; it is never re-read at
-    # resume (the immutability is load-bearing — Orchestra learned it the
-    # hard way).
-    # Only a Work TASK carries a checklist; issues do not, so only a task id
-    # earns the checklist protocol in the brief.
-    item = run["work_item"] if "work_item" in run.keys() else None
-    text = brief.compose(run_id=run_id, slug=run["slug"], profile=profile,
-                         mission=mission, requester=run["requested_by"],
-                         root=root, workdir=workdir, extra_context=context,
-                         work_snapshot=work_snapshot,
-                         work_item=item if (item or "").startswith("W-") else None,
-                         recent_commits=worktree.recent_commits(Path(workdir)))
     bp = paths.briefs_dir() / f"run-{run_id}.md"
-    bp.write_text(text, encoding="utf-8")
     lp = paths.logs_dir() / f"run-{run_id}.jsonl"
-    lp.touch()
+    created = None
+    try:
+        if use_worktree:
+            created, branch = worktree.create(
+                root, run_id, project.dir_key_for(con, run),
+                backend=profile["backend"])
+            workdir = str(created)
+        if (Path(workdir) / ".git").exists():
+            try:
+                base_commit = worktree.head(Path(workdir))
+            except RuntimeError:
+                base_commit = None  # fresh repository with no commits yet
+        # The Work snapshot is frozen here, at dispatch; it is never re-read at
+        # resume (the immutability is load-bearing — Orchestra learned it the
+        # hard way).
+        # Only a Work TASK carries a checklist; issues do not, so only a task id
+        # earns the checklist protocol in the brief.
+        item = run["work_item"] if "work_item" in run.keys() else None
+        text = brief.compose(
+            run_id=run_id, slug=run["slug"], profile=profile,
+            mission=mission, requester=run["requested_by"], root=root,
+            workdir=workdir, extra_context=context, work_snapshot=work_snapshot,
+            work_item=item if (item or "").startswith("W-") else None,
+            recent_commits=worktree.recent_commits(Path(workdir)))
+        bp.write_text(text, encoding="utf-8")
+        lp.touch()
+        con.execute(
+            "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
+            "base_commit=? WHERE id=?",
+            (str(bp), str(lp), workdir, branch, base_commit, run_id),
+        )
+    except BaseException:
+        for artifact in (bp, lp):
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if created is not None and branch is not None:
+            try:
+                cleanup = worktree.discard_created(created, root, branch)
+            except Exception as cleanup_error:
+                cleanup = {"removed": False, "branch_deleted": False,
+                           "error": str(cleanup_error)}
+            if not cleanup["removed"] or not cleanup["branch_deleted"]:
+                con.execute(
+                    "UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
+                    (str(created) if not cleanup["removed"] else str(root),
+                     branch, base_commit, run_id))
+        raise
+
+
+def fail_launch(con, root: Path, run_id: int, error: BaseException | str,
+                prefix: str = "Launch setup failed") -> dict:
+    """Terminalize a prepared run that never reached a supervisor."""
+    root = Path(root)
+    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    cleanup = None
+    workdir = run["workdir"] if run is not None else str(root)
+    branch = run["branch"] if run is not None else None
+    base_commit = run["base_commit"] if run is not None else None
+    owns_checkout = (run is not None and branch == f"orchestra/run-{run_id}"
+                     and Path(workdir).name == f"run-{run_id}")
+    if owns_checkout:
+        try:
+            cleanup = worktree.discard_created(Path(workdir), root, branch)
+        except Exception as exc:
+            cleanup = {"removed": False, "branch_deleted": False,
+                       "error": str(exc)}
+        if cleanup["removed"]:
+            workdir = str(root)
+        if cleanup["branch_deleted"]:
+            branch = None
+            base_commit = None
+    reason = str(error)[:1000] or error.__class__.__name__
     con.execute(
-        "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, base_commit=? "
-        "WHERE id=?",
-        (str(bp), str(lp), workdir, branch, base_commit, run_id),
-    )
+        "UPDATE runs SET status='failed', summary=?, finished_at=?, workdir=?, "
+        "branch=?, base_commit=? WHERE id=?",
+        (f"{prefix}: {reason}", db.now(), workdir, branch, base_commit, run_id))
+    con.commit()
+    return cleanup or {"removed": False, "branch_deleted": False, "error": None}
 
 
-def rehome(con, root: Path, previous) -> tuple[str, str | None, str | None]:
+def rehome(con, root: Path, previous, run_id: int) \
+        -> tuple[str, str | None, str | None, bool]:
     """SEAM (W-0191): where a run started FROM ``previous`` stands, and on what
-    branch. Returns ``(workdir, branch, base_commit)``.
+    branch. Returns ``(workdir, branch, base_commit, created)``.
 
     Every path that re-dispatches from an earlier run goes through here —
     ``create_followup`` (continuation) and ``observer._retry_row`` (retry) —
@@ -109,13 +190,19 @@ def rehome(con, root: Path, previous) -> tuple[str, str | None, str | None]:
     that copies both fields starts a process in a directory that no longer
     exists and dies instantly with ``FileNotFoundError`` (live runs 9 and 28).
 
-    So: an isolated previous run whose worktree was released gets a FRESH
-    worktree on a fresh branch; a shared-checkout one falls back to the project
-    root, which is always there. A workdir that still exists is kept unchanged.
+    An isolated previous run whose worktree was released gets a fresh worktree
+    on a fresh branch. Failure is returned to the caller; it never downgrades
+    an isolated lineage to the owner's checkout. A shared-checkout run returns
+    to the project root, and an existing workdir is kept unchanged.
     """
     workdir = Path(previous["workdir"] or root)
     branch = previous["branch"]
-    if not workdir.exists():
+    created = False
+    root = Path(root)
+    isolated = _lineage_was_isolated(con, previous)
+    lost_isolation = (isolated and never_started(previous)
+                      and workdir.resolve() == root.resolve())
+    if not workdir.exists() or lost_isolation:
         # The caller's root is the live checkout. project.root_for falls back
         # to the run's own workdir when the project is unknown, which is the
         # very path that is gone — so only consult it if the caller's is not
@@ -124,49 +211,63 @@ def rehome(con, root: Path, previous) -> tuple[str, str | None, str | None]:
         if not (base / ".git").exists():
             base = project.root_for(con, previous)
         workdir, branch = base, None
-        if previous["branch"]:  # it was isolated; give it isolation again
-            seat = con.execute(
-                "SELECT COALESCE(MAX(id), 0) + 1 AS n FROM runs").fetchone()["n"]
-            try:
-                workdir, branch = worktree.create(
-                    base, int(seat), project.dir_key_for(con, previous))
-            except (RuntimeError, SystemExit) as exc:
-                print(f"orchestra: re-dispatch falls back to the shared checkout "
-                      f"({exc})", file=sys.stderr)
+        if isolated:  # it was isolated; give it isolation again
+            workdir, branch = worktree.create(
+                base, run_id, project.dir_key_for(con, previous),
+                backend=previous["backend"])
+            created = True
     base_commit = previous["base_commit"]
     if (workdir / ".git").exists():
         try:
             base_commit = worktree.head(workdir)
         except RuntimeError:
             base_commit = None
-    return str(workdir), branch, base_commit
+    return str(workdir), branch, base_commit, created
 
 
 def create_followup(con, root: Path, parent, requester: str, text: str,
                     title: str | None = None) -> int:
     """New run row that resumes the parent's backend session with ``text``."""
-    workdir, branch, base_commit = rehome(con, root, parent)
     cur = con.execute(
         "INSERT INTO runs(profile, backend, model, title, requested_by, workdir, "
-        "project_id, branch, base_commit, parent_run, session_ref, status, started_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?, 'spawning', ?)",
+        "project_id, parent_run, session_ref, status, started_at, work_item, "
+        "work_seen_ts) VALUES(?,?,?,?,?,?,?,?,?, 'spawning', ?,?,?)",
         (parent["profile"], parent["backend"], parent["model"],
          title or f"continuation of run {parent['id']}", requester,
-         str(workdir), parent["project_id"], branch, base_commit,
-         parent["id"], parent["session_ref"], db.now()))
+         str(root), parent["project_id"], parent["id"], parent["session_ref"],
+         db.now(), parent["work_item"], parent["work_seen_ts"]))
     run_id = int(cur.lastrowid)
-    bp = paths.briefs_dir() / f"run-{run_id}.md"
-    landed = (worktree.recent_commits(Path(root), since=parent["base_commit"])
-              if parent["base_commit"] and (Path(root) / ".git").exists() else [])
-    bp.write_text(brief.compose_continuation(run_id=run_id, parent_run=parent["id"],
-                                             instructions=text, landed=landed),
-                  encoding="utf-8")
-    lp = paths.logs_dir() / f"run-{run_id}.jsonl"
-    lp.touch()
-    con.execute("UPDATE runs SET brief_path=?, log_path=? WHERE id=?",
-                (str(bp), str(lp), run_id))
     con.commit()
-    return run_id
+    bp = paths.briefs_dir() / f"run-{run_id}.md"
+    lp = paths.logs_dir() / f"run-{run_id}.jsonl"
+    workdir, branch, base_commit, created = str(root), None, None, False
+    try:
+        workdir, branch, base_commit, created = rehome(
+            con, root, parent, run_id)
+        landed = (worktree.recent_commits(Path(root), since=parent["base_commit"])
+                  if parent["base_commit"] and (Path(root) / ".git").exists() else [])
+        bp.write_text(
+            brief.compose_continuation(
+                run_id=run_id, parent_run=parent["id"], instructions=text,
+                landed=landed), encoding="utf-8")
+        lp.touch()
+        con.execute(
+            "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
+            "base_commit=? WHERE id=?",
+            (str(bp), str(lp), workdir, branch, base_commit, run_id))
+        con.commit()
+        return run_id
+    except BaseException as exc:
+        for artifact in (bp, lp):
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if created and branch:
+            con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
+                        (workdir, branch, base_commit, run_id))
+        fail_launch(con, root, run_id, exc, prefix="Deferred launch failed")
+        raise
 
 
 # --- safe-boundary message delivery ----------------------------------------
@@ -467,8 +568,6 @@ def process_ready(con, launcher) -> list[dict]:
     resolved per released run rather than passed in.
     """
     results: list[dict] = []
-    if dispatch.paused(con):
-        return results  # W-0164: pause stops new runs starting, in-flight ones run on
     # Decline, cascading: a requires_success edge from an unsuccessful terminal
     # prerequisite fails the dependent, which may fail its own dependents.
     # ponytail: wait_for edges are schema-reserved; implement their release
@@ -491,6 +590,8 @@ def process_ready(con, launcher) -> list[dict]:
                         "WHERE id=? AND status='pending'", (ts, rid))
             results.append({"run_id": rid, "status": "declined"})
         con.commit()
+    if dispatch.paused(con):
+        return results  # settlement continues; only new admission stops
     ready = list(con.execute(
         "SELECT d.run_id, d.mission, d.context, d.use_worktree "
         "FROM deferred_dispatches d JOIN runs r ON r.id=d.run_id "
@@ -500,15 +601,27 @@ def process_ready(con, launcher) -> list[dict]:
         "  WHERE e.run_id=d.run_id AND p.status!='done') "
         "ORDER BY d.run_id"))
     for req in ready:
+        if dispatch.paused(con):
+            break  # the switch may have changed since the ready query
         run_id = int(req["run_id"])
         claimed = con.execute(
             "UPDATE deferred_dispatches SET status='processing' "
             "WHERE run_id=? AND status='pending'", (run_id,))
-        con.commit()
         if claimed.rowcount != 1:
+            con.rollback()
             continue  # a concurrent finalizer claimed it first
-        con.execute("UPDATE runs SET status='spawning', started_at=? "
-                    "WHERE id=? AND status='pending'", (db.now(), run_id))
+        admitted = con.execute(
+            "UPDATE runs SET status='spawning', started_at=? "
+            "WHERE id=? AND status='pending'", (db.now(), run_id))
+        if admitted.rowcount != 1:
+            con.execute(
+                "UPDATE deferred_dispatches SET status='failed', processed_at=?, "
+                "error='run is no longer pending' WHERE run_id=?",
+                (db.now(), run_id))
+            con.commit()
+            results.append({"run_id": run_id, "status": "skipped",
+                            "error": "run is no longer pending"})
+            continue
         con.commit()
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         root = project.root_for(con, run)
@@ -526,10 +639,7 @@ def process_ready(con, launcher) -> list[dict]:
             con.execute("UPDATE deferred_dispatches SET status='failed', "
                         "processed_at=?, error=? WHERE run_id=?",
                         (db.now(), error, run_id))
-            con.execute("UPDATE runs SET status='failed', summary=?, finished_at=? "
-                        "WHERE id=? AND status='spawning'",
-                        (f"Deferred launch failed: {error}", db.now(), run_id))
-            con.commit()
+            fail_launch(con, root, run_id, error, prefix="Deferred launch failed")
             results.append({"run_id": run_id, "status": "failed", "error": error})
     return results
 

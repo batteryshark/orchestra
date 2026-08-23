@@ -198,14 +198,12 @@ struct RunDetailView: View {
             }
         case .merge:
             MergePane(run: live)
-        case .findings:
-            FindingsPane(runID: run.id)
         }
     }
 }
 
 enum RunTab: String, CaseIterable, Identifiable {
-    case trace, thread, brief, facts, summary, merge, findings
+    case trace, thread, brief, facts, summary, merge
     var id: String { rawValue }
 }
 
@@ -653,6 +651,7 @@ private struct FactsPane: View {
                     Fact("profile", run.profile)
                     Fact("harness", [run.backend, run.model ?? ""]
                         .filter { !$0.isEmpty }.joined(separator: " · "))
+                    Fact("isolation", run.isolation)
                     Fact("project", run.project ?? run.projectID)
                     Fact("work item", run.workItem)
                     Fact("requested by", run.requestedBy)
@@ -685,7 +684,7 @@ private struct FactsPane: View {
 
     private var lineage: String? {
         var parts: [String] = []
-        if let parent = run.parentRun { parts.append("spawned by #\(parent)") }
+        if let parent = run.parentRun { parts.append("parent #\(parent)") }
         if let retry = run.retryOf { parts.append("retry of #\(retry)") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -781,7 +780,9 @@ private struct MergePane: View {
             LazyVStack(alignment: .leading, spacing: 10) {
                 if reports.isEmpty {
                     EmptyPane(text: run.branch == nil
-                        ? "No branch. This run worked in the shared tree, so nothing merges."
+                        ? (run.isolation == "not_started"
+                           ? "No branch. Execution never started."
+                           : "No branch. This run worked in the shared tree, so nothing merges.")
                         : "Nothing has landed yet.")
                 }
                 ForEach(reports) { MessageCard(message: $0) }
@@ -854,62 +855,6 @@ private struct DiffBody: View {
         if line.hasPrefix("+") { return .green }
         if line.hasPrefix("-") { return .red }
         return .primary
-    }
-}
-
-// --- findings ----------------------------------------------------------------
-
-/// Findings and proposals are both things a run filed for a human to read,
-/// so they sit together the way the web dashboard puts them.
-private struct FindingsPane: View {
-    @EnvironmentObject private var state: AppState
-    let runID: Int
-
-    private var findings: [Finding] {
-        (state.snapshot?.findings ?? []).filter { $0.run == runID }
-    }
-
-    private var proposals: [Proposal] {
-        (state.snapshot?.proposals ?? []).filter { $0.run == runID }
-    }
-
-    var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                SectionLabel("findings")
-                if findings.isEmpty {
-                    EmptyPane(text: "None filed by this run.")
-                }
-                ForEach(findings) { finding in
-                    Card(tint: .orange) {
-                        VStack(spacing: 0) {
-                            Fact("claim", finding.claim)
-                            Fact("where", finding.with, copyable: true)
-                            Fact("confidence", finding.confidence)
-                            Fact("why not fixed", finding.whyNotFixed)
-                            Fact("filed as", finding.filedAs)
-                            Fact("at", finding.at, last: true)
-                        }
-                    }
-                }
-                SectionLabel("proposals")
-                if proposals.isEmpty {
-                    EmptyPane(text: "None filed by this run.")
-                }
-                ForEach(proposals) { proposal in
-                    Card(tint: .teal) {
-                        VStack(spacing: 0) {
-                            Fact("title", proposal.title)
-                            Fact("why", proposal.why)
-                            Fact("verdict", proposal.verdict)
-                            Fact("action", proposal.action)
-                            Fact("at", proposal.at, last: true)
-                        }
-                    }
-                }
-            }
-            .padding(.vertical, 12)
-        }
     }
 }
 

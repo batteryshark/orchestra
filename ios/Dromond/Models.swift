@@ -56,15 +56,13 @@ struct Snapshot: Decodable, Sendable {
     let dispatch: Dispatch
     let daemon: Daemon
     let statistics: Statistics
-    let findings: [Finding]
-    let proposals: [Proposal]
     /// The most recent control turn (W-0214), pinned at the top of the Runs
     /// tab. Never in `runs`, so the badge and the live count never move.
     let pinnedTurns: [Run]
 
     enum CodingKeys: String, CodingKey {
         case version, runs, home, projects, profiles, runway, dispatch, daemon
-        case statistics, findings, proposals
+        case statistics
         case generatedAt = "generated_at"
         case liveRuns = "live_runs"
         case pinnedTurns = "pinned_turns"
@@ -91,8 +89,6 @@ struct Snapshot: Decodable, Sendable {
         dispatch = (try? v.decode(Dispatch.self, forKey: .dispatch)) ?? Dispatch(paused: false, since: nil)
         daemon = (try? v.decode(Daemon.self, forKey: .daemon)) ?? Daemon()
         statistics = (try? v.decode(Statistics.self, forKey: .statistics)) ?? Statistics()
-        findings = (try? v.decode([Finding].self, forKey: .findings)) ?? []
-        proposals = (try? v.decode([Proposal].self, forKey: .proposals)) ?? []
         pinnedTurns = (try? v.decode([Run].self, forKey: .pinnedTurns)) ?? []
     }
 }
@@ -116,6 +112,7 @@ struct Run: Decodable, Identifiable, Hashable, Sendable {
     let summary: String
     let branch: String?
     let workdir: String?
+    let isolation: String
     /// Where the run started, and where it last anchored its work. The facts
     /// pane names both because a run that merged is judged on the range.
     let baseCommit: String?
@@ -140,7 +137,7 @@ struct Run: Decodable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, slug, status, profile, backend, model, title, project, live
-        case summary, branch, workdir, messages, billing, layer
+        case summary, branch, workdir, isolation, messages, billing, layer
         case workItem = "work_item"
         case baseCommit = "base_commit"
         case checkpointCommit = "checkpoint_commit"
@@ -186,6 +183,8 @@ struct Run: Decodable, Identifiable, Hashable, Sendable {
         summary = (try? v.decode(String.self, forKey: .summary)) ?? ""
         branch = try? v.decode(String.self, forKey: .branch)
         workdir = try? v.decode(String.self, forKey: .workdir)
+        isolation = (try? v.decode(String.self, forKey: .isolation))
+            ?? (branch == nil ? "shared" : "isolated")
         baseCommit = try? v.decode(String.self, forKey: .baseCommit)
         checkpointCommit = try? v.decode(String.self, forKey: .checkpointCommit)
         briefPath = try? v.decode(String.self, forKey: .briefPath)
@@ -277,7 +276,6 @@ struct Profile: Decodable, Identifiable, Hashable, Sendable {
     let tier: Int?
     let tierName: String?
     let priority: Int?
-    let spawnProfiles: [String]
     let note: String?
     let noteAge: String?
 
@@ -286,7 +284,6 @@ struct Profile: Decodable, Identifiable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case name, backend, model, effort, role, variant, tier, priority, note
         case tierName = "tier_name"
-        case spawnProfiles = "spawn_profiles"
         case noteAge = "note_age"
     }
 
@@ -301,7 +298,6 @@ struct Profile: Decodable, Identifiable, Hashable, Sendable {
         tier = try? v.decode(Int.self, forKey: .tier)
         tierName = try? v.decode(String.self, forKey: .tierName)
         priority = try? v.decode(Int.self, forKey: .priority)
-        spawnProfiles = (try? v.decode([String].self, forKey: .spawnProfiles)) ?? []
         note = try? v.decode(String.self, forKey: .note)
         noteAge = try? v.decode(String.self, forKey: .noteAge)
     }
@@ -483,34 +479,6 @@ struct ProfileStat: Decodable, Identifiable, Hashable, Sendable {
     let cost: Double?
 
     var id: String { profile ?? UUID().uuidString }
-}
-
-struct Finding: Decodable, Identifiable, Hashable, Sendable {
-    let id: Int?
-    let run: Int?
-    let claim: String?
-    let with: String?
-    let confidence: String?
-    let whyNotFixed: String?
-    let filedAs: String?
-    let at: String?
-
-    enum CodingKeys: String, CodingKey {
-        case id, run, claim, confidence, at
-        case with = "where"
-        case whyNotFixed = "why_not_fixed"
-        case filedAs = "filed_as"
-    }
-}
-
-struct Proposal: Decodable, Identifiable, Hashable, Sendable {
-    let id: Int?
-    let run: Int?
-    let title: String?
-    let why: String?
-    let verdict: String?
-    let action: String?
-    let at: String?
 }
 
 struct TraceEvent: Decodable, Identifiable, Sendable {

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from orchestra import (acp, auth, conductor, config, daemon, db, dispatch,
-                         hooks, http, merge, messaging, names, nod,
+                         harnesses, hooks, http, merge, messaging, names, nod,
                          observer, paths, proc, profile_edit, profiles, project,
                          review, runway, service, supervise, sweeper, traces,
                          worktree)
@@ -135,6 +135,7 @@ def cmd_dispatch(args):
             after_ids.append(rid)
     initial_status = "pending" if after_ids else "spawning"
     run_id, slug = None, None
+    _gate_dispatch(con, cfg, requester)
     # The in-Python collision check is best-effort; the DB UNIQUE constraint
     # is the real guard — on violation, regenerate the slug and retry.
     for _ in range(names.MAX_ATTEMPTS + 4):
@@ -178,19 +179,26 @@ def cmd_dispatch(args):
                                  context=args.context, use_worktree=args.worktree)
         con.commit()
     except BaseException as exc:
-        con.execute("UPDATE runs SET status='failed', summary=?, finished_at=? WHERE id=?",
-                    (f"Launch setup failed: {exc}", db.now(), run_id))
-        con.commit()
+        supervise.fail_launch(con, root, run_id, exc)
         con.close()
         raise
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     con.close()
     print(f"run {run_id} ({slug}): {args.to} "
-          f"({profile['backend']}/{profile.get('model') or 'default'})"
+          f"({profile['backend']}/{profile.get('model') or 'default'}) "
+          f"isolation={http.run_isolation(run)}"
           + (f" worktree={run['workdir']}" if run["branch"] else ""))
     if args.sync:
         sys.exit(supervise.supervise(root, run_id))
-    supervise.spawn_supervisor(root, run_id)
+    try:
+        supervise.spawn_supervisor(root, run_id)
+    except BaseException as exc:
+        con = db.connect()
+        try:
+            supervise.fail_launch(con, root, run_id, exc)
+        finally:
+            con.close()
+        raise
     print(f"dispatched async. `orchestra show {run_id}` for details.")
 
 
@@ -252,7 +260,8 @@ def cmd_status(args):
             "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=? "
             "ORDER BY depends_on_run", (r["id"],))] if r["status"] == "pending" else []
         label = f"pending-on-{','.join(pending)}" if pending else r["status"]
-        print(f"  run {r['id']}: {r['profile']} [{label}] since {r['started_at']} — "
+        print(f"  run {r['id']}: {r['profile']} "
+              f"[{label}/{http.run_isolation(r)}] since {r['started_at']} — "
               f"{(r['title'] or '')[:50]}")
     recent = list(con.execute(
         f"SELECT * FROM runs WHERE status IN {db.TERMINAL_SQL} "
@@ -260,7 +269,8 @@ def cmd_status(args):
     if recent:
         print("## recent finished")
         for r in recent[::-1]:
-            print(f"  run {r['id']}: {r['profile']} -> {r['status']} — "
+            print(f"  run {r['id']}: {r['profile']} -> {r['status']} "
+                  f"[{http.run_isolation(r)}] — "
                   f"{(r['title'] or '')[:50]}")
     con.close()
 
@@ -282,7 +292,8 @@ def cmd_runs(args):
         "LIMIT 1) AS project FROM runs r"
         + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id", params))
     if args.json:
-        print(json.dumps([dict(r) for r in rows], indent=2))
+        print(json.dumps([{**dict(r), "isolation": http.run_isolation(r)}
+                          for r in rows], indent=2))
         con.close()
         return
     if not rows:
@@ -290,10 +301,11 @@ def cmd_runs(args):
         con.close()
         return
     print(f"{'id':<4} {'slug':<18} {'project':<16} {'profile':<10} "
-          f"{'status':<10} {'started':<21} title")
+          f"{'status':<10} {'mode':<11} {'started':<21} title")
     for r in rows:
         print(f"{r['id']:<4} {r['slug'] or '-':<18} {(r['project'] or '-')[:16]:<16} "
-              f"{r['profile']:<10} {r['status']:<10} {r['started_at']:<21} "
+              f"{r['profile']:<10} {r['status']:<10} "
+              f"{http.run_isolation(r):<11} {r['started_at']:<21} "
               f"{(r['title'] or '')[:50]}")
     con.close()
 
@@ -301,6 +313,7 @@ def cmd_runs(args):
 def cmd_show(args):
     con = db.connect()
     r = _fetch_run(con, args.run_id)
+    print(f"isolation: {http.run_isolation(r)}")
     for k in r.keys():
         v = r[k]
         if k == "summary" and v:
@@ -335,6 +348,7 @@ def cmd_reply(args):
     con = db.connect()
     parent_run = _fetch_run(con, args.run_id)
     cfg = config.load(parent_run["project_id"])
+    _gate_dispatch(con, cfg, _requester(cfg))
     root = project.root_for(con, parent_run)
     parent = _continuation_line(con, args.run_id)[-1]
     if not parent["session_ref"]:
@@ -349,6 +363,7 @@ def cmd_reply(args):
         raise SystemExit(
             f"orchestra: run {args.run_id}'s session is already active as run "
             f"{active['id']} ({active['status']}) — use `orchestra interrupt` instead")
+    _gate_dispatch(con, cfg, _requester(cfg))
     run_id = supervise.create_followup(
         con, root, dict(parent), _requester(cfg), " ".join(args.message))
     con.close()
@@ -359,7 +374,15 @@ def cmd_reply(args):
     if args.sync:
         supervise.supervise(root, run_id)
     else:
-        supervise.spawn_supervisor(root, run_id)
+        try:
+            supervise.spawn_supervisor(root, run_id)
+        except BaseException as exc:
+            con = db.connect()
+            try:
+                supervise.fail_launch(con, root, run_id, exc)
+            finally:
+                con.close()
+            raise
 
 
 def cmd_interrupt(args):
@@ -661,9 +684,6 @@ def _profiles_set(args) -> None:
             changes[key] = value
     if args.priority is not None:
         changes["priority"] = args.priority
-    if args.spawn is not None:
-        changes["spawn_profiles"] = [n for n in args.spawn.split(",") if n.strip()]
-
     _report(profile_edit.save(name, changes, authority=_authority(),
                               options=options), name)
 
@@ -742,7 +762,7 @@ def cmd_profiles(args):
 
 def cmd_doctor(args):
     print("orchestra doctor\n")
-    for tool in ("codex", "claude", "opencode", "reasonix", "git"):
+    for tool in (*harnesses.SUPPORTED, "git"):
         path = proc.which(tool)
         print(f"  {tool:<9} {'available · ' + path if path else 'not found'}")
     gp = paths.global_config_path()
@@ -933,11 +953,6 @@ def cmd_review(args):
 
 
 def cmd_merge(args):
-    if args.criteria_file:
-        raise SystemExit(
-            "orchestra: --criteria-file is unavailable because acceptance "
-            "review is not implemented")
-    criteria = ""
     con = db.connect()
     proj = project.resolve(con, config.load())
     # The by-hand retry judges tripwires against the same mission the
@@ -946,8 +961,7 @@ def cmd_merge(args):
                       (args.branch,)).fetchone()
     mission = merge.run_mission(dict(row)) if row else ""
     con.close()
-    result = merge.merge_run(proj.path, args.branch, criteria=criteria,
-                             mission=mission,
+    result = merge.merge_run(proj.path, args.branch, mission=mission,
                              item_id=args.item,
                              settings=config.load(proj.project_id))
     print(json.dumps(result, indent=2))
@@ -1141,8 +1155,12 @@ def main():
     s.add_argument("--brief-file", help="read the mission from a file")
     s.add_argument("--context", help="extra context appended to the brief")
     s.add_argument("--title")
-    s.add_argument("--worktree", action="store_true",
-                   help="run in an isolated git worktree")
+    isolation = s.add_mutually_exclusive_group()
+    isolation.add_argument("--worktree", dest="worktree", action="store_true",
+                           default=True,
+                           help="run in an isolated git worktree (default)")
+    isolation.add_argument("--shared", dest="worktree", action="store_false",
+                           help="run in the registered checkout; use for read-only work")
     s.add_argument("--sync", action="store_true", help="supervise in the foreground")
     s.set_defaults(fn=cmd_dispatch)
 
@@ -1150,9 +1168,8 @@ def main():
                                       "live run count, waiting items, runs")
     s.set_defaults(fn=cmd_status)
 
-    s = sub.add_parser("pause", help="stop new runs starting; worker processes "
-                                     "continue, but some daemon policy passes "
-                                     "also pause today (DESIGN §4)")
+    s = sub.add_parser("pause", help="stop new runs starting; live runs, reporting, "
+                                     "and daemon maintenance continue")
     s.add_argument("note", nargs="*", help="why, shown wherever the pause is")
     s.set_defaults(fn=cmd_pause)
 
@@ -1195,10 +1212,10 @@ def main():
                    help="the asking run (default: $ORCHESTRA_RUN_ID)")
     s.set_defaults(fn=cmd_ask)
 
-    s = sub.add_parser("hook", help="internal: the lifecycle hook every backend "
-                                    "runs; installed by `orchestra init`")
+    s = sub.add_parser("hook", help="internal: the lifecycle hook every supported "
+                                    "harness runs; installed by `orchestra init`")
     s.add_argument("--backend", default="claude",
-                   choices=("claude", "codex", "opencode", "reasonix"))
+                   choices=harnesses.SUPPORTED)
     s.add_argument("--bind", action="store_true",
                    help="SessionStart: record the harness session id")
     s.add_argument("--event", help="the event name, when the harness cannot "
@@ -1263,9 +1280,6 @@ def main():
                     help="0-99, like a linux nice value: LOWER is more "
                          "preferred. Orders profiles of the same tier (default 50)")
     ps.add_argument("--sandbox", help="codex execution sandbox")
-    # Parsed for configuration compatibility, but hidden until child launch
-    # creates and supervises a real run.
-    ps.add_argument("--spawn", metavar="A,B", help=argparse.SUPPRESS)
     ps.add_argument("--note", help="headroom note; its age is stamped now")
 
     pr = psub.add_parser("rm", help="remove a profile from the config file")
@@ -1289,9 +1303,6 @@ def main():
                                     "land a run branch on the base")
     s.add_argument("branch", help="run branch, e.g. orchestra/run-7")
     s.add_argument("--item", help="Work item id, for the merge commit message")
-    # Retain parsing for callers that already pass it. The default review seam
-    # is unwired, so advertising this as an acceptance gate would be false.
-    s.add_argument("--criteria-file", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_merge)
 
     s = sub.add_parser("prune", help="remove run worktrees nobody owns and the "

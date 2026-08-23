@@ -5,9 +5,8 @@ runs landing at once; ``SWAP_ATTEMPTS`` says how many times to rebase onto the
 new base and try again before it stops being self-correcting and becomes the
 human's problem.
 
-Verification currently enforces declared checks followed by mechanical
-tripwires. The retained agent-review seam is unwired and non-blocking. The merge
-itself happens in a THROWAWAY WORKTREE: the base branch ref is updated with
+Verification enforces declared checks followed by mechanical tripwires. The
+merge itself happens in a THROWAWAY WORKTREE: the base branch ref is updated with
 ``git update-ref``, so the owner's checkout, which routinely holds
 uncommitted work, is never touched.
 
@@ -37,12 +36,12 @@ Per-project configuration, in ``.orchestra/config.toml``::
 Result shape (a plain dict, ready for the caller to post to Work)::
 
     {"ok", "stage", "escalation", "base", "branch", "commit", "files_changed",
-     "checks", "checks_skipped", "tripwires", "review", "conflicts",
+     "checks", "checks_skipped", "tripwires", "conflicts",
      "revert_command", "branch_deleted", "refresh", "note", "kept_ref",
      "dropped", "dirty"}
 
 ``stage`` is where the run stopped: dirty | rebase | checks | tripwires |
-review | merged. ``commit`` is the merge commit this run created, and is None
+merged. ``commit`` is the merge commit this run created, and is None
 when the base already contained the branch — then there is no merge commit and
 no ``revert_command``, because a revert line aimed at a commit the run did not
 create either errors or undoes somebody else's work (I-0077). ``refresh`` reports what happened to a checkout sitting on the base
@@ -61,7 +60,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from orchestra import db, dispatch, messaging, nod, paths, project, work_client
+from orchestra import db, messaging, nod, paths, project, work_client
 from orchestra.work_client import WorkError
 
 SWAP_ATTEMPTS = 3
@@ -88,9 +87,6 @@ DEFAULTS = {
     "resolver_profile": None,
 }
 CHECK_OUTPUT_MAX_CHARS = 4000
-# ponytail: whole diff into the review prompt, capped. Chunk it only if real
-# items start exceeding the cap.
-REVIEW_DIFF_MAX_CHARS = 100_000
 
 
 # --- git --------------------------------------------------------------------
@@ -253,16 +249,6 @@ def judge_tripwires(cfg: dict | None, mission: str, fired: list[str],
     return out
 
 
-def agent_review(diff: str, criteria: str) -> dict:
-    """Reserved acceptance-review seam; the default implementation is unwired.
-
-    An injected reviewer may still gate ``merge_run`` in tests or internal
-    callers. The CLI rejects criteria files until a real default exists.
-    """
-    return {"ok": True, "verdict": "unwired",
-            "notes": "agent review not wired to dispatch yet"}
-
-
 # --- the merge --------------------------------------------------------------
 
 def blank_result(base: str, branch: str, checks_skipped: bool = True) -> dict:
@@ -270,7 +256,7 @@ def blank_result(base: str, branch: str, checks_skipped: bool = True) -> dict:
     return {"ok": False, "stage": "rebase", "escalation": None,
             "base": base, "branch": branch, "commit": None, "files_changed": [],
             "checks": [], "checks_skipped": checks_skipped, "tripwires": [],
-            "review": None, "conflicts": [], "revert_command": None,
+            "conflicts": [], "revert_command": None,
             "branch_deleted": False, "refresh": None, "note": None,
             "kept_ref": None, "dropped": [], "dirty": [],
             "tripwire_verdict": None}
@@ -361,8 +347,7 @@ def dirty_paths(root: Path, base: str) -> list[str]:
     return sorted(line[3:] for line in out.split("\n") if len(line) > 3)
 
 
-def merge_run(root: Path, branch: str, criteria: str = "",
-              item_id: str | None = None, review=None,
+def merge_run(root: Path, branch: str, item_id: str | None = None,
               settings: dict | None = None, mission: str = "",
               judge=None) -> dict:
     """Verify ``branch`` and land it on the base branch. Returns the result dict.
@@ -450,13 +435,6 @@ def merge_run(root: Path, branch: str, criteria: str = "",
             # The facts stay on the result: a landed merge still SAYS it
             # deleted six files, it just no longer asks permission to have
             # done what the mission ordered.
-
-        if criteria.strip():
-            diff = _out(["diff", base_sha, rebased_sha], scratch)[:REVIEW_DIFF_MAX_CHARS]
-            result["review"] = (review or agent_review)(diff, criteria)
-            if not result["review"].get("ok"):
-                return _escalate(result, "review",
-                                 result["review"].get("notes", "agent review rejected the diff"))
 
         subject = f"orchestra: merge {branch}" + (f" ({item_id})" if item_id else "")
         # A base that moved between the rebase and the swap is a RACE, not a
@@ -633,15 +611,6 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
     if status != "done" or not run.get("branch"):
         return None  # only a verified success lands; a shared-tree run has no branch
     branch = run["branch"]
-    if dispatch.paused(con):
-        # A paused daemon must not be landing code (DESIGN §4). In-flight runs
-        # finish; their branches wait for a human `orchestra merge`.
-        note = f"Merge skipped: dispatch is paused. Branch {branch} kept."
-        _thread(con, int(run["id"]), note)
-        return note
-    # ponytail: no acceptance criteria passed, so the (stubbed, non-blocking)
-    # agent-review stage stays out of the way. Feed the item's criteria in when
-    # merge.agent_review is wired to a real dispatch.
     try:
         result = merge_run(project.root_for(con, run), branch,
                            item_id=run.get("work_item"), settings=cfg,
@@ -712,8 +681,10 @@ def _thread(con, run_id: int, body: str) -> None:
 
 
 def _checks_line(result: dict) -> str:
-    if result["checks_skipped"] or not result["checks"]:
+    if result["checks_skipped"]:
         return "none declared"
+    if not result["checks"]:
+        return "not run"
     return "; ".join(
         c["name"] + (" ok" if c["ok"] else f" FAILED (exit {c['exit_code']})")
         for c in result["checks"])
@@ -730,9 +701,6 @@ def _report_text(run: dict, result: dict, request_id: str | None) -> str:
              + (", ".join(f"`{f}`" for f in files[:20])
                 + (" …" if len(files) > 20 else "") if files else "none"),
              f"- checks: {_checks_line(result)}"]
-    if result["review"]:
-        lines.append(f"- review: {result['review'].get('verdict')} — "
-                     f"{result['review'].get('notes', '')}")
     if result["ok"]:
         landed = result["commit"] is not None
         head = (f"run {run['id']} landed `{result['branch']}` on "

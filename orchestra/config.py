@@ -18,10 +18,9 @@ that already has ten of them. An explicit list means only those, and
 still carries one fails loudly (``LEGACY_PROJECT_PROFILES_ERROR``) rather
 than reading as "no overrides".
 
-Enablement binds when a run is staffed (``staff_profile`` below). The
-reserved child-run validator also checks it, although child launch is not
-implemented. A run already in flight is not revalidated: ``profile_cfg`` is
-the unchecked read used by relaunch and continuation paths.
+Enablement binds when a run is staffed (``staff_profile`` below). A run already
+in flight is not revalidated: ``profile_cfg`` is the unchecked read used by
+relaunch and continuation paths.
 
 Profiles are launch templates ONLY (DESIGN D4/D10): any number of
 concurrent runs may share one, and nothing addresses a run by its profile
@@ -37,10 +36,6 @@ from orchestra import paths
 
 DEFAULT_RUN_TIMEOUT_SECONDS = 36000
 DEFAULT_STALL_TIMEOUT_SECONDS = 1800
-# Reserved child-run bounds (DESIGN §5). They are not concurrency caps, and no
-# production path launches a child today.
-DEFAULT_MAX_SPAWN_DEPTH = 3
-DEFAULT_MAX_CHILDREN_PER_RUN = 5
 
 # --- routing metadata a planner reads (W-0181) ------------------------------
 # ``tier`` is capability, ``priority`` is preference WITHIN a tier.
@@ -113,10 +108,6 @@ default_requester = "human"
 # (DESIGN §7). Normalized trace events are kept indefinitely; pruning only
 # loses expand-in-place detail. Run it with `orchestra traces prune`.
 raw_log_retention_days = 30
-# Reserved child-launch bounds. Orchestra validates these legacy settings but
-# does not yet create or launch child runs.
-max_spawn_depth = {DEFAULT_MAX_SPAWN_DEPTH}
-max_children_per_run = {DEFAULT_MAX_CHILDREN_PER_RUN}
 # Optional observer policy. There are no budgets and no run ceilings: a
 # long run is a good run, and this is what catches a feral one instead.
 # observer_profile picks the model that judges transcripts out of band;
@@ -213,7 +204,7 @@ expires_after = 86400
 #          the conductor's planner when settings.planner_profile is unset.
 # priority: 0-99, like a linux process `nice` value — LOWER is more preferred.
 #          Orders profiles of the SAME tier against each other. Default 50.
-# transport: "exec" (default, all four backends) or "acp" — one persistent
+# transport: "exec" (default, all supported harnesses) or "acp" — one persistent
 #          Agent Client Protocol peer instead of one process per turn. Only
 #          opencode and reasonix speak it. It buys mid-turn `tell` (Reasonix
 #          steer), graceful session/cancel instead of kill-and-resume, and
@@ -226,7 +217,6 @@ expires_after = 86400
 # lane:    claude only. "quota" unsets ANTHROPIC_API_KEY so `-p` uses the
 #          Max subscription. "api" keeps the key. Spent quota retries once
 #          on the api lane when a key is present. The trace names the lane.
-# spawn_profiles: reserved compatibility field; child launch is not implemented
 # note / note_at: freeform headroom note + when it was written (D10);
 #                 `orchestra profiles note NAME "..."` sets both
 
@@ -364,12 +354,11 @@ def load(project_id: str | None = None) -> dict:
 
 
 # --- the enabled set (W-0187) ------------------------------------------------
-# A project's ``enabled_profiles`` is a FILTER over the global profiles, and
-# it binds at two moments only: staffing a run, and one running agent
-# delegating to another. Everything else — a relaunch, a continuation, an ACP
-# transport lookup — reads through ``profile_cfg``, unchecked, because a run
-# in flight keeps the preset it launched with even when that preset has since
-# been disabled.
+# A project's ``enabled_profiles`` is a FILTER over the global profiles. It
+# binds when staffing a run. Relaunches, continuations, and ACP transport
+# lookups read through ``profile_cfg``, unchecked, because a run in flight
+# keeps the preset it launched with even when that preset has since been
+# disabled.
 
 def enabled_profiles(cfg: dict) -> dict:
     """The profiles this project may staff, ``name -> table``.
@@ -418,7 +407,7 @@ def staff_profile(cfg: dict, name: str) -> dict:
 
 def profile_cfg(cfg: dict, name: str) -> dict:
     """Resolve one launch template by name. NOT gated by the enabled set —
-    see ``staff_profile`` for the two moments that are."""
+    see ``staff_profile`` for the staffing boundary."""
     profiles = cfg.get("profiles", {})
     if name not in profiles:
         if not profiles:

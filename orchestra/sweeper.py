@@ -370,21 +370,42 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             continue
         routed = None
         try:
-            # An issue claim is OWNERSHIP, not status: Work's reply gate runs
-            # off it, so a claim the server refuses must not spawn. A task
-            # carries no ownership field — its claim is a fact, appended below
-            # beside the dispatch note, once the run has an id to name.
-            if kind == "issue" and client.claim_issue(item_id) is None:
-                ok = False
-                continue
             prior = _last_session_run(con, item_id)
             if prior:
+                late_pause = dispatch.pause_state(con)
+                if late_pause is not None:
+                    if dispatch.hold(con, item_id, kind, _lane, "paused",
+                                     late_pause.get("note")):
+                        actions.append({"action": "hold", "item": item_id,
+                                        "reason": "paused",
+                                        "detail": late_pause.get("note")})
+                    continue
+                # An issue claim is ownership and must precede a reply. It is
+                # deliberately adjacent to setup so a late pause cannot claim
+                # work that will not start.
+                prior_tag = f"[{client.identity}/{prior['slug'] or prior['id']}]"
+                claimed = (client.claim_issue(item_id) if kind == "issue" else
+                           client.log_task(item_id, fact_line(
+                               prior_tag, "claimed", run=int(prior["id"]))))
+                if claimed is None:
+                    ok = False
+                    continue
                 news = _new_human_comments(item, kind, prior["work_seen_ts"],
                                            client.identity)
                 text = _comments_text(news, item_id) or \
                     f"Work {kind} {item_id} was handed back; continue the mission."
-                run_id = supervise.create_followup(con, root, dict(prior), "work",
-                                                   text, title=prior["title"])
+                try:
+                    run_id = supervise.create_followup(
+                        con, root, dict(prior), "work", text, title=prior["title"])
+                except (Exception, SystemExit) as exc:
+                    error = str(exc)[:1000] or exc.__class__.__name__
+                    print(f"orchestra sweep: {item_id} launch setup failed: {error}")
+                    actions.append({"action": "launch_failed", "item": item_id,
+                                    "reason": error})
+                    if not _report(con, client, actions):
+                        ok = False
+                    ok = False
+                    continue
                 slug = None
             else:
                 # SEAM (W-0183): the staffing turn. A fresh dispatch is the
@@ -393,6 +414,14 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                 # reason nothing revalidates a run in flight (W-0187).
                 profile_name, profile, routed = staff(
                     con, pcfg, render_snapshot(item, kind), profile_name, profile)
+                late_pause = dispatch.pause_state(con)
+                if late_pause is not None:
+                    if dispatch.hold(con, item_id, kind, _lane, "paused",
+                                     late_pause.get("note")):
+                        actions.append({"action": "hold", "item": item_id,
+                                        "reason": "paused",
+                                        "detail": late_pause.get("note")})
+                    continue
                 # The run TITLE is the item's own title. The id lives on the
                 # row (`work_item`) and at the head of the brief, so repeating
                 # "Work issue issue_abc123:" here only eats the width the
@@ -401,26 +430,41 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                                            (item.get("title") or item_id)[:80],
                                            item_id, None)
                 run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-                # Swept runs are isolated by default: nobody watches a swept
-                # dispatch, and a shared checkout means an unattended agent
-                # and a working human edit the same files. A project that
-                # cannot host a worktree still runs -- Orchestra lost real
-                # delegations to a hard failure here.
+                tag = f"[{client.identity}/{slug}]"
+                try:
+                    claimed = (client.log_task(
+                        item_id, fact_line(tag, "claimed", run=run_id))
+                        if kind == "task" else client.claim_issue(item_id))
+                except WorkError:
+                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+                    con.commit()
+                    raise
+                if claimed is None:
+                    # No Work admission means no run. Retrying the same ready
+                    # item later is safer than manufacturing terminal rows
+                    # whose facts Work will ignore without a claim window.
+                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+                    con.commit()
+                    ok = False
+                    continue
+                # Swept runs are isolated by default. A project may explicitly
+                # opt into the shared checkout, but an isolation failure never
+                # silently changes the execution mode.
                 isolate = bool(work_cfg(pcfg).get("worktree", True))
                 try:
                     supervise.prepare_launch(
                         con, root, pcfg, run, mission=_mission(item, kind),
                         use_worktree=isolate,
                         work_snapshot=render_snapshot(item, kind))
-                # worktree.create exits for CLI use, so SystemExit counts too.
                 except (Exception, SystemExit) as exc:
-                    if not isolate:
-                        raise
-                    print(f"orchestra: shared checkout for run {run_id} ({exc})")
-                    supervise.prepare_launch(
-                        con, root, pcfg, run, mission=_mission(item, kind),
-                        use_worktree=False,
-                        work_snapshot=render_snapshot(item, kind))
+                    error = str(exc)[:1000] or exc.__class__.__name__
+                    supervise.fail_launch(con, root, run_id, error)
+                    print(f"orchestra sweep: {item_id} launch setup failed: {error}")
+                    actions.append({"action": "launch_failed", "item": item_id,
+                                    "run": run_id, "reason": error})
+                    _report(con, client, actions)
+                    ok = False
+                    continue
             con.execute("UPDATE runs SET work_item=?, work_seen_ts=?, "
                         "routed_reason=? WHERE id=?",
                         (item_id, item.get("updatedAt") or db.now(), routed, run_id))
@@ -431,15 +475,26 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             # was. Absent when routing is off — there is no decision to report.
             if routed:
                 note += f"\nstaffing: {routed}"
-            if kind == "task":
-                # The claim fact opens this run's window: every fact it
-                # reports later counts only while this claim outranks the
-                # human's last move (CONTRACT 0.8).
-                client.log_task(item_id, fact_line(tag, "claimed", run=run_id))
-                client.log_task(item_id, note)
-            else:
-                client.reply_issue(item_id, note)  # claim_issue wrote the fact
-            launcher(root, run_id)
+            try:
+                posted = (client.log_task(item_id, note) if kind == "task" else
+                          client.reply_issue(item_id, note))
+                if posted is None:
+                    print(f"orchestra sweep: dispatch note for {item_id} deferred")
+            except WorkError as exc:
+                # The claim is the authority boundary; this line is only an
+                # informational note and must never strand a prepared run.
+                print(f"orchestra sweep: dispatch note for {item_id} rejected: {exc}")
+            try:
+                launcher(root, run_id)
+            except BaseException as exc:
+                error = str(exc)[:1000] or exc.__class__.__name__
+                supervise.fail_launch(con, root, run_id, error)
+                actions.append({"action": "launch_failed", "item": item_id,
+                                "run": run_id, "reason": error})
+                if not _report(con, client, actions):
+                    ok = False
+                ok = False
+                continue
             actions.append({"action": "dispatch", "item": item_id, "run": run_id,
                             "resumed": bool(prior)})
         except WorkError as exc:

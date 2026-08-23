@@ -103,35 +103,39 @@ checks and the shared key still apply on a tailnet.
 
 ## 4. Dispatch and isolation
 
-Manual dispatch uses the registered checkout unless the caller passes
-`--worktree`. The Work sweeper requests a worktree by default but currently
-falls back to the shared checkout if creation fails. Concurrent mutation is
-safe only when each run has an isolated checkout.
+Manual dispatch uses an isolated worktree by default. `--shared` is an explicit
+choice for read-only work or another case where the caller accepts use of the
+registered checkout. Concurrent mutation is safe only when each run has an
+isolated checkout.
 
-An isolated run uses a branch named `orchestra/run-N`. Read-only inspection may
-use the shared checkout. Unattended mutation must stop silently changing from
-isolated to shared; W-0292 owns that correction.
+An isolated run uses a branch named `orchestra/run-N`. The Work sweeper and
+conductor also request isolation by default. If worktree setup or rehoming
+fails, launch fails closed; unattended execution never changes to the owner's
+checkout. A project's `[work] worktree = false` is the explicit shared mode.
 
 Orchestra has no global, per-project, or per-profile concurrency cap. The
-visible live count and pause switch are the admission controls. Pause is meant
-to stop new runs while live work and completion processing continue. The
-current daemon returns too early and also suspends some reporting, Nod answer,
-runway, refresh, and conductor work. W-0292 owns that defect too.
+visible live count and pause switch are the admission controls. Pause stops
+manual and policy-driven admission, including continuations and ready dependency
+launches. Live work, automatic landing, completion reporting, failed dependency
+settlement, completion-only Nod actions, runway and project refresh, Work message
+ferrying, and health maintenance continue. Ordinary conductor events,
+infrastructure retries, resolver answers, and completion judgments are retained
+for resume. A paused judgment does not spend its planner turn.
 
-## 5. Profiles and child-run seam
+## 5. Profiles and supported harnesses
 
 Profiles are global launch templates, not durable worker identities. A profile
 names a harness, model, effort, priority, tier, and launch settings. A project
 may restrict which global profiles it can use.
 
-Profiles and configuration still carry `spawn_profiles`, depth, and child-count
-fields. `request_spawn` validates those bounds but creates and launches
-nothing. The CLI and worker brief therefore hide delegation. The remaining
-dashboard, iOS, and configuration surfaces are tracked by W-0291.
+Orchestra does not expose child-run settings or delegation guidance. There is
+no child launcher; a real parent/child lifecycle should be added only with an
+end-to-end use case.
 
-Harness support is also registered across several modules: discovery, command
-construction, resume, traces, correction, and usage. W-0294 tracks one
-capability registry and a completeness check for the four supported harnesses.
+One static capability table records discovery, launch, resume, traces,
+correction, usage, additional-directory support, and transport for the four
+supported harnesses. A completeness test checks the concrete integration
+surfaces against that table. It is product data, not a plug-in framework.
 
 There is no team, roster, council, squad, or other grouping layer.
 
@@ -183,16 +187,14 @@ Landing operates in a scratch worktree. It rebases onto the base, runs declared
 project checks, evaluates mechanical tripwires, and updates the base ref with
 compare-and-swap. The owner's checkout is not used as the merge worktree.
 
-Acceptance-criteria review is not wired. The current `agent_review` seam returns
-a non-blocking `unwired` verdict, and automatic landing supplies no criteria.
-The enforceable policy is declared checks plus mechanical tripwires, with an
-optional mission-alignment judgment for tripped limits. W-0291 owns removal of
-the false review surface or a fail-closed replacement.
+Landing has no acceptance-criteria review stage. The enforceable policy is
+declared checks plus mechanical tripwires, with an optional mission-alignment
+judgment for tripped limits. Output identifies the checks and tripwires that
+actually ran.
 
 Every successful run's final handoff is parsed. Findings and proposals are filed
-only when Work is configured and the run has Work context. The confirmation pass
-is not implemented, and the dashboard collections have no backing tables.
-W-0291 also owns those phantom surfaces.
+only when Work is configured and the run has Work context. They have no local
+durable collection, so the dashboard and iOS client do not present one.
 
 ## 10. Optional Work conductor
 

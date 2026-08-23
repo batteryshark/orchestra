@@ -15,7 +15,7 @@ from unittest import mock
 
 import subprocess
 
-from orchestra import cli, db, merge, project, supervise, traces
+from orchestra import cli, db, merge, project, supervise, traces, worktree
 
 
 def _git(root, *args) -> None:
@@ -410,6 +410,8 @@ class FollowupAfterCleanupTests(unittest.TestCase):
             (root / "a.txt").write_text("x\n")
             _git(root, "add", "-A")
             _git(root, "commit", "-qm", "init")
+            (root / ".codex").mkdir()
+            (root / ".codex" / "context.txt").write_text("codex context\n")
 
             con = db.connect()
             try:
@@ -431,5 +433,89 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                                 "a follow-up must have somewhere to stand")
                 self.assertEqual(child["session_ref"], parent["session_ref"],
                                  "the conversation still resumes")
+                self.assertEqual(
+                    (Path(child["workdir"]) / ".codex" / "context.txt").read_text(),
+                    "codex context\n")
+            finally:
+                con.close()
+
+    def test_launch_setup_failure_discards_its_new_worktree_and_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            _git(root, "init", "-q", ".")
+            _git(root, "config", "user.email", "t@example.com")
+            _git(root, "config", "user.name", "t")
+            (root / "a.txt").write_text("x\n")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-qm", "init")
+            con = db.connect()
+            try:
+                cur = con.execute(
+                    "INSERT INTO runs(profile, backend, requested_by, workdir, "
+                    "status, started_at) VALUES('p','codex','human',?,"
+                    "'spawning',?)", (str(root), db.now()))
+                run = con.execute("SELECT * FROM runs WHERE id=?",
+                                  (cur.lastrowid,)).fetchone()
+                cfg = {"profiles": {"p": {"backend": "codex"}}}
+                with mock.patch.object(supervise.brief, "compose",
+                                       side_effect=RuntimeError("brief failed")), \
+                        self.assertRaisesRegex(RuntimeError, "brief failed"):
+                    supervise.prepare_launch(
+                        con, root, cfg, run, mission="x", use_worktree=True)
+                row = con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone()
+                self.assertEqual(row["workdir"], str(root))
+                self.assertIsNone(row["branch"])
+                branches = subprocess.run(
+                    ["git", "-C", str(root), "branch", "--list", "orchestra/run-*"],
+                    check=True, capture_output=True, text=True).stdout
+                self.assertEqual(branches.strip(), "")
+                worktrees = subprocess.run(
+                    ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+                    check=True, capture_output=True, text=True).stdout
+                self.assertNotIn("/run-", worktrees)
+            finally:
+                con.close()
+
+    def test_a_gone_isolated_worktree_never_falls_back_to_shared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            _git(root, "init", "-q", ".")
+            _git(root, "config", "user.email", "t@example.com")
+            _git(root, "config", "user.name", "t")
+            (root / "seed.txt").write_text("seed\n")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-qm", "init")
+            con = db.connect()
+            try:
+                cur = con.execute(
+                    "INSERT INTO runs(profile, backend, requested_by, workdir, "
+                    "branch, status, started_at, session_ref) "
+                    "VALUES('p','codex','work',?,?, 'done', ?, 'sess-1')",
+                    (str(root / "gone"), "orchestra/run-1", db.now()))
+                parent = con.execute("SELECT * FROM runs WHERE id=?",
+                                     (cur.lastrowid,)).fetchone()
+                before = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
+                with mock.patch.object(worktree, "create",
+                                       side_effect=SystemExit("cannot isolate")), \
+                        self.assertRaisesRegex(SystemExit, "cannot isolate"):
+                    supervise.create_followup(con, root, parent, "work", "carry on")
+                rows = list(con.execute("SELECT * FROM runs ORDER BY id"))
+                self.assertEqual(len(rows), before + 1)
+                failed = rows[-1]
+                self.assertEqual(failed["status"], "failed")
+                self.assertIn("cannot isolate", failed["summary"])
+                self.assertIsNone(failed["branch"])
+                self.assertEqual(failed["workdir"], str(root))
+
+                next_id = supervise.create_followup(
+                    con, root, failed, "work", "try once more")
+                resumed = con.execute("SELECT * FROM runs WHERE id=?",
+                                      (next_id,)).fetchone()
+                self.assertNotEqual(resumed["workdir"], str(root))
+                self.assertEqual(resumed["branch"], f"orchestra/run-{next_id}")
+                self.assertTrue(Path(resumed["workdir"]).exists())
             finally:
                 con.close()

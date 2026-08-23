@@ -8,11 +8,11 @@ status flows from the transcript, never from asking the worker to report.
 import json
 import sys
 
-from orchestra import paths
+from orchestra import harnesses, paths
 
 # Verified against the installed CLIs: `opencode run` has no --add-dir and
 # no equivalent directory flag.
-ADD_DIR_BACKENDS = ("claude", "codex", "reasonix")
+ADD_DIR_BACKENDS = harnesses.supporting("add_directory")
 
 _OPENCODE_DELEGATION_PERMISSIONS = (
     "task",
@@ -161,7 +161,7 @@ def build_cmd(profile: dict, *, workdir: str, title: str, prompt: str,
     add_dirs = [arg for d in declared for arg in ("--add-dir", d)]
     if declared and backend not in ADD_DIR_BACKENDS:
         add_dirs = []
-        print(f"orchestra: backend '{backend}' has no --add-dir; ignoring add_dirs "
+        print(f"orchestra: harness '{backend}' has no --add-dir; ignoring add_dirs "
               f"{declared} for profile {profile.get('name')}", file=sys.stderr)
 
     if backend == "opencode":
@@ -270,7 +270,9 @@ def build_cmd(profile: dict, *, workdir: str, title: str, prompt: str,
             cmd += ["--permission-mode", profile.get("permission_mode", "auto")]
         return cmd + add_dirs + extra + [prompt]
 
-    raise SystemExit(f"orchestra: unknown backend '{backend}' for profile {profile['name']}")
+    raise SystemExit(
+        f"orchestra: unknown harness '{backend}' for profile {profile['name']}; "
+        f"supported harnesses: {', '.join(harnesses.SUPPORTED)}")
 
 
 # --- output parsing (tolerant, best-effort) --------------------------------

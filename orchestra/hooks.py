@@ -30,14 +30,14 @@ import json
 import os
 import re
 
-from orchestra import config, db, messaging, paths, traces
+from orchestra import config, db, harnesses, messaging, paths, traces
 
 # A Stop hook that holds a session open for an `ask` needs a timeout longer
 # than the human takes to answer. Same figure Orchestra ran in production.
 HOOK_TIMEOUT = 36_000
 BIND_TIMEOUT = 10
 STATUS_MESSAGE = "Waiting for Orchestra"
-NESTED_BACKENDS = ("claude", "codex")   # matcher-group shape
+NESTED_BACKENDS = harnesses.supporting("correction", "nested-hook")
 SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
 
 

@@ -35,16 +35,16 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import config, paths, profiles, work_client
+from orchestra import config, harnesses, paths, profiles, work_client
 from orchestra.proc import chmod
 
 # The harnesses. The config KEY is still `backend`; "harness" is the word
 # every human-facing string uses (W-0181).
-BACKENDS = ("opencode", "codex", "claude", "reasonix")
+BACKENDS = harnesses.SUPPORTED
 
 # What an agent may retune on its own (DESIGN §5): the cheap knobs. Anything
-# else — a model, a harness, a new profile, a delegation allowlist, and the
-# tier/priority a planner routes on — commits spend or widens authority and
+# else — a model, a harness, a new profile, and the tier/priority a planner
+# routes on — commits spend or widens authority and
 # goes to the human as a Work decision.
 #
 # ``effort`` is here with a direction (W-0176). An agent may LOWER a
@@ -80,7 +80,6 @@ EDITABLE: dict[str, type] = {
     "backend": str, "model": str, "effort": str, "variant": str,
     "tier": int, "priority": int, "sandbox": str, "note": str,
     "timeout": int, "stall_timeout": int,
-    "spawn_profiles": list,
 }
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -222,11 +221,8 @@ def _tables(text: str) -> dict:
 def _verify(before: str, after: str, name: str, expected: dict | None) -> None:
     """Refuse a surgery that did anything but the intended change.
 
-    ponytail: a multi-line array (``spawn_profiles = [\\n "a",\\n]``) is the
-    known ceiling — replacing its first line strands the rest and the parse
-    below fails, so the edit is refused with the reason instead of writing a
-    broken config. Collapse the array onto one line, or teach this a
-    continuation scan when someone actually hits it.
+    The parse and structural comparison below turn any unsafe textual surgery
+    into a refusal instead of a broken config file.
     """
     try:
         new = _tables(after)
@@ -420,7 +416,7 @@ def _coerce(changes: dict) -> tuple[dict, str | None]:
         if want is None:
             return {}, (f"'{key}' is not an editable profile key; editable: "
                         + ", ".join(sorted(EDITABLE)))
-        if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == []:
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
             clean[key] = None  # explicit clear
             continue
         if key == "tier":
@@ -436,10 +432,6 @@ def _coerce(changes: dict) -> tuple[dict, str | None]:
                 return {}, f"{key} must be a whole number"
             if clean[key] < 0:
                 return {}, f"{key} must not be negative"
-        elif want is list:
-            if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
-                return {}, f"{key} must be a list of profile names"
-            clean[key] = [v.strip() for v in raw if v.strip()] or None
         else:
             if not isinstance(raw, str):
                 return {}, f"{key} must be a string"
@@ -447,7 +439,7 @@ def _coerce(changes: dict) -> tuple[dict, str | None]:
     return clean, None
 
 
-def validate(name: str, merged: dict, changes: dict, others: set[str],
+def validate(name: str, merged: dict, changes: dict,
              options: dict | None) -> str | None:
     """One error line, or None. ``merged`` is the profile as it would be."""
     if not NAME_RE.match(name):
@@ -489,13 +481,6 @@ def validate(name: str, merged: dict, changes: dict, others: set[str],
         return (f"the {backend} harness's model '{model}' supports "
                 f"{', '.join(supported)} — not '{effort}'")
 
-    # DESIGN §5: a delegation allowlist may not name a profile that does not
-    # exist. Rejected here rather than at spawn time, where the worker only
-    # finds out mid-run.
-    for target in merged.get("spawn_profiles") or []:
-        if target != name and target not in others:
-            return (f"spawn_profiles names '{target}', which is not a configured "
-                    f"profile; configured: {', '.join(sorted(others)) or 'none'}")
     return None
 
 
@@ -557,19 +542,11 @@ def save(name: str, changes: dict, *, authority: str = "human",
     except ValueError as exc:
         return {"applied": False, "error": str(exc)}
     existing = dict(current.get(name) or {})
-    others = set(current) - {name}
-
     if delete:
         if name not in current:
             return {"applied": False, "error": f"no profile '{name}' to remove"}
         if authority == "agent":
             return _decide(config.load(), name, {}, {"remove the profile"}, work)
-        orphaned = sorted(o for o in others
-                          if name in (current[o].get("spawn_profiles") or []))
-        if orphaned:
-            return {"applied": False,
-                    "error": f"'{name}' is in the spawn_profiles of "
-                             f"{', '.join(orphaned)} — clear it there first"}
         try:
             after = render(text, name, {}, delete=True)
             _verify(text, after, name, None)
@@ -611,7 +588,7 @@ def save(name: str, changes: dict, *, authority: str = "human",
             return _decide(config.load(), name, clean, needs, work)
 
     merged = {k: v for k, v in {**existing, **clean}.items() if v is not None}
-    error = validate(name, merged, clean, others, options)
+    error = validate(name, merged, clean, options)
     if error:
         return {"applied": False, "error": error}
 
