@@ -22,9 +22,9 @@ final class SnapshotDecoderTests: XCTestCase {
         XCTAssertEqual(snapshot.runs.first?.profile, "sol-medium")
     }
 
-    /// The live daemon serves v7. An exact-equality version gate rejected it
-    /// with "not in the correct format" on a snapshot that had merely grown
-    /// fields, and the app was unusable with no way forward.
+    /// Version 7 was the first snapshot newer than the decoder's compatibility
+    /// floor. An exact-equality gate rejected it after the payload merely grew
+    /// fields, leaving the app unusable with no way forward.
     func testNewerSnapshotDecodes() throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "snapshot-v7",

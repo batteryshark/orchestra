@@ -89,7 +89,7 @@ enum KeychainError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case let .saveFailed(status): "Could not save the Dromond key (\(status))."
+        case let .saveFailed(status): "Could not save the Orchestra key (\(status))."
         }
     }
 }

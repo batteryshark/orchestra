@@ -34,8 +34,10 @@ the lettering only.
 
 Two copies live outside this directory and have to be edited with it:
 `orchestra/dashboard.html` inlines the favicon as a data URI and draws the mark as
-inline SVG in its header, and `ios/Orchestra/Assets.xcassets/AppIcon.appiconset/`
-holds the 1024px PNG. Change a hull here and both need the same change.
+inline SVG in its header, and
+`ios/Dromond/Assets.xcassets/AppIcon.appiconset/` holds the 1024px PNG. The iOS
+project keeps its Dromond path for in-place upgrades; the app itself is
+Orchestra. Change a hull here and both need the same change.
 
 ### Light and dark
 
