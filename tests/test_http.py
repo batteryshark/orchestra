@@ -939,6 +939,44 @@ class SseSeamTests(ServerCase):
         seam.assert_not_called()
 
 
+class RunListNumberingTests(ServerCase):
+    """W-0304: a control turn shares the runs id space. The board densifies
+    the worker list in the dashboard; the wire still carries the real id."""
+
+    def test_a_turn_between_workers_leaves_real_ids_on_the_wire(self) -> None:
+        first = self.make_run(status="done", finished_at=db.now())
+        turn = self.make_run(status="done", finished_at=db.now(),
+                             layer="observer", title="observer turn")
+        second = self.make_run(status="done", finished_at=db.now())
+        _, snap = self.json_request()
+        self.assertEqual([r["id"] for r in snap["runs"]], [second, first])
+        self.assertEqual([r["board_n"] for r in snap["runs"]], [2, 1])
+        self.assertEqual(second, first + 2)
+        _, page = self.json_request(path="/api/turns")
+        self.assertEqual([t["id"] for t in page["turns"]], [turn])
+        self.assertIsNone(page["turns"][0]["board_n"])
+        self.assertEqual(len(snap["pinned_turns"]), 1)
+        self.assertEqual(snap["pinned_turns"][0]["id"], turn)
+        self.assertIsNone(snap["pinned_turns"][0]["board_n"])
+        self.assertEqual(snap["pinned_turns"][0]["layer"], "observer")
+
+    def test_the_runs_list_numbers_workers_densely(self) -> None:
+        src = mhttp.DASHBOARD.read_text(encoding="utf-8")
+        start = src.index("function renderRunList(s) {")
+        body = src[start:src.index("\nfunction ", start + 1)]
+        self.assertIn('"#" + r.board_n', body)
+        self.assertNotIn('"#" + r.id', body)
+        self.assertIn("turnItem(pinned)", body)
+        start = src.index("function renderDetail(s) {")
+        detail = src[start:src.index("\nfunction ", start + 1)]
+        self.assertIn('"#" + r.id', detail)
+        start = src.index("async function loadTurns() {")
+        nxt = src.find("\nfunction ", start + 1)
+        nxt_async = src.find("\nasync function ", start + 1)
+        end = min(x for x in (nxt, nxt_async) if x != -1)
+        self.assertIn("data.turns.map(turnItem)", src[start:end])
+
+
 class SeatsAndOutageTests(ServerCase):
     """The seats picker and the auth-outage feed (2026-08-25): an expired
     Claude OAuth ran the router and observer blind for hours — the judgment
