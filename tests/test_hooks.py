@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, hooks, messaging, runners, traces
+from orchestra import brief, config, db, hooks, messaging, runners, traces
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.fake_work import FakeWork
 
@@ -102,6 +102,8 @@ class InstallTests(HookFixture):
                          "orchestra hook --backend claude")
         self.assertEqual(data["hooks"]["SessionStart"][0]["hooks"][0]["command"],
                          "orchestra hook --backend claude --bind")
+        self.assertEqual(data["hooks"]["PostCompact"][0]["hooks"][0]["command"],
+                         "orchestra hook --backend claude --event PostCompact")
         # The Stop hook has to outlive a human deciding on an `ask`.
         self.assertEqual(data["hooks"]["Stop"][0]["hooks"][0]["timeout"],
                          hooks.HOOK_TIMEOUT)
@@ -114,6 +116,8 @@ class InstallTests(HookFixture):
         data = json.loads(path.read_text())
         self.assertEqual(data["hooks"]["Stop"][0]["command"],
                          "orchestra hook --backend reasonix")
+        self.assertEqual(data["hooks"]["PostCompact"][0]["command"],
+                         "orchestra hook --backend reasonix --event PostCompact")
         self.assertNotIn("hooks", data["hooks"]["Stop"][0])
 
     def test_install_is_idempotent_and_keeps_foreign_hooks(self) -> None:
@@ -140,10 +144,16 @@ class InstallTests(HookFixture):
 
     def test_opencode_plugin_is_per_run_not_global(self) -> None:
         hooks.install_all()
+        for home, filename in (("CLAUDE_CONFIG_DIR", "settings.json"),
+                               ("CODEX_HOME", "hooks.json"),
+                               ("REASONIX_HOME", "settings.json")):
+            data = json.loads((Path(os.environ[home]) / filename).read_text())
+            self.assertIn("PostCompact", data["hooks"], home)
         plugin = Path(str(self.tmp_path / "home" / "hooks" / "orchestra-opencode.js"))
         self.assertTrue(plugin.exists())
         self.assertIn("session.idle", plugin.read_text())
         self.assertIn("permission.asked", plugin.read_text())
+        self.assertIn("session.compacted", plugin.read_text())
         env = runners.apply_backend_env({"backend": "opencode"}, {})
         content = json.loads(env["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(content["plugin"], [str(plugin)])
@@ -167,11 +177,11 @@ class CodexTrustTests(HookFixture):
         hooks.install_all()
         text = (Path(os.environ["CODEX_HOME"]) / "config.toml").read_text()
         keys = [key for key, _ in hooks.codex_trust_records()]
-        self.assertEqual(len(keys), 2)
+        self.assertEqual(len(keys), 3)
         for key in keys:
             self.assertIn(hooks._trust_header(key), text)
         self.assertIn("trusted_hash = \"sha256:", text)
-        self.assertIn("provisioned for 2 hook(s)", hooks.codex_trust_status())
+        self.assertIn("provisioned for 3 hook(s)", hooks.codex_trust_status())
         # The bypass flag is never added to a spawn command.
         cmd = runners.build_cmd({"backend": "codex", "name": "stub"},
                                 workdir=str(self.tmp_path), title="t", prompt="p")
@@ -255,6 +265,39 @@ class HookRuntimeTests(HookFixture):
         self.assertIsNone(text)
         names = [e["name"] for e in traces.events_for_run(self.con, 1)]
         self.assertIn("permission.asked", names)
+
+    def test_forced_compaction_reinjects_the_bounded_run_brief(self) -> None:
+        text = brief.compose(
+            run_id=1, slug="brave_otter", profile={"name": "stub"},
+            mission="Work task W-0001: demo item", requester="human",
+            root=self.tmp_path, workdir=str(self.tmp_path),
+            work_item="W-0001", recent_commits=["secret landed detail"],
+            extra_context="secret additional context",
+            work_snapshot=("W-0001 · demo item [ready]\n\n## goal\nKeep the brief."
+                           "\n\n## acceptanceCriteria\n- next turn has context"))
+        path = self.tmp_path / "brief.md"
+        path.write_text(text)
+        self.con.execute("UPDATE runs SET brief_path=? WHERE id=1", (str(path),))
+        self.con.commit()
+        with self.as_run():
+            for backend in ("claude", "codex", "reasonix"):
+                injected = hooks.run_hook(
+                    backend, {"hook_event_name": "PostCompact"})
+                self.assertIn("Item: W-0001", injected, backend)
+                self.assertIn("Title: demo item", injected, backend)
+                self.assertIn("Keep the brief", injected, backend)
+                self.assertIn("next turn has context", injected, backend)
+                self.assertIn("Never run git write commands", injected, backend)
+                self.assertLessEqual(len(injected), brief.POSTCOMPACT_MAX_CHARS)
+                self.assertNotIn("secret landed detail", injected, backend)
+                self.assertNotIn("secret additional context", injected, backend)
+                next_turn = hooks.run_hook(
+                    backend, {"hook_event_name": "SessionStart",
+                              "source": "compact"}, bind=True)
+                rendered = hooks.render(backend, next_turn, context=True)
+                self.assertIn("Item: W-0001", rendered, backend)
+            injected = hooks.run_hook("opencode", {}, event="session.compacted")
+            self.assertIn("Item: W-0001", injected)
 
     def test_render_matches_each_harness(self) -> None:
         self.assertEqual(hooks.render("opencode", "go on"), "go on")
