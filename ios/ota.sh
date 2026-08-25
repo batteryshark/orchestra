@@ -13,13 +13,13 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-TEAM="${ORCHESTRA_TEAM:-${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+TEAM="${ORCHESTRA_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
   | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}}"
-PORT="${ORCHESTRA_OTA_PORT:-${DROMOND_OTA_PORT:-8791}}"
+PORT="${ORCHESTRA_OTA_PORT:-8791}"
 # Every app installs from one namespace, one app per leaf, so publishing one
 # never unmounts another and the tailnet has a single obvious place to look.
-WEBPATH="${ORCHESTRA_OTA_PATH:-${DROMOND_OTA_PATH:-/ios-installer/dromond}}"
-OUT="${TMPDIR:-/tmp}/dromond-ota"
+WEBPATH="${ORCHESTRA_OTA_PATH:-/ios-installer/orchestra}"
+OUT="${TMPDIR:-/tmp}/orchestra-ota"
 HOST="$(tailscale status --json 2>/dev/null \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
 
@@ -35,8 +35,8 @@ fi
 
 rm -rf "$OUT"; mkdir -p "$OUT/serve"
 echo "ota: archiving…"
-xcodebuild -project Dromond.xcodeproj -scheme Dromond -configuration Release \
-  -destination 'generic/platform=iOS' -archivePath "$OUT/Dromond.xcarchive" \
+xcodebuild -project Orchestra.xcodeproj -scheme Orchestra -configuration Release \
+  -destination 'generic/platform=iOS' -archivePath "$OUT/Orchestra.xcarchive" \
   DEVELOPMENT_TEAM="$TEAM" -allowProvisioningUpdates archive | tail -1
 
 cat > "$OUT/export.plist" <<PLIST
@@ -51,12 +51,12 @@ cat > "$OUT/export.plist" <<PLIST
 PLIST
 
 echo "ota: exporting…"
-xcodebuild -exportArchive -archivePath "$OUT/Dromond.xcarchive" \
+xcodebuild -exportArchive -archivePath "$OUT/Orchestra.xcarchive" \
   -exportOptionsPlist "$OUT/export.plist" -exportPath "$OUT/export" \
   -allowProvisioningUpdates | tail -1
-cp "$OUT/export/Dromond.ipa" "$OUT/serve/"
+cp "$OUT/export/Orchestra.ipa" "$OUT/serve/"
 
-APP="$OUT/Dromond.xcarchive/Products/Applications/Dromond.app"
+APP="$OUT/Orchestra.xcarchive/Products/Applications/Orchestra.app"
 VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist")
 BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist")
 
@@ -66,7 +66,7 @@ cat > "$OUT/serve/manifest.plist" <<PLIST
 <plist version="1.0"><dict><key>items</key><array><dict>
   <key>assets</key><array><dict>
     <key>kind</key><string>software-package</string>
-    <key>url</key><string>https://$HOST$WEBPATH/Dromond.ipa</string>
+    <key>url</key><string>https://$HOST$WEBPATH/Orchestra.ipa</string>
   </dict></array>
   <key>metadata</key><dict>
     <key>bundle-identifier</key><string>com.batteryshark.dromond</string>
@@ -82,15 +82,15 @@ cat > "$OUT/serve/index.html" <<HTML
 <!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Install Orchestra</title>
 <style>body{font:17px -apple-system,system-ui;margin:0;min-height:100vh;display:grid;
-place-items:center;background:#161B23;color:#DFE3EA}
-a{display:block;padding:18px 34px;background:#61A5E8;color:#0b0f14;text-decoration:none;
+place-items:center;background:#0b0d10;color:#f3f4f2}
+a{display:block;padding:18px 34px;background:#f3f4f2;color:#0b0d10;text-decoration:none;
 border-radius:14px;font-weight:700}
 p{color:#8b95a5;font-size:14px;text-align:center;max-width:22rem;line-height:1.5}</style>
 <div style="display:grid;gap:22px;justify-items:center">
-<svg width="76" height="76" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#161B23"/>
-<path transform="translate(78,96)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
-<path transform="translate(118,214)" fill="#61A5E8" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/>
-<path transform="translate(78,332)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/></svg>
+<svg width="76" height="76" viewBox="0 0 128 128"><rect width="128" height="128" rx="24" fill="#0b0d10"/>
+<g fill="#f3f4f2"><rect x="25" y="55" width="20" height="42" rx="10" opacity=".45"/>
+<rect x="54" y="30" width="20" height="67" rx="10"/>
+<rect x="83" y="46" width="20" height="51" rx="10" opacity=".7"/></g></svg>
 <a href="itms-services://?action=download-manifest&url=https://$HOST$WEBPATH/manifest.plist">Install Orchestra $VER ($BUILD)</a>
 <p>Tap install, then find Orchestra on the home screen. The phone has to be on the tailnet.</p>
 </div>
@@ -104,5 +104,5 @@ tailscale serve --bg --set-path "$WEBPATH" "http://127.0.0.1:$PORT" >/dev/null
 
 echo
 echo "  Open this on the phone:  https://$HOST$WEBPATH/"
-echo "  Orchestra $VER ($BUILD) · $(du -h "$OUT/serve/Dromond.ipa" | cut -f1)"
+echo "  Orchestra $VER ($BUILD) · $(du -h "$OUT/serve/Orchestra.ipa" | cut -f1)"
 echo "  Stop serving with:       ./ios/ota.sh --off"

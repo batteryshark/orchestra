@@ -83,7 +83,7 @@ struct RunDetailView: View {
         }
     }
 
-    private func act(_ body: @escaping (DromondAPI) async throws -> Void) {
+    private func act(_ body: @escaping (OrchestraAPI) async throws -> Void) {
         Task {
             acting = true
             defer { acting = false }

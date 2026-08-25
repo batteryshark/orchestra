@@ -1,5 +1,5 @@
 import XCTest
-@testable import Dromond
+@testable import Orchestra
 
 final class SnapshotDecoderTests: XCTestCase {
     private func decodeFixture(_ name: String) throws -> Snapshot {

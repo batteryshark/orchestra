@@ -1,25 +1,25 @@
 import SwiftUI
 
-/// The fleet mark, drawn rather than shipped as an asset so it scales and
-/// tints anywhere. Three hulls in echelon, the middle one leading.
-struct DromondMark: View {
+/// The Orchestra mark, drawn rather than shipped as an asset so it scales
+/// anywhere. Three vertical bars at different heights, like section levels
+/// on a mixing desk. Geometry matches assets/orchestra-mark.svg (128 grid).
+struct OrchestraMark: View {
     var tile = true
 
-    private static let teal = Color(red: 0.310, green: 0.702, blue: 0.769)
-    private static let blue = Color(red: 0.380, green: 0.647, blue: 0.910)
-    private static let ink = Color(red: 0.086, green: 0.106, blue: 0.137)
+    private static let bar = Color(red: 0.953, green: 0.957, blue: 0.949)
+    private static let ink = Color(red: 0.043, green: 0.051, blue: 0.063)
 
     var body: some View {
         GeometryReader { proxy in
             let side = min(proxy.size.width, proxy.size.height)
-            let s = side / 512
+            let s = side / 128
             ZStack(alignment: .topLeading) {
                 if tile {
-                    RoundedRectangle(cornerRadius: 112 * s).fill(Self.ink)
+                    RoundedRectangle(cornerRadius: 24 * s).fill(Self.ink)
                 }
-                hull(s, x: 78, y: 96, fill: Self.teal)
-                hull(s, x: 118, y: 214, fill: Self.blue)
-                hull(s, x: 78, y: 332, fill: Self.teal)
+                bar(s, x: 25, y: 55, height: 42, opacity: 0.45)
+                bar(s, x: 54, y: 30, height: 67, opacity: 1)
+                bar(s, x: 83, y: 46, height: 51, opacity: 0.7)
             }
             .frame(width: side, height: side)
         }
@@ -27,32 +27,12 @@ struct DromondMark: View {
         .accessibilityLabel("Orchestra")
     }
 
-    private func hull(_ s: CGFloat, x: CGFloat, y: CGFloat, fill: Color) -> some View {
-        HullShape()
-            .fill(fill)
-            .frame(width: 296 * s, height: 92 * s)
+    private func bar(_ s: CGFloat, x: CGFloat, y: CGFloat,
+                     height: CGFloat, opacity: Double) -> some View {
+        RoundedRectangle(cornerRadius: 10 * s)
+            .fill(Self.bar.opacity(opacity))
+            .frame(width: 20 * s, height: height * s)
             .offset(x: x * s, y: y * s)
-    }
-}
-
-/// One hull: belly aft, long raking bow. A single filled silhouette, so
-/// direction survives downscaling to a favicon.
-struct HullShape: Shape {
-    func path(in rect: CGRect) -> Path {
-        // The source outline is 296 wide by 92 tall; everything below is a
-        // fraction of that, so the hull fits whatever frame it is handed.
-        let w = rect.width / 296, h = rect.height / 92
-        var p = Path()
-        p.move(to: CGPoint(x: 0, y: 10 * h))
-        p.addLine(to: CGPoint(x: 296 * w, y: 0))
-        p.addCurve(to: CGPoint(x: 100 * w, y: 82 * h),
-                   control1: CGPoint(x: 238 * w, y: 40 * h),
-                   control2: CGPoint(x: 176 * w, y: 74 * h))
-        p.addCurve(to: CGPoint(x: 0, y: 10 * h),
-                   control1: CGPoint(x: 58 * w, y: 86 * h),
-                   control2: CGPoint(x: 16 * w, y: 54 * h))
-        p.closeSubpath()
-        return p
     }
 }
 

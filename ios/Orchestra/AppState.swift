@@ -34,13 +34,13 @@ final class AppState: ObservableObject {
             && !Keychain.load(for: server.keyAccount).isEmpty
     }
 
-    func api() throws -> DromondAPI {
+    func api() throws -> OrchestraAPI {
         guard let server = selectedServer,
               let url = URL(string: server.url), let scheme = url.scheme,
               ["http", "https"].contains(scheme), url.host != nil else {
             throw APIError.invalidURL
         }
-        return DromondAPI(baseURL: url, key: Keychain.load(for: server.keyAccount))
+        return OrchestraAPI(baseURL: url, key: Keychain.load(for: server.keyAccount))
     }
 
     // --- the server list --------------------------------------------------
@@ -156,7 +156,7 @@ final class AppState: ObservableObject {
 
     // --- actions the views call; each refreshes so the UI cannot drift -----
 
-    func perform(_ body: @escaping (DromondAPI) async throws -> Void) async -> String? {
+    func perform(_ body: @escaping (OrchestraAPI) async throws -> Void) async -> String? {
         do {
             try await body(try api())
             await refresh()

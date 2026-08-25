@@ -7,12 +7,11 @@
 #
 # The team id is read from the Apple Development certificate in the keychain,
 # so nothing about the developer account is committed here. Override with
-# ORCHESTRA_TEAM=... if the machine holds more than one. DROMOND_TEAM remains a
-# compatibility fallback for existing automation.
+# ORCHESTRA_TEAM=... if the machine holds more than one.
 set -euo pipefail
 
 cd "$(dirname "$0")"
-DD="${TMPDIR:-/tmp}/dromond-device-build"
+DD="${TMPDIR:-/tmp}/orchestra-device-build"
 
 devices() { xcrun devicectl list devices 2>/dev/null | grep -i iphone; }
 
@@ -25,7 +24,7 @@ if [ -z "$DEVICE" ]; then
   exit 1
 fi
 
-TEAM="${ORCHESTRA_TEAM:-${DROMOND_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+TEAM="${ORCHESTRA_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
   | openssl x509 -noout -subject 2>/dev/null | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2)}}"
 if [ -z "$TEAM" ]; then
   echo "deploy: no Apple Development certificate in the keychain." >&2
@@ -37,12 +36,12 @@ echo "deploy: device $DEVICE, team $TEAM"
 
 # -allowProvisioningUpdates lets Xcode mint the profile for com.batteryshark.dromond
 # on first run; after that it is cached and this is offline.
-xcodebuild -project Dromond.xcodeproj -scheme Dromond -configuration Release \
+xcodebuild -project Orchestra.xcodeproj -scheme Orchestra -configuration Release \
   -destination "platform=iOS,id=$DEVICE" -derivedDataPath "$DD" \
   DEVELOPMENT_TEAM="$TEAM" -allowProvisioningUpdates build \
   | tail -3
 
-APP="$DD/Build/Products/Release-iphoneos/Dromond.app"
+APP="$DD/Build/Products/Release-iphoneos/Orchestra.app"
 [ -d "$APP" ] || { echo "deploy: build produced no app at $APP" >&2; exit 1; }
 
 xcrun devicectl device install app --device "$DEVICE" "$APP" | grep -E "App installed|bundleID"

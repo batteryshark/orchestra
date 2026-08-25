@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct DromondApp: App {
+struct OrchestraApp: App {
     @StateObject private var state = AppState()
 
     var body: some Scene {

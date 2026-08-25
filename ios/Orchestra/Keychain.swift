@@ -2,6 +2,8 @@ import Foundation
 import Security
 
 enum Keychain {
+    /// Keeps the shipped bundle id so an installed app upgrades in place and
+    /// finds its saved secrets. Changing it orphans every stored key.
     private static let service = "com.batteryshark.dromond"
     /// Pre-rename service name. Read once, then migrated to `service`.
     private static let legacyService = "com.batteryshark.maestro"
