@@ -102,7 +102,9 @@ from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
 # inert delegation field on profiles.
 # v12 (W-0292): every run reports its effective isolation state explicitly.
 # v13 (W-0301): statistics include the latest run instrumentation report.
-SNAPSHOT_VERSION = 13
+# v14 (W-0304): each worker run carries board_n, a dense rank among
+# layer-IS-NULL rows. Turns keep id and carry board_n null.
+SNAPSHOT_VERSION = 14
 
 DEFAULT_PORT = 3011
 KEY_ENV = "ORCHESTRA_KEY"
@@ -491,13 +493,18 @@ _RUN_SELECT = (
     "(SELECT work_id FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
     "AS project_work_id, "
     "(SELECT name FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
-    "AS project_name FROM runs r ")
+    "AS project_name, "
+    # W-0304: dense worker rank, window-independent. Turns share the id
+    # space; the board numbers workers only.
+    "(SELECT COUNT(*) FROM runs w WHERE w.layer IS NULL AND w.id<=r.id) "
+    "AS board_n FROM runs r ")
 
 
 def _run_payload(con, r, blocked: dict) -> dict:
     summary = r["summary"] or ""
     return {
         "id": r["id"],
+        "board_n": None if r["layer"] else r["board_n"],
         "slug": r["slug"],
         "status": r["status"],
         "profile": r["profile"],

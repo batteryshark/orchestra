@@ -801,12 +801,14 @@ function renderRunList(s) {
     return;
   }
   const ids = new Set(runs.map((r) => r.id));
+  // W-0304: workers number densely via board_n; turns stay unnumbered.
+  // The real id stays on the detail header.
   box.replaceChildren(...pin, ...runs.map((r) => {
     const lineage = (r.retry_of && ids.has(r.retry_of)) ? " continuation"
                   : (r.parent_run && ids.has(r.parent_run)) ? " related" : "";
     const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
     const top = el("div", "top");
-    top.append(el("span", "mono", "#" + r.id));
+    top.append(el("span", "mono", "#" + r.board_n));
     if (r.slug) top.append(el("span", "mono dim", r.slug));
     top.append(statusChip(r));
     const when = el("span", "mono dim", dur(r.elapsed_seconds));
