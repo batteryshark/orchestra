@@ -339,7 +339,7 @@ _CACHE: dict = {}
 OPTIONS_TTL = 300  # seconds; discovery shells out to three CLIs
 
 
-def picker_options(found: dict) -> dict:
+def picker_options(found: dict, local: list | None = None) -> dict:
     """Discovery, reshaped for a model/effort picker.
 
     ``supports_effort`` False is OpenCode's whole story: it has no effort
@@ -381,14 +381,27 @@ def picker_options(found: dict) -> dict:
         "free_model": True, "free_effort": True, "models": [],
         "error": (found.get("claude") or {}).get("error") or CLAUDE_NOTE,
     }
+    # Local inference servers (W-0306 idea 3) are a discovery SOURCE, not a
+    # harness: the entry is marked ``local`` so the dashboard keeps it out of
+    # the harness picker and offers the names wherever a model is typed.
+    # ``validate`` never reads it — options are looked up by backend name —
+    # so a typed hosted model stays as saveable as before. The key exists
+    # only when a server answered: an absent server adds nothing.
+    if local:
+        out["local"] = {"local": True, "error": None,
+                        "models": [{"id": m["id"], "efforts": [],
+                                    "local": True, "source": m["source"]}
+                                   for m in local]}
     return out
 
 
 def discovery_options(force: bool = False) -> dict:
-    """Cached picker options. Discovery costs three subprocesses."""
+    """Cached picker options. Discovery costs three subprocesses, plus three
+    one-second localhost probes for local inference servers (W-0306)."""
     now = datetime.now(timezone.utc).timestamp()
     if force or not _CACHE or now - _CACHE.get("at", 0) > OPTIONS_TTL:
-        _CACHE.update(at=now, options=picker_options(profiles.discover()))
+        _CACHE.update(at=now, options=picker_options(profiles.discover(),
+                                                     profiles.discover_local()))
     return _CACHE["options"]
 
 
