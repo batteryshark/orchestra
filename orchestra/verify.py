@@ -36,7 +36,8 @@ Orchestra test methods inside the Work checkout, read exit 5 as failure,
 and blocked a verified item. Declined criteria join no dialogue (the
 second voice cannot see another repository either) and, like unchecked
 ones, leave the item in review with no fact: the pass certifies only
-evidence it inspected.
+evidence it inspected. A bare ``test`` that collects zero tests is
+judgment too (W-0311): an empty discovery proves nothing either way.
 """
 import shlex
 import shutil
@@ -209,7 +210,13 @@ def run_method(root: Path, method: str) -> tuple[bool | None, str]:
         return r.returncode == 0, note
     if kind == "test":
         cmd = [sys.executable, "-m", "unittest"] + (shlex.split(arg) if arg else ["discover"])
-        return _command(root, cmd, method)
+        ok, note = _command(root, cmd, method)
+        # A bare test that collects nothing proves nothing: unittest exits 5
+        # (NO TESTS RAN) in a checkout with no Python tests, and run 54 read
+        # that as failure (W-0311). Targeted tests keep their verdicts.
+        if not arg and note.endswith("exit 5"):
+            return None, f"{method}: no tests ran in this checkout — needs judgment"
+        return ok, note
     return _command(root, shlex.split(method), method)
 
 
