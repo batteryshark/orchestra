@@ -163,6 +163,21 @@ class AutoVerifyTests(SweeperFixture, unittest.TestCase):
         self.assertNotIn("test_refine", halted[0])
         self.assertTrue(task["acceptanceCriteria"][1]["declined"])
 
+    def test_a_bare_test_that_collects_nothing_is_judgment_not_failure(self) -> None:
+        """W-0311, the last run 54 shape: bare ``test`` in a checkout with
+        no Python tests exits 5 (NO TESTS RAN). An empty discovery proves
+        nothing — needs judgment, no veto."""
+        self._land("the guard holds — test")
+        self.sweep()
+        task = self.work.tasks["W-0001"]
+        self.assertNotEqual(task["status"], "blocked")
+        messages = [e["message"] for e in task["log"]]
+        self.assertTrue(any("no tests ran in this checkout" in m
+                            for m in messages))
+        self.assertFalse(any("fact: halted" in m for m in messages))
+        run = self._verify_run()
+        self.assertIn("Inconclusive", run["summary"])
+
     def test_a_worker_decline_is_respected_not_rerun(self) -> None:
         """Run 54 re-ran a criterion the worker had declined and failed it
         in the wrong checkout. A decline on the record stays the answer:
