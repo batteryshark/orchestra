@@ -198,6 +198,22 @@
   .c-blocked { background: var(--think); }
   .c-turn { background: var(--think); }
 
+  /* the tier cards: what 1/2/3 mean, beside the list that assigns them */
+  .tiers { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem;
+           flex: 0 0 auto; }
+  .tiercard { background: var(--panel); border: 1px solid var(--line);
+              border-top: 2px solid var(--line); border-radius: 8px;
+              padding: .6rem .85rem; font-size: 12.5px;
+              display: flex; flex-direction: column; gap: .25rem; }
+  .tierhead { display: flex; align-items: baseline; gap: .5rem; }
+  .tiernum { font-size: 1.3rem; font-weight: 700; color: var(--dim);
+             line-height: 1; }
+  .tierhead b { font-size: 12.5px; letter-spacing: .06em;
+                text-transform: uppercase; }
+  .tierwho { color: var(--dim); font-size: 11.5px; margin-top: .2rem;
+             border-top: 1px solid var(--line); padding-top: .4rem; }
+  @media (max-width: 60rem) { .tiers { grid-template-columns: 1fr; } }
+
   /* the seats: one dropdown per judgment layer */
   .seatrow { display: grid; grid-template-columns: 6.5rem 15rem 1fr;
              gap: .7rem; align-items: center; padding: .28rem 0;
@@ -418,6 +434,10 @@
 
   <!-- ================= PROFILES ================= -->
   <section class="view vstack" id="view-profiles" hidden>
+    <!-- The three capability tiers (W-0181), explained beside the list
+         that assigns them. Live: each card names the profiles holding
+         its tier and the seats that default to it. -->
+    <div id="tiers" class="tiers"></div>
     <div class="card grow">
       <h2>profiles</h2>
       <div class="pad">
@@ -1481,7 +1501,40 @@ function enabledCell(name) {
   return l;
 }
 
+// The three capability tiers (W-0181): tier is capability, priority orders
+// profiles WITHIN a tier. The wording follows config.py's own table.
+const TIER_CARDS = [
+  [1, "workhorse", "a cheap, fast model for well-defined, bounded tasks",
+   "the spin observer and the landing verifier default here", "--tool"],
+  [2, "generalist", "a mid-tier model for everyday missions",
+   "the conductor's planner defaults here", "--live"],
+  [3, "heavy", "the frontier model, for the hardest thinking",
+   "no seat defaults here — staffed deliberately or by the router", "--think"],
+];
+function tierNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const named = {cheap: 1, fast: 1, low: 1, mid: 2, medium: 2,
+                 heavy: 3, high: 3, frontier: 3}[String(value).toLowerCase()];
+  const n = named || Number(value);
+  return n >= 1 && n <= 3 ? Math.round(n) : null;
+}
+function renderTiers(profiles) {
+  $("tiers").replaceChildren(...TIER_CARDS.map(([n, name, what, rides, accent]) => {
+    const card = el("div", "tiercard");
+    card.style.borderTopColor = "var(" + accent + ")";
+    const head = el("div", "tierhead");
+    head.append(el("span", "tiernum", String(n)), el("b", null, name));
+    const members = profiles.filter((p) => tierNumber(p.tier) === n)
+                            .map((p) => p.name);
+    card.append(head, el("div", null, what), el("div", "dim", rides),
+      el("div", "tierwho", members.length ? members.join(" · ")
+                                          : "no profile holds this tier"));
+    return card;
+  }));
+}
+
 function renderProfiles(s) {
+  renderTiers(s.profiles || []);
   // Already in routing order: the server sorts by priority, then name.
   // Profiles are GLOBAL presets (W-0187), so this is the same list whatever
   // the picker says, and it is editable whatever the picker says. What a
