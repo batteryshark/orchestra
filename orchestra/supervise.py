@@ -679,6 +679,41 @@ def _checkpoint_commit(run: dict, terminal_status: str) -> str | None:
     return worktree.head(workdir)
 
 
+def _ferry_check_failure(con, cfg: dict, run, status: str, *,
+                         boundary: bool = True) -> bool:
+    """Checkpoint a completed turn and ferry a failed declared check back.
+
+    The run stays live. Its next turn receives the check result through the
+    normal message path, so the worker never has to watch CI or query a row.
+    """
+    settings = merge.merge_cfg(cfg)
+    if status != "done" or not run["branch"] or not settings["checks"]:
+        return False
+    try:
+        checkpoint = _checkpoint_commit(dict(run), status)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"orchestra: run {run['id']} check ferry checkpoint failed: {exc}",
+              file=sys.stderr)
+        return False  # finalization records the same checkpoint failure
+    con.execute("UPDATE runs SET checkpoint_commit=? WHERE id=?",
+                (checkpoint, run["id"]))
+    con.commit()
+    checks, ok = merge.run_checks(settings, Path(run["workdir"]))
+    if ok:
+        return False
+    failed = checks[-1]
+    output = (failed["output"] or "(no output)").strip()
+    body = ("A declared merge check failed after your completed turn. Fix the "
+            "failure, then finish the mission again. Do not wait or poll for "
+            "the check; Orchestra runs it after each completed turn.\n\n"
+            f"check: {failed['name']}\ncommand: {failed['command']}\n"
+            f"exit: {failed['exit_code']}\noutput:\n{output}")
+    messaging.queue_tell(
+        con, int(run["id"]), "orchestra:merge-check", body, run["log_path"],
+        boundary=boundary)
+    return True
+
+
 def release_worktree(con, run: dict, status: str) -> str | None:
     """SEAM (W-0172): a terminal run gives its isolated checkout back.
 
@@ -814,7 +849,7 @@ def finalize_run(con, run, status: str, exit_code: int | None, *,
 
     checkpoint_commit = latest["checkpoint_commit"]
     checkpoint_note = None
-    if checkpoint_commit is None and not latest["finalized"]:
+    if not latest["finalized"]:
         try:
             checkpoint_commit = _checkpoint_commit(run, status)
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
@@ -843,7 +878,7 @@ def finalize_run(con, run, status: str, exit_code: int | None, *,
         con.execute(
             "UPDATE runs SET status=?, exit_code=?, "
             "session_ref=COALESCE(?, session_ref), summary=?, "
-            "checkpoint_commit=COALESCE(checkpoint_commit, ?), "
+            "checkpoint_commit=?, "
             "finished_at=COALESCE(finished_at, ?) WHERE id=?",
             (status, exit_code, session_ref, summary, checkpoint_commit,
              db.now(), run_id))
@@ -1113,6 +1148,15 @@ def supervise(root: Path, run_id: int) -> int:
             print(f"orchestra: run {run_id}: quota exhausted; retrying on the api lane",
                   file=sys.stderr)
             continue
+        if _ferry_check_failure(con, cfg, run, status):
+            resume_ref = run["session_ref"]
+            delivered = _mark_pending_delivered(con, run_id)
+            prompt = _resume_prompt(delivered)
+            if not resume_ref:
+                prompt = f"{brief_prompt}\n\n{prompt}"
+            if last_msg_file:
+                Path(last_msg_file).unlink(missing_ok=True)
+            continue
         break
 
     if transport == "acp":
@@ -1123,7 +1167,9 @@ def supervise(root: Path, run_id: int) -> int:
                                       **{auth.TOKEN_ENV: run_token})), root))
         status, exit_code = acp.supervise_run(
             con, run, profile, prompt=prompt, run_id=run_id, env=env,
-            deadline=deadline, stall_timeout=stall_timeout)
+            deadline=deadline, stall_timeout=stall_timeout,
+            at_boundary=lambda: _ferry_check_failure(
+                con, cfg, run, "done", boundary=False))
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
 
     # --- finalization ---

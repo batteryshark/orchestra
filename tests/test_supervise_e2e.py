@@ -16,7 +16,7 @@ from unittest import mock
 
 import subprocess
 
-from orchestra import cli, db, merge, project, supervise, traces, worktree
+from orchestra import cli, db, merge, messaging, project, supervise, traces, worktree
 
 
 def _git(root, *args) -> None:
@@ -170,6 +170,37 @@ class E2ETestCase(unittest.TestCase):
                                   args=(self.root, run_id))
         thread.start()
         return thread
+
+    def test_merge_check_failure_is_injected_into_the_same_run(self) -> None:
+        root = _seed_repo(str(self.tmp_path))
+        run_dir, branch = worktree.create(root, 99, PROJECT_ID)
+        log = self.tmp_path / "check-ferry.jsonl"
+        log.write_text("")
+        con = db.connect()
+        try:
+            cur = con.execute(
+                "INSERT INTO runs(profile, backend, requested_by, workdir, "
+                "project_id, branch, log_path, status, started_at, session_ref) "
+                "VALUES('stub','opencode','work',?,?,?,?, 'running', ?, 'sess-1')",
+                (str(run_dir), PROJECT_ID, branch, str(log), db.now()))
+            con.commit()
+            run_id = int(cur.lastrowid)
+            run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+
+            ferried = supervise._ferry_check_failure(
+                con, {"merge": {"checks": {"test": "exit 7"}}}, run, "done")
+            delivered = messaging.claim_pending(con, run_id)
+
+            self.assertTrue(ferried)
+            self.assertEqual(len(delivered), 1)
+            self.assertEqual(delivered[0]["sender"], "orchestra:merge-check")
+            self.assertIn("exit: 7", delivered[0]["body"])
+            injections = [event for event in traces.events_for_run(con, run_id)
+                          if event["kind"] == "human_injection"]
+            self.assertEqual(len(injections), 1)
+            self.assertIn("declared merge check failed", injections[0]["payload"])
+        finally:
+            con.close()
 
     def test_dispatch_supervise_complete(self) -> None:
         """One default run, asserted in phases; the subTest names what broke.
