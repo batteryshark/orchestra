@@ -604,7 +604,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         briefs = {r["work_item"]: Path(r["brief_path"]).read_text()
                   for r in con.execute("SELECT work_item, brief_path FROM runs")}
         con.close()
-        self.assertIn("work check W-0001 requirement|acceptance <index>",
+        self.assertIn("work check W-0001 requirement|acceptance <index> --root ",
                       briefs["W-0001"])
         self.assertIn("--decline", briefs["W-0001"])
         self.assertNotIn("work check", briefs["issue_abc123"])

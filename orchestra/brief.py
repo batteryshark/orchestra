@@ -34,12 +34,12 @@ WRITEBACK_STYLE = Path(__file__).resolve().parent.parent / "docs/WRITEBACK-STYLE
 # checklist to answer, and a brief never teaches a verb it cannot use.
 WORK_CHECKLIST_PROTOCOL = """\
 Before you stop, account for every requirement and acceptance criterion above.
-Tick each one you verified: `work check {item} requirement|acceptance <index>`
-(indexes count from 0, as `work show {item}` lists them). Decline each one you
-did not, with the reason: `--decline "not attempted, blocked on X"`. Declining
-is expected and is not a failure — leaving an item unanswered is. Whatever you
-leave unanswered is declined for you, naming your run as the one that did not
-account for it.
+Tick each one you verified: `work check {item} requirement|acceptance <index> --root {root}`
+(indexes count from 0, as `work show {item} --root {root}` lists them). Decline
+each one you did not: `work check {item} requirement|acceptance <index> --root {root} --decline "not attempted, blocked on X"`.
+Declining is expected and is not a failure — leaving an item unanswered is.
+Whatever you leave unanswered is declined for you, naming your run as the one
+that did not account for it.
 """
 
 
@@ -114,7 +114,7 @@ Project: `{root}` · Working directory: `{workdir}`.
         # dispatch and passes it here, capped at 2,000 chars (D6).
         parts.append(f"## Work item snapshot\n\n{work_snapshot[:WORK_SNAPSHOT_MAX_CHARS]}\n")
         if work_item:
-            parts.append(WORK_CHECKLIST_PROTOCOL.format(item=work_item))
+            parts.append(WORK_CHECKLIST_PROTOCOL.format(item=work_item, root=root))
     if extra_context:
         parts.append(f"## Additional context\n\n{extra_context}\n")
     parts.append(writeback_section())
