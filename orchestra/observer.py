@@ -521,7 +521,7 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
     A separate process with its own prompt: the worker's session is never
     resumed, never interrupted, and never billed for this.
 
-    With ``layer`` set (router / merge / observer / conductor) the turn is a
+    With ``layer`` set (router / merge / observer / conductor / dialogue) the turn is a
     CONTROL turn (W-0214): its transcript is retained instead of unlinked,
     and the turn is recorded as a terminal runs row whose events normalize
     through ``traces.ingest`` — including a FAILED turn, which used to leave
