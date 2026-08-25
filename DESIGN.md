@@ -53,7 +53,8 @@ landed fact dispatches a verification run in the same pass, under `[verify]
 profile` — defaulting to the one enabled workhorse-tier profile, a cheaper
 model than the worker's. It executes each acceptance criterion's stated
 method against landed main and writes the result to Work; `[verify] enabled
-= false` turns it off.
+= false` turns it off. A criterion with no mechanical method may get a
+capped two-seat dialogue under `[verify] second_opinion`; unset, that path is off.
 
 The refine lane sits on the other side of execution (W-0309): a human tags an
 item `refine` and the next sweep dispatches one shaping run under `[work]
