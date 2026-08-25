@@ -8,7 +8,7 @@ status flows from the transcript, never from asking the worker to report.
 import json
 import sys
 
-from orchestra import harnesses, paths
+from orchestra import config, harnesses, paths
 
 # Verified against the installed CLIs: `opencode run` has no --add-dir and
 # no equivalent directory flag.
@@ -96,12 +96,16 @@ def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
     1. OpenCode's ``run --auto`` can leave a native task child blocked forever
        on its own permission ask. Supervised workers get explicit orchestration
        from Orchestra instead, so deny native/plugin delegation to avoid that
-       unobservable deadlock. ``opencode_native_subagents = true`` on a profile
-       deliberately restores them.
+        unobservable deadlock. ``opencode_native_subagents = true`` on a profile
+        deliberately restores them.
     2. OpenCode has no shell hooks (DESIGN §6), so Orchestra's JS plugin is
-       delivered PER RUN here rather than installed into the user's own
-       ``~/.config/opencode`` — the human's interactive sessions stay clean.
+        delivered PER RUN here rather than installed into the user's own
+        ``~/.config/opencode`` — the human's interactive sessions stay clean.
+
+    Profile ``env`` is applied here so exec, ACP, and control turns share one
+    seam. Lane quota still wins after that and strips the API credentials.
     """
+    env = config.apply_profile_env(profile, env)
     if profile.get("backend") == "claude" and lane_of(profile) == "quota":
         updated = dict(env)
         for name in API_AUTH_VARS:
