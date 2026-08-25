@@ -466,6 +466,7 @@ def _run_payload(con, r, blocked: dict) -> dict:
         "session_ref": r["session_ref"],
         "retry_of": r["retry_of"],
         "layer": r["layer"],
+        "routed_reason": r["routed_reason"],
         "tokens_in": r["tokens_in"],
         "tokens_out": r["tokens_out"],
         "tokens_total": r["tokens_total"],

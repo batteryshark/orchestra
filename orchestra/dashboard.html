@@ -196,6 +196,14 @@
   .c-failed, .c-timeout { background: var(--bad); }
   .c-killed { background: var(--dim); }
   .c-blocked { background: var(--think); }
+  .c-turn { background: var(--think); }
+
+  /* control turns: one row per machine decision (W-0214) */
+  .turnitem { padding: .45rem .2rem; border-bottom: 1px solid var(--line);
+              font-size: 12.5px; }
+  .turnitem:last-child { border-bottom: 0; }
+  .turnitem .prose { margin-top: .2rem; color: var(--dim); }
+  #runlist .turnitem { padding: .45rem .6rem; background: var(--panel); }
 
   /* The detail header and its tab strip sit outside #pbody, which is the only
      thing that scrolls — so name, status, tabs and stop never scroll away. */
@@ -465,6 +473,13 @@
         </div>
       </div>
     </div>
+    <!-- The machine's own decisions — router staffing, observer verdicts,
+         merge judgments — recorded as layered runs rows (W-0214) that the
+         board deliberately never lists. This card is their reading surface. -->
+    <div class="card" style="flex:0 1 auto; max-height:38%">
+      <h2>control turns <span class="dim" id="turnstate"></span></h2>
+      <div class="pad" id="turnsbox"></div>
+    </div>
     <div class="card grow">
       <h2>daemon log <span class="dim" id="logstate"></span></h2>
       <div class="pad" style="overflow:hidden">
@@ -611,7 +626,7 @@ function showView(name) {
     b.classList.toggle("on", b.dataset.view === name);
   });
   // Neither stream runs behind a view nobody is looking at.
-  if (name === "health") openLog(); else closeLog();
+  if (name === "health") { openLog(); loadTurns(); } else closeLog();
   if (name === "runway") refreshRunway();  // opening the view is a request
   if (name === "settings") loadConfig();
   syncTrace();
@@ -735,14 +750,21 @@ function renderRunList(s) {
   const box = $("runlist");
   const runs = visibleRuns(s);
   $("runcount").textContent = runs.length ? "(" + runs.length + ")" : "";
+  // The scoped project's newest control turn, pinned above its runs
+  // (W-0214). Only when a project is picked: a staffing decision about
+  // another project pinned here would read as if it happened here. The
+  // full feed lives on the health view.
+  const pinned = PROJECT === null ? null
+    : (s.pinned_turns || []).find((t) => t.project_id === PROJECT);
+  const pin = pinned ? [turnItem(pinned)] : [];
   if (!runs.length) {
-    box.replaceChildren(el("div", "runitem dim", PROJECT === null
+    box.replaceChildren(...pin, el("div", "runitem dim", PROJECT === null
       ? "no runs yet — `orchestra run`"
       : "no runs for " + projectName(PROJECT) + " in the snapshot window"));
     return;
   }
   const ids = new Set(runs.map((r) => r.id));
-  box.replaceChildren(...runs.map((r) => {
+  box.replaceChildren(...pin, ...runs.map((r) => {
     const lineage = (r.retry_of && ids.has(r.retry_of)) ? " continuation"
                   : (r.parent_run && ids.has(r.parent_run)) ? " related" : "";
     const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
@@ -952,6 +974,10 @@ const PANES = {
 
   facts: (s, r) => kv([
     ["profile", r.profile],
+    // The router's one-liner from the staffing turn (W-0183) — why THIS
+    // profile got the work. Absent on manual dispatches and continuations;
+    // kv skips undefined rows entirely.
+    ["staffing", r.routed_reason || undefined],
     ["harness", r.backend + (r.model ? " · " + r.model : "")],
     ["isolation", r.isolation],
     ["project", r.project || r.project_id],
@@ -1281,6 +1307,33 @@ function closeLog() {
   LOG.close();
   LOG = null;
   $("logstate").textContent = "· paused (open this view to stream)";
+}
+
+// --- control turns ----------------------------------------------------------
+// One row per machine decision: which layer spoke, on what profile, and its
+// one-line reason. The summary already names the run it acted on, so the
+// text is the link — no second pointer is stored.
+function turnItem(t) {
+  const item = el("div", "turnitem");
+  const head = el("div");
+  head.append(el("span", "chip c-turn", t.layer || "turn"),
+              el("span", "dim", " " + [t.project || t.project_id, t.profile,
+                                       ago(t.started_at)]
+                                      .filter(Boolean).join(" · ")));
+  item.append(head, el("div", "prose", (t.summary || "(no summary recorded)")
+                                       .slice(0, 400)));
+  return item;
+}
+
+async function loadTurns() {
+  try {
+    const data = await api("/api/turns?limit=30");
+    $("turnstate").textContent = "· latest " + data.turns.length;
+    $("turnsbox").replaceChildren(...(data.turns.length
+      ? data.turns.map(turnItem)
+      : [el("p", "dim",
+            "no turns yet — the router, observer, and judge write one per decision")]));
+  } catch (e) { fail(e); }
 }
 
 // --- profiles (W-0173) ------------------------------------------------------
