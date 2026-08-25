@@ -48,9 +48,12 @@ brief, records checklist accounting, and writes outcomes back through Work's
 agent API. Work is the intent and ledger system in that mode. It is not needed
 for local project registration or direct dispatch.
 
-Work sign-off is separate and disabled by default. When enabled, it records a
-verification run under `verify_profile`, executes each acceptance criterion's
-stated method against landed main, and writes the result to Work.
+Work sign-off is separate and on by default (W-0299): the sweep that posts a
+landed fact dispatches a verification run in the same pass, under `[verify]
+profile` — defaulting to the one enabled workhorse-tier profile, a cheaper
+model than the worker's. It executes each acceptance criterion's stated
+method against landed main and writes the result to Work; `[verify] enabled
+= false` turns it off.
 
 ## 2. Daemon and central state
 
