@@ -423,8 +423,14 @@ def progress(log_path: str, backend: str) -> str | None:
         parts.append(f"last: {_action_label(*last)}")
     elif said:
         parts.append(f"last said: {said[:120]}")
-    parts.append(f"log written {profiles.age_text(max(quiet, 0))}")
-    return "; ".join(parts)[:400]
+    age = f"log written {profiles.age_text(max(quiet, 0))}"
+    head = "; ".join(parts)
+    # The age is the hang signal: never let the 400-char cap cut it off.
+    # Trim the head (the tool label), which is the least important part.
+    room = 400 - len(age) - 2   # "; " joins head and age
+    if len(head) > room:
+        head = head[:room]
+    return f"{head}; {age}" if head else age
 
 
 def _action_label(name: str | None, line: str) -> str:
