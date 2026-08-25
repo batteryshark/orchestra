@@ -39,6 +39,13 @@ worktree = false
 """
 
 
+# A per-project enabled set that names another profile (tests of the
+# refusal path append this to the global config verbatim).
+OTHER_PROFILE_ONLY = (
+    "\n[profiles.other]\nbackend = \"codex\"\n"
+    f"\n[project.\"{PROJECT_ID}\"]\nenabled_profiles = [\"other\"]\n")
+
+
 def tool_line(tool: str, **args) -> str:
     """One finished tool in the fixture profile's backend (opencode) — the
     shape the progress heartbeat counts."""
@@ -177,11 +184,68 @@ class SweeperFixture:
 
     def age_progress(self, run_id) -> None:
         """Let the next sweep past the progress rate limit."""
+        self.db_exec("UPDATE runs SET work_progress_at='2000-01-01T00:00:00Z' "
+                     "WHERE id=?", run_id)
+
+    def db_exec(self, sql, *args) -> None:
         con = db.connect()
-        con.execute("UPDATE runs SET work_progress_at='2000-01-01T00:00:00Z' "
-                    "WHERE id=?", (run_id,))
+        con.execute(sql, args)
         con.commit()
         con.close()
+
+    def db_one(self, sql, *args):
+        con = db.connect()
+        row = con.execute(sql, args).fetchone()
+        con.close()
+        return row
+
+    def dispatch_item(self, item="W-0001", title="job", **kw):
+        """Add a delegated item, sweep once, return its run row."""
+        add = self.work.add_issue if item.startswith("issue") else self.work.add_task
+        add(item, title, delegated=True, **kw)
+        self.sweep()
+        return self.db_run()
+
+    def mark_running(self, run_id, session_ref) -> None:
+        self.db_exec("UPDATE runs SET status='running', session_ref=? "
+                     "WHERE id=?", session_ref, run_id)
+
+    def report(self, run_id):
+        """One report_result pass over the run's current row."""
+        con = db.connect()
+        try:
+            return sweeper.report_result(con, self.client,
+                                         dict(self.db_run(run_id)))
+        finally:
+            con.close()
+
+    def lose_response(self, method="log_task", marker=None):
+        """Patch a client call so the fake commits but the response is lost
+        (None) for calls whose body contains ``marker`` — every call when
+        ``marker`` is None."""
+        real = getattr(self.client, method)
+
+        def committed_then_lost(item_id, *args):
+            result = real(item_id, *args)
+            return None if marker is None or marker in args[0] else result
+
+        return mock.patch.object(self.client, method, committed_then_lost)
+
+    def add_config(self, extra: str) -> None:
+        self.global_config.write_text(self.global_config.read_text() + extra)
+
+    def enable_worktree(self) -> None:
+        self.global_config.write_text(self.global_config.read_text().replace(
+            "worktree = false", "worktree = true"))
+
+    def init_repo(self, message="seed") -> None:
+        for args in (["init", "-q"], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *args], cwd=self.root, check=True)
+        (self.root / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "seed.txt"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", message], cwd=self.root,
+                       check=True)
 
 
 class SweeperTestCase(SweeperFixture, unittest.TestCase):
@@ -232,7 +296,6 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
     def test_lost_task_claim_response_reuses_the_reserved_run(self) -> None:
         self.work.add_task("W-0001", "claim once", delegated=True)
-        post = self.client.log_task
 
         with mock.patch.object(
                 self.client, "log_task",
@@ -241,11 +304,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         pending = self.db_run()
         self.assertEqual(pending["work_claim_status"], "pending")
 
-        def committed_then_lost(item_id, body):
-            result = post(item_id, body)
-            return None if " fact: claimed" in body else result
-
-        with mock.patch.object(self.client, "log_task", committed_then_lost):
+        with self.lose_response(marker=" fact: claimed"):
             self.assertEqual(self.sweep(), [])
         still_pending = self.db_run()
         self.assertEqual(still_pending["id"], pending["id"])
@@ -269,13 +328,8 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
     def test_human_override_settles_a_prepared_pending_claim(self) -> None:
         self.work.add_task("W-0001", "do not launch stale work", delegated=True)
-        post = self.client.log_task
 
-        def committed_then_lost(item_id, body):
-            result = post(item_id, body)
-            return None if " fact: claimed" in body else result
-
-        with mock.patch.object(self.client, "log_task", committed_then_lost):
+        with self.lose_response(marker=" fact: claimed"):
             self.assertEqual(self.sweep(), [])
         pending = self.db_run()
         con = db.connect()
@@ -299,21 +353,14 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(abandoned["status"], "killed")
         self.assertEqual(abandoned["work_claim_status"], "abandoned")
         self.assertFalse(Path(prepared["brief_path"]).exists())
-        con = db.connect()
-        self.assertEqual(con.execute(
+        self.assertEqual(self.db_one(
             "SELECT COUNT(*) FROM observations WHERE run_id=? AND layer='retry'",
-            (pending["id"],)).fetchone()[0], 0)
-        con.close()
+            pending["id"])[0], 0)
 
     def test_lost_issue_claim_response_reconciles_claimed_by(self) -> None:
         self.work.add_issue("issue_once", "claim once", delegated=True)
-        claim = self.client.claim_issue
 
-        def committed_then_lost(item_id):
-            claim(item_id)
-            return None
-
-        with mock.patch.object(self.client, "claim_issue", committed_then_lost):
+        with self.lose_response(method="claim_issue"):
             self.assertEqual(self.sweep(), [])
         pending = self.db_run()
         self.assertEqual((pending["status"], pending["work_claim_status"]),
@@ -333,20 +380,17 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.sweep()
         self.assertEqual(self.launched, [(self.root, pending["id"])])
 
-    def test_unassigned_or_wrong_state_items_are_untouched(self) -> None:
+    def test_unassigned_wrong_state_or_legacy_items_are_untouched(self) -> None:
         self.work.add_task("W-0001", "not ours", agents=["someone_else"])
         self.work.add_task("W-0002", "ours but backlog", delegated=True,
                            status="backlog")
-        self.assertEqual(self.sweep(), [])
-        self.assertIsNone(self.db_run())
-
-    def test_a_legacy_agents_list_is_history_not_delegation(self) -> None:
-        # It records which agent did the work in an older system. Reading it
-        # as delegation offered 96 finished records to the runner, so Work
-        # stopped emitting the key and the contract stopped honouring it.
-        # Only an explicit human tick dispatches.
-        self.work.add_task("W-0001", "legacy shape", agents=["orchestra"])
-        del self.work.tasks["W-0001"]["delegated"]
+        # A legacy agents list is history, not delegation: it records which
+        # agent did the work in an older system. Reading it as delegation
+        # offered 96 finished records to the runner, so Work stopped emitting
+        # the key and the contract stopped honouring it. Only an explicit
+        # human tick dispatches.
+        self.work.add_task("W-0003", "legacy shape", agents=["orchestra"])
+        del self.work.tasks["W-0003"]["delegated"]
         self.assertEqual(self.sweep(), [])
         self.assertIsNone(self.db_run())
 
@@ -368,33 +412,22 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.work.human_move("W-0001", "ready")
         actions = self.sweep()
         self.assertNotIn("dispatch", [a["action"] for a in actions])
-        con = db.connect()
-        n = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
-        con.close()
-        self.assertEqual(n, 1)
+        self.assertEqual(self.db_one("SELECT COUNT(*) AS n FROM runs")["n"], 1)
 
     # --- ferry --------------------------------------------------------------
 
     def test_human_comment_is_ferried_to_the_live_run(self) -> None:
-        self.work.add_task("W-0001", "with feedback", delegated=True)
-        self.sweep()
-        run = self.db_run()
-        con = db.connect()
-        con.execute("UPDATE runs SET status='running', session_ref='sess-1' "
-                    "WHERE id=?", (run["id"],))
-        con.commit()
-        con.close()
+        run = self.dispatch_item(title="with feedback")
+        self.mark_running(run["id"], "sess-1")
         self.work.human_log("W-0001", "Prefer tabs over spaces here.")
         actions = self.sweep()
         self.assertIn({"action": "ferry", "item": "W-0001", "run": run["id"],
                        "comments": 1}, actions)
-        con = db.connect()
-        msg = con.execute(
+        msg = self.db_one(
             "SELECT * FROM messages WHERE run_id=? AND kind='interrupt'",
-            (run["id"],)).fetchone()
-        seen = con.execute("SELECT work_seen_ts FROM runs WHERE id=?",
-                           (run["id"],)).fetchone()["work_seen_ts"]
-        con.close()
+            run["id"])
+        seen = self.db_one("SELECT work_seen_ts FROM runs WHERE id=?",
+                           run["id"])["work_seen_ts"]
         self.assertIn("Prefer tabs over spaces here.", msg["body"])
         self.assertEqual(msg["sender"], "work:W-0001")
         self.assertIsNone(msg["delivered_at"])  # supervisor owns delivery
@@ -404,39 +437,24 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertNotIn("ferry", [a["action"] for a in again])
 
     def test_issue_human_reply_is_ferried(self) -> None:
-        self.work.add_issue("issue_x", "threaded", delegated=True)
-        self.sweep()
-        run = self.db_run()
-        con = db.connect()
-        con.execute("UPDATE runs SET status='running', session_ref='sess-9' "
-                    "WHERE id=?", (run["id"],))
-        con.commit()
-        con.close()
+        run = self.dispatch_item("issue_x", "threaded")
+        self.mark_running(run["id"], "sess-9")
         self.work.human_reply("issue_x", "Also cover the SSO path.")
         self.sweep()
-        con = db.connect()
-        msg = con.execute(
+        msg = self.db_one(
             "SELECT body FROM messages WHERE run_id=? AND kind='interrupt'",
-            (run["id"],)).fetchone()
-        con.close()
+            run["id"])
         self.assertIn("Also cover the SSO path.", msg["body"])
 
     def test_ferry_waits_for_a_session_ref(self) -> None:
-        self.work.add_task("W-0001", "early comment", delegated=True)
-        self.sweep()
+        self.dispatch_item(title="early comment")
         self.work.human_log("W-0001", "too early")
         actions = self.sweep()  # run has no session_ref yet
         self.assertNotIn("ferry", [a["action"] for a in actions])
 
     def test_ferry_losing_the_terminal_race_is_a_no_op(self) -> None:
-        self.work.add_task("W-0001", "late comment", delegated=True)
-        self.sweep()
-        run = self.db_run()
-        con = db.connect()
-        con.execute("UPDATE runs SET status='running', session_ref='sess-1' WHERE id=?",
-                    (run["id"],))
-        con.commit()
-        con.close()
+        run = self.dispatch_item(title="late comment")
+        self.mark_running(run["id"], "sess-1")
         self.work.human_log("W-0001", "too late")
         with mock.patch.object(sweeper.messaging, "queue_tell",
                                side_effect=sweeper.messaging.RunClosed("done")):
@@ -446,146 +464,83 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
     # --- report -------------------------------------------------------------
 
     def test_report_waits_for_completion_and_handoff_receipts(self) -> None:
-        self.work.add_task("W-0001", "not finalized yet", delegated=True)
-        self.sweep()
-        run = self.db_run()
-        con = db.connect()
-        con.execute("UPDATE runs SET status='done', summary='done', finished_at=? "
-                    "WHERE id=?", (db.now(), run["id"]))
-        con.commit()
+        run = self.dispatch_item(title="not finalized yet")
+        self.db_exec("UPDATE runs SET status='done', summary='done', "
+                     "finished_at=? WHERE id=?", db.now(), run["id"])
         before = self.work.mutation_count()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (run["id"],)).fetchone())
-        self.assertEqual(sweeper.report_result(con, self.client, result), (True, None))
-        con.execute(
+        self.assertEqual(self.report(run["id"]), (True, None))
+        self.db_exec(
             "INSERT INTO messages(run_id, sender, body, kind, created_at) "
             "VALUES(?, 'orchestra', 'finished', 'completion', ?)",
-            (run["id"], db.now()))
-        con.commit()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (run["id"],)).fetchone())
-        self.assertEqual(sweeper.report_result(con, self.client, result), (True, None))
-        con.execute("UPDATE runs SET handoff_processed_at=? WHERE id=?",
-                    (db.now(), run["id"]))
-        con.commit()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (run["id"],)).fetchone())
-        settled, action = sweeper.report_result(con, self.client, result)
-        con.close()
+            run["id"], db.now())
+        self.assertEqual(self.report(run["id"]), (True, None))
+        self.db_exec("UPDATE runs SET handoff_processed_at=? WHERE id=?",
+                     db.now(), run["id"])
+        settled, action = self.report(run["id"])
         self.assertTrue(settled)
         self.assertEqual(action["action"], "report")
         self.assertGreater(self.work.mutation_count(), before)
 
     def test_lost_report_comment_response_does_not_duplicate_the_comment(self) -> None:
-        self.work.add_task("W-0001", "ambiguous comment", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="ambiguous comment")
         self.finish_run(run["id"], "done", "Shipped once.")
-        con = db.connect()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (run["id"],)).fetchone())
-        post = self.client.log_task
 
         with mock.patch.object(
                 self.client, "task",
                 side_effect=WorkError(503, "unavailable", "try again")):
-            self.assertEqual(sweeper.report_result(con, self.client, result),
-                             (False, None))
-        self.assertIsNone(con.execute(
-            "SELECT work_reported_at FROM runs WHERE id=?", (run["id"],)
-        ).fetchone()["work_reported_at"])
+            self.assertEqual(self.report(run["id"]), (False, None))
+        self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
 
-        def committed_then_lost(item_id, body):
-            reply = post(item_id, body)
-            return None if " finished: " in body else reply
-
-        with mock.patch.object(self.client, "log_task", committed_then_lost):
-            self.assertEqual(sweeper.report_result(con, self.client, result),
-                             (False, None))
-        settled, _ = sweeper.report_result(con, self.client, result)
-        con.close()
+        with self.lose_response(marker=" finished: "):
+            self.assertEqual(self.report(run["id"]), (False, None))
+        settled, _ = self.report(run["id"])
         self.assertTrue(settled)
         messages = [entry["message"] for entry in self.work.tasks["W-0001"]["log"]]
         self.assertEqual(sum(" finished: done" in message for message in messages), 1)
 
     def test_lost_report_fact_response_is_reconciled_before_retry(self) -> None:
-        self.work.add_task("W-0001", "ambiguous fact", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="ambiguous fact")
         self.finish_run(run["id"], "done", "Shipped once.")
-        con = db.connect()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (run["id"],)).fetchone())
-        post = self.client.log_task
 
-        def committed_then_lost(item_id, body):
-            reply = post(item_id, body)
-            return None if " fact: landed" in body else reply
-
-        with mock.patch.object(self.client, "log_task", committed_then_lost):
-            self.assertEqual(sweeper.report_result(con, self.client, result),
-                             (False, None))
-        settled, action = sweeper.report_result(con, self.client, result)
-        con.close()
+        with self.lose_response(marker=" fact: landed"):
+            self.assertEqual(self.report(run["id"]), (False, None))
+        settled, action = self.report(run["id"])
         self.assertTrue(settled)
         self.assertEqual(action["action"], "report")
         messages = [entry["message"] for entry in self.work.tasks["W-0001"]["log"]]
         self.assertEqual(sum(" fact: landed" in message for message in messages), 1)
 
     def test_lost_issue_fact_response_is_reconciled_after_close(self) -> None:
-        self.work.add_issue("issue_once", "ambiguous issue fact", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item("issue_once", "ambiguous issue fact")
         self.finish_run(run["id"], "done", "Resolved once.")
-        con = db.connect()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (run["id"],)).fetchone())
-        post = self.client.reply_issue
 
-        def committed_then_lost(item_id, body):
-            reply = post(item_id, body)
-            return None if " fact: resolved" in body else reply
-
-        with mock.patch.object(self.client, "reply_issue", committed_then_lost):
-            self.assertEqual(sweeper.report_result(con, self.client, result),
-                             (False, None))
-        settled, action = sweeper.report_result(con, self.client, result)
-        con.close()
+        with self.lose_response(method="reply_issue", marker=" fact: resolved"):
+            self.assertEqual(self.report(run["id"]), (False, None))
+        settled, action = self.report(run["id"])
         self.assertTrue(settled)
         self.assertEqual(action["to"], "closed")
         messages = [entry["body"] for entry in self.work.issues["issue_once"]["messages"]]
         self.assertEqual(sum(" fact: resolved" in message for message in messages), 1)
 
     def test_completed_run_reports_a_landed_fact_and_writes_no_status(self) -> None:
-        self.work.add_task("W-0001", "finishes well", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="finishes well")
         self.finish_run(run["id"], "done", "Shipped the fix; tests pass.")
-        finalizer = db.connect()
-        finalizer.execute("UPDATE runs SET branch='orchestra/run-race' WHERE id=?",
-                          (run["id"],))
-        finalizer.execute(
+        self.db_exec("UPDATE runs SET branch='orchestra/run-race' WHERE id=?",
+                     run["id"])
+        self.db_exec(
             "INSERT INTO messages(run_id, sender, body, kind, created_at) "
             "VALUES(?, 'orchestra', 'old readiness signal', 'merge', ?)",
-            (run["id"], db.now()))
-        finalizer.commit()
+            run["id"], db.now())
         before = self.work.mutation_count()
         self.assertEqual(self.sweep(), [], "a terminal row is not a landing")
         self.assertEqual(self.work.mutation_count(), before)
         self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
-        finalizer.execute("UPDATE runs SET landing_status='ok' WHERE id=?",
-                          (run["id"],))
-        finalizer.commit()
-        finalizer.close()
+        self.db_exec("UPDATE runs SET landing_status='ok' WHERE id=?", run["id"])
 
-        result = dict(self.db_run(run["id"]))
-        con = db.connect()
         with mock.patch.object(self.client, "log_task", return_value=None):
-            self.assertEqual(sweeper.report_result(con, self.client, result),
-                             (False, None))
+            self.assertEqual(self.report(run["id"]), (False, None))
         self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
-        settled, action = sweeper.report_result(con, self.client, result)
-        con.close()
+        settled, action = self.report(run["id"])
         self.assertTrue(settled)
         self.assertEqual(action, {"action": "report", "item": "W-0001",
                                   "run": run["id"], "to": "review"})
@@ -601,9 +556,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
 
     def test_failed_run_reports_a_failed_fact_and_reads_blocked(self) -> None:
-        self.work.add_task("W-0001", "goes badly", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="goes badly")
         self.finish_run(run["id"], "failed", "Cannot find the config file.")
         policy = db.connect()
         policy.execute(
@@ -640,29 +593,29 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
         self.assertIsNotNone(self.db_run(newer["id"])["work_reported_at"])
 
-    def test_the_brief_tells_a_task_run_to_account_for_every_criterion(self) -> None:
-        self.work.add_task("W-0001", "gated job", delegated=True,
-                           acceptance=("proves it", "and the other thing"))
-        self.sweep()
-        text = Path(self.db_run()["brief_path"]).read_text()
-        self.assertIn("work check W-0001 requirement|acceptance <index>", text)
-        self.assertIn("--decline", text)
-
-    def test_an_issue_run_is_never_taught_the_checklist_verb(self) -> None:
+    def test_the_brief_teaches_the_checklist_verb_to_task_runs_only(self) -> None:
         # Issues carry no checklist, and a brief never teaches a verb the run
         # cannot use (D11).
+        self.work.add_task("W-0001", "gated job", delegated=True,
+                           acceptance=("proves it", "and the other thing"))
         self.work.add_issue("issue_abc123", "no checklist here", delegated=True)
         self.sweep()
-        self.assertNotIn("work check", Path(self.db_run()["brief_path"]).read_text())
+        con = db.connect()
+        briefs = {r["work_item"]: Path(r["brief_path"]).read_text()
+                  for r in con.execute("SELECT work_item, brief_path FROM runs")}
+        con.close()
+        self.assertIn("work check W-0001 requirement|acceptance <index>",
+                      briefs["W-0001"])
+        self.assertIn("--decline", briefs["W-0001"])
+        self.assertNotIn("work check", briefs["issue_abc123"])
 
     def test_a_run_that_leaves_criteria_open_is_accounted_for_anyway(self) -> None:
         # CONTRACT §3 verb 2: nothing leaves the run's hands unanswered. A run
         # that dies without ticking or declining anything answers for none of
         # them, so the sweeper declines what is left before reporting its fact.
-        self.work.add_task("W-0001", "dies mid-flight", delegated=True,
-                           acceptance=("proves it", "and the other thing"))
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(
+            title="dies mid-flight",
+            acceptance=("proves it", "and the other thing"))
         self.finish_run(run["id"], "failed", "Cannot find the config file.")
         actions = self.sweep()
 
@@ -677,10 +630,9 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
 
     def test_what_the_run_ticked_itself_is_left_alone(self) -> None:
-        self.work.add_task("W-0001", "half done", delegated=True,
-                           acceptance=("proves it", "and the other thing"))
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(
+            title="half done",
+            acceptance=("proves it", "and the other thing"))
         # The worker ticked the first criterion and declined nothing else.
         self.client.check_task_item("W-0001", "acceptance", 0, checked=True)
         self.finish_run(run["id"], "failed", "ran out of road")
@@ -695,10 +647,8 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         # longer downgrades that claim to blocked on its behalf. It answers
         # for the criteria the run left silent -- declined, naming the run --
         # and the human reads both on the board.
-        self.work.add_task("W-0001", "claims success", delegated=True,
-                           acceptance=("proves it",))
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="claims success",
+                                 acceptance=("proves it",))
         self.finish_run(run["id"], "done", "Shipped it.")
         self.sweep()
 
@@ -711,42 +661,20 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
     def test_a_dispatched_brief_names_what_recently_landed(self) -> None:
         # End to end: real repository, real git log, real brief on disk.
-        for args in (["init", "-q"], ["config", "user.email", "t@example.com"],
-                     ["config", "user.name", "t"]):
-            subprocess.run(["git", *args], cwd=self.root, check=True)
-        (self.root / "seed.txt").write_text("seed\n")
-        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
-        subprocess.run(["git", "commit", "-qm", "the observer looks after 5m"],
-                       cwd=self.root, check=True)
-
-        self.work.add_task("W-0001", "build the thing", delegated=True)
-        self.sweep()
-
-        text = Path(self.db_run()["brief_path"]).read_text()
+        self.init_repo("the observer looks after 5m")
+        run = self.dispatch_item(title="build the thing")
+        text = Path(run["brief_path"]).read_text()
         self.assertIn("## Recently landed here", text)
         self.assertIn("the observer looks after 5m", text)
 
     def test_a_brief_outside_a_repository_has_no_empty_commit_block(self) -> None:
-        self.work.add_task("W-0001", "build the thing", delegated=True)
-        self.sweep()
-        self.assertNotIn("Recently landed",
-                         Path(self.db_run()["brief_path"]).read_text())
+        run = self.dispatch_item(title="build the thing")
+        self.assertNotIn("Recently landed", Path(run["brief_path"]).read_text())
 
     def test_swept_run_isolates_and_cleans_up_if_supervisor_never_starts(self) -> None:
-        self.global_config.write_text(
-            self.global_config.read_text().replace("worktree = false",
-                                                   "worktree = true"))
-        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
-        subprocess.run(["git", "config", "user.email", "t@example.com"],
-                       cwd=self.root, check=True)
-        subprocess.run(["git", "config", "user.name", "t"], cwd=self.root, check=True)
-        (self.root / "seed.txt").write_text("seed\n")
-        subprocess.run(["git", "add", "seed.txt"], cwd=self.root, check=True)
-        subprocess.run(["git", "commit", "-qm", "seed"], cwd=self.root, check=True)
-
-        self.work.add_task("W-0001", "isolated job", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        self.enable_worktree()
+        self.init_repo()
+        run = self.dispatch_item(title="isolated job")
         self.assertNotEqual(run["workdir"], str(self.root),
                             "a swept run must not share the human's checkout")
         self.assertEqual(run["branch"], f"orchestra/run-{run['id']}")
@@ -758,11 +686,9 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual([a["action"] for a in actions], ["launch_failed"])
         self.assertEqual(failed["status"], "failed")
         self.assertIsNone(failed["work_reported_at"])
-        con = db.connect()
-        self.assertEqual(con.execute(
+        self.assertEqual(self.db_one(
             "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
-            (failed["id"],)).fetchone()["action"], "deferred")
-        con.close()
+            failed["id"])["action"], "deferred")
         self.assertEqual(failed["workdir"], str(self.root))
         self.assertIsNone(failed["branch"])
         self.assertIn("supervisor absent", failed["summary"])
@@ -776,9 +702,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertNotIn(f"/run-{failed['id']}", worktrees)
 
     def test_swept_run_fails_closed_when_worktree_is_impossible(self) -> None:
-        self.global_config.write_text(
-            self.global_config.read_text().replace("worktree = false",
-                                                   "worktree = true"))
+        self.enable_worktree()
         # The fixture root is not a git repo. It must not silently become a
         # shared-checkout run.
         self.work.add_task("W-0001", "no repo here", delegated=True)
@@ -793,17 +717,13 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIsNone(run["work_reported_at"])
         self.assertEqual(self.launched, [])
         self.assertEqual(self.sweep(), [])
-        con = db.connect()
-        self.assertEqual(con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"], 1)
-        self.assertEqual(con.execute(
+        self.assertEqual(self.db_one("SELECT COUNT(*) AS n FROM runs")["n"], 1)
+        self.assertEqual(self.db_one(
             "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
-            (run["id"],)).fetchone()["action"], "deferred")
-        con.close()
+            run["id"])["action"], "deferred")
 
     def test_progress_heartbeat_posts_then_rate_limits(self) -> None:
-        self.work.add_task("W-0001", "long job", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="long job")
         Path(run["log_path"]).write_text(tool_line("bash", command="pytest -q"))
 
         self.sweep()  # first pass after activity: heartbeat posts
@@ -820,9 +740,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         healthy run indistinguishable from a hung one (I-0121). Run 234 held
         at "1 tool call" for 40 minutes because only shell commands counted,
         while it went on reading and grepping 80-odd times."""
-        self.work.add_task("W-0001", "long job", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="long job")
         log = Path(run["log_path"])
         log.write_text(tool_line("bash", command="pytest -q"))
         self.sweep()
@@ -839,9 +757,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("last: grep def main", notes)
 
     def test_progress_heartbeat_skips_terminal_runs(self) -> None:
-        self.work.add_task("W-0001", "quick job", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="quick job")
         Path(run["log_path"]).write_text(tool_line("bash", command="ls"))
         self.finish_run(run["id"], "done", "finished")
         self.sweep()
@@ -895,9 +811,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         killed, and its late report reopened what the human had settled. A
         human move dismisses every earlier run's narrative, so the report
         lands as history — the board does not move, and nothing waits."""
-        self.work.add_task("W-0001", "settled by hand", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="settled by hand")
         self.work.human_move("W-0001", "done")          # the human settles it
         self.finish_run(run["id"], "killed", "stopped mid-flight")
         actions = self.sweep()
@@ -919,15 +833,10 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         the human closed, and a refused append is terminal: stamp it reported
         and never retry (two closed issues once became permanent sweep noise,
         2026-08-20)."""
-        self.work.add_issue("issue_x", "settled by hand", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item("issue_x", "settled by hand")
         self.work.human_close_issue("issue_x", summary="I did it myself")
         self.finish_run(run["id"], "done", "Root cause fixed.")
-        con = db.connect()
-        refused = sweeper.report_result(con, self.client,
-                                        dict(self.db_run(run["id"])))
-        con.close()
+        refused = self.report(run["id"])
 
         issue = self.work.issues["issue_x"]
         self.assertEqual(issue["state"], "closed")
@@ -941,9 +850,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
     # --- the §4 step-5 loop: human answers, session resumes ------------------
 
     def test_human_answer_resumes_the_prior_session(self) -> None:
-        self.work.add_task("W-0001", "needs an answer", delegated=True)
-        self.sweep()
-        first = self.db_run()
+        first = self.dispatch_item(title="needs an answer")
         self.finish_run(first["id"], "failed", "Which auth provider?",
                         session_ref="sess-42")
         self.sweep()  # reports; task -> blocked
@@ -963,13 +870,10 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         # A backend session is single-writer even without a Work item. Force
         # two continuations to read the same terminal parent before either can
         # reserve its child; only one may be admitted.
-        con = db.connect()
-        con.execute("UPDATE runs SET status='done', finished_at=?, work_item=NULL "
-                    "WHERE id=?", (db.now(), followup["id"]))
-        con.commit()
-        parent = dict(con.execute("SELECT * FROM runs WHERE id=?",
-                                  (followup["id"],)).fetchone())
-        con.close()
+        self.db_exec("UPDATE runs SET status='done', finished_at=?, "
+                     "work_item=NULL WHERE id=?", db.now(), followup["id"])
+        parent = dict(self.db_one("SELECT * FROM runs WHERE id=?",
+                                  followup["id"]))
 
         def reserve(con):
             return supervise.reserve_followup(
@@ -980,29 +884,19 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         refused = [reason for row, reason in outcomes if row is None]
         self.assertEqual(len(admitted), 1)
         self.assertEqual(refused, [f"session:{admitted[0]['id']}"])
-        con = db.connect()
-        children = con.execute(
+        self.assertEqual(self.db_one(
             "SELECT COUNT(*) AS n FROM runs WHERE parent_run=?",
-            (followup["id"],)).fetchone()["n"]
-        con.close()
-        self.assertEqual(children, 1)
+            followup["id"])["n"], 1)
 
     def test_lost_continuation_claim_keeps_its_atomic_reservation(self) -> None:
-        self.work.add_task("W-0001", "needs an answer", delegated=True)
-        self.sweep()
-        first = self.db_run()
+        first = self.dispatch_item(title="needs an answer")
         self.finish_run(first["id"], "failed", "Which provider?",
                         session_ref="sess-42")
         self.sweep()
         self.work.human_log("W-0001", "Use Okta.")
         self.work.human_move("W-0001", "ready")
-        post = self.client.log_task
 
-        def committed_then_lost(item_id, body):
-            result = post(item_id, body)
-            return None if " fact: claimed" in body else result
-
-        with mock.patch.object(self.client, "log_task", committed_then_lost):
+        with self.lose_response(marker=" fact: claimed"):
             self.assertEqual(self.sweep(), [])
         pending = self.db_run()
         self.assertEqual(pending["parent_run"], first["id"])
@@ -1019,9 +913,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("Use Okta.", Path(resumed["brief_path"]).read_text())
 
     def test_failed_issue_continuation_releases_ownership_to_the_human(self) -> None:
-        self.work.add_issue("issue_x", "needs an answer", delegated=True)
-        self.sweep()
-        first = self.db_run()
+        first = self.dispatch_item("issue_x", "needs an answer")
         self.finish_run(first["id"], "failed", "Which provider?",
                         session_ref="sess-42")
         self.sweep()
@@ -1039,42 +931,28 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(failed["work_item"], "issue_x")
         self.assertIn("cannot compose", failed["summary"])
         self.assertIsNone(failed["work_reported_at"])
-        con = db.connect()
-        self.assertEqual(con.execute(
+        self.assertEqual(self.db_one(
             "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
-            (failed["id"],)).fetchone()["action"], "deferred")
-        con.close()
+            failed["id"])["action"], "deferred")
         self.assertEqual(self.sweep(), [])
 
-    def test_a_halted_run_blocks_the_item_with_its_reason(self) -> None:
-        self.work.add_task("W-0001", "doomed", delegated=True)
-        self.sweep()
-        run = self.db_run()
+    def test_a_halted_run_blocks_the_item_and_later_sweeps_pass_over_it(self) -> None:
+        run = self.dispatch_item(title="doomed")
         self.finish_run(run["id"], "halted", "the vendor API is gone")
         actions = self.sweep()
         self.assertIn({"action": "report", "item": "W-0001", "run": run["id"],
                        "to": "blocked"}, actions)
         task = self.work.tasks["W-0001"]
         self.assertEqual(task["status"], "blocked")
-        notes = " ".join(str(e) for e in task.get("log", []))
-        self.assertIn("the vendor API is gone", notes)
-
-    def test_a_sweep_passes_over_a_halted_item(self) -> None:
-        self.work.add_task("W-0001", "doomed", delegated=True)
-        self.sweep()
-        run = self.db_run()
-        self.finish_run(run["id"], "halted", "the vendor API is gone")
-        self.sweep()
+        self.assertIn("the vendor API is gone", self.item_log())
         launched = len(self.launched)
-        actions = self.sweep()
-        self.assertNotIn("dispatch", [a["action"] for a in actions])
+        again = self.sweep()
+        self.assertNotIn("dispatch", [a["action"] for a in again])
         self.assertEqual(len(self.launched), launched)
         self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
 
     def test_clearing_a_halt_dispatches_fresh(self) -> None:
-        self.work.add_task("W-0001", "doomed", delegated=True)
-        self.sweep()
-        first = self.db_run()
+        first = self.dispatch_item(title="doomed")
         self.finish_run(first["id"], "halted", "the vendor API is gone",
                         session_ref="sess-42")
         self.sweep()
@@ -1091,9 +969,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         """Live failure (run 27): the sweeper resumed a KILLED run's session,
         the backend answered `no session matches`, and the item failed in
         under a second. A stop is not a conversation to continue."""
-        self.work.add_task("W-0001", "stop this one", delegated=True)
-        self.sweep()
-        first = self.db_run()
+        first = self.dispatch_item(title="stop this one")
         self.finish_run(first["id"], "killed", "stopped by a human",
                         session_ref="sess-42")
         self.sweep()
@@ -1126,9 +1002,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
     # --- cursor -------------------------------------------------------------
 
     def test_cursor_advances_and_a_second_pass_mutates_nothing(self) -> None:
-        self.work.add_task("W-0001", "cursor check", delegated=True)
-        self.sweep()
-        run = self.db_run()
+        run = self.dispatch_item(title="cursor check")
         self.finish_run(run["id"], "done", "done deal")
         self.sweep()
         before = self.work.mutation_count()
@@ -1174,13 +1048,6 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
     # --- project resolution (DESIGN §2) --------------------------------------
 
-    def test_swept_run_carries_the_projects_immutable_id(self) -> None:
-        self.work.add_task("W-0001", "keyed on projectId", delegated=True)
-        self.sweep()
-        run = self.db_run()
-        self.assertEqual(run["project_id"], PROJECT_ID)
-        self.assertEqual(run["workdir"], str(self.root))
-
     def test_two_projects_land_in_one_database(self) -> None:
         other_id = "b993cc1f-857d-450c-96ec-c8864f754bef"
         (self.workspace / "other").mkdir()
@@ -1194,6 +1061,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         rows = {r["work_item"]: r for r in con.execute("SELECT * FROM runs")}
         con.close()
         self.assertEqual(rows["W-0001"]["project_id"], PROJECT_ID)
+        self.assertEqual(rows["W-0001"]["workdir"], str(self.root))
         self.assertEqual(rows["W-0002"]["project_id"], other_id)
         self.assertEqual(rows["W-0002"]["workdir"], str(self.workspace / "other"))
 
@@ -1207,22 +1075,18 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
     def test_per_project_overrides_pick_the_launch_profile(self) -> None:
         """DESIGN §2: [project."<projectId>"] in the one config file, not a
         file inside the project."""
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + "\n[profiles.special]\nbackend = \"codex\"\n"
+        self.add_config(
+            "\n[profiles.special]\nbackend = \"codex\"\n"
             + f"\n[project.\"{PROJECT_ID}\".work]\nprofile = \"special\"\n")
-        self.work.add_task("W-0001", "overridden", delegated=True)
-        self.sweep()
-        self.assertEqual(self.db_run()["profile"], "special")
+        self.assertEqual(self.dispatch_item(title="overridden")["profile"],
+                         "special")
 
     # --- the enabled set (W-0187) --------------------------------------------
 
     def test_an_absent_enabled_set_staffs_as_before(self) -> None:
         """No [project."<id>"] table anywhere: every profile is enabled, so
         the move to an enabled set changes nothing for an existing install."""
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + f"\n[project.\"{PROJECT_ID}\".settings]\ntimeout = 30\n")
+        self.add_config(f"\n[project.\"{PROJECT_ID}\".settings]\ntimeout = 30\n")
         self.work.add_task("W-0001", "unchanged", delegated=True)
         self.assertEqual([a["action"] for a in self.sweep()], ["dispatch"])
         self.assertEqual(self.db_run()["profile"], "stub")
@@ -1230,10 +1094,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
     def test_a_profile_the_project_has_not_enabled_is_refused_by_name(self) -> None:
         """Not a silent fallback to whatever IS enabled: nothing is staffed,
         the item stays claimable, and the refusal names the project."""
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + "\n[profiles.other]\nbackend = \"codex\"\n"
-            + f"\n[project.\"{PROJECT_ID}\"]\nenabled_profiles = [\"other\"]\n")
+        self.add_config(OTHER_PROFILE_ONLY)
         self.work.add_task("W-0001", "not enabled here", delegated=True)
         with mock.patch("builtins.print") as printed:
             self.assertEqual([a["action"] for a in self.sweep()], [])
@@ -1245,9 +1106,8 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(self.work.tasks["W-0001"]["status"], "ready")
 
     def test_an_enabled_profile_still_dispatches(self) -> None:
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + f"\n[project.\"{PROJECT_ID}\"]\nenabled_profiles = [\"stub\"]\n")
+        self.add_config(
+            f"\n[project.\"{PROJECT_ID}\"]\nenabled_profiles = [\"stub\"]\n")
         self.work.add_task("W-0001", "enabled here", delegated=True)
         self.assertEqual([a["action"] for a in self.sweep()], ["dispatch"])
         self.assertEqual(self.db_run()["profile"], "stub")
@@ -1258,10 +1118,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         from argparse import Namespace
 
         from orchestra import cli
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + "\n[profiles.other]\nbackend = \"codex\"\n"
-            + f"\n[project.\"{PROJECT_ID}\"]\nenabled_profiles = [\"other\"]\n")
+        self.add_config(OTHER_PROFILE_ONLY)
         con = db.connect()
         try:
             self.assertTrue(project.refresh(con, config.load()))
@@ -1284,14 +1141,9 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         preset, that's on me." So a run dispatched on `stub` keeps running on
         `stub` after the project disables it — the sweeper reports it,
         transitions its item, and nothing anywhere re-checks the preset."""
-        self.work.add_task("W-0001", "in flight", delegated=True)
-        self.sweep()
-        run_id = self.db_run()["id"]
+        run_id = self.dispatch_item(title="in flight")["id"]
         # the project changes its mind mid-run
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + "\n[profiles.other]\nbackend = \"codex\"\n"
-            + f"\n[project.\"{PROJECT_ID}\"]\nenabled_profiles = [\"other\"]\n")
+        self.add_config(OTHER_PROFILE_ONLY)
         self.cfg = config.load()
         pcfg = config.load(PROJECT_ID)
         # the launch path reads through profile_cfg, which is ungated

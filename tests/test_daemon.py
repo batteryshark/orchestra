@@ -52,6 +52,15 @@ class DaemonTests(unittest.TestCase):
             (status, supervisor_pid, supervisor_pid_identity,
              PROJECT_ID, db.now())).lastrowid)
 
+    def _set_worker(self, run_id: int, pid: int, identity=None) -> None:
+        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
+                         (pid, identity, run_id))
+
+    def _completions(self, run_id: int) -> int:
+        return self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (run_id,)).fetchone()[0]
+
     def test_tick_reaps_a_run_whose_supervisor_vanished(self) -> None:
         # PID 1 exists (launchd) and is not ours -> alive; a free high pid is not.
         lifecycle = []
@@ -63,9 +72,7 @@ class DaemonTests(unittest.TestCase):
         daemon.observer.defer_retry(self.con, recovered)
         lifecycle.append(("defer", recovered, self.con.in_transaction, "failed"))
         self.con.commit()  # simulate a crash before result enrichment
-        self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
-            (recovered,)).fetchone()[0], 0)
+        self.assertEqual(self._completions(recovered), 0)
 
         dead = self._run(supervisor_pid=_free_pid())
         stopped_worker_pid = 98001
@@ -76,14 +83,10 @@ class DaemonTests(unittest.TestCase):
         reused_worker = self._run(supervisor_pid=_free_pid())
         legacy_worker_pid = 98004
         legacy_worker = self._run(supervisor_pid=_free_pid())
-        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
-                         (stopped_worker_pid, "stopped-owner", stopped_worker))
-        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
-                         (stuck_worker_pid, "stuck-owner", stuck_worker))
-        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
-                         (reused_worker_pid, "original-owner", reused_worker))
-        self.con.execute("UPDATE runs SET pid=? WHERE id=?",
-                         (legacy_worker_pid, legacy_worker))
+        self._set_worker(stopped_worker, stopped_worker_pid, "stopped-owner")
+        self._set_worker(stuck_worker, stuck_worker_pid, "stuck-owner")
+        self._set_worker(reused_worker, reused_worker_pid, "original-owner")
+        self._set_worker(legacy_worker, legacy_worker_pid)
         alive_identity = proc.process_identity(os.getpid())
         alive = self._run(supervisor_pid=os.getpid(),
                           supervisor_pid_identity=alive_identity)
@@ -178,9 +181,7 @@ class DaemonTests(unittest.TestCase):
                 "SELECT action FROM observations WHERE run_id=? AND layer='retry' "
                 "ORDER BY id", (run_id,))]
             self.assertEqual(actions, ["deferred", "retry"])
-            self.assertEqual(self.con.execute(
-                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
-                (run_id,)).fetchone()[0], 1)
+            self.assertEqual(self._completions(run_id), 1)
         self.assertEqual([call.args[2] for call in failed_launches.call_args_list],
                          [stale, malformed])
         retries = list(self.con.execute(
@@ -295,8 +296,7 @@ class DaemonTests(unittest.TestCase):
         self.con.execute(
             "UPDATE runs SET status='killed', worker_status='killed' "
             "WHERE id IN (?,?)", (live_owner, reused))
-        self.con.execute("UPDATE runs SET pid=?, pid_identity='original-owner' "
-                         "WHERE id=?", (reused_pid, reused))
+        self._set_worker(reused, reused_pid, "original-owner")
         self.con.commit()
         real_signal_group = daemon.proc.signal_group
 
@@ -322,37 +322,28 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(rows[receipt]["exit_code"], 0)
         self.assertNotIn("vanished", rows[receipt]["summary"] or "")
         for finalized in (receipt, done):
-            self.assertEqual(self.con.execute(
-                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
-                (finalized,)).fetchone()[0], 1)
+            self.assertEqual(self._completions(finalized), 1)
         for untouched in (live_owner, reused):
-            self.assertEqual(self.con.execute(
-                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
-                (untouched,)).fetchone()[0], 0)
+            self.assertEqual(self._completions(untouched), 0)
         self.assertIn("identity changed", diagnostics.getvalue())
 
-    def test_tick_without_work_configured_does_not_sweep(self) -> None:
-        report = daemon.tick()
-        self.assertEqual(report["swept"], [])
-
-    def test_once_runs_a_single_tick_and_returns_zero(self) -> None:
-        with mock.patch.object(daemon, "tick", return_value={}) as ticked:
-            self.assertEqual(daemon.run(interval=1, once=True), 0)
-        self.assertEqual(ticked.call_count, 1)
-
-    def test_tick_carries_the_nod_answers_report(self) -> None:
+    def test_tick_report_contract(self) -> None:
+        """Without Work configured nothing is swept; the nod answers land in
+        the report, and a raising nod pass never ends the tick."""
+        self.assertEqual(daemon.tick()["swept"], [])
         acted = [{"request_id": "req_1", "action": "retry", "outcome": "landed"}]
-        with mock.patch.object(daemon.nod, "act_on_answers",
-                               return_value=acted) as pass_:
-            report = daemon.tick()
-        self.assertEqual(report["nod_answers"], acted)
-        pass_.assert_called_once()
-
-    def test_tick_survives_the_nod_answers_pass_raising(self) -> None:
-        with mock.patch.object(daemon.nod, "act_on_answers",
-                               side_effect=RuntimeError("nod exploded")):
-            report = daemon.tick()  # must not raise
-        self.assertEqual(report["nod_answers"], [])
+        cases = {
+            "the answers are carried": ({"return_value": acted}, acted),
+            "a raising pass is survived": (
+                {"side_effect": RuntimeError("nod exploded")}, []),
+        }
+        for label, (patched, expected) in cases.items():
+            with self.subTest(label), \
+                    mock.patch.object(daemon.nod, "act_on_answers",
+                                      **patched) as pass_:
+                report = daemon.tick()  # must not raise
+            self.assertEqual(report["nod_answers"], expected)
+            pass_.assert_called_once()
 
     def test_paused_tick_runs_every_non_admission_pass(self) -> None:
         dead = self._run(supervisor_pid=_free_pid())
@@ -384,9 +375,14 @@ class DaemonTests(unittest.TestCase):
         swept.assert_called_once()
         conducted.assert_called_once()
 
-    def test_a_failing_tick_does_not_end_the_daemon(self) -> None:
-        with mock.patch.object(daemon, "tick", side_effect=RuntimeError("boom")):
-            self.assertEqual(daemon.run(interval=1, once=True), 0)
+    def test_once_runs_a_single_tick_even_a_failing_one_and_returns_zero(self) -> None:
+        cases = {"a clean tick": {"return_value": {}},
+                 "a failing tick": {"side_effect": RuntimeError("boom")}}
+        for label, patched in cases.items():
+            with self.subTest(label), \
+                    mock.patch.object(daemon, "tick", **patched) as ticked:
+                self.assertEqual(daemon.run(interval=1, once=True), 0)
+            self.assertEqual(ticked.call_count, 1)
 
     @unittest.skipIf(sys.platform == "win32",
                      "os.kill(SIGTERM) terminates immediately on Windows")
@@ -435,18 +431,34 @@ class ServiceTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def test_install_writes_the_plist_and_never_loads_it(self) -> None:
+    def test_the_plist_lifecycle_never_loads_and_removes_only_ours(self) -> None:
+        """status creates nothing; install writes the plist idempotently and
+        never loads it; uninstall removes only the plist Orchestra wrote."""
+        self.assertEqual(service.status(), 0)
+        self.assertFalse(self.agents.exists())
+        self.launchctl.reset_mock()  # status may ask launchd, install must not
+
         self.assertEqual(service.install(), 0)
         p = self.agents / "local.orchestra.daemon.plist"
-        self.assertTrue(p.is_file())
         with open(p, "rb") as f:
             plist = plistlib.load(f)
-        self.assertEqual(plist["Label"], "local.orchestra.daemon")
-        self.assertEqual(plist["ProgramArguments"][-1], "daemon")
-        self.assertTrue(plist["StandardOutPath"].startswith(str(self.tmp_path / "home")))
-        self.assertEqual(plist["EnvironmentVariables"]["ORCHESTRA_HOME"],
-                         str(self.tmp_path / "home"))
+        home = str(self.tmp_path / "home")
+        self.assertEqual(
+            (plist["Label"], plist["ProgramArguments"][-1],
+             plist["EnvironmentVariables"]["ORCHESTRA_HOME"]),
+            ("local.orchestra.daemon", "daemon", home))
+        self.assertTrue(plist["StandardOutPath"].startswith(home))
         self.launchctl.assert_not_called()
+
+        first = p.read_bytes()
+        service.install()
+        self.assertEqual(p.read_bytes(), first, "install is idempotent")
+
+        keep = self.agents / "someone.elses.plist"
+        keep.write_text("not ours")
+        self.assertEqual(service.uninstall(), 0)
+        self.assertFalse(p.exists())
+        self.assertTrue(keep.exists())
 
     def test_install_start_bootstraps_the_job(self) -> None:
         self.launchctl.return_value = mock.Mock(returncode=0, stdout="", stderr="")
@@ -454,25 +466,6 @@ class ServiceTests(unittest.TestCase):
         args = self.launchctl.call_args[0]
         self.assertEqual(args[0], "bootstrap")
         self.assertTrue(args[2].endswith("local.orchestra.daemon.plist"))
-
-    def test_install_is_idempotent(self) -> None:
-        service.install()
-        first = (self.agents / "local.orchestra.daemon.plist").read_bytes()
-        service.install()
-        self.assertEqual((self.agents / "local.orchestra.daemon.plist").read_bytes(),
-                         first)
-
-    def test_uninstall_removes_only_the_plist_orchestra_wrote(self) -> None:
-        service.install()
-        keep = self.agents / "someone.elses.plist"
-        keep.write_text("not ours")
-        self.assertEqual(service.uninstall(), 0)
-        self.assertFalse((self.agents / "local.orchestra.daemon.plist").exists())
-        self.assertTrue(keep.exists())
-
-    def test_status_reports_absent_before_install(self) -> None:
-        self.assertEqual(service.status(), 0)
-        self.assertFalse(self.agents.exists())
 
 
 def _free_pid() -> int:
@@ -488,35 +481,34 @@ class ServiceRestartTests(unittest.TestCase):
     """`orchestra service restart` is the deploy step for an editable install:
     the code is read from the working tree, so restarting is all that ships."""
 
-    def test_restart_kickstarts_a_loaded_agent(self) -> None:
-        calls = []
-
-        def fake(*args):
-            calls.append(args)
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        with mock.patch.object(service, "_windows", return_value=False), \
-             mock.patch.object(service, "is_loaded", return_value=True), \
-             mock.patch.object(service, "_launchctl", side_effect=fake):
-            self.assertEqual(0, service.restart())
-        self.assertEqual("kickstart", calls[0][0])
-        self.assertIn("-k", calls[0])
-
-    def test_restart_reports_a_bare_daemon_rather_than_pretending(self) -> None:
+    def test_restart_contract(self) -> None:
         # Nothing supervises a foreground daemon, so there is nothing to
         # restart; saying so beats a success message that changed nothing.
-        with mock.patch.object(service, "_windows", return_value=False), \
-             mock.patch.object(service, "is_loaded", return_value=False), \
-             mock.patch("subprocess.run",
-                        return_value=subprocess.CompletedProcess([], 0, "4242\n", "")):
-            self.assertEqual(1, service.restart())
+        cases = {
+            "kickstarts a loaded agent": (True, 0, "", 0),
+            "reports a bare daemon rather than pretending": (False, 0, "4242\n", 1),
+            "says so when nothing runs": (False, 1, "", 1),
+        }
+        for label, (loaded, pgrep_rc, pgrep_out, expected) in cases.items():
+            calls = []
 
-    def test_restart_says_so_when_nothing_runs(self) -> None:
-        with mock.patch.object(service, "_windows", return_value=False), \
-             mock.patch.object(service, "is_loaded", return_value=False), \
-             mock.patch("subprocess.run",
-                        return_value=subprocess.CompletedProcess([], 1, "", "")):
-            self.assertEqual(1, service.restart())
+            def fake(*args):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with self.subTest(label), \
+                    mock.patch.object(service, "_windows", return_value=False), \
+                    mock.patch.object(service, "is_loaded", return_value=loaded), \
+                    mock.patch.object(service, "_launchctl", side_effect=fake), \
+                    mock.patch("subprocess.run",
+                               return_value=subprocess.CompletedProcess(
+                                   [], pgrep_rc, pgrep_out, "")):
+                self.assertEqual(expected, service.restart())
+            if loaded:
+                self.assertEqual("kickstart", calls[0][0])
+                self.assertIn("-k", calls[0])
+            else:
+                self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

@@ -185,7 +185,11 @@ class ControlTurnTestCase(unittest.TestCase):
         """It names no project, so there is no board it belongs above."""
         observer.record_turn(self.con, "router", PROFILE,
                              _write(self.tmp.name), True, "no project")
-        self.assertEqual(http.snapshot(self.con)["pinned_turns"], [])
+        snapshot = http.snapshot(self.con)
+        self.assertEqual(snapshot["pinned_turns"], [])
+        # ...and even a projectless turn stays out of the fleet's numbers.
+        self.assertEqual(snapshot["statistics"]["runs_total"], 0)
+        self.assertEqual(review.performance(self.con), [])
 
     # --- the log: the series behind the pinned line (I-0081) -----------------
 
@@ -257,14 +261,6 @@ class ControlTurnTestCase(unittest.TestCase):
                          "caller's")
         self.assertEqual(http.control_turns("proj-a", limit=0,
                                             con=self.con)["limit"], 1)
-
-    def test_statistics_and_the_performance_review_skip_turns(self) -> None:
-        from orchestra import review
-        observer.record_turn(self.con, "merge", PROFILE,
-                             _write(self.tmp.name), True, "escalate")
-        stats = http.snapshot(self.con)["statistics"]
-        self.assertEqual(stats["runs_total"], 0)
-        self.assertEqual(review.performance(self.con), [])
 
     # --- the decision links both ways ----------------------------------------
 
