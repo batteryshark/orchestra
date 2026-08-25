@@ -12,6 +12,9 @@ Deterministic code only (DESIGN principle 6) — one pass:
   fresh dispatch, or a session continuation when a prior run for the item
   left a resumable session (the "answer from the phone, the run picks it
   up" path of §4 step 5).
+- **Refine**: an item carrying the `refine` tag gets a shaping run (W-0309,
+  ``refine.py``) — any status, delegated or not, because refinement comes
+  before execution. It claims nothing and lands nothing.
 - **Ferry**: a new human comment on an in-flight item is delivered to the
   owning run as a safe-boundary interrupt (the phase-1 delivery path).
 - **Cursor**: ``updatedSince`` watermarks live in the meta table and only
@@ -22,7 +25,7 @@ import time
 from pathlib import Path
 
 from orchestra import (brief, config, db, dispatch, messaging, paths, project,
-                         router, supervise, traces, verify, work_client)
+                         refine, router, supervise, traces, verify, work_client)
 from orchestra.work_client import WorkClient, WorkError, fact_line, from_cfg
 
 CURSOR_KEYS = {"task": "work_cursor_tasks", "issue": "work_cursor_issues"}
@@ -263,6 +266,14 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
     report.
     """
     if not result["work_item"]:
+        return True, None
+    if result["requested_by"] == refine.REQUESTED_BY:
+        # The refine lane reports itself, from inside the run: the sections,
+        # a `fact: refined` line, and the tag drop. It has no branch to land
+        # and no checklist to answer, so the worker report path — which would
+        # decline every open criterion and append `fact: landed` — must never
+        # run for one.
+        _mark_reported(con, result)
         return True, None
     if not _report_ready(con, result):
         return True, None
@@ -761,6 +772,10 @@ def sweep(cfg: dict, client: WorkClient,
             fetched += [(kind, item) for item in got]
             stamps = [i.get("updatedAt") or "" for i in got]
             cursors[kind] = max([since or ""] + stamps) or None
+        # Shaping runs before building: a refine-tagged item takes its run
+        # slot first, so the worker that claims it next dispatches against
+        # the rewritten sections.
+        ok &= refine.after_fetch(con, cfg, client, fetched, launcher, actions)
         ok &= _claim(con, cfg, client, fetched, launcher, actions)
         ok &= _ferry(con, client, fetched, actions)
         if ok:

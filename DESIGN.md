@@ -55,6 +55,16 @@ model than the worker's. It executes each acceptance criterion's stated
 method against landed main and writes the result to Work; `[verify] enabled
 = false` turns it off.
 
+The refine lane sits on the other side of execution (W-0309): a human tags an
+item `refine` and the next sweep dispatches one shaping run under `[work]
+refine_profile`, whatever the item's status and whether or not it is
+delegated — refinement comes before execution, so it waits for neither
+signal. The run rewrites the item's six sections to `docs/GOAL-STANDARD.md`
+around the owner's own words, leaves every undecidable point as a `Q:` line,
+appends `fact: refined`, and drops the tag that asked for it. It claims
+nothing, ticks nothing, and lands nothing. The tag is the receipt: a tag
+still present with no refine run live dispatches the pass again.
+
 ## 2. Daemon and central state
 
 SQLite state, briefs, raw logs, and worktrees live under `~/.orchestra/`.
