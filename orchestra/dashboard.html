@@ -34,10 +34,13 @@
      request. assets/orchestra-favicon.svg is the source of truth. -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20128%20128%22%3E%3Crect%20width%3D%22128%22%20height%3D%22128%22%20rx%3D%2224%22%20fill%3D%22%230b0d10%22%2F%3E%3Cg%20fill%3D%22%23f3f4f2%22%3E%3Crect%20x%3D%2225%22%20y%3D%2255%22%20width%3D%2220%22%20height%3D%2242%22%20rx%3D%2210%22%20opacity%3D%22.45%22%2F%3E%3Crect%20x%3D%2254%22%20y%3D%2230%22%20width%3D%2220%22%20height%3D%2267%22%20rx%3D%2210%22%2F%3E%3Crect%20x%3D%2283%22%20y%3D%2246%22%20width%3D%2220%22%20height%3D%2251%22%20rx%3D%2210%22%20opacity%3D%22.7%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E">
 <style>
+  /* The original Orchestra palette, restored with the mark: saturated
+     blue/green/red/amber against a near-black ground, not the muted
+     Dromond pastels these tokens held in between. */
   :root {
-    --bg: #14161a; --panel: #1c1f25; --line: #2c313a; --text: #dfe3ea;
-    --dim: #8b93a3; --ok: #6fbf73; --warn: #d9a441; --bad: #d96a6a;
-    --live: #61a5e8; --think: #a98be0; --tool: #4fb3c4; --sel: #232a35;
+    --bg: #0f1115; --panel: #181b21; --line: #2a2f3a; --text: #e5e9f0;
+    --dim: #8b95a5; --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+    --live: #2563eb; --think: #8b5cf6; --tool: #0891b2; --sel: #1e2a44;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -64,7 +67,21 @@
   .mark { width: 1.35rem; height: 1.35rem; flex: none; }
   .live { font-size: 1.5rem; font-weight: 700; color: var(--live); line-height: 1; }
   .live small { font-size: .7rem; color: var(--dim); font-weight: 400; }
-  nav { display: flex; gap: .3rem; margin-left: auto; }
+  /* The legacy runway rail flattened into the header: one glyph per
+     provider — monogram + headroom — tinted by the same tone rules the
+     runway cards use. The strip owns the header's spring, so an empty
+     strip still pushes the tabs to the right edge. */
+  #rwstrip { display: flex; gap: .25rem; flex-wrap: wrap; margin-left: auto; }
+  .rwchip { display: flex; align-items: center; gap: .35rem; padding: .1rem .5rem;
+            background: none; border: 1px solid var(--line); border-radius: 99px;
+            font-size: 11px; }
+  .rwchip:hover:enabled { background: var(--sel); }
+  .rwchip span { color: var(--dim); font-weight: 700; letter-spacing: .04em; }
+  .rwchip b { font-weight: 700; color: var(--ok); }
+  .rwchip b.watch { color: var(--warn); }
+  .rwchip b.critical { color: var(--bad); }
+  .rwchip.unavailable { opacity: .55; }
+  nav { display: flex; gap: .3rem; }
   nav button.tab { border-radius: 6px 6px 0 0; }
   nav button.tab.on { color: var(--live); border-color: var(--live); background: var(--sel); }
 
@@ -166,16 +183,18 @@
                     overflow-wrap: anywhere; }
   .runitem .meta { font-size: 11px; color: var(--dim); margin-top: .2rem;
                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  /* an unknown status still shows as a chip, never as invisible text */
+  /* an unknown status still shows as a chip, never as invisible text.
+     White text: the restored fills are 600-weight colours, too deep for
+     the dark ink the pastels carried. */
   .chip { display: inline-block; padding: 0 .5rem; border-radius: 99px;
-          font-size: 11px; font-weight: 600; color: #10131a;
+          font-size: 11px; font-weight: 600; color: #fff;
           background: var(--dim); }
   .c-running, .c-interrupt { background: var(--live); }
   .c-spawning { background: var(--warn); }
   .c-done { background: var(--ok); }
   .c-failed, .c-timeout { background: var(--bad); }
   .c-killed { background: var(--dim); }
-  .c-blocked { background: #6b5ea8; color: #eee; }
+  .c-blocked { background: var(--think); }
 
   /* The detail header and its tab strip sit outside #pbody, which is the only
      thing that scrolls — so name, status, tabs and stop never scroll away. */
@@ -345,6 +364,7 @@
     </button>
     <div id="projmenu" role="listbox" aria-label="projects with runs" hidden></div>
   </div>
+  <div id="rwstrip" aria-label="provider runway"></div>
   <nav id="tabs">
     <button class="tab on" data-view="runs">runs</button>
     <button class="tab" data-view="profiles">profiles</button>
@@ -1515,12 +1535,39 @@ function balanceOf(r) {
 }
 
 function renderRunway(list) {
+  renderRunwayStrip(list);
   const box = $("runway");
   if (!list.length) {
     box.replaceChildren(el("p", "dim", "no polls yet — press refresh"));
     return;
   }
   box.replaceChildren(...list.map(runwayCard));
+}
+
+// The header strip. Every chip is a door to the runway view, and both
+// renderers feed it: the 4s snapshot and an explicit refresh.
+const MONOGRAMS = {minimax: "MM", kimi: "K", claude: "CL", deepseek: "DS",
+                   codex: "CX", xai: "X"};
+function renderRunwayStrip(list) {
+  const strip = $("rwstrip");
+  strip.replaceChildren(...(list || []).map((r) => {
+    const money = balanceOf(r);
+    const known = r.windows.filter((w) => w.remaining != null);
+    const headroom = r.known && known.length
+      ? Math.round(Math.min(...known.map((w) => w.remaining))) : null;
+    const chip = el("button",
+      "rwchip" + (money || headroom !== null ? "" : " unavailable"));
+    chip.type = "button";
+    chip.title = r.provider
+      + (r.age_hours != null && r.age_hours >= 2
+         ? " · read " + ageText(r.age_hours) + " ago" : "");
+    chip.append(
+      el("span", null, MONOGRAMS[r.provider] || r.provider.slice(0, 2).toUpperCase()),
+      el("b", money ? null : tone(headroom) || null,
+         money || (headroom !== null ? pct(headroom) : "–")));
+    chip.onclick = () => showView("runway");
+    return chip;
+  }));
 }
 
 function ageText(hours) {
