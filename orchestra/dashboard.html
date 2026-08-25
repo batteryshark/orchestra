@@ -4,8 +4,10 @@
 
      Five views, one concern each, reached by the tabs: RUNS (master-detail,
      the default), PROFILES, SETTINGS, RUNWAY, HEALTH. The selected run's detail has a
-     second tab strip of its own (W-0180) — trace, thread, brief, facts,
-     summary, merge — under a header that never scrolls.
+     second tab strip of its own (W-0180) — trace, inbox/outbox, merge — under
+     a header that never scrolls. The thread holds the run's whole
+     conversation: brief first, tells and asks between, handoff last, the
+     composer under it. Facts sit behind the ⓘ glyph beside the run's name.
 
      Every view OWNS THE VIEWPORT (W-0186): the page itself does not scroll,
      each view fills the height under the header, and the scrolling happens
@@ -210,6 +212,14 @@
   @media (max-width: 560px) {
     .run-actions { grid-template-columns: 1fr; }
   }
+  /* Facts live behind a glyph at the end of the run's name row, not in
+     the tab strip: metadata is reference, not a place you work. */
+  .facts-glyph { margin-left: auto; border-radius: 99px; padding: 0 .5rem;
+                 font-size: 12px; }
+  .facts-glyph.on { color: var(--live); border-color: var(--live);
+                    background: var(--sel); }
+  /* Machine chatter (NOISE set) hides until its checkbox shows it. */
+  .tracebox:not(.chatter) .titem.noise { display: none; }
   #ptabs { display: flex; gap: .3rem; flex-wrap: wrap;
            padding: .4rem .8rem; border-bottom: 1px solid var(--line); }
   #ptabs .stop-run { margin-left: auto; }
@@ -791,6 +801,17 @@ function instructionPane(r) {
   return box;
 }
 
+// The run's final summary, drawn as the closing message of its thread:
+// the handoff is the last thing the run says.
+function handoffItem(text) {
+  const item = el("div", "msg outbound");
+  const head = el("div", "head");
+  head.append(el("i", "g", "\u{1F4E4}"), el("span", "label", "handoff"),
+              el("span", "dim", "the run's final summary"));
+  item.append(head, el("div", "prose", text));
+  return item;
+}
+
 function messageItem(m) {
   const item = el("div", "msg " + m.direction);
   const head = el("div", "head");
@@ -820,7 +841,7 @@ function loadBrief(id) {
   BRIEF_WAIT.add(id);
   api("/api/runs/" + id + "/brief").then((b) => {
     BRIEFS.set(id, b);
-    if (SNAP && SELECTED === id && runTab() === "brief") renderDetail(SNAP);
+    if (SNAP && SELECTED === id && runTab() === "messages") renderDetail(SNAP);
   }).catch(fail).finally(() => BRIEF_WAIT.delete(id));
 }
 
@@ -859,10 +880,6 @@ function renderDiff(text) {
 const TABS = [
   ["trace", "trace"],
   ["messages", "inbox / outbox"],
-  ["instruction", "send instruction"],
-  ["brief", "brief"],
-  ["facts", "facts"],
-  ["summary", "summary"],
   ["merge", "merge"],
 ];
 // Remembered per run for as long as the page is open: come back to a run and
@@ -885,8 +902,7 @@ function renderTabs(run) {
   strip.hidden = !run;
   if (!run) return strip.replaceChildren();
   const active = runTab();
-  strip.replaceChildren(...TABS.filter(([key]) => run.live || key !== "instruction")
-    .map(([key, label]) => {
+  strip.replaceChildren(...TABS.map(([key, label]) => {
     const b = el("button", key === active ? "on" : null, label);
     b.onclick = () => setRunTab(key);
     return b;
@@ -906,29 +922,32 @@ function renderTabs(run) {
 const PANES = {
   trace: tracePane,
 
+  // The whole conversation WITH the run in one place. The brief opens it —
+  // it is the first thing put in — tells and asks follow, the handoff closes
+  // it, and the composer sits under the thread like any reply box. The brief
+  // file is read once per run by /api/runs/<id>/brief; it is not in the
+  // snapshot, which carries every run every 4s.
   messages: (s, r) => {
-    const thread = (r.messages || []).filter((m) => m.kind !== "merge");
-    return thread.length ? wrap(thread.map(messageItem))
-      : el("p", "dim",
-           "no messages — nothing was told to this run and it asked nothing");
-  },
-
-  instruction: (s, r) => instructionPane(r),
-
-  // The whole brief, read off disk by /api/runs/<id>/brief when this tab is
-  // opened. It is not in the snapshot: that carries every run every 4s.
-  brief: (s, r) => {
     const box = el("div");
     const b = BRIEFS.get(r.id);
     if (b === undefined) {
       loadBrief(r.id);
       box.append(el("p", "dim", "reading the brief file…"));
-      return box;
+    } else if (b.text) {
+      box.append(collapsible("msg-brief", MSG_GLYPH.tell, "brief",
+        "what the run was dispatched with", b.text,
+        {payload_len: b.text.length, truncated: false}));
     }
-    if (b.text) box.append(el("div", "prose", b.text));
-    else box.append(el("div", "prose", r.title || "(no title recorded)"),
-                    el("p", "dim", b.message || "no brief file"));
-    if (b.path) box.append(el("p", "dim mono", b.path));
+    const thread = (r.messages || []).filter((m) => m.kind !== "merge");
+    thread.forEach((m) => box.append(messageItem(m)));
+    if (!thread.length)
+      box.append(el("p", "dim",
+        "nothing was told to this run and it asked nothing"));
+    // A Work-backed run's completion writeback already carries the summary
+    // into the thread; a second handoff card under it would say it twice.
+    if (r.summary && !thread.some((m) => m.kind === "completion"))
+      box.append(handoffItem(r.summary));
+    if (r.live) box.append(instructionPane(r));
     return box;
   },
 
@@ -960,12 +979,6 @@ const PANES = {
              : r.cost_usd === null ? "not captured" : money(r.cost_usd)],
     ["usage from", r.usage_source],
   ]),
-
-  summary: (s, r) => r.summary
-    ? el("div", "prose", r.summary)
-    : el("p", "dim", r.live
-        ? "no summary yet — a run writes one when it finishes"
-        : "this run finished without writing a summary"),
 
   // The merge report is written into the run's own thread as a message of
   // kind `merge` (merge._thread), so it needs no second source.
@@ -1012,7 +1025,16 @@ function tracePane() {
   const cb = el("input"); cb.type = "checkbox"; cb.id = "followcb"; cb.checked = FOLLOW;
   cb.onchange = () => { FOLLOW = cb.checked; };
   follow.append(cb, el("span", null, " follow tail"));
-  h3.append(state, follow);
+  const chat = el("label", "dim");
+  chat.style.cssText =
+    "float:right;font-weight:400;text-transform:none;margin-right:.9rem";
+  const cb2 = el("input"); cb2.type = "checkbox"; cb2.checked = CHATTER;
+  cb2.onchange = () => {
+    CHATTER = cb2.checked;
+    TRACE_BOX.classList.toggle("chatter", CHATTER);
+  };
+  chat.append(cb2, el("span", null, " machine chatter"));
+  h3.append(state, follow, chat);
   pane.append(h3, TRACE_BOX);
   return pane;
 }
@@ -1034,14 +1056,18 @@ function renderDetail(s) {
   if (r.slug) head.append(el("span", "mono dim", r.slug));
   head.append(statusChip(r));
   if (r.work_item) head.append(el("span", "mono", r.work_item));
-  // A run can finish while its instruction tab is open. Return to trace;
-  // a dead tab is worse than moving to the run's final output.
-  if (!r.live && runTab() === "instruction") RUN_TAB.delete(r.id);
+  // Facts left the tab strip: eighteen rows of metadata are reference, not a
+  // place you work, so they live behind a glyph beside the run's name.
+  const facts = el("button",
+    "facts-glyph" + (runTab() === "facts" ? " on" : ""), "ⓘ");
+  facts.title = "run facts";
+  facts.onclick = () => setRunTab(runTab() === "facts" ? "trace" : "facts");
+  head.append(facts);
   renderTabs(r);
   const pane = runTab();
   // A snapshot lands every four seconds. Do not replace the composer while
   // the human is typing; the next poll after focus leaves may rebuild it.
-  if (pane !== "instruction" || !body.contains(document.activeElement))
+  if (pane !== "messages" || !body.contains(document.activeElement))
     body.replaceChildren(PANES[pane](s, r));
 }
 
@@ -1070,8 +1096,9 @@ function lineageNode(s, r) {
 // --- the trace stream (SSE) -------------------------------------------------
 // The trace pane is owned by the stream, never by the 4s poll: the box node is
 // kept across re-renders so appended events and open <details> survive.
-const TRACE_BOX = el("div");
-let TRACE = null, TRACE_RUN = null, TRACE_STATE = "", FOLLOW = true;
+const TRACE_BOX = el("div", "tracebox");
+let TRACE = null, TRACE_RUN = null, TRACE_STATE = "", FOLLOW = true,
+    CHATTER = false;
 
 function setTraceState(text) {
   TRACE_STATE = text;
@@ -1144,6 +1171,16 @@ const GLYPH = {
   lifecycle: "⚙",             // gear — the harness, not the agent
 };
 const UNKNOWN_GLYPH = "•";    // bullet — a kind this build does not know
+// Machine chatter the parsers record but nobody reads while watching a run:
+// progress pings, stream retries, usage counters, hook plumbing, turn and
+// step markers. Measured on the live store, these were half of all events.
+// Failures (turn.failed, error, session.error) are never in this set.
+// Hidden by default; the "machine chatter" checkbox shows them.
+const NOISE = new Set(["tool_progress", "stream_attempt", "usage",
+  "hook_started", "hook_response", "step_start", "step-start",
+  "step_finish", "step-finish", "session.idle", "session.updated",
+  "message.updated", "thread.started", "turn.started", "turn.completed",
+  "turn_started", "session.created"]);
 // About 6–8 wrapped lines in the trace pane: useful at a glance without
 // letting longer reasoning blocks take over the feed.
 const SHORT_REASONING_CHARS = 512;
@@ -1209,7 +1246,8 @@ function traceItem(row) {
     return eventItem("injection", GLYPH.human_injection,
                      "put into the session", name, payload);
   if (row.kind === "lifecycle")
-    return eventItem("meta", GLYPH.lifecycle, name || "lifecycle", "",
+    return eventItem("meta" + (NOISE.has(name) ? " noise" : ""),
+                     GLYPH.lifecycle, name || "lifecycle", "",
                      payload.slice(0, 300));
   return eventItem("meta", UNKNOWN_GLYPH, name || row.kind, row.kind,
                    payload.slice(0, 300));
