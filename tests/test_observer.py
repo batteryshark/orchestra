@@ -10,6 +10,7 @@ load-bearing claims are:
 * one infrastructure failure is retried once, and a second consecutive one
   on the same item escalates instead of spending a third.
 """
+import contextlib
 import json
 import os
 import tempfile
@@ -35,6 +36,12 @@ tier = 1
 """
 
 
+def with_settings(extra: str) -> str:
+    """CONFIG with a line added to [settings] (TOML forbids a second one)."""
+    return CONFIG.replace("[settings]\ntimeout = 60",
+                          f"[settings]\ntimeout = 60\n{extra}")
+
+
 class ObserverCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -55,6 +62,16 @@ class ObserverCase(unittest.TestCase):
     # -- helpers
     def cfg(self) -> dict:
         return config.load(PROJECT_ID)
+
+    def one(self, sql: str, *args):
+        return self.con.execute(sql, args).fetchone()
+
+    def run_status(self, run_id: int) -> str:
+        return self.one("SELECT status FROM runs WHERE id=?", run_id)["status"]
+
+    def escalation_body(self, run_id: int) -> str:
+        return self.one("SELECT body FROM messages WHERE run_id=? AND "
+                        "kind='escalation'", run_id)["body"]
 
     def make_run(self, status="running", **cols) -> int:
         fields = {"profile": "worker", "backend": "opencode", "title": "do it",
@@ -97,42 +114,38 @@ class ObserverCase(unittest.TestCase):
 
 
 class ProfileTests(ObserverCase):
-    def test_the_workhorse_tier_is_the_default_observer(self) -> None:
-        for tier in ("1", '"cheap"'):
-            with self.subTest(tier=tier):
-                self.config_path.write_text(CONFIG.replace("tier = 1", f"tier = {tier}"))
-                self.assertEqual(observer.profile_name(self.cfg()), "cheap")
+    def test_profile_resolution_contract(self) -> None:
+        """The workhorse tier is the default observer; an explicit setting
+        wins; an unknown name is refused; no configured observer says exactly
+        what to add. Expected is a profile name, or the markers the
+        ObserverUnconfigured message must carry."""
+        cases = {
+            "tier as number": (CONFIG, "cheap"),
+            "tier as name": (CONFIG.replace("tier = 1", 'tier = "cheap"'),
+                             "cheap"),
+            "explicit setting wins": (
+                with_settings('observer_profile = "worker"'), "worker"),
+            "unknown named profile refused": (
+                with_settings('observer_profile = "ghost"'), []),
+            "nothing configured says what to add": (
+                '[profiles.worker]\nbackend = "opencode"\n',
+                ["observer_profile", "cheap", "no default profiles"]),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                self.config_path.write_text(text)
+                if isinstance(expected, str):
+                    self.assertEqual(observer.profile_name(self.cfg()), expected)
+                else:
+                    with self.assertRaises(observer.ObserverUnconfigured) as caught:
+                        observer.profile_name(self.cfg())
+                    for marker in expected:
+                        self.assertIn(marker, str(caught.exception))
 
-    def test_an_explicit_setting_wins(self) -> None:
-        self.config_path.write_text(CONFIG + '\n[settings]\nobserver_profile = "worker"\n')
-        # TOML forbids a second [settings]; write the whole file instead.
-        self.config_path.write_text(CONFIG.replace(
-            "[settings]\ntimeout = 60",
-            '[settings]\ntimeout = 60\nobserver_profile = "worker"'))
-        self.assertEqual(observer.profile_name(self.cfg()), "worker")
-
-    def test_no_configured_observer_says_exactly_what_to_add(self) -> None:
-        self.config_path.write_text('[profiles.worker]\nbackend = "opencode"\n')
-        with self.assertRaises(observer.ObserverUnconfigured) as caught:
-            observer.profile_name(self.cfg())
-        message = str(caught.exception)
-        self.assertIn("observer_profile", message)
-        self.assertIn("cheap", message)
-        self.assertIn("no default profiles", message)
-
-    def test_an_unknown_named_profile_is_refused(self) -> None:
-        self.config_path.write_text(CONFIG.replace(
-            "[settings]\ntimeout = 60",
-            '[settings]\ntimeout = 60\nobserver_profile = "ghost"'))
-        with self.assertRaises(observer.ObserverUnconfigured):
-            observer.profile_name(self.cfg())
-
-    # --- the enabled set (W-0187) --------------------------------------------
-    # Picking the observer is a staffing moment: it spends a model turn on the
-    # project's behalf, so a profile the project disabled must not be
-    # volunteered for it by the back door of the tier scan.
-
-    def test_the_tier_scan_only_sees_profiles_the_project_enabled(self) -> None:
+    def test_the_enabled_set_gates_the_observer(self) -> None:
+        """W-0187: picking the observer is a staffing moment — it spends a
+        model turn on the project's behalf, so a profile the project disabled
+        must not be volunteered for it by the back door of the tier scan."""
         self.config_path.write_text(
             CONFIG + f'\n[project."{PROJECT_ID}"]\nenabled_profiles = ["worker"]\n')
         with self.assertRaises(observer.ObserverUnconfigured) as caught:
@@ -141,14 +154,12 @@ class ProfileTests(ObserverCase):
         # another project, which enabled everything, still finds it
         self.assertEqual(observer.profile_name(config.load("other-uuid")), "cheap")
 
-    def test_a_named_observer_the_project_disabled_is_refused_by_name(self) -> None:
+        # A named observer the project disabled: the NAME still resolves — it
+        # is a configured profile — but staffing it does not.
         self.config_path.write_text(
-            CONFIG.replace("[settings]\ntimeout = 60",
-                           '[settings]\ntimeout = 60\nobserver_profile = "cheap"')
+            with_settings('observer_profile = "cheap"')
             + f'\n[project."{PROJECT_ID}"]\nenabled_profiles = ["worker"]\n')
-        # the NAME still resolves — it is a configured profile
         self.assertEqual(observer.profile_name(self.cfg()), "cheap")
-        # staffing it does not
         with self.assertRaises(observer.ObserverUnconfigured) as caught:
             observer.observer_profile(self.cfg())
         message = str(caught.exception)
@@ -159,46 +170,45 @@ class ProfileTests(ObserverCase):
 class LoopDetectionTests(ObserverCase):
     """Layer (b): zero tokens, read from the NORMALIZED events table."""
 
-    def test_a_long_productive_run_is_never_stopped(self) -> None:
-        run_id = self.make_run()
-        for n in range(400):  # hours of varied, honest work
-            self.add_event(run_id, "tool_call", "bash",
-                           json.dumps({"command": f"pytest tests/test_{n}.py"}))
-            self.add_event(run_id, "tool_result", "bash", "ok")
-            self.add_event(run_id, "tool_call", "edit",
-                           json.dumps({"file_path": f"/src/mod_{n}.py"}))
-        self.assertIsNone(observer.loop_reason(self.con, run_id))
-        self.assertIsNone(observer.mechanical(self.con, run_id, self.cfg()))
-        self.assertEqual(
-            self.con.execute("SELECT status FROM runs WHERE id=?",
-                             (run_id,)).fetchone()["status"], "running")
+    def test_loop_detection_contract(self) -> None:
+        """A long productive run is never stopped (hours of varied, honest
+        work); the same call repeated back to back is caught, as is one file
+        edited over and over; edits broken up by other work are not a loop.
+        Each case is (events as add_event triples, expected reason or None)."""
+        def bash(cmd):
+            return ("tool_call", "bash", json.dumps({"command": cmd}))
 
-    def test_the_same_call_repeated_is_caught(self) -> None:
-        run_id = self.make_run()
-        payload = json.dumps({"command": "npm test"})
-        for _ in range(observer.TOOL_REPEATS):
-            self.add_event(run_id, "tool_call", "bash", payload)
-        found = observer.loop_reason(self.con, run_id)
-        self.assertIsNotNone(found)
-        self.assertIn("same bash call", found[0])
+        def edit(name, path, n=0):
+            return ("tool_call", name, json.dumps({"file_path": path, "new": n}))
 
-    def test_one_file_edited_over_and_over_is_caught(self) -> None:
-        run_id = self.make_run()
-        for n in range(observer.FILE_REPEATS):
-            self.add_event(run_id, "tool_call", "Edit",
-                           json.dumps({"file_path": "/src/a.py", "new": n}))
-        found = observer.loop_reason(self.con, run_id)
-        self.assertIsNotNone(found)
-        self.assertIn("/src/a.py", found[0])
-
-    def test_edits_broken_up_by_other_work_are_not_a_loop(self) -> None:
-        run_id = self.make_run()
-        for n in range(observer.FILE_REPEATS * 2):
-            self.add_event(run_id, "tool_call", "Edit",
-                           json.dumps({"file_path": "/src/a.py", "new": n}))
-            self.add_event(run_id, "tool_call", "bash",
-                           json.dumps({"command": f"pytest -k {n}"}))
-        self.assertIsNone(observer.loop_reason(self.con, run_id))
+        cases = {
+            "a long productive run is never stopped": (  # hours of varied work
+                [ev for n in range(400) for ev in
+                 (bash(f"pytest tests/test_{n}.py"), ("tool_result", "bash", "ok"),
+                  edit("edit", f"/src/mod_{n}.py", n))], None),
+            "the same call repeated is caught": (
+                [bash("npm test")] * observer.TOOL_REPEATS, "same bash call"),
+            "one file edited over and over is caught": (
+                [edit("Edit", "/src/a.py", n)
+                 for n in range(observer.FILE_REPEATS)], "/src/a.py"),
+            "edits broken up by other work are not a loop": (
+                [ev for n in range(observer.FILE_REPEATS * 2) for ev in
+                 (edit("Edit", "/src/a.py", n), bash(f"pytest -k {n}"))], None),
+        }
+        for label, (events, expected) in cases.items():
+            with self.subTest(label):
+                run_id = self.make_run()
+                for event in events:
+                    self.add_event(run_id, *event)
+                found = observer.loop_reason(self.con, run_id)
+                if expected is None:
+                    self.assertIsNone(found)
+                    self.assertIsNone(
+                        observer.mechanical(self.con, run_id, self.cfg()))
+                    self.assertEqual(self.run_status(run_id), "running")
+                else:
+                    self.assertIsNotNone(found)
+                    self.assertIn(expected, found[0])
 
     def test_first_trip_corrects_and_the_second_stops_with_reasoning(self) -> None:
         run_id = self.make_run(log_path=str(self.tmp_path / "run.jsonl"))
@@ -208,9 +218,8 @@ class LoopDetectionTests(ObserverCase):
             self.add_event(run_id, "tool_call", "bash", payload)
         first = observer.mechanical(self.con, run_id, self.cfg())
         self.assertEqual(first["action"], "tell")
-        queued = self.con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='interrupt'",
-            (run_id,)).fetchone()
+        queued = self.one("SELECT body FROM messages WHERE run_id=? AND "
+                          "kind='interrupt'", run_id)
         self.assertIn("loop", queued["body"])
         # The same tail must not produce a correction every poll.
         self.assertIsNone(observer.mechanical(self.con, run_id, self.cfg()))
@@ -220,13 +229,8 @@ class LoopDetectionTests(ObserverCase):
         second = observer.mechanical(self.con, run_id, self.cfg())
         self.assertEqual(second["action"], "stop")
         self.assertTrue(second["reason"])
-        self.assertEqual(self.con.execute(
-            "SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"],
-            "killed")
-        escalation = self.con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='escalation'",
-            (run_id,)).fetchone()
-        self.assertIn(second["reason"], escalation["body"])
+        self.assertEqual(self.run_status(run_id), "killed")
+        self.assertIn(second["reason"], self.escalation_body(run_id))
         stops = [o for o in observer.observations(self.con, run_id)
                  if o["action"] == "stop"]
         self.assertEqual(len(stops), 1)
@@ -234,17 +238,18 @@ class LoopDetectionTests(ObserverCase):
 
 
 class VerdictTests(ObserverCase):
-    def test_a_verdict_is_read_out_of_chatty_output(self) -> None:
+    def test_verdict_parsing_contract(self) -> None:
+        """A verdict is read out of chatty output; invalid output never costs
+        a run its life."""
         verdict = observer.parse_verdict(
             'Thinking about it...\n{"action": "stop", "reason": "it is stuck"}\n'
             "Hope that helps.")
-        self.assertEqual(verdict["action"], "stop")
-        self.assertEqual(verdict["reason"], "it is stuck")
-
-    def test_invalid_output_never_costs_a_run_its_life(self) -> None:
+        self.assertEqual((verdict["action"], verdict["reason"]),
+                         ("stop", "it is stuck"))
         for text in ("", "I think it's fine?", "{not json", '{"reason": "x"}',
                      '{"action": "terminate"}'):
-            self.assertEqual(observer.parse_verdict(text)["action"], "ok")
+            with self.subTest(text=text or "<empty>"):
+                self.assertEqual(observer.parse_verdict(text)["action"], "ok")
 
 
 class ObserverTurnTests(ObserverCase):
@@ -254,18 +259,15 @@ class ObserverTurnTests(ObserverCase):
         self.add_event(run_id, "assistant_text", None, "refactoring the parser")
         turn = self.stub("ok", "steady progress on the parser")
         verdict = observer.judge(self.con, run_id, self.cfg(), turn=turn)
-        self.assertEqual(verdict["action"], "ok")
-        self.assertEqual(verdict["profile"], "cheap")
+        self.assertEqual((verdict["action"], verdict["profile"]),
+                         ("ok", "cheap"))
         self.assertIn("LENGTH IS NOT A FAULT", turn.calls[0]["prompt"])
         self.assertIn("refactoring the parser", turn.calls[0]["prompt"])
         observer.apply_verdict(self.con, run_id, verdict, self.cfg())
         # Nothing was injected into the run and nothing was stopped.
-        self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE run_id=?",
-            (run_id,)).fetchone()["n"], 0)
-        self.assertEqual(self.con.execute(
-            "SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"],
-            "running")
+        self.assertEqual(self.one("SELECT COUNT(*) AS n FROM messages "
+                                  "WHERE run_id=?", run_id)["n"], 0)
+        self.assertEqual(self.run_status(run_id), "running")
         self.assertEqual(observer.observations(self.con, run_id)[0]["action"], "ok")
 
     def test_a_tell_reaches_the_worker_as_an_interrupt(self) -> None:
@@ -275,9 +277,8 @@ class ObserverTurnTests(ObserverCase):
                                  turn=self.stub("tell", "wrong file", "edit b.py"))
         result = observer.apply_verdict(self.con, run_id, verdict, self.cfg())
         self.assertTrue(result["tell"]["queued"])
-        self.assertEqual(self.con.execute(
-            "SELECT body FROM messages WHERE run_id=?", (run_id,)).fetchone()["body"],
-            "edit b.py")
+        self.assertEqual(self.one("SELECT body FROM messages WHERE run_id=?",
+                                  run_id)["body"], "edit b.py")
 
     def test_a_stop_always_escalates_with_its_reasoning(self) -> None:
         run_id = self.make_run()
@@ -286,13 +287,8 @@ class ObserverTurnTests(ObserverCase):
             turn=self.stub("stop", "it has re-read the same file for an hour"))
         result = observer.apply_verdict(self.con, run_id, verdict, self.cfg())
         self.assertTrue(result["escalation"])
-        self.assertEqual(self.con.execute(
-            "SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"],
-            "killed")
-        body = self.con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='escalation'",
-            (run_id,)).fetchone()["body"]
-        self.assertIn("re-read the same file", body)
+        self.assertEqual(self.run_status(run_id), "killed")
+        self.assertIn("re-read the same file", self.escalation_body(run_id))
         recorded = observer.observations(self.con, run_id)[-1]
         self.assertEqual(recorded["action"], "stop")
         self.assertIn("re-read the same file", recorded["reason"])
@@ -303,22 +299,21 @@ class ObserverTurnTests(ObserverCase):
         self.add_transcript(run_id)
         watcher = observer.Watcher(run_id, PROJECT_ID)
         watcher._pass()
-        self.assertEqual(self.con.execute(
-            "SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"],
-            "running")
+        self.assertEqual(self.run_status(run_id), "running")
         note = observer.observations(self.con, run_id)[0]
         self.assertEqual(note["action"], "ok")
         self.assertIn("could not run", note["reason"])
 
 
 class CadenceTests(ObserverCase):
-    def test_a_terminal_run_is_never_looked_at(self) -> None:
-        run_id = self.make_run(status="done")
-        watcher = observer.Watcher(run_id, PROJECT_ID,
+    def test_looks_are_gated_by_status_and_rate(self) -> None:
+        """A terminal run is never looked at; a live one is polled at most
+        once per POLL_EVERY."""
+        done = self.make_run(status="done")
+        watcher = observer.Watcher(done, PROJECT_ID,
                                    clock=lambda: time.time() + observer.FIRST_LOOK * 4)
         self.assertFalse(watcher._due(self.con, self.cfg()))
 
-    def test_polling_is_rate_limited(self) -> None:
         run_id = self.make_run()
         clock = [time.time()]
         watcher = observer.Watcher(run_id, PROJECT_ID, clock=lambda: clock[0])
@@ -344,22 +339,24 @@ class CheckOnDemandTests(ObserverCase):
         self.assertIn("wrong module", result["verdict"])
         self.assertEqual(len(turn.calls), 1)
 
-    def test_a_run_with_no_transcript_yet_costs_nothing(self) -> None:
+    def test_check_spends_no_model_without_cause(self) -> None:
+        """A run with no transcript yet costs nothing, and mechanical-only
+        never calls a model; the skip says why, and the mechanical path still
+        produces a verdict."""
         from orchestra import http
-        run_id = self.make_run()
-        with mock.patch.object(observer, "model_turn") as never:
-            result = http.check_run(self.con, run_id)
-        never.assert_not_called()
-        self.assertIn("nothing in the trace", result["observer"]["skipped"])
-
-    def test_mechanical_only_never_calls_a_model(self) -> None:
-        from orchestra import http
-        run_id = self.make_run()
-        with mock.patch.object(observer, "model_turn") as never:
-            result = http.check_run(self.con, run_id, observe=False)
-        never.assert_not_called()
-        self.assertTrue(result["verdict"])
-        self.assertIn("mechanical", result["observer"]["skipped"])
+        cases = {
+            "no transcript yet": ({}, "nothing in the trace", False),
+            "mechanical only": ({"observe": False}, "mechanical", True),
+        }
+        for label, (kwargs, marker, has_verdict) in cases.items():
+            with self.subTest(label):
+                run_id = self.make_run()
+                with mock.patch.object(observer, "model_turn") as never:
+                    result = http.check_run(self.con, run_id, **kwargs)
+                never.assert_not_called()
+                self.assertIn(marker, result["observer"]["skipped"])
+                if has_verdict:
+                    self.assertTrue(result["verdict"])
 
     def test_an_unconfigured_observer_degrades_to_the_mechanical_verdict(self) -> None:
         from orchestra import http
@@ -372,6 +369,9 @@ class CheckOnDemandTests(ObserverCase):
 
 
 class RetryTests(ObserverCase):
+    AUTH_SUMMARY = ("Failed to authenticate: OAuth session expired and "
+                    "could not be refreshed")
+
     def _brief(self, run_id: int, text: str = "the original mission") -> None:
         from orchestra import paths
         path = paths.briefs_dir() / f"run-{run_id}.md"
@@ -386,6 +386,43 @@ class RetryTests(ObserverCase):
             "AND kind='completion')", (run_id, db.now(), run_id))
         self.con.commit()
 
+    @contextlib.contextmanager
+    def _nod_stubbed(self):
+        """The auth escalation must page through nod.alert, never nod.failure."""
+        with mock.patch.object(observer.nod, "from_cfg", return_value=object()), \
+                mock.patch.object(observer.nod, "alert",
+                                  return_value={"request_id": "auth-alert"}) as alert, \
+                mock.patch.object(observer.nod, "failure") as failure:
+            yield alert, failure
+
+    def retries_of(self, run_id: int) -> int:
+        return self.one("SELECT COUNT(*) AS n FROM runs WHERE retry_of=?",
+                        run_id)["n"]
+
+    def _add_waiter(self, depends_on: int, mission: str) -> int:
+        """A pending run whose dispatch waits on ``depends_on``."""
+        dependent = self.make_run(status="pending")
+        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+                         "VALUES(?,?)", (dependent, depends_on))
+        self.con.execute(
+            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
+            "created_at) VALUES(?, ?, 0, ?)", (dependent, mission, db.now()))
+        self.con.commit()
+        return dependent
+
+    def _finish_and_release(self, done_id: int, dependent: int) -> None:
+        """Finishing the current owner fires the waiter; nothing replays."""
+        self.con.execute("UPDATE runs SET status='done', finished_at=? WHERE id=?",
+                         (db.now(), done_id))
+        self.con.commit()
+        released = []
+        self.assertEqual(supervise.process_ready(
+            self.con, launcher=lambda root, rid: released.append(rid)),
+            [{"run_id": dependent, "status": "fired"}])
+        self.assertEqual(released, [dependent])
+        self.assertEqual(observer.resume_deferred_retries(
+            self.con, self.cfg(), launcher=lambda root, rid: None), [])
+
     def test_an_infrastructure_failure_is_retried_once_with_the_same_brief(self) -> None:
         run_id = self.make_run(status="failed", work_item="W-0001")
         self._brief(run_id)
@@ -393,59 +430,42 @@ class RetryTests(ObserverCase):
         result = observer.after_terminal(self.con, run_id,
                                          launcher=lambda root, rid: launched.append(rid))
         self.assertEqual(result["action"], "retry")
-        retry = self.con.execute("SELECT * FROM runs WHERE id=?",
-                                 (result["run"],)).fetchone()
-        self.assertEqual(retry["retry_of"], run_id)
-        self.assertEqual(retry["work_item"], "W-0001")
-        self.assertIsNone(retry["session_ref"], "a retry is a fresh run, not a resume")
-        self.assertEqual(Path(retry["brief_path"]).read_text(), "the original mission")
+        retry = self.one("SELECT * FROM runs WHERE id=?", result["run"])
+        self.assertEqual(
+            (retry["retry_of"], retry["work_item"], retry["session_ref"],
+             Path(retry["brief_path"]).read_text()),
+            (run_id, "W-0001", None, "the original mission"),
+            "a retry is a fresh run with the same brief, not a resume")
         self.assertEqual(launched, [result["run"]])
         replay = observer.after_terminal(
             self.con, run_id,
             launcher=lambda root, rid: self.fail("settled retry replayed"))
         self.assertEqual(replay["action"], "none")
         self.assertIn("already settled", replay["reason"])
-        self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) AS n FROM runs WHERE retry_of=?", (run_id,)
-        ).fetchone()["n"], 1)
+        self.assertEqual(self.retries_of(run_id), 1)
 
     def test_expired_authentication_requires_a_changed_precondition(self) -> None:
-        run_id = self.make_run(
-            status="failed", backend="claude", work_item="W-auth",
-            summary="Failed to authenticate: OAuth session expired and could not be refreshed")
+        run_id = self.make_run(status="failed", backend="claude",
+                               work_item="W-auth", summary=self.AUTH_SUMMARY)
         self._brief(run_id)
-        dependent = self.make_run(status="pending")
-        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
-                         "VALUES(?,?)", (dependent, run_id))
-        self.con.execute(
-            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
-            "created_at) VALUES(?, 'continue after auth', 0, ?)",
-            (dependent, db.now()))
-        self.con.commit()
+        dependent = self._add_waiter(run_id, "continue after auth")
         launched = []
 
-        with mock.patch.object(observer.nod, "from_cfg", return_value=object()), \
-                mock.patch.object(observer.nod, "alert",
-                                  return_value={"request_id": "auth-alert"}) as alert, \
-                mock.patch.object(observer.nod, "failure") as failure:
+        with self._nod_stubbed() as (alert, failure):
             result = observer.after_terminal(
                 self.con, run_id, launcher=lambda root, rid: launched.append(rid))
 
-        self.assertEqual(result["action"], "escalate")
-        self.assertEqual(result["precondition"], "reauthenticate")
-        self.assertEqual(result["escalation"]["nod"], "auth-alert")
+        self.assertEqual(
+            (result["action"], result["precondition"], result["escalation"]["nod"]),
+            ("escalate", "reauthenticate", "auth-alert"))
         alert.assert_called_once()
         failure.assert_not_called()
         self.assertEqual(launched, [])
-        self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) AS n FROM runs WHERE retry_of=?", (run_id,)
-        ).fetchone()["n"], 0)
+        self.assertEqual(self.retries_of(run_id), 0)
         observation = observer.observations(self.con, run_id, layer="retry")[0]
         self.assertEqual(observation["action"], "escalate")
         self.assertIn("reauthenticate Claude", observation["reason"])
-        message = self.con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='escalation'",
-            (run_id,)).fetchone()["body"]
+        message = self.escalation_body(run_id)
         self.assertIn("Reauthenticate Claude", message)
         self.assertNotIn("choose Retry", message)
         self.assertEqual(supervise.process_ready(
@@ -453,23 +473,37 @@ class RetryTests(ObserverCase):
             [{"run_id": dependent, "status": "declined"}])
         self.assertEqual(launched, [])
 
-    def test_auth_history_does_not_spend_a_later_transient_retry(self) -> None:
-        auth = self.make_run(
-            status="failed", backend="claude", work_item="W-auth-history",
-            summary="Failed to authenticate: OAuth session expired and could not be refreshed")
-        self._brief(auth)
-        observer.after_terminal(self.con, auth, launcher=lambda root, rid: None)
+    def test_transient_retries_survive_auth_noise(self) -> None:
+        """Auth history on the item, or mere credential wording in the
+        summary, must not spend the one transient retry."""
+        def auth_history():
+            auth = self.make_run(status="failed", backend="claude",
+                                 work_item="W-auth-history",
+                                 summary=self.AUTH_SUMMARY)
+            self._brief(auth)
+            observer.after_terminal(self.con, auth, launcher=lambda root, rid: None)
+            later = self.make_run(status="failed", backend="claude",
+                                  work_item="W-auth-history",
+                                  summary="connection reset")
+            self._brief(later)
+            return later
 
-        later = self.make_run(
-            status="failed", backend="claude", work_item="W-auth-history",
-            summary="connection reset")
-        self._brief(later)
-        launched = []
-        result = observer.after_terminal(
-            self.con, later, launcher=lambda root, rid: launched.append(rid))
+        def credential_wording():
+            run_id = self.make_run(status="failed", backend="claude",
+                                   summary="Need credentials.")
+            self._brief(run_id)
+            return run_id
 
-        self.assertEqual(result["action"], "retry")
-        self.assertEqual(launched, [result["run"]])
+        cases = {"auth history does not spend a later transient": auth_history,
+                 "ordinary credential language": credential_wording}
+        for label, build in cases.items():
+            with self.subTest(label):
+                launched = []
+                result = observer.after_terminal(
+                    self.con, build(),
+                    launcher=lambda root, rid: launched.append(rid))
+                self.assertEqual(result["action"], "retry")
+                self.assertEqual(launched, [result["run"]])
 
     def test_auth_on_a_retry_escalates_before_the_two_failure_rule(self) -> None:
         first = self.make_run(
@@ -479,35 +513,17 @@ class RetryTests(ObserverCase):
             self.con, first, launcher=lambda root, rid: None)["run"]
         self.con.execute(
             "UPDATE runs SET status='failed', summary=? WHERE id=?",
-            ("Failed to authenticate: OAuth session expired and could not be refreshed",
-             retry_id))
+            (self.AUTH_SUMMARY, retry_id))
         self.con.commit()
 
-        with mock.patch.object(observer.nod, "from_cfg", return_value=object()), \
-                mock.patch.object(observer.nod, "alert",
-                                  return_value={"request_id": "auth-alert"}) as alert, \
-                mock.patch.object(observer.nod, "failure") as failure:
+        with self._nod_stubbed() as (alert, failure):
             result = observer.after_terminal(
                 self.con, retry_id, launcher=lambda root, rid: self.fail("launched"))
 
         self.assertEqual(result["precondition"], "reauthenticate")
         alert.assert_called_once()
         failure.assert_not_called()
-        self.assertEqual(self.con.execute(
-            "SELECT COUNT(*) AS n FROM runs WHERE retry_of=?", (retry_id,)
-        ).fetchone()["n"], 0)
-
-    def test_ordinary_credential_language_keeps_the_transient_retry(self) -> None:
-        run_id = self.make_run(
-            status="failed", backend="claude", summary="Need credentials.")
-        self._brief(run_id)
-        launched = []
-
-        result = observer.after_terminal(
-            self.con, run_id, launcher=lambda root, rid: launched.append(rid))
-
-        self.assertEqual(result["action"], "retry")
-        self.assertEqual(launched, [result["run"]])
+        self.assertEqual(self.retries_of(retry_id), 0)
 
     def test_a_second_consecutive_failure_escalates_instead(self) -> None:
         from orchestra import dispatch
@@ -525,9 +541,7 @@ class RetryTests(ObserverCase):
         self.assertEqual(result["action"], "escalate")
         self.assertEqual(launched, [], "nothing spends a third attempt")
         self.assertEqual(result["streak"], 2)
-        body = self.con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='escalation'",
-            (retry_id,)).fetchone()["body"]
+        body = self.escalation_body(retry_id)
         self.assertIn("Two infrastructure failures", body)
         self.assertIn("W-0002", body)
 
@@ -547,9 +561,8 @@ class RetryTests(ObserverCase):
         result = observer.after_terminal(self.con, run_id,
                                          launcher=lambda root, rid: 1 / 0)
         self.assertEqual(result["action"], "none")
-        summary = self.con.execute("SELECT summary FROM runs WHERE id=?",
-                                   (run_id,)).fetchone()["summary"]
-        self.assertIn("it went feral", summary)
+        self.assertIn("it went feral", self.one(
+            "SELECT summary FROM runs WHERE id=?", run_id)["summary"])
         self.assertEqual([row["action"] for row in observer.observations(
             self.con, run_id, layer="retry")], ["deferred", "cancelled"])
 
@@ -557,14 +570,7 @@ class RetryTests(ObserverCase):
         from orchestra import dispatch
         run_id = self.make_run(status="failed")
         self._brief(run_id)
-        dependent = self.make_run(status="pending")
-        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
-                         "VALUES(?,?)", (dependent, run_id))
-        self.con.execute(
-            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
-            "created_at) VALUES(?, 'continue after retry', 0, ?)",
-            (dependent, db.now()))
-        self.con.commit()
+        dependent = self._add_waiter(run_id, "continue after retry")
         dispatch.pause(self.con, "maintenance")
         result = observer.after_terminal(self.con, run_id,
                                          launcher=lambda root, rid: 1 / 0)
@@ -587,20 +593,10 @@ class RetryTests(ObserverCase):
         self.assertEqual(resumed[0]["action"], "retry")
         self.assertEqual(launched, [resumed[0]["run"]])
         retry_id = resumed[0]["run"]
-        edge = self.con.execute(
-            "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
-            (dependent,)).fetchone()
+        edge = self.one("SELECT depends_on_run FROM dispatch_dependencies "
+                        "WHERE run_id=?", dependent)
         self.assertEqual(edge["depends_on_run"], retry_id)
-        self.con.execute("UPDATE runs SET status='done', finished_at=? WHERE id=?",
-                         (db.now(), retry_id))
-        self.con.commit()
-        released = []
-        self.assertEqual(supervise.process_ready(
-            self.con, launcher=lambda root, rid: released.append(rid)),
-            [{"run_id": dependent, "status": "fired"}])
-        self.assertEqual(released, [dependent])
-        self.assertEqual(observer.resume_deferred_retries(
-            self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid)), [])
+        self._finish_and_release(retry_id, dependent)
 
         # Another dispatcher can claim the item after the pause lifts but
         # before the daemon replays its deferred retry. The waiter must follow
@@ -608,14 +604,7 @@ class RetryTests(ObserverCase):
         launched.clear()
         failed = self.make_run(status="failed", work_item="W-COMPETING")
         self._brief(failed)
-        dependent = self.make_run(status="pending")
-        self.con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
-                         "VALUES(?,?)", (dependent, failed))
-        self.con.execute(
-            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
-            "created_at) VALUES(?, 'follow the winner', 0, ?)",
-            (dependent, db.now()))
-        self.con.commit()
+        dependent = self._add_waiter(failed, "follow the winner")
         dispatch.pause(self.con, "maintenance")
         observer.after_terminal(self.con, failed,
                                 launcher=lambda root, rid: launched.append(rid))
@@ -635,27 +624,16 @@ class RetryTests(ObserverCase):
         self.assertEqual(resumed[0]["action"], "none")
         self.assertIn(f"work_item:{winner['id']}", resumed[0]["reason"])
         self.assertEqual(launched, [])
-        self.assertEqual(self.con.execute(
+        self.assertEqual(self.one(
             "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
-            (dependent,)).fetchone()["depends_on_run"], winner["id"])
+            dependent)["depends_on_run"], winner["id"])
         retry_notes = observer.observations(self.con, failed, layer="retry")
         self.assertEqual([note["action"] for note in retry_notes],
                          ["deferred", "superseded"])
         self.assertEqual(json.loads(retry_notes[-1]["detail"])["winning_run"],
                          winner["id"])
-        self.assertIsNone(self.con.execute(
-            "SELECT id FROM runs WHERE retry_of=?", (failed,)).fetchone())
-
-        self.con.execute("UPDATE runs SET status='done', finished_at=? WHERE id=?",
-                         (db.now(), winner["id"]))
-        self.con.commit()
-        released = []
-        self.assertEqual(supervise.process_ready(
-            self.con, launcher=lambda root, rid: released.append(rid)),
-            [{"run_id": dependent, "status": "fired"}])
-        self.assertEqual(released, [dependent])
-        self.assertEqual(observer.resume_deferred_retries(
-            self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid)), [])
+        self.assertEqual(self.retries_of(failed), 0)
+        self._finish_and_release(winner["id"], dependent)
 
     def test_dependents_wait_on_the_retry_instead_of_being_declined(self) -> None:
         first = self.make_run(status="running")
@@ -675,9 +653,8 @@ class RetryTests(ObserverCase):
             other.close()
         retry_id = observer.after_terminal(
             self.con, first, launcher=lambda root, rid: None)["run"]
-        edge = self.con.execute(
-            "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
-            (dependent,)).fetchone()
+        edge = self.one("SELECT depends_on_run FROM dispatch_dependencies "
+                        "WHERE run_id=?", dependent)
         self.assertEqual(edge["depends_on_run"], retry_id)
         self.assertEqual([note["action"] for note in observer.observations(
             self.con, first, layer="retry")], ["deferred", "retry"])
@@ -685,14 +662,7 @@ class RetryTests(ObserverCase):
     def test_blocked_retry_chases_the_winners_current_owner(self) -> None:
         failed = self.make_run(status="failed", work_item="W-RACE")
         self._brief(failed)
-        dependent = self.make_run(status="pending")
-        self.con.execute(
-            "INSERT INTO dispatch_dependencies(run_id, depends_on_run) VALUES(?,?)",
-            (dependent, failed))
-        self.con.execute(
-            "INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
-            "created_at) VALUES(?, 'follow the final owner', 0, ?)",
-            (dependent, db.now()))
+        dependent = self._add_waiter(failed, "follow the final owner")
         self.assertTrue(observer.defer_retry(self.con, failed))
         self.con.commit()
         winner = self.make_run(status="failed", work_item="W-RACE")
@@ -734,7 +704,6 @@ class RetryTests(ObserverCase):
         self.assertEqual(decision["action"], "superseded")
         self.assertEqual(json.loads(decision["detail"])["winning_run"], current)
 
-
     def test_a_retry_re_homes_when_the_failed_runs_worktree_is_gone(self) -> None:
         """Live failure (run 28): the automatic retry of run 27 copied the
         failed run's workdir and branch into the new row with no existence
@@ -770,8 +739,7 @@ class RetryTests(ObserverCase):
         result = observer.after_terminal(
             self.con, run_id, launcher=lambda root, rid: launched.append((root, rid)))
         self.assertEqual(result["action"], "retry")
-        retry = self.con.execute("SELECT * FROM runs WHERE id=?",
-                                 (result["run"],)).fetchone()
+        retry = self.one("SELECT * FROM runs WHERE id=?", result["run"])
         self.assertNotEqual(retry["workdir"], str(released))
         self.assertTrue(Path(retry["workdir"]).exists(),
                         "a retry must have somewhere to stand")
@@ -785,10 +753,9 @@ class RetryTests(ObserverCase):
         self._brief(run_id)
         retry_id = observer.after_terminal(
             self.con, run_id, launcher=lambda root, rid: None)["run"]
-        retry = self.con.execute("SELECT workdir, branch FROM runs WHERE id=?",
-                                 (retry_id,)).fetchone()
-        self.assertEqual(retry["workdir"], str(self.tmp_path))
-        self.assertEqual(retry["branch"], "orchestra/run-1")
+        retry = self.one("SELECT workdir, branch FROM runs WHERE id=?", retry_id)
+        self.assertEqual((retry["workdir"], retry["branch"]),
+                         (str(self.tmp_path), "orchestra/run-1"))
 
 
 class PlannerSeamTests(ObserverCase):
@@ -799,9 +766,7 @@ class PlannerSeamTests(ObserverCase):
         self.assertEqual(result["action"], "deferred")
         recorded = observer.observations(self.con, run_id, layer="planner")
         self.assertEqual(len(recorded), 1)
-        body = self.con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='escalation'",
-            (run_id,)).fetchone()["body"]
+        body = self.escalation_body(run_id)
         self.assertIn("never assert anything", body)
         self.assertIn("judgment failure", body)
 
@@ -903,15 +868,11 @@ class WatcherCadenceTests(ObserverCase):
 
     def test_a_configured_observer_reports_its_cadence(self) -> None:
         state = observer.status(self.cfg())
-        self.assertTrue(state["enabled"])
-        self.assertEqual(state["profile"], "cheap")
-        self.assertEqual(state["first_look"], observer.FIRST_LOOK)
+        self.assertEqual((state["enabled"], state["profile"], state["first_look"]),
+                         (True, "cheap", observer.FIRST_LOOK))
         self.assertIn("cheap", "\n".join(observer.status_report(self.cfg())))
-
-    def test_the_first_look_stays_configurable(self) -> None:
-        self.config_path.write_text(CONFIG.replace(
-            "[settings]\ntimeout = 60",
-            "[settings]\ntimeout = 60\nobserver_first_look = 45"))
+        # ...and the first look stays configurable.
+        self.config_path.write_text(with_settings("observer_first_look = 45"))
         self.assertEqual(observer.first_look(self.cfg()), 45)
 
 

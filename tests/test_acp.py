@@ -42,27 +42,28 @@ backend = "reasonix"
 class AcpUnitTest(unittest.TestCase):
     """The parts with no process and no database in them."""
 
-    def test_absent_transport_is_exec(self) -> None:
-        self.assertEqual(acp.transport_for({"backend": "reasonix"}), "exec")
-        self.assertEqual(acp.transport_for({"backend": "claude"}), "exec")
-        self.assertEqual(acp.transport_for({"backend": "codex",
-                                            "transport": "exec"}), "exec")
-
-    def test_opt_in_is_case_insensitive(self) -> None:
-        self.assertEqual(acp.transport_for({"backend": "opencode",
-                                            "transport": " ACP "}), "acp")
-
-    def test_acp_on_a_backend_without_it_is_a_configuration_error(self) -> None:
-        """Never a silent downgrade: an unreasonable-about run is exactly what
-        the no-fallback rule exists to prevent."""
+    def test_transport_selection(self) -> None:
+        """Absent means exec, opt-in is case-insensitive, and ACP on a backend
+        without it is a configuration error — never a silent downgrade: an
+        unreasonable-about run is exactly what the no-fallback rule exists to
+        prevent. Unknown transports are rejected too."""
+        accepted = {
+            "absent is exec": ({"backend": "reasonix"}, "exec"),
+            "absent is exec for claude": ({"backend": "claude"}, "exec"),
+            "explicit exec": ({"backend": "codex", "transport": "exec"}, "exec"),
+            "opt-in survives case and space": (
+                {"backend": "opencode", "transport": " ACP "}, "acp"),
+        }
+        for label, (profile, expected) in accepted.items():
+            with self.subTest(label):
+                self.assertEqual(acp.transport_for(profile), expected)
         for backend in ("claude", "codex"):
-            with self.assertRaises(SystemExit) as caught:
+            with self.subTest(f"no ACP mode on {backend}"), \
+                    self.assertRaises(SystemExit) as caught:
                 acp.transport_for({"backend": backend, "transport": "acp",
                                    "name": "p"})
             self.assertIn("no ACP mode", str(caught.exception))
-
-    def test_unknown_transport_is_rejected(self) -> None:
-        with self.assertRaises(SystemExit):
+        with self.subTest("unknown transport"), self.assertRaises(SystemExit):
             acp.transport_for({"backend": "reasonix", "transport": "grpc"})
 
     def test_command_per_backend(self) -> None:
@@ -122,64 +123,70 @@ class AcpTraceParsingTest(unittest.TestCase):
         # self-describing, so parsing must not depend on the run row.
         return traces.parse_line("claude", line)
 
-    def test_streamed_messages(self) -> None:
-        events = self.parse('{"jsonrpc":"2.0","method":"session/update","params":'
-                            '{"update":{"sessionUpdate":"agent_message_chunk",'
-                            '"content":{"type":"text","text":"hello"}}}}')
-        # merge=True: ACP streams chunks, so they coalesce into one row.
-        self.assertEqual(events, [{"kind": "assistant_text", "name": None,
-                                   "payload": "hello", "ts": None,
-                                   "merge": True}])
-
-    def test_thoughts_and_plans_are_reasoning(self) -> None:
-        thought = self.parse('{"jsonrpc":"2.0","method":"session/update","params":'
-                             '{"update":{"sessionUpdate":"agent_thought_chunk",'
-                             '"content":{"type":"text","text":"hmm"}}}}')
-        self.assertEqual(thought[0]["kind"], "reasoning")
-        plan = self.parse('{"jsonrpc":"2.0","method":"session/update","params":'
-                          '{"update":{"sessionUpdate":"plan","entries":'
-                          '[{"content":"step one","status":"pending"}]}}}')
-        self.assertEqual(plan[0]["kind"], "reasoning")
-        self.assertEqual(plan[0]["name"], "plan")
-        self.assertIn("step one", plan[0]["payload"])
-
-    def test_tool_activity(self) -> None:
-        call = self.parse('{"jsonrpc":"2.0","method":"session/update","params":'
-                          '{"update":{"sessionUpdate":"tool_call","title":"read x",'
-                          '"status":"pending","rawInput":{"path":"x"}}}}')
-        self.assertEqual((call[0]["kind"], call[0]["name"]), ("tool_call", "read x"))
-        self.assertIn("path", call[0]["payload"])
-        done = self.parse('{"jsonrpc":"2.0","method":"session/update","params":'
-                          '{"update":{"sessionUpdate":"tool_call_update",'
-                          '"title":"read x","status":"completed",'
-                          '"content":[{"type":"text","text":"file body"}]}}}')
-        self.assertEqual((done[0]["kind"], done[0]["payload"]),
-                         ("tool_result", "file body"))
-
-    def test_permission_request(self) -> None:
-        events = self.parse('{"jsonrpc":"2.0","id":7,"method":'
-                            '"session/request_permission","params":{"toolCall":'
-                            '{"title":"write x","kind":"edit"},"options":[]}}')
-        self.assertEqual((events[0]["kind"], events[0]["name"]),
-                         ("permission_request", "write x"))
-
-    def test_what_orchestra_sends_in_is_a_human_injection(self) -> None:
-        for method in ("session/prompt", "_reasonix.io/session/steer"):
-            events = self.parse('{"jsonrpc":"2.0","_dir":"out","id":3,"method":"'
-                                + method + '","params":{"prompt":'
-                                '[{"type":"text","text":"do the thing"}]}}')
-            self.assertEqual((events[0]["kind"], events[0]["payload"]),
-                             ("human_injection", "do the thing"))
-
-    def test_responses_and_errors_are_lifecycle(self) -> None:
-        stop = self.parse('{"jsonrpc":"2.0","id":3,"_method":"session/prompt",'
-                          '"result":{"stopReason":"end_turn"}}')
-        self.assertEqual((stop[0]["kind"], stop[0]["name"]),
-                         ("lifecycle", "stop:end_turn"))
-        bad = self.parse('{"jsonrpc":"2.0","id":3,"_method":"session/new",'
-                         '"error":{"code":-32603,"message":"boom"}}')
-        self.assertEqual((bad[0]["kind"], bad[0]["name"]),
-                         ("lifecycle", "session/new error"))
+    def test_acp_frames_map_onto_the_exec_kinds(self) -> None:
+        """Streamed chunks merge (ACP streams, so they coalesce into one row);
+        thoughts and plans are reasoning; tool activity keeps its title and
+        result; what Orchestra sends in — prompt or Reasonix steer — is a
+        human injection; stops and errors are lifecycle. Each case is
+        (frame, expected event fields, payload substring or None)."""
+        cases = {
+            "streamed message": (
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"update":{"sessionUpdate":"agent_message_chunk",'
+                '"content":{"type":"text","text":"hello"}}}}',
+                {"kind": "assistant_text", "name": None, "payload": "hello",
+                 "ts": None, "merge": True}, None),
+            "thought": (
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"update":{"sessionUpdate":"agent_thought_chunk",'
+                '"content":{"type":"text","text":"hmm"}}}}',
+                {"kind": "reasoning"}, None),
+            "plan": (
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"update":{"sessionUpdate":"plan","entries":'
+                '[{"content":"step one","status":"pending"}]}}}',
+                {"kind": "reasoning", "name": "plan"}, "step one"),
+            "tool call": (
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"update":{"sessionUpdate":"tool_call","title":"read x",'
+                '"status":"pending","rawInput":{"path":"x"}}}}',
+                {"kind": "tool_call", "name": "read x"}, "path"),
+            "tool result": (
+                '{"jsonrpc":"2.0","method":"session/update","params":'
+                '{"update":{"sessionUpdate":"tool_call_update",'
+                '"title":"read x","status":"completed",'
+                '"content":[{"type":"text","text":"file body"}]}}}',
+                {"kind": "tool_result", "payload": "file body"}, None),
+            "permission request": (
+                '{"jsonrpc":"2.0","id":7,"method":'
+                '"session/request_permission","params":{"toolCall":'
+                '{"title":"write x","kind":"edit"},"options":[]}}',
+                {"kind": "permission_request", "name": "write x"}, None),
+            "outbound prompt": (
+                '{"jsonrpc":"2.0","_dir":"out","id":3,"method":'
+                '"session/prompt","params":{"prompt":'
+                '[{"type":"text","text":"do the thing"}]}}',
+                {"kind": "human_injection", "payload": "do the thing"}, None),
+            "outbound steer": (
+                '{"jsonrpc":"2.0","_dir":"out","id":3,"method":'
+                '"_reasonix.io/session/steer","params":{"prompt":'
+                '[{"type":"text","text":"do the thing"}]}}',
+                {"kind": "human_injection", "payload": "do the thing"}, None),
+            "stop response": (
+                '{"jsonrpc":"2.0","id":3,"_method":"session/prompt",'
+                '"result":{"stopReason":"end_turn"}}',
+                {"kind": "lifecycle", "name": "stop:end_turn"}, None),
+            "error response": (
+                '{"jsonrpc":"2.0","id":3,"_method":"session/new",'
+                '"error":{"code":-32603,"message":"boom"}}',
+                {"kind": "lifecycle", "name": "session/new error"}, None),
+        }
+        for label, (line, expected, contains) in cases.items():
+            with self.subTest(label):
+                event = self.parse(line)[0]
+                self.assertEqual({k: event[k] for k in expected}, expected)
+                if contains is not None:
+                    self.assertIn(contains, event["payload"])
 
     def test_every_kind_is_one_of_the_existing_seven(self) -> None:
         lines = [
@@ -222,20 +229,19 @@ class AcpDeliveryStateTest(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def test_acp_message_carries_no_boundary_offset(self) -> None:
+    def test_acp_skips_the_boundary_exec_still_pends_on_one(self) -> None:
         messaging.queue_tell(self.con, 1, "human", "use tabs", None, boundary=False)
         row = self.con.execute("SELECT delivery_offset FROM messages").fetchone()
         self.assertIsNone(row["delivery_offset"])
         badge = traces.run_messages(self.con, 1)[0]
-        self.assertFalse(badge["pending_boundary"])
-        self.assertEqual(badge["state"], "queued")
+        self.assertEqual((badge["pending_boundary"], badge["state"]),
+                         (False, "queued"))
         # The exec boundary machinery must not see it either.
         self.assertIsNone(supervise._pending_delivery_offset(self.con, 1))
 
-    def test_exec_message_still_pends_on_a_boundary(self) -> None:
         messaging.queue_tell(self.con, 1, "human", "use tabs", None)
-        badge = traces.run_messages(self.con, 1)[0]
-        self.assertTrue(badge["pending_boundary"])
+        exec_badge = traces.run_messages(self.con, 1)[1]
+        self.assertTrue(exec_badge["pending_boundary"])
         self.assertEqual(supervise._pending_delivery_offset(self.con, 1), 0)
 
 
@@ -330,7 +336,14 @@ class AcpEndToEndTest(unittest.TestCase):
         return rows
 
     # -- proofs
-    def test_handshake_and_session_creation(self) -> None:
+    def test_handshake_events_and_permission_over_one_session(self) -> None:
+        """One run proves the happy path end to end: handshake, session
+        creation, and events landing in the normalized table with exec
+        shapes. The permission knob is on because DESIGN §6 says the ask is
+        a protocol message Orchestra answers, not a TTY prompt nobody is
+        watching — the stub's turn does not finish until the answer arrives,
+        so completing at all proves it."""
+        os.environ["STUB_ACP_PERMISSION"] = "1"
         run_id = self._dispatch()
         rc, run = self._run(run_id)
         self.assertEqual(rc, 0)
@@ -341,26 +354,21 @@ class AcpEndToEndTest(unittest.TestCase):
         # really did go through prepare_launch and not some ACP-only path.
         self.assertIn("stub acp turn complete", run["summary"])
         self.assertIn("acpstub", run["summary"])
-        names = [e["name"] for e in self._events(run_id)]
+
+        events = self._events(run_id)
+        names = [e["name"] for e in events]
         self.assertIn("initialize", names)
         self.assertIn("session/new", names)
         self.assertIn("stop:end_turn", names)
-
-    def test_opencode_uses_the_same_transport(self) -> None:
-        run_id = self._dispatch(profile="acpoc")
-        _, run = self._run(run_id)
-        self.assertEqual(run["status"], "done")
-        self.assertEqual(run["session_ref"], "stub-acp-session-1")
-
-    def test_events_land_in_the_normalized_table_with_exec_shapes(self) -> None:
-        run_id = self._dispatch()
-        self._run(run_id)
-        events = self._events(run_id)
         kinds = {e["kind"] for e in events}
         self.assertLessEqual(kinds, set(traces.KINDS))
         for expected in ("assistant_text", "reasoning", "tool_call", "tool_result",
                          "human_injection", "lifecycle"):
             self.assertIn(expected, kinds)
+        asks = [e for e in events if e["kind"] == "permission_request"]
+        self.assertEqual(len(asks), 1)
+        self.assertEqual(asks[0]["name"], "write to README.md")
+        self.assertIn("allow_once", asks[0]["payload"])
         # Every event points back at a real byte range in the raw log, so the
         # dashboard's expand-in-place works exactly as it does for exec.
         con = db.connect()
@@ -374,19 +382,34 @@ class AcpEndToEndTest(unittest.TestCase):
             cursor["byte_offset"],
             (self.tmp_path / "home" / "logs" / f"run-{run_id}.jsonl").stat().st_size)
 
-    def test_a_permission_request_surfaces(self) -> None:
-        """DESIGN §6: over ACP the ask is a protocol message Orchestra answers,
-        not a TTY prompt nobody is watching. The stub's turn does not finish
-        until the answer arrives, so completing at all proves it."""
-        os.environ["STUB_ACP_PERMISSION"] = "1"
-        run_id = self._dispatch()
-        _, run = self._run(run_id)
+    def test_opencode_uses_the_same_transport_and_delivers_at_turn_end(self) -> None:
+        """OpenCode rides the same transport, but has no steer, so its
+        message goes as the next prompt on the SAME session — still no kill,
+        no re-exec, no boundary badge."""
+        os.environ["STUB_ACP_TURN"] = "3"
+        run_id = self._dispatch(profile="acpoc")
+        thread = threading.Thread(target=supervise.supervise,
+                                  args=(self.root, run_id))
+        thread.start()
+        try:
+            self.assertTrue(self._wait_for_session(run_id), "session never opened")
+            os.environ["STUB_ACP_TURN"] = "0.2"
+            cli.cmd_interrupt(Namespace(run_id=run_id, message=["use", "tabs"],
+                                        message_file=None, now=False))
+        finally:
+            thread.join(timeout=60)
+        run = self._row(run_id)
         self.assertEqual(run["status"], "done")
-        asks = [e for e in self._events(run_id)
-                if e["kind"] == "permission_request"]
-        self.assertEqual(len(asks), 1)
-        self.assertEqual(asks[0]["name"], "write to README.md")
-        self.assertIn("allow_once", asks[0]["payload"])
+        self.assertEqual(run["session_ref"], "stub-acp-session-1")
+        self.assertIn("use tabs", run["summary"])
+        self.assertNotIn("steered mid-turn", run["summary"])   # no steer here
+        self.assertEqual(self._sent(run_id, "session/new"), 1)
+        self.assertEqual(self._sent(run_id, "session/prompt"), 2)
+        con = db.connect()
+        badge = traces.run_messages(con, run_id)[0]
+        con.close()
+        self.assertFalse(badge["pending_boundary"])
+        self.assertIsNotNone(badge["delivered_at"])
 
     def test_steer_delivers_a_message_mid_turn(self) -> None:
         """The whole point of ACP for Reasonix: the message lands while the
@@ -419,33 +442,6 @@ class AcpEndToEndTest(unittest.TestCase):
                  if (e["name"] or "").startswith("stop:")]
         self.assertEqual(stops, ["stop:end_turn"])
 
-    def test_opencode_delivers_at_the_end_of_the_live_turn(self) -> None:
-        """OpenCode has no steer, so its message goes as the next prompt on
-        the SAME session — still no kill, no re-exec, no boundary badge."""
-        os.environ["STUB_ACP_TURN"] = "3"
-        run_id = self._dispatch(profile="acpoc")
-        thread = threading.Thread(target=supervise.supervise,
-                                  args=(self.root, run_id))
-        thread.start()
-        try:
-            self.assertTrue(self._wait_for_session(run_id), "session never opened")
-            os.environ["STUB_ACP_TURN"] = "0.2"
-            cli.cmd_interrupt(Namespace(run_id=run_id, message=["use", "tabs"],
-                                        message_file=None, now=False))
-        finally:
-            thread.join(timeout=60)
-        run = self._row(run_id)
-        self.assertEqual(run["status"], "done")
-        self.assertIn("use tabs", run["summary"])
-        self.assertNotIn("steered mid-turn", run["summary"])   # no steer here
-        self.assertEqual(self._sent(run_id, "session/new"), 1)
-        self.assertEqual(self._sent(run_id, "session/prompt"), 2)
-        con = db.connect()
-        badge = traces.run_messages(con, run_id)[0]
-        con.close()
-        self.assertFalse(badge["pending_boundary"])
-        self.assertIsNotNone(badge["delivered_at"])
-
     def test_cancel_leaves_a_resumable_session(self) -> None:
         """`--now` over ACP is session/cancel, not a kill: the same session id
         takes the next prompt, so Reasonix's prefix cache survives."""
@@ -473,30 +469,28 @@ class AcpEndToEndTest(unittest.TestCase):
         self.assertEqual(self._sent(run_id, "session/new"), 1)   # one session
         self.assertEqual(self._sent(run_id, "initialize"), 1)    # one peer
 
-    def test_a_peer_that_will_not_start_fails_the_run_with_a_reason(self) -> None:
-        os.environ["STUB_ACP_DIE"] = "start"
-        run_id = self._dispatch()
-        rc, run = self._run(run_id)
-        self.assertEqual(rc, 1)
-        self.assertEqual(run["status"], "failed")
-        self.assertIn("ACP handshake failed", run["summary"])
-
-    def test_a_peer_that_dies_mid_turn_fails_the_run_with_a_reason(self) -> None:
-        """Never a silent fallback to exec: the run ends, and says why."""
-        os.environ["STUB_ACP_DIE"] = "turn"
-        run_id = self._dispatch()
-        rc, run = self._run(run_id)
-        self.assertEqual(rc, 1)
-        self.assertEqual(run["status"], "failed")
-        self.assertIn("ACP transport failed", run["summary"])
-        self.assertIn("peer", run["summary"])
-
-    def test_a_protocol_version_mismatch_fails_the_handshake(self) -> None:
-        os.environ["STUB_ACP_BAD_VERSION"] = "1"
-        run_id = self._dispatch()
-        _, run = self._run(run_id)
-        self.assertEqual(run["status"], "failed")
-        self.assertIn("protocolVersion", run["summary"])
+    def test_a_dead_peer_fails_the_run_with_a_reason(self) -> None:
+        """Never a silent fallback to exec: whether the peer refuses to
+        start, dies mid-turn, or speaks the wrong protocolVersion, the run
+        ends failed and says why. One fresh run per case."""
+        cases = {
+            "will not start": (
+                {"STUB_ACP_DIE": "start"}, ("ACP handshake failed",)),
+            "dies mid-turn": (
+                {"STUB_ACP_DIE": "turn"}, ("ACP transport failed", "peer")),
+            "protocol version mismatch": (
+                {"STUB_ACP_BAD_VERSION": "1"}, ("protocolVersion",)),
+        }
+        for label, (knobs, reasons) in cases.items():
+            with self.subTest(label):
+                os.environ.update({"STUB_ACP_DIE": "", "STUB_ACP_BAD_VERSION": "0"})
+                os.environ.update(knobs)
+                run_id = self._dispatch()
+                rc, run = self._run(run_id)
+                self.assertEqual(rc, 1)
+                self.assertEqual(run["status"], "failed")
+                for reason in reasons:
+                    self.assertIn(reason, run["summary"])
 
     def test_an_undelivered_message_is_still_marked_undeliverable(self) -> None:
         """DESIGN §6 holds for ACP too: marked and surfaced, never dropped."""

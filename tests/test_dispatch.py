@@ -1,7 +1,7 @@
 """Dispatch policy (DESIGN §4, W-0164): no caps, order, honest queue state,
 the pause switch.
 
-The headline is a negative and it gets a test of its own: fifteen delegated
+The headline is a negative and it opens its own test: fifteen delegated
 items in one project dispatch in ONE pass, with no cap and no stagger. The
 rest cover what only matters for items that must wait.
 """
@@ -17,7 +17,10 @@ from tests.test_sweeper import PROJECT_ID, SweeperFixture
 
 
 class NoCapsTests(SweeperFixture, unittest.TestCase):
-    def test_fifteen_items_in_one_project_dispatch_in_a_single_pass(self) -> None:
+    def test_fifteen_items_dispatch_in_one_pass_and_live_runs_never_gate(self) -> None:
+        """Fifteen delegated items in ONE pass, no cap, no stagger; then a
+        second pass adds more runs beside the live ones -- no global ceiling,
+        live runs never gate the next dispatch."""
         for n in range(15):
             self.work.add_task(f"W-{n:04d}", f"job {n}", delegated=True)
         actions = self.sweep()
@@ -34,17 +37,12 @@ class NoCapsTests(SweeperFixture, unittest.TestCase):
         self.assertEqual(
             {t["status"] for t in self.work.tasks.values()}, {"in_progress"})
 
-    def test_a_second_pass_adds_more_runs_beside_the_live_ones(self) -> None:
-        # No global ceiling: live runs never gate the next dispatch.
-        for n in range(10):
-            self.work.add_task(f"W-{n:04d}", f"job {n}", delegated=True)
-        self.sweep()
-        for n in range(10, 15):
+        for n in range(15, 20):
             self.work.add_task(f"W-{n:04d}", f"job {n}", delegated=True)
         actions = self.sweep()
         self.assertEqual([a["action"] for a in actions], ["dispatch"] * 5)
         con = db.connect()
-        self.assertEqual(dispatch.live_runs(con), 15)
+        self.assertEqual(dispatch.live_runs(con), 20)
         con.close()
 
 
@@ -55,40 +53,37 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
         con.close()
         return rows
 
-    def test_dependency_blocked_item_waits_with_its_reason(self) -> None:
+    def test_dependency_holds_are_honest_logged_once_and_settle(self) -> None:
+        """depends_on and blocked_by both hold with the blocker as the
+        detail; holding is logged once, not once per pass; a settled
+        dependency releases the item and its queue row clears at dispatch."""
         self.work.add_task("W-0001", "the prerequisite", status="in_progress")
         self.work.add_task("W-0002", "the dependent", delegated=True,
                            depends_on=["W-0001"])
+        self.work.add_task("W-0003", "blocker", status="review")
+        self.work.add_task("W-0004", "blocked", delegated=True,
+                           blocked_by=["W-0003"])
         actions = self.sweep()
-        self.assertEqual([a["action"] for a in actions], ["hold"])
-        self.assertEqual(actions[0]["reason"], "dependency")
-        self.assertEqual(actions[0]["detail"], "W-0001")
-        # Honest queue state: it waits, so it is NOT in_progress and has no run.
+        self.assertEqual(
+            [(a["action"], a["reason"], a["detail"]) for a in actions],
+            [("hold", "dependency", "W-0001"),
+             ("hold", "dependency", "W-0003")])
+        # Honest queue state: they wait, so NOT in_progress and no runs.
         self.assertEqual(self.work.tasks["W-0002"]["status"], "ready")
         self.assertIsNone(self.db_run())
         self.assertEqual(self.launched, [])
-        row = self.waiting()[0]
-        self.assertEqual((row["item_id"], row["reason"], row["detail"]),
-                         ("W-0002", "dependency", "W-0001"))
-
-    def test_blocked_by_counts_as_a_dependency_too(self) -> None:
-        self.work.add_task("W-0001", "blocker", status="review")
-        self.work.add_task("W-0002", "blocked", delegated=True,
-                           blocked_by=["W-0001"])
-        self.sweep()
-        self.assertEqual(self.waiting()[0]["detail"], "W-0001")
-        self.assertIsNone(self.db_run())
-
-    def test_a_settled_dependency_releases_the_item(self) -> None:
-        self.work.add_task("W-0001", "the prerequisite", status="in_progress")
-        self.work.add_task("W-0002", "the dependent", delegated=True,
-                           depends_on=["W-0001"])
-        self.sweep()
+        self.assertEqual(
+            [(r["item_id"], r["reason"], r["detail"]) for r in self.waiting()],
+            [("W-0002", "dependency", "W-0001"),
+             ("W-0004", "dependency", "W-0003")])
+        self.assertEqual(self.sweep(), [])  # logged once, not once per pass
+        self.assertEqual(len(self.waiting()), 2)
         self.work.human_move("W-0001", "done")
         actions = self.sweep()
         self.assertEqual([a["action"] for a in actions], ["dispatch"])
         self.assertEqual(self.db_run()["work_item"], "W-0002")
-        self.assertEqual(self.waiting(), [])  # queue row cleared at dispatch
+        # W-0002's queue row cleared at dispatch; the other still waits.
+        self.assertEqual([r["item_id"] for r in self.waiting()], ["W-0004"])
 
     def test_an_open_issue_dependency_holds_until_the_issue_closes(self) -> None:
         # Work's semantics: an issue in dependsOn is settled only when its
@@ -109,15 +104,7 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
         self.assertEqual(self.db_run()["work_item"], "W-0001")
         self.assertEqual(self.waiting(), [])  # queue row cleared at dispatch
 
-    def test_holding_is_logged_once_not_once_per_pass(self) -> None:
-        self.work.add_task("W-0001", "the prerequisite", status="in_progress")
-        self.work.add_task("W-0002", "the dependent", delegated=True,
-                           depends_on=["W-0001"])
-        self.assertEqual(len(self.sweep()), 1)
-        self.assertEqual(self.sweep(), [])
-        self.assertEqual(len(self.waiting()), 1)
-
-    def test_ready_lane_board_order_decides_who_goes_first(self) -> None:
+    def test_board_order_decides_and_dependencies_outrank_it(self) -> None:
         # Work has no priority field: the lane's order is the whole signal.
         con = db.connect()
         dispatch.pause(con, "hold everything")
@@ -136,18 +123,36 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
         self.assertEqual([a["item"] for a in actions],
                          ["W-0003", "W-0001", "W-0002"])
 
-    def test_dependencies_outrank_board_order(self) -> None:
-        self.work.add_task("W-0001", "prerequisite", status="in_progress")
-        self.work.add_task("W-0002", "blocked, but first on the board",
-                           delegated=True, depends_on=["W-0001"])
-        self.work.add_task("W-0003", "ready, second on the board", delegated=True)
+        self.work.add_task("W-0004", "prerequisite", status="in_progress")
+        self.work.add_task("W-0005", "blocked, but first on the board",
+                           delegated=True, depends_on=["W-0004"])
+        self.work.add_task("W-0006", "ready, second on the board", delegated=True)
         actions = self.sweep()
         # The ready one goes; the blocked one waits despite being higher.
         self.assertEqual([(a["action"], a["item"]) for a in actions],
-                         [("dispatch", "W-0003"), ("hold", "W-0002")])
+                         [("dispatch", "W-0006"), ("hold", "W-0005")])
 
 
 class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
+    def insert_run(self, con, run_id: int, status: str, *, depends_on=None,
+                   mission=None, use_worktree=0, **cols) -> None:
+        """Seed a run row directly, plus its dependency edge and deferred
+        dispatch when given."""
+        cols = {"profile": "stub", "backend": "opencode",
+                "requested_by": "human", "workdir": str(self.root),
+                "status": status, "started_at": db.now(), **cols}
+        con.execute(
+            f"INSERT INTO runs(id, {', '.join(cols)}) "
+            f"VALUES(?, {', '.join('?' * len(cols))})",
+            (run_id, *cols.values()))
+        if depends_on is not None:
+            con.execute("INSERT INTO dispatch_dependencies(run_id, "
+                        "depends_on_run) VALUES(?, ?)", (run_id, depends_on))
+        if mission is not None:
+            con.execute("INSERT INTO deferred_dispatches(run_id, mission, "
+                        "use_worktree, created_at) VALUES(?, ?, ?, ?)",
+                        (run_id, mission, use_worktree, db.now()))
+
     def restart(self) -> bool:
         """A daemon restart holds nothing in memory, so the switch has to
         come back out of the database on a fresh connection."""
@@ -157,20 +162,30 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
         finally:
             con.close()
 
-    def test_pause_persists_across_a_restart_and_blocks_new_dispatch(self) -> None:
+    def test_pause_survives_restart_blocks_dispatch_and_resume_releases(self) -> None:
         con = db.connect()
         dispatch.pause(con, "provider is flaky")
         con.close()
         self.assertTrue(self.restart())
         self.work.add_task("W-0001", "would have run", delegated=True)
         actions = self.sweep()
-        self.assertEqual([(a["action"], a["reason"]) for a in actions],
-                         [("hold", "paused")])
-        self.assertEqual(actions[0]["detail"], "provider is flaky")
+        self.assertEqual(
+            [(a["action"], a["reason"], a["detail"]) for a in actions],
+            [("hold", "paused", "provider is flaky")])
         # Not started, and not claiming to be started.
         self.assertIsNone(self.db_run())
         self.assertEqual(self.work.tasks["W-0001"]["status"], "ready")
         self.assertEqual(self.launched, [])
+
+        con = db.connect()
+        self.assertIsNotNone(dispatch.resume(con))
+        # A second resume on an unpaused switch is a no-op.
+        self.assertIsNone(dispatch.resume(con))
+        self.assertFalse(dispatch.paused(con))
+        con.close()
+        actions = self.sweep()
+        self.assertEqual([a["action"] for a in actions], ["dispatch"])
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
 
     def test_pause_leaves_in_flight_runs_completely_alone(self) -> None:
         self.work.add_task("W-0001", "already running", delegated=True)
@@ -190,26 +205,6 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
                         session_ref="sess-1")
         self.work.human_log("W-0001", "one more thing")
         self.assertEqual([a["action"] for a in self.sweep()], ["ferry"])
-
-    def test_resume_lets_the_held_item_go(self) -> None:
-        con = db.connect()
-        dispatch.pause(con)
-        con.close()
-        self.work.add_task("W-0001", "held", delegated=True)
-        self.sweep()
-        con = db.connect()
-        was = dispatch.resume(con)
-        con.close()
-        self.assertIsNotNone(was)
-        actions = self.sweep()
-        self.assertEqual([a["action"] for a in actions], ["dispatch"])
-        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
-
-    def test_resume_when_not_paused_is_a_no_op(self) -> None:
-        con = db.connect()
-        self.assertIsNone(dispatch.resume(con))
-        self.assertFalse(dispatch.paused(con))
-        con.close()
 
     def test_manual_dispatch_refuses_while_paused(self) -> None:
         con = db.connect()
@@ -289,18 +284,10 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "seed"], cwd=self.root,
                        check=True)
         con = db.connect()
-        con.execute(
-            "INSERT INTO runs(id, profile, backend, title, requested_by, workdir, "
-            "project_id, status, started_at) VALUES(1,'stub','opencode','done one',"
-            "'human',?,?, 'done', ?)", (str(self.root), PROJECT_ID, db.now()))
-        con.execute(
-            "INSERT INTO runs(id, profile, backend, title, requested_by, workdir, "
-            "project_id, status, started_at) VALUES(2,'stub','opencode','waiting',"
-            "'human',?,?, 'pending', ?)", (str(self.root), PROJECT_ID, db.now()))
-        con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
-                    "VALUES(2, 1)")
-        con.execute("INSERT INTO deferred_dispatches(run_id, mission, use_worktree, "
-                    "created_at) VALUES(2, 'go', 1, ?)", (db.now(),))
+        self.insert_run(con, 1, "done", title="done one", project_id=PROJECT_ID)
+        self.insert_run(con, 2, "pending", title="waiting",
+                        project_id=PROJECT_ID, depends_on=1, mission="go",
+                        use_worktree=1)
         con.commit()
         con.close()
         launched: list[int] = []
@@ -343,18 +330,8 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
 
     def test_pause_still_settles_a_broken_dependency_chain(self) -> None:
         con = db.connect()
-        con.execute(
-            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
-            "status, started_at) VALUES(1,'stub','opencode','human',?,"
-            "'failed',?)", (str(self.root), db.now()))
-        con.execute(
-            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
-            "status, started_at) VALUES(2,'stub','opencode','human',?,"
-            "'pending',?)", (str(self.root), db.now()))
-        con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
-                    "VALUES(2, 1)")
-        con.execute("INSERT INTO deferred_dispatches(run_id, mission, created_at) "
-                    "VALUES(2, 'go', ?)", (db.now(),))
+        self.insert_run(con, 1, "failed")
+        self.insert_run(con, 2, "pending", depends_on=1, mission="go")
         con.commit()
         dispatch.pause(con, "no new work")
         launched = []
@@ -365,18 +342,9 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
             con.execute("SELECT status FROM runs WHERE id=2").fetchone()["status"],
             "failed")
 
-        con.execute(
-            "INSERT INTO runs(id, profile, backend, requested_by, workdir, branch, "
-            "status, started_at) VALUES(3,'stub','opencode','human',?,"
-            "'orchestra/run-3','done',?)", (str(self.root), db.now()))
-        con.execute(
-            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
-            "status, started_at) VALUES(4,'stub','opencode','human',?,"
-            "'pending',?)", (str(self.root), db.now()))
-        con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
-                    "VALUES(4, 3)")
-        con.execute("INSERT INTO deferred_dispatches(run_id, mission, created_at) "
-                    "VALUES(4, 'wait for landing', ?)", (db.now(),))
+        self.insert_run(con, 3, "done", branch="orchestra/run-3")
+        self.insert_run(con, 4, "pending", depends_on=3,
+                        mission="wait for landing")
         con.commit()
         self.assertEqual(supervise.process_ready(
             con, lambda root, rid: launched.append(rid)), [],
