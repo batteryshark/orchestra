@@ -57,24 +57,23 @@ class MergeTestCase(unittest.TestCase):
 
     # --- cases --------------------------------------------------------------
 
-    def _live_record_store(self) -> None:
-        """A repository that tracked a service's record store, then stopped.
-
-        This is the real shape of the recurring escalation: `.work/` held a
-        live Work database, git tracked it, and every run committed whatever
-        snapshot happened to be on disk.
-        """
+    def test_a_run_cannot_land_a_file_the_base_branch_stopped_tracking(self):
+        """The drop rule, in the real shape of the recurring escalation:
+        `.work/` held a live Work database, git tracked it, and every run
+        committed whatever snapshot happened to be on disk. Two runs branched
+        while it was still tracked — one edited the snapshot alongside real
+        work (as an agent with a file editor will when the file is sitting in
+        its worktree), one touched ONLY the snapshot. Then the base untracked
+        it while Work kept writing the real copy. Both runs still land; only
+        their stale snapshots are dropped."""
         (self.root / ".work").mkdir()
         self.write(".work/W-0171.md", "status: backlog\n")
         git(self.root, "add", "-A")
         git(self.root, "commit", "--quiet", "-m", "records, tracked by mistake")
-
-    def test_a_run_cannot_land_a_file_the_base_branch_stopped_tracking(self):
-        self._live_record_store()
-        # The run edited the record store, as an agent with a file editor will
-        # when the file is sitting in its worktree.
         self.run_branch({".work/W-0171.md": "status: done\n",
                          "docs.md": "the actual work\n"})
+        self.run_branch({".work/W-0171.md": "status: done\n"},
+                        branch="orchestra/run-2")
         # Meanwhile the base untracked it and Work kept writing the real copy.
         git(self.root, "rm", "-r", "--quiet", "--cached", ".work")
         self.write(".gitignore", ".work/\n")
@@ -82,31 +81,25 @@ class MergeTestCase(unittest.TestCase):
         git(self.root, "commit", "--quiet", "-m", "stop tracking .work")
         (self.root / ".work" / "W-0171.md").write_text("status: in_progress\n")
 
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+        with self.subTest("real work lands without the snapshot"):
+            result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+            # Before this rule the rebase conflicted here, every time, forever.
+            self.assertTrue(result["ok"], result)
+            self.assertEqual([".work/W-0171.md"], result["dropped"])
+            self.assertEqual(["docs.md"], result["files_changed"])
 
-        # Before this rule the rebase conflicted here, every time, forever.
-        self.assertTrue(result["ok"], result)
-        self.assertEqual([".work/W-0171.md"], result["dropped"])
-        self.assertEqual(["docs.md"], result["files_changed"])
-        # The service's own copy is untouched on disk; only the run's stale
-        # snapshot was dropped.
+        with self.subTest("a run that only touched untracked state still lands"):
+            result = merge.merge_run(self.root, "orchestra/run-2",
+                                     settings=self.settings)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual([".work/W-0171.md"], result["dropped"])
+            self.assertEqual([], result["files_changed"])
+
+        # The service's own copy is untouched on disk; only the runs' stale
+        # snapshots were dropped, and none reached the tree.
         self.assertEqual("status: in_progress\n",
                          (self.root / ".work" / "W-0171.md").read_text())
         self.assertNotIn(".work", git(self.root, "ls-tree", "-r", "--name-only", "main"))
-
-    def test_a_run_that_only_touched_untracked_state_still_lands(self):
-        self._live_record_store()
-        self.run_branch({".work/W-0171.md": "status: done\n"})
-        git(self.root, "rm", "-r", "--quiet", "--cached", ".work")
-        self.write(".gitignore", ".work/\n")
-        git(self.root, "add", ".gitignore")
-        git(self.root, "commit", "--quiet", "-m", "stop tracking .work")
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual([".work/W-0171.md"], result["dropped"])
-        self.assertEqual([], result["files_changed"])
 
     def test_a_legacy_branch_with_agent_commits_still_lands(self):
         """W-0259: history exists. Merge takes the agent's own commits too."""
@@ -125,12 +118,15 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual(["one.py", "two.py"], result["files_changed"])
 
     def test_a_real_source_conflict_still_reaches_the_human(self):
-        # The rule drops what the base says is not source. It must not soften
-        # a genuine conflict in code, which is a judgment nobody can automate.
+        """The drop rule drops what the base says is not source. It must not
+        soften a genuine conflict in code, which is a judgment nobody can
+        automate — and the conflicting rebase aborts cleanly: base unmoved,
+        branch kept, no scratch worktree, no half-rebased state left."""
         self.run_branch({"app.py": "print('from the run')\n"})
         self.write("app.py", "print('from the owner')\n")
         git(self.root, "add", "-A")
         git(self.root, "commit", "--quiet", "-m", "owner edit")
+        before = git(self.root, "rev-parse", "main")
 
         result = merge.merge_run(self.root, BRANCH, settings=self.settings)
 
@@ -138,35 +134,31 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual("rebase", result["stage"])
         self.assertEqual(["app.py"], result["conflicts"])
         self.assertEqual([], result["dropped"])
+        self.assertIsNone(result["commit"])
+        self.assertEqual(before, git(self.root, "rev-parse", "main"))
+        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
+        self.assertEqual(1, len(git(self.root, "worktree", "list").splitlines()))
+        self.assertEqual([], list(self.root.glob(".git/worktrees/*")))
+        self.assertFalse((self.root / ".git" / "rebase-merge").exists())
 
     def test_a_dirty_base_checkout_that_the_merge_does_not_touch_still_lands(self):
-        # THE recurrence (runs 60/61/62): a repo whose owner works in it is
-        # dirty nearly always, and refusing on that escalated every single
-        # run -- including the resolver dispatched to clear the escalation.
-        # Edits the merge does not rewrite are none of its business.
-        self.run_branch({"feature.py": "x = 1\n"})
-        self.write("app.py", "print('owner is editing this')\n")
+        """THE recurrence (runs 60/61/62): a repo whose owner works in it is
+        dirty nearly always, and refusing on that escalated every single run
+        — including the resolver dispatched to clear the escalation. Edits
+        the merge does not rewrite are none of its business.
 
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(["app.py"], result["dirty"])
-        # Their work is untouched: never committed, never stashed, never reverted.
-        self.assertEqual("print('owner is editing this')\n",
-                         (self.root / "app.py").read_text())
-        self.assertIn("M app.py", git(self.root, "status", "--porcelain"))
-        self.assertEqual("refreshed", result["refresh"]["status"])
-
-    def test_the_merge_commit_never_carries_the_owners_dirty_files(self):
-        """I-0012: a run merge published the owner's work in flight under the
-        run's message (bb3eb6f, 2026-08-14). The merge is built in a scratch
-        worktree, so the dirty file must appear in no commit it creates."""
+        And I-0012: a run merge once published the owner's work in flight
+        under the run's message (bb3eb6f, 2026-08-14). The merge is built in
+        a scratch worktree, so the dirty file must appear in no commit it
+        creates."""
         self.run_branch({"feature.py": "x = 1\n"})
         self.write("app.py", "print('half-finished, mine, not for main')\n")
 
         result = merge.merge_run(self.root, BRANCH, settings=self.settings)
 
         self.assertTrue(result["ok"], result)
+        self.assertEqual(["app.py"], result["dirty"])
+        self.assertEqual("refreshed", result["refresh"]["status"])
         merge_sha = git(self.root, "rev-parse", "HEAD")
         landed = git(self.root, "show", "--name-only", "--format=", merge_sha)
         self.assertNotIn("app.py", landed,
@@ -175,7 +167,8 @@ class MergeTestCase(unittest.TestCase):
         # the pickaxe is the assertion that would have caught bb3eb6f.
         self.assertEqual("", git(self.root, "log", "--all", "--oneline",
                                  "-S", "half-finished, mine, not for main"))
-        # Still theirs, still uncommitted, still exactly as they left it.
+        # Their work is untouched: never committed, never stashed, never
+        # reverted — still an unstaged local modification.
         self.assertIn("M app.py", git(self.root, "status", "--porcelain"))
         self.assertEqual("print('half-finished, mine, not for main')\n",
                          (self.root / "app.py").read_text())
@@ -204,19 +197,36 @@ class MergeTestCase(unittest.TestCase):
         self.assertIn("read-tree", result["note"])
         self.assertIn("app.py", result["note"])
 
-    def test_require_clean_restores_the_old_refusal(self):
-        # The escape hatch for anyone who wants the merge to wait.
+    def test_require_clean_gates_the_merge_but_never_the_owners_edit(self):
+        """require_clean = true restores the old refusal — the escape hatch
+        for anyone who wants the merge to wait on an overlapping edit. Turned
+        off, the merge lands and the refresh becomes the last line of
+        defence: it declines rather than overwriting the owner's edit, which
+        is why turning require_clean off is safe rather than reckless."""
         self.run_branch({"app.py": "x = 1\n"})
         self.write("app.py", "print('owner is editing this')\n")
-        self.config("[merge]\nrequire_clean = true\n")
         before = git(self.root, "rev-parse", "main")
 
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+        with self.subTest("require_clean = true refuses"):
+            self.config("[merge]\nrequire_clean = true\n")
+            result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+            self.assertFalse(result["ok"])
+            self.assertEqual("dirty", result["stage"])
+            self.assertEqual(before, git(self.root, "rev-parse", "main"))
+            self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
 
-        self.assertFalse(result["ok"])
-        self.assertEqual("dirty", result["stage"])
-        self.assertEqual(before, git(self.root, "rev-parse", "main"))
-        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
+        with self.subTest("turned off, the merge lands and the refresh refuses"):
+            self.config("[merge]\nrequire_clean = false\n")
+            result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+            self.assertTrue(result["ok"], result)
+            # The owner's edit is still theirs: never committed, never reverted.
+            self.assertEqual("print('owner is editing this')\n",
+                             (self.root / "app.py").read_text())
+            self.assertIn("app.py", git(self.root, "status", "--porcelain"))
+            self.assertEqual("refused", result["refresh"]["status"])
+            self.assertIn("read-tree -m -u", result["refresh"]["command"])
+            self.assertIn("read-tree -m -u", result["note"])
+            self.assertIn("overwritten", result["refresh"]["why"])
 
     def test_an_untracked_file_is_not_dirty_enough_to_refuse(self):
         # A build directory or a scratch note is not work in flight, and
@@ -230,30 +240,29 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual([], result["dirty"])
         self.assertEqual("notes\n", (self.root / "scratch.txt").read_text())
 
-    def test_require_clean_can_be_turned_off(self):
-        self.run_branch({"app.py": "x = 1\n"})
-        self.write("app.py", "print('owner is editing this')\n")
-        self.config("[merge]\nrequire_clean = false\n")
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertTrue(result["ok"], result)
-        # The owner's edit is still theirs: never committed, never reverted.
-        self.assertEqual("print('owner is editing this')\n",
-                         (self.root / "app.py").read_text())
-
     def test_a_checkout_on_another_branch_is_not_this_merge_s_business(self):
-        # base is pinned, so HEAD sitting elsewhere means this dirt belongs to
-        # a different tree and the guard has nothing to say about it.
+        """base is pinned, so HEAD sitting elsewhere means this dirt belongs
+        to a different tree and the guard has nothing to say about it — and
+        the refresh skips rather than yanking the owner off their branch."""
+        self.config('[merge]\nbase = "main"\n')
         self.run_branch({"feature.py": "x = 1\n"})
-        self.config("[merge]\nbase = \"main\"\n")
-        git(self.root, "checkout", "--quiet", "-b", "side")
+        git(self.root, "checkout", "--quiet", "-b", "sidequest")
         self.write("app.py", "print('editing on a side branch')\n")
+        self.write("sidequest.txt", "mine\n")
 
         result = merge.merge_run(self.root, BRANCH, settings=self.settings)
 
         self.assertTrue(result["ok"], result)
+        self.assertEqual("main", result["base"])
         self.assertEqual([], result["dirty"])
+        self.assertEqual("skipped", result["refresh"]["status"])
+        self.assertIsNone(result["refresh"]["command"])
+        self.assertIn("not on main", result["refresh"]["why"])
+        self.assertEqual("sidequest", git(self.root, "rev-parse", "--abbrev-ref", "HEAD"))
+        self.assertFalse((self.root / "feature.py").exists())
+        self.assertEqual("print('editing on a side branch')\n",
+                         (self.root / "app.py").read_text())
+        self.assertEqual("mine\n", (self.root / "sidequest.txt").read_text())
 
     def test_a_mission_that_ordered_the_deletions_lands_them(self):
         # Run 35 was dispatched to delete dead code, deleted six files, and the
@@ -279,35 +288,59 @@ class MergeTestCase(unittest.TestCase):
         self.assertEqual("mission_work", result["tripwire_verdict"]["verdict"])
         self.assertNotIn("notes.txt", git(self.root, "ls-tree", "--name-only", "main"))
 
-    def test_a_judge_that_says_escalate_still_escalates(self):
-        self.run_branch({"notes.txt": None})
-        result = merge.merge_run(
-            self.root, BRANCH, settings=self.settings,
-            mission="Refactor one function in feature.py.",
-            judge=lambda cfg, m, f, d: {"verdict": "escalate",
-                                        "rationale": "nothing here asks for a deletion"})
-        self.assertFalse(result["ok"])
-        self.assertEqual("tripwires", result["stage"])
-        self.assertIn("nothing here asks for a deletion", result["escalation"])
+    def test_every_escalation_leaves_the_base_unmoved_and_the_branch_kept(self):
+        """Four ways a deletion-bearing branch fails to land, chained on one
+        repo — safe because an escalation moves nothing.
 
-    def test_no_mission_means_no_judgment_means_escalate(self):
-        # The real judge refuses an empty mission before any model call; the
-        # pipeline must escalate on that refusal, exactly as before the judge
-        # existed.
+        - No mission: the real judge refuses an empty mission before any
+          model call, and the pipeline escalates on that refusal exactly as
+          before the judge existed. The tripwire names the deleted file.
+        - A judge that says escalate still escalates.
+        - judge_tripwires = false: the judge must not even be consulted.
+        - A declared check failure outranks tripwires: the stage is checks,
+          and allow_deletions keeps the tripwire list empty."""
         self.run_branch({"notes.txt": None})
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-        self.assertFalse(result["ok"])
-        self.assertEqual("tripwires", result["stage"])
+        before = git(self.root, "rev-parse", "main")
 
-    def test_judging_can_be_turned_off(self):
-        self.config("[merge]\njudge_tripwires = false\n")
-        called = []
-        self.run_branch({"notes.txt": None})
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings,
-                                 mission="Delete everything.",
-                                 judge=lambda *a: called.append(1))
-        self.assertFalse(result["ok"])
-        self.assertEqual([], called, "the judge must not even be consulted")
+        with self.subTest("no mission means no judgment means escalate"):
+            result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+            self.assertFalse(result["ok"])
+            self.assertEqual("tripwires", result["stage"])
+            self.assertIn("notes.txt", result["tripwires"][0])
+
+        with self.subTest("a judge that says escalate still escalates"):
+            result = merge.merge_run(
+                self.root, BRANCH, settings=self.settings,
+                mission="Refactor one function in feature.py.",
+                judge=lambda cfg, m, f, d: {
+                    "verdict": "escalate",
+                    "rationale": "nothing here asks for a deletion"})
+            self.assertFalse(result["ok"])
+            self.assertEqual("tripwires", result["stage"])
+            self.assertIn("nothing here asks for a deletion", result["escalation"])
+
+        with self.subTest("judging can be turned off"):
+            self.config("[merge]\njudge_tripwires = false\n")
+            called = []
+            result = merge.merge_run(self.root, BRANCH, settings=self.settings,
+                                     mission="Delete everything.",
+                                     judge=lambda *a: called.append(1))
+            self.assertFalse(result["ok"])
+            self.assertEqual([], called, "the judge must not even be consulted")
+
+        with self.subTest("a declared check failure outranks tripwires"):
+            self.config('[merge]\nallow_deletions = true\n\n'
+                        '[merge.checks]\ntest = "exit 3"\n')
+            result = merge.merge_run(self.root, BRANCH, settings=self.settings)
+            self.assertFalse(result["ok"])
+            self.assertEqual("checks", result["stage"])
+            self.assertFalse(result["checks_skipped"])
+            self.assertEqual(3, result["checks"][0]["exit_code"])
+            self.assertEqual([], result["tripwires"])
+
+        # None of the four moved the base or consumed the branch.
+        self.assertEqual(before, git(self.root, "rev-parse", "main"))
+        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
 
     def test_the_judge_itself_fails_toward_escalation(self):
         # No nameable profile, a dead turn, an unparsable reply: each is an
@@ -333,7 +366,7 @@ class MergeTestCase(unittest.TestCase):
                                   turn=lambda p, t: '{"verdict": "mission_work", "rationale": "asked for"}')
         self.assertEqual("mission_work", v["verdict"])
 
-    def test_clean_merge_lands_and_deletes_the_branch(self):
+    def test_clean_merge_lands_deletes_the_branch_and_refreshes_the_checkout(self):
         self.run_branch({"feature.py": "x = 1\n"})
         before = git(self.root, "rev-parse", "main")
 
@@ -355,51 +388,13 @@ class MergeTestCase(unittest.TestCase):
         # merge commit, not a fast-forward
         self.assertEqual(2, len(git(self.root, "rev-list", "--parents", "-n", "1",
                                     result["commit"]).split()) - 1)
-
-    def test_conflicting_rebase_aborts_cleanly(self):
-        self.run_branch({"notes.txt": "run version\n"})
-        self.write("notes.txt", "main version\n")
-        git(self.root, "add", "-A")
-        git(self.root, "commit", "--quiet", "-m", "main moves")
-        before = git(self.root, "rev-parse", "main")
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertFalse(result["ok"])
-        self.assertEqual("rebase", result["stage"])
-        self.assertEqual(["notes.txt"], result["conflicts"])
-        self.assertIsNone(result["commit"])
-        self.assertEqual(before, git(self.root, "rev-parse", "main"))
-        # branch kept, no scratch worktree and no half-rebased state left
-        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
-        self.assertEqual(1, len(git(self.root, "worktree", "list").splitlines()))
-        self.assertEqual([], list(self.root.glob(".git/worktrees/*")))
-        self.assertFalse((self.root / ".git" / "rebase-merge").exists())
-
-    def test_tripwire_blocks_the_merge(self):
-        self.run_branch({"app.py": None})
-        before = git(self.root, "rev-parse", "main")
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertFalse(result["ok"])
-        self.assertEqual("tripwires", result["stage"])
-        self.assertIn("app.py", result["tripwires"][0])
-        self.assertEqual(before, git(self.root, "rev-parse", "main"))
-        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
-
-    def test_declared_check_failure_outranks_tripwires(self):
-        self.config('[merge]\nallow_deletions = true\n\n'
-                    '[merge.checks]\ntest = "exit 3"\n')
-        self.run_branch({"app.py": None})
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertFalse(result["ok"])
-        self.assertEqual("checks", result["stage"])
-        self.assertFalse(result["checks_skipped"])
-        self.assertEqual(3, result["checks"][0]["exit_code"])
-        self.assertEqual([], result["tripwires"])
+        # and the owner's clean checkout on the base is refreshed to it
+        self.assertEqual("refreshed", result["refresh"]["status"])
+        self.assertIsNone(result["refresh"]["command"])
+        self.assertIsNone(result["note"])
+        self.assertEqual("x = 1\n", (self.root / "feature.py").read_text())
+        self.assertEqual("", git(self.root, "status", "--porcelain"))
+        self.assertEqual(result["commit"], git(self.root, "rev-parse", "HEAD"))
 
     def test_declared_checks_run_against_the_rebased_content(self):
         self.config('[merge.checks]\ntest = "test -f feature.py"\n')
@@ -436,9 +431,6 @@ class MergeTestCase(unittest.TestCase):
         # the untouched edit does not block the refresh
         self.assertEqual("refreshed", result["refresh"]["status"])
 
-    # --- refreshing the owner's checkout ------------------------------------
-
-
     def test_a_base_that_moved_is_retried_not_escalated(self) -> None:
         """Two runs landing at once is a race, not a conflict. The
         compare-and-swap refuses the stale write; the merge rebases onto the
@@ -471,91 +463,35 @@ class MergeTestCase(unittest.TestCase):
                              capture_output=True, text=True).stdout
         self.assertIn("sibling", log)
 
-    def test_refresh_updates_a_clean_checkout_on_the_base(self):
-        self.run_branch({"feature.py": "x = 1\n"})
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertEqual("refreshed", result["refresh"]["status"])
-        self.assertIsNone(result["refresh"]["command"])
-        self.assertIsNone(result["note"])
-        self.assertEqual("x = 1\n", (self.root / "feature.py").read_text())
-        self.assertEqual("", git(self.root, "status", "--porcelain"))
-        self.assertEqual(result["commit"], git(self.root, "rev-parse", "HEAD"))
-
-    def test_refresh_refuses_rather_than_clobber_a_local_edit(self):
-        # With the guard off, the refresh is the last line of defence, and it
-        # declines rather than overwriting. That is why turning require_clean
-        # off is safe rather than reckless.
-        self.run_branch({"notes.txt": "run version\n"})
-        self.config("[merge]\nrequire_clean = false\n")
-        self.write("notes.txt", "MY UNCOMMITTED EDIT\n")
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual("refused", result["refresh"]["status"])
-        self.assertEqual("MY UNCOMMITTED EDIT\n", (self.root / "notes.txt").read_text())
-        self.assertIn("notes.txt", git(self.root, "status", "--porcelain"))
-        self.assertIn("read-tree -m -u", result["refresh"]["command"])
-        self.assertIn("read-tree -m -u", result["note"])
-        self.assertIn("overwritten", result["refresh"]["why"])
-
-    def test_refresh_skips_a_checkout_on_another_branch(self):
-        self.config('[merge]\nbase = "main"\n')
-        self.run_branch({"feature.py": "x = 1\n"})
-        git(self.root, "checkout", "--quiet", "-b", "sidequest")
-        self.write("sidequest.txt", "mine\n")
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual("main", result["base"])
-        self.assertEqual("skipped", result["refresh"]["status"])
-        self.assertIsNone(result["refresh"]["command"])
-        self.assertIn("not on main", result["refresh"]["why"])
-        self.assertEqual("sidequest", git(self.root, "rev-parse", "--abbrev-ref", "HEAD"))
-        self.assertFalse((self.root / "feature.py").exists())
-        self.assertEqual("mine\n", (self.root / "sidequest.txt").read_text())
-
     # --- a merge that had nothing to do (I-0077) ----------------------------
 
-    def _already_landed(self) -> str:
+    def test_a_branch_already_on_the_base_reports_no_merge_commit(self):
         """Run 65's shape: the branch's work is already on main, and somebody
-        else committed afterwards. Returns that unrelated commit's sha."""
+        else committed afterwards. The run created nothing, so nothing is
+        attributed to it — least of all the owner's commit that HEAD happened
+        to be sitting on. And `git revert -m 1 <not a merge>` either errors
+        or, without -m 1, destroys a bystander's change, so the report and
+        the note must not offer it at all."""
         self.run_branch({"feature.py": "x = 1\n"})
         git(self.root, "merge", "--quiet", "--no-ff", "-m", "run 62 landed it", BRANCH)
         self.write("ota.sh", "the owner's own commit\n")
         git(self.root, "add", "-A")
         git(self.root, "commit", "--quiet", "-m", "OTA install, nothing to do with the run")
-        return git(self.root, "rev-parse", "main")
-
-    def test_a_branch_already_on_the_base_reports_no_merge_commit(self):
-        unrelated = self._already_landed()
+        unrelated = git(self.root, "rev-parse", "main")
 
         result = merge.merge_run(self.root, BRANCH, settings=self.settings)
 
         self.assertTrue(result["ok"], result)
         self.assertEqual("merged", result["stage"])
         self.assertEqual([], result["files_changed"])
-        # The run created nothing, so nothing is attributed to it — least of
-        # all the owner's commit that HEAD happened to be sitting on.
         self.assertIsNone(result["commit"])
-        self.assertNotEqual(unrelated, result["commit"])
         self.assertIsNone(result["revert_command"])
         self.assertIn("nothing to merge", result["note"])
         self.assertEqual(unrelated, git(self.root, "rev-parse", "main"))
         self.assertTrue(result["branch_deleted"])
 
-    def test_the_report_for_a_no_op_merge_offers_no_revert(self):
-        unrelated = self._already_landed()
-
-        result = merge.merge_run(self.root, BRANCH, settings=self.settings)
         report = merge._report_text({"id": 65}, result, None)
         note = merge._note({"id": 65}, result, None)
-
-        # `git revert -m 1 <not a merge>` either errors or, without -m 1,
-        # destroys a bystander's change. It must not be offered at all.
         self.assertNotIn("revert", report)
         self.assertNotIn(unrelated, report)
         self.assertNotIn(unrelated, note)
@@ -602,43 +538,35 @@ class MergeTestCase(unittest.TestCase):
             con.close()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FileCardStageTestCase(unittest.TestCase):
     """The stage pass-through: a tripwire card and a conflict card stop
     looking identical once nod.merge_conflict grows ``stage=`` — and the
     guard lets this branch run against a nod.py that has not grown it yet."""
 
-    def _result(self) -> dict:
-        result = merge.blank_result("main", "orchestra/run-7")
-        return merge._escalate(result, "tripwires", "touches 99 files")
-
-    def test_stage_is_passed_once_merge_conflict_accepts_it(self) -> None:
+    def test_stage_is_passed_exactly_when_merge_conflict_accepts_it(self) -> None:
+        result = merge._escalate(merge.blank_result("main", "orchestra/run-7"),
+                                 "tripwires", "touches 99 files")
         seen = {}
 
         def grown(target, detail, *, stage=None, **ctx):
             seen["stage"] = stage
             return {"request_id": "req_9"}
 
-        with mock.patch.object(merge.nod, "from_cfg", return_value=object()), \
-                mock.patch.object(merge.nod, "merge_conflict", grown):
-            rid = merge._file_card(None, {}, {"id": 7}, self._result())
-        self.assertEqual("req_9", rid)
-        self.assertEqual("tripwires", seen["stage"])
-
-    def test_todays_merge_conflict_is_not_passed_a_stage(self) -> None:
-        seen = {}
-
         def today(target, detail, **ctx):
             seen.update(ctx)
             return {"request_id": "req_9"}
 
-        with mock.patch.object(merge.nod, "from_cfg", return_value=object()), \
-                mock.patch.object(merge.nod, "merge_conflict", today):
-            merge._file_card(None, {}, {"id": 7}, self._result())
-        self.assertNotIn("stage", seen)
+        for label, handler, expect_stage in (
+                ("grown merge_conflict is passed the stage", grown, "tripwires"),
+                ("today's merge_conflict is not", today, None)):
+            with self.subTest(label):
+                seen.clear()
+                with mock.patch.object(merge.nod, "from_cfg",
+                                       return_value=object()), \
+                        mock.patch.object(merge.nod, "merge_conflict", handler):
+                    rid = merge._file_card(None, {}, {"id": 7}, result)
+                self.assertEqual("req_9", rid)
+                self.assertEqual(expect_stage, seen.get("stage"))
 
 
 class KeptRefTestCase(unittest.TestCase):
@@ -675,3 +603,7 @@ class KeptRefTestCase(unittest.TestCase):
         kept = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify",
                                "refs/orchestra/run-99^{commit}"], capture_output=True, text=True)
         self.assertEqual(kept.stdout.strip(), head)
+
+
+if __name__ == "__main__":
+    unittest.main()
