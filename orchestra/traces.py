@@ -103,9 +103,11 @@ def _claude_blocks(blocks) -> list[dict]:
 # Claude Code's `system` lines are mostly telemetry. One real run carried 892
 # `thinking_tokens` counters and 186 `status` pings against 94 actual thinking
 # blocks — recorded as lifecycle they bury the trace they are supposed to
-# annotate. Only the subtypes a human would read become events; the rest are
-# recognized and dropped, so the skipped counter still sees them.
-_CLAUDE_NOISE = {"thinking_tokens", "status"}
+# annotate. `hook_started`/`hook_response` bracket tool calls the trace
+# already shows as tool_call/tool_result. Only the subtypes a human would
+# read become events; the rest are recognized and dropped. The raw log keeps
+# every line either way.
+_CLAUDE_NOISE = {"thinking_tokens", "status", "hook_started", "hook_response"}
 
 
 def _claude(obj) -> list[dict] | None:
@@ -140,9 +142,15 @@ _CODEX_TOOL_ITEMS = {"command_execution", "file_change", "patch",
 
 def _codex(obj) -> list[dict] | None:
     kind = obj.get("type")
-    if kind in ("thread.started", "turn.started", "turn.completed",
-                "turn.failed", "error", "session.created"):
+    if kind in ("turn.failed", "error"):
         return [_ev("lifecycle", kind, obj, _ts(obj))]
+    if kind in ("thread.started", "turn.started", "turn.completed",
+                "session.created"):
+        # Thread and turn markers frame items the trace already carries;
+        # measured on the live store, chatter like this was ~530 of ~1300
+        # events. Usage rides `turn.completed` but is read from the raw log
+        # (runners.parse_usage), never from stored events.
+        return []
     if kind in ("item.started", "item.updated", "item.completed"):
         item = obj.get("item") or {}
         item_type = item.get("type")
@@ -185,13 +193,21 @@ def _opencode(obj) -> list[dict] | None:
         if status in ("completed", "error"):
             return [_ev("tool_result", name,
                         _text_of(state.get("output") or state.get("error")), _ts(part))]
-        if status in ("pending", "running"):
+        if status == "running":
+            # Every tool logs the same part at "pending" and again at
+            # "running" (222 calls vs 111 results on one bash-heavy run), so
+            # only the running part is the tool_call.
             return [_ev("tool_call", name, state.get("input"), _ts(part))]
         return []
+    if kind == "session.error":
+        return [_ev("lifecycle", kind, obj, _ts(obj))]
     if part_type in ("step-start", "step-finish") or kind in (
-            "step_finish", "session.idle", "session.updated", "session.error",
-            "message.updated"):
-        return [_ev("lifecycle", kind or part_type, obj, _ts(obj))]
+            "step_start", "step_finish"):
+        # Step markers bracket parts the trace already carries; session.idle,
+        # session.updated and message.updated fall to the prefix catch-all
+        # below. Boundary watching (supervise) and usage capture (runners)
+        # read these from the raw log, never from stored events.
+        return []
     if kind == "text" and isinstance(obj.get("text"), str):
         return [_ev("assistant_text", None, obj["text"])]  # bare shape, older builds
     if kind.startswith(("message.", "session.", "storage.", "file.", "server.")):
@@ -203,7 +219,12 @@ def _opencode(obj) -> list[dict] | None:
 # which is Claude-shaped (`{"type": "result", ...}`) and carries session_id,
 # total_cost_usd and token usage. Both shapes have to parse.
 _REASONIX_FRAGMENTS = {"text": "assistant_text", "reasoning": "reasoning"}
-_REASONIX_LIFECYCLE = ("turn_started", "stream_attempt", "usage")
+# Turn markers, stream retries, interim tool output and per-turn usage
+# counters: measured on the live store, chatter like this was ~530 of ~1300
+# events. The final Claude-shaped result line is the authoritative usage
+# source (runners._usage_reasonix) and stays stored; per-turn `usage` lines
+# duplicate it.
+_REASONIX_NOISE = ("turn_started", "stream_attempt", "usage", "tool_progress")
 
 
 def _reasonix(obj) -> list[dict] | None:
@@ -232,13 +253,8 @@ def _reasonix(obj) -> list[dict] | None:
         # The whole tool object: `err` has to stay visible, and `output` is
         # truncated with a byte offset like any other oversized payload.
         return [_ev("tool_result", tool.get("name"), tool)]
-    if kind == "tool_progress":
-        # Interim output of a still-running tool. It earns a lifecycle row
-        # rather than a tool_result, so call/result stay paired one to one
-        # and nothing is dropped silently.
-        return [_ev("lifecycle", "tool_progress", tool or obj)]
-    if kind in _REASONIX_LIFECYCLE:
-        return [_ev("lifecycle", kind, obj, _ts(obj))]
+    if kind in _REASONIX_NOISE:
+        return []
     return None
 
 

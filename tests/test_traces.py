@@ -58,6 +58,9 @@ OPENCODE = [
                                               "text": "grep for the symbol"}},
     {"type": "message.part.updated", "part": {
         "type": "tool", "tool": "grep",
+        "state": {"status": "pending", "input": {"pattern": "def main"}}}},
+    {"type": "message.part.updated", "part": {
+        "type": "tool", "tool": "grep",
         "state": {"status": "running", "input": {"pattern": "def main"}}}},
     {"type": "message.part.updated", "part": {
         "type": "tool", "tool": "grep",
@@ -134,10 +137,13 @@ class TraceTestCase(unittest.TestCase):
 
 class ParserTests(TraceTestCase):
     def test_every_backend_normalizes_into_the_shared_shape(self) -> None:
+        # Codex and OpenCode store lifecycle only for failures (W-0303), and
+        # these fixtures are happy paths; their turn/step/session markers are
+        # recognized chatter, so skipped stays 0 without any stored rows.
         expected = {
             "claude": set(traces.KINDS),
-            "codex": set(traces.KINDS) - {"human_injection"},
-            "opencode": set(traces.KINDS) - {"human_injection"},
+            "codex": set(traces.KINDS) - {"human_injection", "lifecycle"},
+            "opencode": set(traces.KINDS) - {"human_injection", "lifecycle"},
             "reasonix": set(traces.KINDS)
             - {"human_injection", "permission_request"},
         }
@@ -166,6 +172,80 @@ class ParserTests(TraceTestCase):
         self.assertEqual(report["skipped"], 4)
         self.assertEqual(self.kinds(run_id), ["lifecycle"])
 
+
+class NoiseTests(TraceTestCase):
+    """Machine chatter is dropped at ingest, not stored (W-0303).
+
+    Measured on the live store, ~530 of ~1300 events were lifecycle chatter
+    the dashboard hid client-side. The raw log keeps every line; failures
+    (turn.failed, error, session.error) are never noise."""
+
+    DROPPED = {
+        "reasonix": [
+            {"kind": "turn_started"},
+            {"kind": "stream_attempt", "streamAttempt": {"id": "sa-1"}},
+            {"kind": "usage", "usage": {"totalTokens": 14}},
+            {"kind": "tool_progress", "tool": {"id": "t1", "output": "…"}},
+        ],
+        "codex": [
+            {"type": "thread.started", "thread_id": "sess-1"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {"input_tokens": 10}},
+            {"type": "session.created"},
+        ],
+        "opencode": [
+            {"type": "message.part.updated", "part": {"type": "step-start"}},
+            {"type": "step_finish", "part": {"type": "step-finish"}},
+            {"type": "session.idle"},
+            {"type": "session.updated", "sessionID": "sess-1"},
+            {"type": "message.updated"},
+            {"type": "message.part.updated", "part": {
+                "type": "tool", "tool": "bash",
+                "state": {"status": "pending", "input": {"command": "ls"}}}},
+        ],
+        "claude": [
+            {"type": "system", "subtype": "hook_started"},
+            {"type": "system", "subtype": "hook_response"},
+        ],
+    }
+    KEPT = {
+        "codex": [{"type": "turn.failed", "error": {"message": "boom"}},
+                  {"type": "error", "message": "boom"}],
+        "opencode": [{"type": "session.error", "error": {"name": "Unknown"}}],
+    }
+
+    def test_chatter_is_recognized_and_returns_nothing(self) -> None:
+        for backend, rows in self.DROPPED.items():
+            for row in rows:
+                with self.subTest(backend=backend, line=row):
+                    self.assertEqual(
+                        traces.parse_line(backend, json.dumps(row)), [])
+
+    def test_failures_still_land_as_lifecycle(self) -> None:
+        for backend, rows in self.KEPT.items():
+            for row in rows:
+                with self.subTest(backend=backend, line=row):
+                    events = traces.parse_line(backend, json.dumps(row))
+                    self.assertEqual([e["kind"] for e in events], ["lifecycle"])
+                    self.assertEqual(events[0]["name"], row["type"])
+
+    def test_reasonix_fixture_stores_no_chatter_rows(self) -> None:
+        log = write_jsonl(self.dir / "r.jsonl", REASONIX)
+        run_id = self.make_run("reasonix", log)
+        self.assertEqual(traces.ingest(self.con, run_id)["skipped"], 0)
+        names = {r["name"] for r in traces.events_for_run(self.con, run_id)}
+        self.assertEqual(names & {"tool_progress", "stream_attempt", "usage",
+                                  "turn_started"}, set())
+
+    def test_opencode_completed_tools_pair_calls_with_results(self) -> None:
+        log = write_jsonl(self.dir / "o.jsonl", OPENCODE)
+        run_id = self.make_run("opencode", log)
+        traces.ingest(self.con, run_id)
+        kinds = self.kinds(run_id)
+        self.assertEqual(kinds.count("tool_call"), 1)  # pending + running once
+        self.assertEqual(kinds.count("tool_call"), kinds.count("tool_result"))
+
+
 class IngestTests(TraceTestCase):
     def test_ingest_is_incremental_and_idempotent(self) -> None:
         log = write_jsonl(self.dir / "o.jsonl", OPENCODE[:4])
@@ -183,7 +263,7 @@ class IngestTests(TraceTestCase):
 
     def test_a_partial_trailing_line_waits_for_its_newline(self) -> None:
         log = self.dir / "p.jsonl"
-        log.write_text(json.dumps(CODEX[0]) + "\n" + '{"type": "item.star')
+        log.write_text(json.dumps(CODEX[2]) + "\n" + '{"type": "item.star')
         run_id = self.make_run("codex", log)
         report = traces.ingest(self.con, run_id)
         self.assertEqual(report["events"], 1)
