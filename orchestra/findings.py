@@ -312,7 +312,7 @@ def _child_count(tasks: list[dict], goal_id: str) -> int:
 
 def _decision(client, run, goal_id: str, proposal: dict, tag: str,
               reasons: list[str], verdict: dict | None, marker: str,
-              decisions: list[dict]) -> dict:
+              decisions: list[dict], project_path: str | None = None) -> dict:
     """A proposal the human must rule on: a Work decision in needs-you."""
     existing = _record_with(decisions, marker)
     if existing is not None:
@@ -344,7 +344,10 @@ def _decision(client, run, goal_id: str, proposal: dict, tag: str,
                                    "the owner's call. The planner verdict and "
                                    "tripwires above are evidence, not a "
                                    "recommendation."),
-            refs=[goal_id], project_path=proposal.get("project"))
+            # The decision files where the run worked unless the proposal
+            # names another project — same rule as the adopted-task path.
+            # Runs 38's two projectless orphans are the offense record.
+            refs=[goal_id], project_path=proposal.get("project") or project_path)
     except WorkError as exc:
         return {"action": ("deferred" if work_client.retryable(exc)
                            else "rejected"),
@@ -428,7 +431,7 @@ def file_proposals(con, client, run, entries: list[dict], project_path: str | No
         verdict = evaluate_alignment(goal, proposal, run)
         if fired or verdict is None or verdict["verdict"] == "pivot":
             results.append(_decision(client, run, goal_id, proposal, tag, fired,
-                                     verdict, marker, decisions))
+                                     verdict, marker, decisions, project_path))
             continue
         try:
             created = client.create_task(
