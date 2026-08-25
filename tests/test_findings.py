@@ -334,6 +334,16 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("different goal",
                       self.work.decisions[result["proposals"][0]["decision"]]["detail"])
 
+    def test_a_projectless_proposal_decision_files_under_the_runs_project(self) -> None:
+        # Run 38's two orphans: the proposal named no project and the decision
+        # landed nowhere. It files where the run worked, like the adopted-task
+        # path always has.
+        planner = lambda **kw: {"verdict": "pivot", "rationale": "different goal"}
+        with mock.patch.object(findings, "PLANNER", planner):
+            result = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        decision = self.work.decisions[result["proposals"][0]["decision"]]
+        self.assertEqual("demo", decision["projectPath"])
+
     def test_the_decision_says_what_each_choice_does(self) -> None:
         # "Add as a child of W-0001" named a relationship, not an outcome, and
         # the owner could not tell what clicking it would create.
