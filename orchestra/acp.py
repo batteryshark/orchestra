@@ -373,7 +373,7 @@ def permission_answer(profile: dict, params: dict) -> dict:
 def supervise_run(con, run, profile: dict, *, prompt: str, run_id: int,
                   deadline: float, env: dict | None = None,
                   stall_timeout: int | None = None,
-                  peer_factory=None) -> tuple[str, int | None]:
+                  peer_factory=None, at_boundary=None) -> tuple[str, int | None]:
     """Run one worker to completion over ACP. Returns (status, exit_code).
 
     Called from ``supervise.supervise`` in place of the exec loop; every
@@ -406,7 +406,8 @@ def supervise_run(con, run, profile: dict, *, prompt: str, run_id: int,
     try:
         return _turns(con, peer, run, profile, session_id, prompt=prompt,
                       run_id=run_id, backend=backend, log_path=log_path,
-                      deadline=deadline, stall_timeout=stall_timeout)
+                      deadline=deadline, stall_timeout=stall_timeout,
+                      at_boundary=at_boundary)
     except AcpError as exc:
         # A human's `orchestra kill` takes the peer's process group down with
         # it, which surfaces here as a dead peer. That is a kill, not a
@@ -498,7 +499,7 @@ def _text_prompt(text: str) -> list[dict]:
 
 def _turns(con, peer, run, profile, session_id: str, *, prompt: str,
            run_id: int, backend: str, log_path: str, deadline: float,
-           stall_timeout: int | None) -> tuple[str, int | None]:
+           stall_timeout: int | None, at_boundary=None) -> tuple[str, int | None]:
     """Prompt, watch, deliver, repeat until the mission ends."""
     spin = observer.Watcher(run_id, run["project_id"])
     # The handshake records the peer's pid and kernel identity immediately;
@@ -523,6 +524,8 @@ def _turns(con, peer, run, profile, session_id: str, *, prompt: str,
             return "killed", None
         if outcome == "ended":
             _result("session/prompt", frame)      # an error frame fails the run
+            if at_boundary is not None:
+                at_boundary()
             if not _has_pending(con, run_id):
                 return "done", 0
         # A cancelled turn leaves the session RESUMABLE: same session id, so
