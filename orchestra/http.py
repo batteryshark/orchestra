@@ -191,6 +191,47 @@ RECENT_TURNS = 200
 # Unlisted in auth.ROUTES, so the human's alone — the file holds the shared
 # secret and every profile.
 CONFIG_ROUTE = "/api/config"
+# ``GET /api/seats`` — which profile each judgment layer runs on; ``POST``
+# sets one. The 2026-08-25 auth outage showed the seats were invisible:
+# every layer rode the same expired-auth profile and the only way to move
+# any of them was hand-editing config.toml. Unlisted in auth.ROUTES, so the
+# human's alone, like the raw config it edits.
+SEATS_ROUTE = "/api/seats"
+# seat -> (table header, key). The write goes through profile_edit.render,
+# the same comment-preserving surgery every managed config edit uses. An
+# empty router seat turns routing OFF; the other seats then derive from
+# profile tiers.
+SEATS = {
+    "observer": ("[settings]", "observer_profile"),
+    "planner": ("[settings]", "planner_profile"),
+    "router": ("[work]", "router"),
+    "verify": ("[verify]", "profile"),
+    "resolver": ("[merge]", "resolver_profile"),
+}
+
+
+def seats_payload() -> dict:
+    cfg = config.load()
+    tables = {"observer": cfg.get("settings") or {},
+              "planner": cfg.get("settings") or {},
+              "router": cfg.get("work") or {},
+              "verify": cfg.get("verify") or {},
+              "resolver": cfg.get("merge") or {}}
+    return {
+        "seats": {seat: str(tables[seat].get(key) or "") or None
+                  for seat, (_, key) in SEATS.items()},
+        "profiles": sorted(cfg.get("profiles", {})),
+    }
+
+
+def set_seat(seat: str, profile_name: str | None) -> dict:
+    header, key = SEATS[seat]
+    cfg_path = config.ensure_global_config()
+    text = cfg_path.read_text(encoding="utf-8")
+    new = profile_edit.render(text, "", {key: profile_name}, header=header)
+    config.check(new)
+    profile_edit.write_atomic(cfg_path, new)
+    return seats_payload()
 
 
 # --- config: the shared secret, the bind address, the accepted hosts --------
@@ -373,7 +414,26 @@ def health(con) -> dict:
     except ValueError:
         entry = {}
     entry["observer"] = observer.status()
+    # Auth outages (2026-08-25): a harness whose credential died answers
+    # every call with its own auth error. The flag is set where that reply
+    # is recognized (observer.note_auth_outage) and cleared by the next
+    # clean turn; here it rides the snapshot so the banner can say it.
+    entry["outages"] = _auth_outages(con)
     return entry
+
+
+def _auth_outages(con) -> list[dict]:
+    out = []
+    for row in con.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'auth_outage:%' "
+            "AND value != ''"):
+        try:
+            entry = json.loads(row["value"])
+        except ValueError:
+            continue
+        entry["backend"] = row["key"].split(":", 1)[1]
+        out.append(entry)
+    return out
 
 
 def record_health(report: dict, error: str | None = None, con=None) -> dict:
@@ -1368,6 +1428,8 @@ class Handler(BaseHTTPRequestHandler):
             cfg_path = config.ensure_global_config()
             return self._json({"path": str(cfg_path),
                                "text": cfg_path.read_text(encoding="utf-8")})
+        if path == SEATS_ROUTE:
+            return self._json(seats_payload())
         if path == OPTIONS_ROUTE:
             # What the harnesses actually offer, for the model/effort
             # pickers (DESIGN §5). Cached: it costs three subprocesses.
@@ -1467,6 +1529,20 @@ class Handler(BaseHTTPRequestHandler):
                         wake.set()
                     restarting = True
             return self._json({"applied": True, "restarting": restarting})
+        if path == SEATS_ROUTE:
+            seat = str(body.get("seat") or "")
+            if seat not in SEATS:
+                return self._deny(400, "unknown seat "
+                                  f"(known: {', '.join(sorted(SEATS))})")
+            name = body.get("profile")
+            if name is not None:
+                name = str(name).strip() or None
+            if name is not None and name not in config.load().get("profiles", {}):
+                return self._deny(400, f"unknown profile '{name}'")
+            try:
+                return self._json(set_seat(seat, name))
+            except ValueError as exc:
+                return self._json({"applied": False, "error": str(exc)}, 400)
         if path == "/api/sweep":
             wake = getattr(self.server, "wake", None)
             if wake is None:

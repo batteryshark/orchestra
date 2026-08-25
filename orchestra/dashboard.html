@@ -198,6 +198,14 @@
   .c-blocked { background: var(--think); }
   .c-turn { background: var(--think); }
 
+  /* the seats: one dropdown per judgment layer */
+  .seatrow { display: grid; grid-template-columns: 6.5rem 15rem 1fr;
+             gap: .7rem; align-items: center; padding: .28rem 0;
+             font-size: 12.5px; }
+  .seatrow select { font: inherit; font-size: 12px; color: var(--text);
+                    background: #262b33; border: 1px solid var(--line);
+                    border-radius: 6px; padding: .28rem .4rem; }
+
   /* control turns: one row per machine decision (W-0214) */
   .turnitem { padding: .45rem .2rem; border-bottom: 1px solid var(--line);
               font-size: 12.5px; }
@@ -428,6 +436,15 @@
        The whole config file in a textarea (W-0190). Profiles stay on their
        own tab; this is everything else, including them, as written. -->
   <section class="view vstack" id="view-settings" hidden>
+    <!-- Which profile each judgment layer runs on. These seats were
+         invisible during the 2026-08-25 auth outage; a picker beats
+         knowing the right TOML key. -->
+    <div class="card" style="flex:0 0 auto">
+      <h2>model seats <span class="dim" id="seatsmsg"></span></h2>
+      <div class="pad" style="overflow:visible">
+        <div id="seats"></div>
+      </div>
+    </div>
     <div class="card grow">
       <h2>config.toml <span class="dim" id="cfgpath"></span>
         <span class="spacer"></span>
@@ -628,7 +645,7 @@ function showView(name) {
   // Neither stream runs behind a view nobody is looking at.
   if (name === "health") { openLog(); loadTurns(); } else closeLog();
   if (name === "runway") refreshRunway();  // opening the view is a request
-  if (name === "settings") loadConfig();
+  if (name === "settings") { loadConfig(); loadSeats(); }
   syncTrace();
 }
 document.querySelectorAll("#tabs .tab").forEach((b) => {
@@ -1325,6 +1342,44 @@ function turnItem(t) {
   return item;
 }
 
+// --- the seats (settings) ---------------------------------------------------
+// One dropdown per judgment layer, over /api/seats. Empty derives the seat
+// from profile tiers — except the router, where empty is routing off.
+const SEAT_ROWS = [
+  ["router", "router", "picks each swept run's profile; (off) keeps the [work] profile"],
+  ["observer", "observer", "judges live runs out of band"],
+  ["planner", "planner", "takes the conductor's turns"],
+  ["verify", "verifier", "reviews every landing"],
+  ["resolver", "resolver", "retries failed landings"],
+];
+async function loadSeats() {
+  try {
+    const data = await api("/api/seats");
+    $("seats").replaceChildren(...SEAT_ROWS.map(([seat, label, hint]) => {
+      const row = el("div", "seatrow");
+      const sel = el("select");
+      sel.setAttribute("aria-label", label + " profile");
+      const auto = el("option");
+      auto.value = "";
+      auto.textContent = seat === "router" ? "(off)" : "(auto by tier)";
+      sel.append(auto, ...data.profiles.map((p) => {
+        const o = el("option"); o.value = p; o.textContent = p; return o;
+      }));
+      sel.value = data.seats[seat] || "";
+      sel.onchange = async () => {
+        try {
+          await api("/api/seats", {method: "POST", body: JSON.stringify(
+            {seat: seat, profile: sel.value || null})});
+          $("seatsmsg").textContent = "· saved";
+          setTimeout(() => { $("seatsmsg").textContent = ""; }, 2000);
+        } catch (e) { fail(e); loadSeats(); }
+      };
+      row.append(el("b", null, label), sel, el("span", "dim", hint));
+      return row;
+    }));
+  } catch (e) { fail(e); }
+}
+
 async function loadTurns() {
   try {
     const data = await api("/api/turns?limit=30");
@@ -1878,7 +1933,14 @@ function renderDaemon(d) {
 let paused = false;
 function render(s) {
   SNAP = s;
-  $("banner").textContent = "";
+  // A dead credential must reach the operator: the daemon flags the backend
+  // (health.outages) and this banner says it on every view, every 4s, until
+  // the next clean turn on that backend clears it.
+  const outages = (s.daemon && s.daemon.outages) || [];
+  $("banner").textContent = outages.map((o) =>
+    o.backend + " cannot authenticate (since " + ago(o.at) + ") — " +
+    "reauthenticate it; its runs and judgment turns fail until then")
+    .join("  ·  ");
   $("livecount").textContent = s.live_runs;
   paused = s.dispatch.paused;
   $("paused").hidden = !paused;

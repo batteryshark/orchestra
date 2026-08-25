@@ -575,6 +575,20 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
                 record_turn(con, layer, profile, log_path, False,
                             "the turn produced no text", meta, project_id)
             raise ObserverTurnError("the observer turn produced no text")
+        if _is_auth_error(text):
+            # The harness answered with its own auth failure, not a judgment.
+            # Recording it as a successful turn is how an expired Claude OAuth
+            # ran the router and observer blind for hours on 2026-08-25 —
+            # every turn "succeeded" with the error string as its reply and
+            # nothing reached the dashboard.
+            note_auth_outage(con, profile.get("backend"), text)
+            note = (f"{profile.get('backend')} cannot authenticate; "
+                    "reauthenticate it — the next clean turn clears this")
+            if layer:
+                record_turn(con, layer, profile, log_path, False, note, meta,
+                            project_id)
+            raise ObserverTurnError(note)
+        clear_auth_outage(con, profile.get("backend"))
         if layer:
             record_turn(con, layer, profile, log_path, True,
                         (text or "").strip().splitlines()[0][:200], meta,
@@ -583,6 +597,36 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
     finally:
         if own:
             con.close()
+
+
+# --- auth outage (the 2026-08-25 blind spot) ---------------------------------
+# One meta flag per backend: set when a turn or a terminal run comes back as
+# the harness's own authentication failure, cleared by the next clean turn on
+# that backend. ``http.health`` reports the set flags and the dashboard
+# banner shows them — reauthentication is the operator's move, so the outage
+# has to reach the operator.
+
+_AUTH_PREFIX = "failed to authenticate:"
+
+
+def _is_auth_error(text: str | None) -> bool:
+    return (text or "").strip().casefold().startswith(_AUTH_PREFIX)
+
+
+def note_auth_outage(con, backend: str | None, detail: str | None = None) -> None:
+    if not backend or con is None:
+        return
+    db.meta_set(con, f"auth_outage:{backend}", json.dumps(
+        {"at": db.now(), "detail": (detail or "").strip()[:300]}))
+    con.commit()
+
+
+def clear_auth_outage(con, backend: str | None) -> None:
+    if not backend or con is None:
+        return
+    if db.meta_get(con, f"auth_outage:{backend}"):
+        db.meta_set(con, f"auth_outage:{backend}", "")
+        con.commit()
 
 
 def last_json_object(text: str, key: str) -> dict | None:
@@ -1094,6 +1138,10 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     if blocker:
         record(con, run_id, "retry", "escalate", blocker,
                {"precondition": "reauthenticate", "backend": run["backend"]})
+        # The worker-run half of the same outage flag the turn runner sets:
+        # a Nod alert on a disabled Nod reaches nobody, the banner always
+        # reaches the operator.
+        note_auth_outage(con, run["backend"], run["summary"])
         con.commit()
         result = {"action": "escalate", "reason": blocker,
                   "precondition": "reauthenticate"}

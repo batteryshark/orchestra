@@ -901,6 +901,38 @@ sys.exit(0)
 """
 
 
+class AuthOutageTurnTests(ObserverCase):
+    """A turn whose reply is the harness's own auth error is not a judgment
+    (2026-08-25): recording it as a success ran the router and observer
+    blind for hours. The turn records as failed, the backend's outage flag
+    is set for the banner, and the next clean turn clears it."""
+
+    AUTH_TEXT = ("Failed to authenticate: OAuth session expired and could "
+                 "not be refreshed")
+
+    def _turn(self, reply: str):
+        proc = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch.object(observer.subprocess, "run",
+                               return_value=proc), \
+             mock.patch.object(observer.runners, "parse_log",
+                               return_value=(None, reply)):
+            return observer.model_turn(
+                {"backend": "claude", "model": "opus"}, "judge this",
+                layer="router", con=self.con)
+
+    def test_an_auth_reply_records_a_failed_turn_and_flags_the_backend(self):
+        with self.assertRaises(observer.ObserverTurnError) as caught:
+            self._turn(self.AUTH_TEXT)
+        self.assertIn("reauthenticate", str(caught.exception))
+        turn = self.one("SELECT * FROM runs WHERE layer='router'")
+        self.assertEqual(turn["status"], "failed")
+        self.assertIn("cannot authenticate", turn["summary"])
+        self.assertTrue(db.meta_get(self.con, "auth_outage:claude"))
+
+        self.assertEqual(self._turn('{"profile": "a"}'), '{"profile": "a"}')
+        self.assertFalse(db.meta_get(self.con, "auth_outage:claude"))
+
+
 class SupervisedRunTests(unittest.TestCase):
     """The seams as the supervisor actually reaches them, against a stub
     backend binary. No model is dispatched anywhere in here."""
