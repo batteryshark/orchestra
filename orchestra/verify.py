@@ -17,7 +17,15 @@ is NOT run and NOT a veto: it reports as needing judgment and the item
 stays in review for the human. On 2026-08-25 "harness fixture test" and
 "click through" were exec'd as commands, failed with ENOENT, and blocked
 two items whose work was green — the exact damage a read-and-report
-verifier must never do. A model turn for judged criteria still waits.
+verifier must never do.
+
+A criterion that needs judgment can get it (W-0307): when `[verify]
+second_opinion` names a profile, the pass runs a capped dialogue between
+the verify seat and that second voice — message cap, output budget, and
+per-turn timeout enforced in code, the yeschef rooms lesson (W-0306) —
+recorded as `dialogue` control turns. The verdict is advisory: it may
+tick a criterion, never fail one, and a dialogue that settles every open
+criterion completes the pass exactly as an all-mechanical one would.
 """
 import shlex
 import shutil
@@ -25,12 +33,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from orchestra import config, db, project, supervise
+from orchestra import config, db, observer, project, supervise
 from orchestra.work_client import WorkClient, fact_line, verifier_identity
 
 METHOD_TIMEOUT = 60
 REQUESTED_BY = "verify"
 VERIFY_TIER = 1  # workhorse — the "cheaper model" the default promises (W-0299)
+# The dialogue's hard caps (W-0307). Configurable via [verify]
+# dialogue_messages / dialogue_budget; the per-turn ceiling is
+# observer.TURN_TIMEOUT. Enforced in the loop, never hoped for.
+DIALOGUE_MESSAGES = 4
+DIALOGUE_BUDGET = 8000  # total reply characters across the whole dialogue
 
 
 def _default_profile(pcfg: dict, item_id: str) -> str | None:
@@ -107,7 +120,30 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
         results = _execute(verifier, item_id, root)
         failed = [r for r in results if r["ok"] is False]
         unchecked = [r for r in results if r["ok"] is None]
-        _writeback(verifier, item_id, run_id, results, failed, unchecked)
+        dialogue_reason = None
+        # A mechanical failure already halts; spending model turns arguing
+        # about the rest would decorate a blocked item. Judgment only when
+        # judgment is the only thing missing.
+        if unchecked and not failed:
+            seats = _dialogue_seats(pcfg, worker["profile"], profile_name,
+                                    profile)
+            if seats:
+                item = verifier.task(item_id) or {"id": item_id}
+                met, dialogue_reason = _dialogue(
+                    con, pcfg, item, unchecked, worker, seats,
+                    worker["project_id"])
+                for r in unchecked:
+                    if met.get(r["index"]):
+                        verifier.check_task_item(item_id, "acceptance",
+                                                 r["index"], checked=True)
+                        verifier.log_task(
+                            item_id, f"{r['text']}: judged met by the "
+                                     "second-opinion dialogue")
+                        r["ok"] = True
+                        r["note"] = "judged met by the second-opinion dialogue"
+                unchecked = [r for r in results if r["ok"] is None]
+        _writeback(verifier, item_id, run_id, results, failed, unchecked,
+                   dialogue_reason)
         # What code cannot check, code must not veto: unchecked criteria
         # leave the item in review for the human, with no fact either way.
         if failed:
@@ -213,6 +249,93 @@ def _execute(client: WorkClient, item_id: str, root: Path) -> list[dict]:
     return results
 
 
+# --- the second-opinion dialogue (W-0307) ------------------------------------
+
+def _dialogue_seats(pcfg: dict, worker_profile: str, verify_name: str,
+                    verify_profile: dict):
+    """The two voices, or None: an unset second seat means the dialogue is
+    off and the pass behaves exactly as before. The second voice opens —
+    the verify seat already spoke through the mechanical pass."""
+    vcfg = dict(pcfg.get("verify") or {})
+    name = str(vcfg.get("second_opinion") or "").strip()
+    if not name:
+        return None
+    if name in (worker_profile, verify_name):
+        print(f"orchestra verify: second opinion skipped — {name} is "
+              "already at the table")
+        return None
+    try:
+        return [(name, config.staff_profile(pcfg, name)),
+                (verify_name, verify_profile)]
+    except SystemExit as exc:
+        print(f"orchestra verify: second opinion not staffed: {exc}")
+        return None
+
+
+def _dialogue_prompt(packet: str, transcript: list, speaker: str,
+                     last: bool) -> str:
+    said = "\n\n".join(f"[{who}] {text}" for who, text in transcript)
+    ask = ("Reply ONLY with the verdict JSON now: "
+           '{"criteria": [{"index": N, "verdict": "met" or "unclear"}]} '
+           "with one entry per numbered criterion." if last else
+           "Answer in a few sentences. When you are already satisfied, end "
+           "early by emitting the verdict JSON "
+           '{"criteria": [{"index": N, "verdict": "met" or "unclear"}]}.')
+    role = ("Assess each criterion against the evidence and say what would "
+            "make you doubt it." if not transcript else
+            "Answer the doubts raised so far with evidence, not reassurance.")
+    return (f"You are {speaker}, one of two reviewers in a bounded dialogue.\n"
+            f"{packet}\n\n"
+            + (f"The dialogue so far:\n{said}\n\n" if said else "")
+            + f"{role}\n{ask}")
+
+
+def _dialogue(con, pcfg: dict, item: dict, unchecked: list[dict], worker,
+              seats: list, project_id: str | None):
+    """Run the capped exchange. Returns (met, reason): ``met`` maps a
+    criterion index to True when the dialogue judged it met, and ``reason``
+    says how the dialogue ended. Advisory only — the caller ticks, never
+    fails, and every cap breach is a recorded ending, not an exception."""
+    vcfg = dict(pcfg.get("verify") or {})
+    cap = max(1, int(vcfg.get("dialogue_messages", DIALOGUE_MESSAGES) or 0))
+    budget = max(1, int(vcfg.get("dialogue_budget", DIALOGUE_BUDGET) or 0))
+    named = "\n".join(f"{r['index']}. {r['text']}" for r in unchecked)
+    packet = (f"Work item {item.get('id')}: {item.get('title') or ''}\n"
+              f"The worker's handoff:\n{(worker['summary'] or '')[:2000]}\n\n"
+              "These acceptance criteria carry no mechanical method; judge "
+              f"each against the handoff and the landed work:\n{named}")
+    transcript, spent = [], 0
+    for turn in range(cap):
+        speaker, profile = seats[turn % 2]
+        prompt = _dialogue_prompt(packet, transcript, speaker, turn == cap - 1)
+        try:
+            text = observer.model_turn(profile, prompt, layer="dialogue",
+                                       con=con, project_id=project_id)
+        except observer.ObserverTurnError as exc:
+            return {}, f"dialogue ended on a failed turn: {exc}"
+        transcript.append((speaker, text.strip()))
+        spent += len(text)
+        verdict = observer.last_json_object(text, "criteria")
+        if verdict:
+            met = {}
+            for entry in verdict.get("criteria") or []:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    index = int(entry.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if entry.get("verdict") == "met":
+                    met[index] = True
+            return met, (f"second-opinion dialogue: verdict after "
+                         f"{turn + 1} message(s)")
+        if spent >= budget:
+            return {}, (f"second-opinion dialogue ended: output budget "
+                        f"({budget} chars) reached without a verdict")
+    return {}, (f"second-opinion dialogue ended: message cap ({cap}) "
+                "reached without a verdict")
+
+
 def _summary(item_id: str, results: list[dict], failed: list[dict],
              unchecked: list[dict]) -> str:
     if failed:
@@ -226,7 +349,8 @@ def _summary(item_id: str, results: list[dict], failed: list[dict],
 
 def _writeback(client: WorkClient, item_id: str, run_id: int,
                results: list[dict], failed: list[dict],
-               unchecked: list[dict]) -> None:
+               unchecked: list[dict],
+               dialogue_reason: str | None = None) -> None:
     tag = f"[{client.identity}/{run_id}]"
     if failed:
         named = "\n".join(f"- {r['text']}: {r['note']}" for r in failed)
@@ -237,9 +361,10 @@ def _writeback(client: WorkClient, item_id: str, run_id: int,
                 r["text"] or f"AC{r['index']}" for r in failed))[:300])
     elif unchecked:
         named = "\n".join(f"- {r['text']}: {r['note']}" for r in unchecked)
+        judged = f"\n\n{dialogue_reason}." if dialogue_reason else ""
         body = (f"{tag} Inconclusive. {item_id}: these criteria carry no "
                 f"mechanical method, so this pass judged nothing.\n\n"
-                f"{named}\n\nThe item stays in review; sign-off is yours.")
+                f"{named}{judged}\n\nThe item stays in review; sign-off is yours.")
         fact = None
     else:
         body = (f"{tag} Verified. {item_id} is done.\n\n"

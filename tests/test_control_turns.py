@@ -226,6 +226,16 @@ class ControlTurnTestCase(unittest.TestCase):
                          "a layer that has not decided anything is empty, "
                          "not everything")
 
+    def test_a_dialogue_turn_is_a_layer_row_like_any_other(self) -> None:
+        """W-0307: the second-opinion dialogue records through record_turn,
+        so its messages are control turns the log filters by layer."""
+        observer.record_turn(self.con, "dialogue", PROFILE,
+                             _write(self.tmp.name), True, "doubted, answered",
+                             project_id="proj-a")
+        page = http.control_turns("proj-a", "dialogue", con=self.con)
+        self.assertEqual([t["layer"] for t in page["turns"]], ["dialogue"])
+        self.assertEqual(page["turns"][0]["summary"], "doubted, answered")
+
     def test_the_log_is_turns_alone_and_carries_the_trace_link(self) -> None:
         """A worker run in the log would be the fleet again — and the row has
         to be a run payload, because the client opens it in the run detail
