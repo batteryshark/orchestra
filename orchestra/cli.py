@@ -515,7 +515,8 @@ def cmd_hook(args):
     except Exception as exc:  # a hook must never take the harness down with it
         print(f"orchestra hook: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         text = None
-    out = hooks.render(args.backend, text)
+    out = hooks.render(args.backend, text, context=args.bind,
+                       lifecycle=args.event == "PostCompact")
     if out:
         print(out)
 
