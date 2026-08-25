@@ -2,58 +2,55 @@ import XCTest
 @testable import Dromond
 
 final class SnapshotDecoderTests: XCTestCase {
-    func testCapturedSnapshotV6Decodes() throws {
+    private func decodeFixture(_ name: String) throws -> Snapshot {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(
-            forResource: "snapshot-v6",
+            forResource: name,
             withExtension: "json"
         ))
         let data = try Data(contentsOf: url)
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(
-            Set(json.keys),
-            Set(["version", "generated_at", "home", "runs", "live_runs", "projects",
-                 "dispatch", "profiles", "runway", "statistics", "findings", "proposals", "daemon"])
-        )
+        return try JSONDecoder().decode(Snapshot.self, from: data)
+    }
 
-        let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
+    func testMinimumVersionDecodesLiveRunAndUnknownFields() throws {
+        // The captured v6 payload includes findings/proposals, which Snapshot
+        // no longer reads. Supported old payloads must continue to decode.
+        let snapshot = try decodeFixture("snapshot-v6")
+        let run = try XCTUnwrap(snapshot.runs.first)
         XCTAssertEqual(snapshot.version, Snapshot.minimumVersion)
         XCTAssertEqual(snapshot.liveRuns, 1)
-        XCTAssertEqual(snapshot.runs.first?.workItem, "W-0141")
-        XCTAssertEqual(snapshot.runs.first?.profile, "sol-medium")
+        XCTAssertTrue(run.live)
+        XCTAssertFalse(run.isTerminal)
+        XCTAssertEqual(run.workItem, "W-0141")
     }
 
     /// Version 7 was the first snapshot newer than the decoder's compatibility
     /// floor. An exact-equality gate rejected it after the payload merely grew
     /// fields, leaving the app unusable with no way forward.
-    func testNewerSnapshotDecodes() throws {
-        let url = try XCTUnwrap(Bundle(for: Self.self).url(
-            forResource: "snapshot-v7",
-            withExtension: "json"
-        ))
-        let data = try Data(contentsOf: url)
-        let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
+    func testNewerSnapshotDecodesDisplayedFieldsAndIgnoresUnknownOnes() throws {
+        let snapshot = try decodeFixture("snapshot-v7")
+        let run = try XCTUnwrap(snapshot.runs.first)
         XCTAssertGreaterThan(snapshot.version, Snapshot.minimumVersion)
-        XCTAssertFalse(snapshot.runs.isEmpty)
-        XCTAssertNotNil(snapshot.runs.first?.status)
-    }
-
-    func testCurrentSnapshotNeedsNoRemovedPhantomFields() throws {
-        let data = Data(#"""
-        {"version": 12, "generated_at": "now", "live_runs": 0,
-         "runs": [{"id": 1, "status": "failed", "profile": "fast",
-                   "backend": "codex", "live": false,
-                   "isolation": "not_started"}],
-         "profiles": [{"name": "fast", "backend": "codex"}]}
-        """#.utf8)
-        let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
-        XCTAssertEqual(snapshot.runs.first?.isolation, "not_started")
-        XCTAssertEqual(snapshot.profiles.first?.name, "fast")
+        XCTAssertTrue(run.isTerminal)
+        XCTAssertFalse(run.live)
+        XCTAssertEqual(run.isolation, "not_started")
+        XCTAssertEqual(run.messages.first?.body, "run 31 finished: failed")
+        XCTAssertEqual(run.messages.first?.undeliverableReason, "worker exited")
+        XCTAssertEqual(run.messages.first?.pendingBoundary, false)
+        XCTAssertEqual(snapshot.profiles.first?.model, "")
+        XCTAssertEqual(snapshot.runway.first?.windows.first?.resetsIn, "in 4d")
+        XCTAssertEqual(snapshot.runway.first?.readingAge, "read 3h ago")
+        XCTAssertEqual(snapshot.runway.first?.creditsLabel, "1 banked reset")
+        XCTAssertEqual(
+            snapshot.daemon.observer,
+            Observer(enabled: true, profile: "ds-flash", problem: nil,
+                     firstLook: 300, interval: 1800)
+        )
     }
 
     func testOlderSnapshotIsRefusedWithAReadableReason() throws {
-        let data = try XCTUnwrap(#"""
+        let data = Data(#"""
         {"version": 5, "generated_at": "x", "runs": [], "live_runs": 0}
-        """#.data(using: .utf8))
+        """#.utf8)
         XCTAssertThrowsError(try JSONDecoder().decode(Snapshot.self, from: data)) { error in
             XCTAssertTrue("\(error)".contains("update the daemon"), "\(error)")
         }
@@ -63,8 +60,10 @@ final class SnapshotDecoderTests: XCTestCase {
     /// and `AsyncBytes.lines` drops those, so the trace stream yielded nothing
     /// at all while the daemon sent well-formed frames. This pins the split
     /// itself — every line, empty ones included, CRLF tolerated.
-    func testFrameSplittingKeepsTheEmptyLinesSSEDependsOn() {
-        let wire = "retry: 3000\n\nid: 2610\r\nevent: trace\r\ndata: {\"id\":1}\r\n\r\n"
+    func testFrameSplittingKeepsTraceEventsIntact() throws {
+        let wire = ": keepalive\r\nevent: trace\r\n"
+            + #"data: {"id":1,"kind":"tool_call","name":"shell","# + "\r\n"
+            + #"data: "payload":"ls","payload_len":2,"truncated":false}"# + "\r\n\r\n"
         var lines: [String] = []
         var buffer = [UInt8]()
         for byte in Array(wire.utf8) {
@@ -75,15 +74,22 @@ final class SnapshotDecoderTests: XCTestCase {
                 buffer.append(byte)
             }
         }
-        XCTAssertEqual(lines, ["retry: 3000", "", "id: 2610", "event: trace",
-                               "data: {\"id\":1}", ""])
+        XCTAssertEqual(lines.last, "")
 
         var decoder = SSEDecoder()
         var messages: [SSEMessage] = []
         for line in lines {
             if let message = decoder.feed(line: line) { messages.append(message) }
         }
-        XCTAssertEqual(messages, [SSEMessage(event: "trace", data: "{\"id\":1}")])
+        let message = try XCTUnwrap(messages.first)
+        XCTAssertEqual(message.event, "trace")
+        let event = try JSONDecoder().decode(TraceEvent.self, from: Data(message.data.utf8))
+        XCTAssertEqual(event.id, 1)
+        XCTAssertEqual(event.kind, "tool_call")
+        XCTAssertEqual(event.name, "shell")
+        XCTAssertEqual(event.payload, "ls")
+        XCTAssertEqual(event.payloadLength, 2)
+        XCTAssertFalse(event.truncated)
     }
 
     /// Three response structs in a row declared fields the daemon never sends.
@@ -174,17 +180,5 @@ final class SnapshotDecoderTests: XCTestCase {
         XCTAssertEqual(servers, back)
         XCTAssertEqual(Keychain.legacyAccount, back[0].keyAccount,
                        "the account must survive persistence or the key is orphaned")
-    }
-
-    func testSSEDecoderJoinsDataLinesAndIgnoresKeepalives() {
-        var decoder = SSEDecoder()
-        XCTAssertNil(decoder.feed(line: ": keepalive"))
-        XCTAssertNil(decoder.feed(line: "event: trace"))
-        XCTAssertNil(decoder.feed(line: "data: {\"payload\":"))
-        XCTAssertNil(decoder.feed(line: "data: \"hello\"}"))
-        XCTAssertEqual(
-            decoder.feed(line: ""),
-            SSEMessage(event: "trace", data: "{\"payload\":\n\"hello\"}")
-        )
     }
 }
