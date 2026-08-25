@@ -229,6 +229,10 @@ expires_after = 86400
 # lane:    claude only. "quota" unsets ANTHROPIC_API_KEY so `-p` uses the
 #          Max subscription. "api" keeps the key. Spent quota retries once
 #          on the api lane when a key is present. The trace names the lane.
+# env:     optional table of string keys to string values for THIS profile.
+#          Wins over [worker_env] and the inherited process environment.
+#          Unnamed variables stay put. Point a harness at a local endpoint:
+#            env = {{ ANTHROPIC_BASE_URL = "http://127.0.0.1:8080" }}
 # note / note_at: freeform headroom note + when it was written (D10);
 #                 `orchestra profiles note NAME "..."` sets both
 
@@ -449,6 +453,8 @@ def profile_cfg(cfg: dict, name: str) -> dict:
             f"orchestra: add_dirs must be a list of directory paths "
             f"(profile '{name}', {paths.global_config_path()})")
     profile["add_dirs"] = [str(Path(d).expanduser()) for d in raw]
+    if "env" in profile:
+        _check_env_table(profile["env"], kind="profile environment")
     return profile
 
 
@@ -480,18 +486,35 @@ def forget_profile_note(name: str) -> None:
     profile_notes_path().write_text(json.dumps(notes, indent=2), encoding="utf-8")
 
 
+def _check_env_table(values, *, kind: str) -> None:
+    if not isinstance(values, dict):
+        raise SystemExit(f"orchestra: {kind} must be a TOML table")
+    for name, value in values.items():
+        if not isinstance(name, str) or not name or "=" in name or "\0" in name:
+            raise SystemExit(f"orchestra: invalid {kind} name {name!r}")
+        if not isinstance(value, str) or "\0" in value:
+            raise SystemExit(f"orchestra: {kind} value for {name} must be a string")
+
+
 def apply_worker_env(cfg: dict, env: dict[str, str], root: Path) -> dict[str, str]:
     """Apply non-secret project values to every worker process."""
     values = cfg.get("worker_env", {})
-    if not isinstance(values, dict):
-        raise SystemExit("orchestra: [worker_env] must be a TOML table")
+    _check_env_table(values, kind="worker environment")
     updated = dict(env)
     for name, value in values.items():
-        if not isinstance(name, str) or not name or "=" in name or "\0" in name:
-            raise SystemExit(f"orchestra: invalid worker environment name {name!r}")
-        if not isinstance(value, str) or "\0" in value:
-            raise SystemExit(f"orchestra: worker environment value for {name} must be a string")
         updated[name] = value.replace("{root}", str(root))
+    return updated
+
+
+def apply_profile_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
+    """Profile env wins over inherited env. Unnamed variables stay put."""
+    values = profile.get("env")
+    if values is None:
+        return env
+    _check_env_table(values, kind="profile environment")
+    # ponytail: no {root} expansion; add if a profile env path needs the project root
+    updated = dict(env)
+    updated.update(values)
     return updated
 
 

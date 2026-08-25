@@ -135,6 +135,24 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             config.apply_worker_env(cfg, {}, self.root)
 
+    def test_profile_env_rejects_malformed_tables(self) -> None:
+        self.path.write_text('[profiles.mine]\nbackend = "claude"\n')
+        cases = (
+            ({"BAD=NAME": "x"}, "BAD=NAME"),
+            ({"": "x"}, "''"),
+            ({"OK": 1}, "must be a string"),
+            (["not", "a", "table"], "must be a TOML table"),
+            ({"X\0Y": "x"}, "X"),
+        )
+        for values, marker in cases:
+            with self.subTest(values=values):
+                cfg = config.load()
+                cfg["profiles"]["mine"]["env"] = values
+                with self.assertRaises(SystemExit) as caught:
+                    config.profile_cfg(cfg, "mine")
+                self.assertIn("profile environment", str(caught.exception))
+                self.assertIn(marker, str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
