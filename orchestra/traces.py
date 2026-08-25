@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import db, paths, runners
+from orchestra import db, paths, profiles, runners
 
 KINDS = ("assistant_text", "reasoning", "tool_call", "tool_result",
          "permission_request", "human_injection", "lifecycle")
@@ -384,6 +384,11 @@ def progress(log_path: str, backend: str) -> str | None:
     reports is one -- counting shell commands alone froze run 234 at "1
     tool call" for 40 minutes while it made 84.
 
+    Carries how long ago the trace last grew, because the count alone still
+    hides a hang: a run stuck on its first tool repeats "1 tool call"
+    forever, and only the age separates that from a run between tools. The
+    same fact `orchestra check` reports as "log written Ns ago".
+
     Deterministic transcript reading, never a question put to the worker --
     a status report costs a model turn, this costs a file read.
     """
@@ -402,6 +407,7 @@ def progress(log_path: str, backend: str) -> str | None:
                         last_result = (event["name"], line)
                     elif kind == "assistant_text" and event["payload"].strip():
                         said = event["payload"].strip().splitlines()[0]
+        quiet = time.time() - Path(log_path).stat().st_mtime
     except (OSError, TypeError):   # a run claimed before its log path is set
         return None
     # Finished tools are the one count every backend agrees on: opencode
@@ -417,18 +423,24 @@ def progress(log_path: str, backend: str) -> str | None:
         parts.append(f"last: {_action_label(*last)}")
     elif said:
         parts.append(f"last said: {said[:120]}")
+    parts.append(f"log written {profiles.age_text(max(quiet, 0))}")
     return "; ".join(parts)[:400]
 
 
 def _action_label(name: str | None, line: str) -> str:
     """A tool's name plus its argument, best-effort — each backend buries
-    the argument at a different depth, and Reasonix carries none at all."""
+    the argument at a different depth, and Reasonix carries none at all.
+
+    Whitespace collapses: a heredoc or a `python -c` script is a real
+    command, and its newlines would break the one-line progress note into
+    an unreadable block on the board.
+    """
     try:
         obj = json.loads(line)
     except ValueError:
         return name or "tool"
     arg = runners._find_command(obj) or next(iter(runners._dig(obj, ARG_KEYS)), "")
-    return f"{name or 'tool'} {arg}".strip()[:120]
+    return " ".join(f"{name or 'tool'} {arg}".split())[:120]
 
 
 # --- ingest -----------------------------------------------------------------

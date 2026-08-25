@@ -118,6 +118,19 @@ def discover(runner=_run, reasonix_config: Path = REASONIX_CONFIG) -> dict:
 
 # --- display ----------------------------------------------------------------
 
+def age_text(seconds: float) -> str:
+    """'2h ago' from an age in seconds. One phrasing for every surface that
+    shows how old a fact is — a profile note here, a run's last trace write
+    in the progress heartbeat (traces.progress)."""
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
 def note_age(note_at: str | None, now: datetime | None = None) -> str | None:
     """'2h ago' from an ISO timestamp; None when absent or unreadable."""
     if not note_at:
@@ -129,12 +142,4 @@ def note_age(note_at: str | None, now: datetime | None = None) -> str | None:
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
     seconds = ((now or datetime.now(timezone.utc)) - then).total_seconds()
-    if seconds < 0:
-        seconds = 0
-    if seconds < 60:
-        return "just now"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m ago"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}h ago"
-    return f"{int(seconds // 86400)}d ago"
+    return age_text(max(seconds, 0))
