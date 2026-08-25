@@ -930,7 +930,7 @@ def cmd_stats(args):
     the same function. Tokens/cost read the run rows the supervisor stamped
     at completion; a dash means no backend usage was captured."""
     con = db.connect()
-    stats = http._statistics(con)  # one owner for the numbers, two surfaces
+    stats = http._statistics(con, instrumentation_limit=getattr(args, "runs", 30))
     con.close()
     if args.json:
         print(json.dumps(stats, indent=2))
@@ -950,6 +950,23 @@ def cmd_stats(args):
         print(f"{p['profile'][:20]:<20} {p['runs']:>5} {p['active']:>7} "
               f"{_dur(p['seconds']):>9} {_stat(p['tokens']):>14} "
               f"{_spend(p['cost'], p.get('billing', 'api')):>12}")
+    report = stats["instrumentation"]
+    print(f"\ninstrumentation  latest {report['runs_count']} of "
+          f"{report['window']} requested runs")
+    print(f"turns {report['turns']}  compactions {report['compactions']}  "
+          f"classification {report['classification_rate'] * 100:.1f}%  "
+          f"failure {(_stat(report['failure_rate']))}  "
+          f"landings/hour {_stat(report['landings_per_hour'])}")
+    print(f"{'tool class':<14} {'calls':>7} {'errors':>7} {'rate':>7} "
+          f"{'time':>9} {'timed':>7}")
+    for kind, item in report["tools"].items():
+        print(f"{kind:<14} {item['calls']:>7} {item['errors']:>7} "
+              f"{item['error_rate'] * 100:>6.1f}% {_dur(item['seconds']):>9} "
+              f"{item['timed_calls']:>7}")
+    if report["gap_candidates"]:
+        print("\ngap candidates")
+        for gap in report["gap_candidates"][:10]:
+            print(f"{gap['count']:>4}  {gap['kind']}: {gap['value']}")
 
 
 def cmd_review(args):
@@ -1338,6 +1355,8 @@ def main():
     s = sub.add_parser("stats", help="runs, worker time, tokens and cost per "
                                      "profile (DESIGN §11)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--runs", type=int, default=30,
+                   help="instrument the latest N worker runs (default: 30)")
     s.set_defaults(fn=cmd_stats)
 
     s = sub.add_parser("review", help="performance review of runners: outcomes "
