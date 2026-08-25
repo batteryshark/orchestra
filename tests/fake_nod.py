@@ -90,7 +90,7 @@ class FakeNod:
     def start(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self))
         self._thread = threading.Thread(target=self._server.serve_forever,
-                                        daemon=True)
+                                        args=(0.01,), daemon=True)
         self._thread.start()
         return f"http://127.0.0.1:{self._server.server_address[1]}{self.prefix}"
 

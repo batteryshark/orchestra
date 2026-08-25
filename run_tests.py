@@ -2,19 +2,13 @@
 """Run the suite with one process per test module.
 
 Every module builds its own tempdir, its own ORCHESTRA_HOME and its own fake
-servers, so nothing is shared and nothing has to run in order. Serially that
-independence bought nothing; here it is the whole speedup, and the wall clock
-becomes the slowest single module instead of the sum of all of them.
+servers, so nothing is shared and nothing has to run in order.
 
     uv run python run_tests.py            # everything
     uv run python run_tests.py merge http # substring match on module names
     uv run python run_tests.py -j 4       # fewer workers
 
-Slowest-first scheduling needs last run's timings, kept in .test-times.json.
-A missing or stale entry just means that module is scheduled last, which
-costs a little packing efficiency and nothing else.
 """
-import json
 import os
 import subprocess
 import sys
@@ -23,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-TIMES = ROOT / ".test-times.json"
 
 
 def modules(patterns: list[str]) -> list[str]:
@@ -53,9 +46,6 @@ def main() -> int:
         print(f"no test modules match {argv}")
         return 1
 
-    known = json.loads(TIMES.read_text()) if TIMES.exists() else {}
-    targets.sort(key=lambda m: -known.get(m, 0.0))  # long poles start first
-
     wall = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(run, targets))
@@ -70,8 +60,6 @@ def main() -> int:
             failed += 1
             print(f"\n{'=' * 70}\nFAILED: {module}\n{'=' * 70}\n{output.rstrip()}")
 
-    TIMES.write_text(json.dumps({m: round(t, 2) for m, _, _, t in results}, indent=1,
-                                sort_keys=True))
     slowest = sorted(results, key=lambda r: -r[3])[:3]
     print(f"\nRan {ran} tests in {wall:.1f}s across {len(targets)} modules, "
           f"{workers} workers")
