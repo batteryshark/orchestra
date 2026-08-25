@@ -161,11 +161,18 @@ progress_interval = 900
 # Swept runs get an isolated git worktree: nobody is watching a swept
 # dispatch, so it must not share a checkout with a working human.
 worktree = true
-# Sign-off (W-0269). Off: items stay in review for a human. On: a
-# verification run executes each acceptance criterion's stated method
-# against landed main. verify_profile must not be the worker's `profile`.
-verify = false
-# verify_profile = "judge"
+
+# --- Sign-off (W-0269, W-0299) --------------------------------------------
+# A verifier run follows every landing: when the sweeper's landed fact moves
+# an item to review, a verification run executes each acceptance criterion's
+# stated method against landed main. ON by default — no human asks. profile
+# names the launch template; unset, the one enabled profile marked tier = 1
+# (workhorse) takes the run — a cheaper model than the worker's, and never
+# the worker's own profile. Zero or several tier-1 profiles: the pass says
+# so and skips. Legacy [work] verify / verify_profile keys are still read.
+[verify]
+# enabled = true
+# profile = "judge"
 
 # --- Optional Nod notification adapter -----------------------------------
 # Escalations are delivered as Nod request cards. Off unless enabled.
@@ -325,6 +332,10 @@ def load(project_id: str | None = None) -> dict:
         # its defaults, so a configured `test` check never ran — for the
         # supervisor OR for `orchestra merge`.
         cfg.setdefault("merge", {}).update(overlay.get("merge", {}))
+        # [verify] is the sign-off pass (W-0299). Every table has to be
+        # listed here to survive the load — the same omission once meant a
+        # configured [merge] check never ran.
+        cfg.setdefault("verify", {}).update(overlay.get("verify", {}))
         # [http] trust_local = true makes an unauthenticated request FROM THIS MACHINE
 # the human, so a browser on localhost never pastes the key. Off by default:
 # workers run on this machine too, and loopback cannot tell them apart, so

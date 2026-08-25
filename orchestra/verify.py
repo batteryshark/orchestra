@@ -1,9 +1,10 @@
 """Sign-off is a run (W-0269): verification earns done, or blocks with reasons.
 
-When a swept item reaches ``review``, and ``[work] verify`` is on, the runner
-records a verification run on ``verify_profile`` — never the worker's profile
-or session — and executes each acceptance criterion's stated method against
-landed main. All pass: it ticks them and appends ``fact: verified``, which
+When the sweeper's landed fact moves a swept item to ``review``, the runner
+records a verification run — ON by default (W-0299), no human asks — on
+``[verify] profile``, defaulting to the one tier-1 (workhorse) profile and
+never the worker's profile or session, and executes each acceptance
+criterion's stated method against landed main. All pass: it ticks them and appends ``fact: verified``, which
 reads **done** on top of the worker's landing. Any fail: ``fact: halted``
 naming those criteria, which reads blocked. Surface lane, no ring.
 
@@ -23,6 +24,26 @@ from orchestra.work_client import WorkClient, fact_line, verifier_identity
 
 METHOD_TIMEOUT = 60
 REQUESTED_BY = "verify"
+VERIFY_TIER = 1  # workhorse — the "cheaper model" the default promises (W-0299)
+
+
+def _default_profile(pcfg: dict, item_id: str) -> str | None:
+    """The one ENABLED tier-1 profile, else None with the fix printed.
+
+    The same volunteer rule as ``observer.profile_name``: ambiguity is
+    reported, never guessed — two tier-1 profiles is a config the owner
+    resolves, not something to pick for them.
+    """
+    cheap = sorted(name for name, p in config.enabled_profiles(pcfg).items()
+                   if config.tier_of(p.get("tier")) == VERIFY_TIER)
+    if len(cheap) == 1:
+        return cheap[0]
+    fix = (f"several tier-1 profiles ({', '.join(cheap)}) — set "
+           '[verify] profile = "NAME"' if cheap else
+           'no verify profile — set [verify] profile = "NAME" or mark one '
+           "profile tier = 1 (workhorse)")
+    print(f"orchestra verify: {item_id} skipped — {fix}")
+    return None
 
 
 def after_report(con, cfg: dict, client: WorkClient, actions: list) -> None:
@@ -47,13 +68,19 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
     if already:
         return
     pcfg = config.load(worker["project_id"]) if worker["project_id"] else cfg
+    vcfg = dict(pcfg.get("verify") or {})
     work = dict(pcfg.get("work") or {})
-    if not work.get("verify"):
+    # W-0299: on by default — every landing gets this pass without a human
+    # asking. An explicit [verify] enabled wins; the legacy [work] verify key
+    # is still honored, so a pre-W-0299 config keeps meaning what it said.
+    if not vcfg.get("enabled", work.get("verify", True)):
         return
-    profile_name = (work.get("verify_profile") or "").strip()
+    profile_name = (vcfg.get("profile") or work.get("verify_profile")
+                    or "").strip()
     if not profile_name:
-        print(f"orchestra verify: {item_id} skipped — no verify_profile")
-        return
+        profile_name = _default_profile(pcfg, item_id)
+        if not profile_name:
+            return
     if profile_name == worker["profile"]:
         print(f"orchestra verify: {item_id} skipped — verify_profile is the "
               f"worker's profile ({profile_name})")
