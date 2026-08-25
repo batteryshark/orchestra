@@ -30,10 +30,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>orchestra</title>
-<!-- The favicon is the 32px variant inlined as a data URI: the page
-     makes no external request, and that rule does not bend for a
-     16px icon. assets/orchestra-favicon.svg is the source of truth. -->
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20512%20512%22%3E%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%2296%22%20fill%3D%22%23161B23%22%2F%3E%3Cpath%20transform%3D%22translate%2854%2C60%29%22%20fill%3D%22%234FB3C4%22%20d%3D%22M0%2C12%20L340%2C0%20C273%2C48%20202%2C88%20115%2C98%20C67%2C102%2018%2C64%200%2C12%20Z%22%2F%3E%3Cpath%20transform%3D%22translate%2894%2C206%29%22%20fill%3D%22%2361A5E8%22%20d%3D%22M0%2C12%20L340%2C0%20C273%2C48%20202%2C88%20115%2C98%20C67%2C102%2018%2C64%200%2C12%20Z%22%2F%3E%3Cpath%20transform%3D%22translate%2854%2C352%29%22%20fill%3D%22%234FB3C4%22%20d%3D%22M0%2C12%20L340%2C0%20C273%2C48%20202%2C88%20115%2C98%20C67%2C102%2018%2C64%200%2C12%20Z%22%2F%3E%3C%2Fsvg%3E">
+<!-- The favicon is inlined as a data URI: the page makes no external
+     request. assets/orchestra-favicon.svg is the source of truth. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20128%20128%22%3E%3Crect%20width%3D%22128%22%20height%3D%22128%22%20rx%3D%2224%22%20fill%3D%22%230b0d10%22%2F%3E%3Cg%20fill%3D%22%23f3f4f2%22%3E%3Crect%20x%3D%2225%22%20y%3D%2255%22%20width%3D%2220%22%20height%3D%2242%22%20rx%3D%2210%22%20opacity%3D%22.45%22%2F%3E%3Crect%20x%3D%2254%22%20y%3D%2230%22%20width%3D%2220%22%20height%3D%2267%22%20rx%3D%2210%22%2F%3E%3Crect%20x%3D%2283%22%20y%3D%2246%22%20width%3D%2220%22%20height%3D%2251%22%20rx%3D%2210%22%20opacity%3D%22.7%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E">
 <style>
   :root {
     --bg: #14161a; --panel: #1c1f25; --line: #2c313a; --text: #dfe3ea;
@@ -330,7 +329,7 @@
 <div id="banner"></div>
 <div id="paused" hidden></div>
 <header>
-  <svg class="mark" viewBox="0 0 512 512" role="img" aria-label="Orchestra"><path transform="translate(78,96)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/><path transform="translate(118,214)" fill="#61A5E8" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/><path transform="translate(78,332)" fill="#4FB3C4" d="M0,10 L296,0 C238,40 176,74 100,82 C58,86 16,54 0,10 Z"/></svg>
+  <svg class="mark" viewBox="0 0 128 128" role="img" aria-label="Orchestra"><g fill="#f3f4f2"><rect x="25" y="55" width="20" height="42" rx="10" opacity=".45"/><rect x="54" y="30" width="20" height="67" rx="10"/><rect x="83" y="46" width="20" height="51" rx="10" opacity=".7"/></g></svg>
   <h1>orchestra</h1>
   <div class="live"><span id="livecount">–</span> <small>live</small></div>
   <!-- The project picker stands where the snapshot stamp used to (W-0186).

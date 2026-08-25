@@ -1,7 +1,4 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/orchestra-wordmark-dark.svg">
-  <img src="assets/orchestra-wordmark.svg" alt="Orchestra" width="360">
-</picture>
+<img src="assets/orchestra-logo.svg" alt="Orchestra" width="360">
 
 ## What this is
 

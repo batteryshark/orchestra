@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 128" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestra</title>
+  <desc id="desc">Three vertical bars followed by the Orchestra wordmark.</desc>
+  <rect width="520" height="128" rx="24" fill="#0b0d10"/>
+  <g fill="#f3f4f2">
+    <rect x="42" y="54" width="20" height="42" rx="10" opacity=".45"/>
+    <rect x="72" y="30" width="20" height="66" rx="10"/>
+    <rect x="102" y="46" width="20" height="50" rx="10" opacity=".7"/>
+    <text x="154" y="88" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="62" font-weight="620" letter-spacing="-2">orchestra</text>
+  </g>
+</svg>
