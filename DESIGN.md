@@ -96,9 +96,10 @@ the static dashboard on one port. Reads and actions require either the human
 secret or a scoped per-run token. A run token can read shared state but can act
 only on its own run; termination revokes it.
 
-The dashboard and iOS app are optional clients of that API. The iOS project and
-bundle identifiers retain the Dromond name for upgrade and Keychain
-compatibility. User-facing copy and protocol names use Orchestra.
+The dashboard and iOS app are optional clients of that API. The iOS bundle
+identifier and Keychain service keep their shipped string for upgrade and
+Keychain compatibility; every name in the project and on the phone is
+Orchestra.
 
 The HTTP server can bind to loopback or a discovered Tailscale address. Host
 checks and the shared key still apply on a tailnet.

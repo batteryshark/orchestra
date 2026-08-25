@@ -89,7 +89,7 @@ struct ConnectView: View {
         NavigationStack {
             Form {
                 Section {
-                    DromondMark()
+                    OrchestraMark()
                         .frame(width: 76, height: 76)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)

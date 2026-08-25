@@ -1,6 +1,6 @@
 import Foundation
 
-struct DromondAPI: Sendable {
+struct OrchestraAPI: Sendable {
     let baseURL: URL
     let key: String
     var session: URLSession = .shared

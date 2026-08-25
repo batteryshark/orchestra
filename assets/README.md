@@ -2,7 +2,7 @@
 
 Three vertical bars at different heights, like section levels on a mixing
 desk: many voices, one piece. This is the original Orchestra mark, restored
-2026-08-24 after the Dromond fleet interlude.
+2026-08-24.
 
 ## Palette
 
@@ -23,12 +23,12 @@ Two colours only. The three bars differ by opacity on the same gray:
 | `orchestra-favicon.svg` | browser tab | `<link rel="icon" type="image/svg+xml" href="assets/orchestra-favicon.svg">` |
 | `orchestra-icon-1024.png` | iOS app icon, the 1024×1024 App Store slot | drop into the `AppIcon` asset set |
 
-Two copies live outside this directory and have to be edited with it:
+Three copies live outside this directory and have to be edited with it:
 `orchestra/dashboard.html` inlines the favicon as a data URI and draws the
-bars (no tile) as inline SVG in its header, and
-`ios/Dromond/Assets.xcassets/AppIcon.appiconset/` holds the 1024px PNG under
-its Dromond filename for in-place upgrades. Change a bar here and both need
-the same change.
+bars (no tile) as inline SVG in its header,
+`ios/Orchestra/Assets.xcassets/AppIcon.appiconset/` holds a copy of the
+1024px PNG, and `ios/Orchestra/Components.swift` draws the mark as SwiftUI
+shapes. Change a bar here and all three need the same change.
 
 The logo names its type as Inter with a system-sans fallback; no font file
 ships with it, so a machine without Inter renders the fallback.

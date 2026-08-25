@@ -197,7 +197,7 @@ struct HealthView: View {
 
     // --- actions ----------------------------------------------------------
 
-    private func act(_ done: String, _ body: @escaping (DromondAPI) async throws -> Void) async {
+    private func act(_ done: String, _ body: @escaping (OrchestraAPI) async throws -> Void) async {
         busy = true
         defer { busy = false }
         if let problem = await state.perform(body) {
