@@ -77,7 +77,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
-                         profile_edit, profiles, project, runway, supervise,
+                         instrumentation, profile_edit, profiles, project, runway, supervise,
                          traces)
 
 # Bumped by ANY change to the snapshot payload (DESIGN §3 acceptance).
@@ -101,7 +101,8 @@ from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
 # v11 (W-0291): removed the always-empty findings/proposals arrays and the
 # inert delegation field on profiles.
 # v12 (W-0292): every run reports its effective isolation state explicitly.
-SNAPSHOT_VERSION = 12
+# v13 (W-0301): statistics include the latest run instrumentation report.
+SNAPSHOT_VERSION = 13
 
 DEFAULT_PORT = 3011
 KEY_ENV = "ORCHESTRA_KEY"
@@ -708,7 +709,8 @@ def _add(carried, value, digits: int | None = None):
     return round(total, digits) if digits is not None else total
 
 
-def _statistics(con, project_id: str | None = None) -> dict:
+def _statistics(con, project_id: str | None = None,
+                instrumentation_limit: int = 30) -> dict:
     """Per DESIGN §11, plus the plan/api split (W-0179): a run on a
     subscription has NO price. OpenCode reports ``cost: 0`` on plan data and
     Codex reports none at all — both read as "free" if shown as money, so a
@@ -760,6 +762,8 @@ def _statistics(con, project_id: str | None = None) -> dict:
         "tokens_total": tokens,
         "cost_usd": cost,
         "by_profile": [by_profile[k] for k in sorted(by_profile)],
+        "instrumentation": instrumentation.report(
+            con, instrumentation_limit, project_id),
     }
 
 

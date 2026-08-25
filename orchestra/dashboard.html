@@ -1791,7 +1791,47 @@ function renderStats(s) {
                                   p.billing === "plan" ? "plan"
                                   : p.cost === null ? "–" : money(p.cost)]))
     : el("p", "dim", "no runs recorded yet");
-  $("stats").replaceChildren(head, block("per profile", per));
+  const report = st.instrumentation;
+  const pct = (v) => v === null ? "–" : (v * 100).toFixed(1) + "%";
+  const toolRows = Object.keys(report.tools).map((kind) => {
+    const item = report.tools[kind];
+    return [kind, item.calls, item.errors, pct(item.error_rate),
+            dur(item.seconds), item.timed_calls + " timed"];
+  });
+  const toolSummary = kv([
+    ["window", report.runs_count + " latest runs · limit " + report.window],
+    ["turns / compactions", report.turns + " / " + report.compactions],
+    ["tokens", num(report.tokens)],
+    ["failure rate", pct(report.failure_rate)],
+    ["landings per hour", report.landings_per_hour === null
+        ? "–" : report.landings_per_hour],
+    ["classified", pct(report.classification_rate)],
+  ]);
+  const runRows = report.runs.map((r) => {
+    const open = el("button", null, r.slug || "#" + r.run_id);
+    open.onclick = () => { $("statsdlg").close(); selectRun(r.run_id); };
+    return [open, r.profile, r.model || "–", r.status, dur(r.seconds),
+            num(r.tokens), r.turns, r.compactions, pct(r.classification_rate)];
+  });
+  const comparisons = report.comparisons.length
+    ? table(["profile", "model", "runs", "failure", "landings/hour"],
+        report.comparisons.map((r) => [r.profile, r.model || "–", r.runs,
+          pct(r.failure_rate), r.landings_per_hour === null ? "–" : r.landings_per_hour]))
+    : el("p", "dim", "no runs in this window");
+  const gaps = report.gap_candidates.length
+    ? table(["candidate", "count", "runs"], report.gap_candidates.map((g) => [
+        g.kind + ": " + g.value, g.count, g.runs.join(", ")]))
+    : el("p", "dim", "no repeated failures or file reads");
+  $("stats").replaceChildren(head, block("per profile", per),
+    block("latest run instrumentation", wrap([toolSummary,
+      table(["tool class", "calls", "errors", "error rate", "time", "coverage"],
+            toolRows)])),
+    block("per profile and model", comparisons),
+    block("gap candidates", gaps),
+    block("runs · click through", runRows.length
+      ? table(["run", "profile", "model", "status", "time", "tokens", "turns",
+               "compactions", "classified"], runRows)
+      : el("p", "dim", "no runs in this window")));
 }
 
 // No CLI commands here: the daemon writes this, and the buttons below drive
