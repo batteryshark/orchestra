@@ -35,6 +35,41 @@ class AliveTests(unittest.TestCase):
         self.skipTest("no free pid found")
 
 
+class ProcessIdentityTests(unittest.TestCase):
+    def test_unix_identity_uses_birth_token_and_requires_group_leadership(self) -> None:
+        with mock.patch.object(proc, "IS_WIN", False), \
+                mock.patch.object(proc.sys, "platform", "darwin"), \
+                mock.patch.object(proc, "_darwin_process_info",
+                                  return_value=(4242, 100, 7)):
+            self.assertEqual(proc.process_identity(4242), "darwin:100:7")
+        with mock.patch.object(proc, "IS_WIN", False), \
+                mock.patch.object(proc.sys, "platform", "darwin"), \
+                mock.patch.object(proc, "_darwin_process_info",
+                                  return_value=(99, 100, 7)):
+            self.assertIsNone(proc.process_identity(4242))
+
+        fields = ["S", "1", "4242", "4242"] + ["0"] * 15 + ["98765"]
+        stat = "4242 (worker with spaces) " + " ".join(fields)
+        with mock.patch.object(proc, "IS_WIN", False), \
+                mock.patch.object(proc.sys, "platform", "linux"), \
+                mock.patch.object(proc.Path, "read_text",
+                                  side_effect=[stat, "boot-id\n"]):
+            self.assertEqual(proc.process_identity(4242),
+                             "linux:boot-id:98765")
+        fields[2] = "99"
+        stat = "4242 (worker with spaces) " + " ".join(fields)
+        with mock.patch.object(proc, "IS_WIN", False), \
+                mock.patch.object(proc.sys, "platform", "linux"), \
+                mock.patch.object(proc.Path, "read_text",
+                                  side_effect=[stat, "boot-id\n"]):
+            self.assertIsNone(proc.process_identity(4242))
+        with mock.patch.object(proc, "IS_WIN", False), \
+                mock.patch.object(proc.sys, "platform", "linux"), \
+                mock.patch.object(proc.Path, "read_text",
+                                  side_effect=["malformed", "boot-id\n"]):
+            self.assertIsNone(proc.process_identity(4242))
+
+
 class SessionKwargsTests(unittest.TestCase):
     def test_unix_uses_start_new_session(self) -> None:
         with mock.patch.object(proc, "IS_WIN", False):
@@ -88,6 +123,29 @@ class TerminateGroupTests(unittest.TestCase):
              mock.patch.object(proc.os, "killpg", gone):
             proc.terminate_group(4242)
             proc.terminate_group(4242, force=True)
+
+        with mock.patch.object(proc, "signal_group",
+                               side_effect=ProcessLookupError):
+            self.assertEqual(
+                proc.signal_owned_group(4242, "owner", signal.SIGTERM)[0],
+                "gone")
+        with mock.patch.object(proc, "signal_group") as sent, \
+                mock.patch.object(proc, "process_identity",
+                                  return_value="new-owner"):
+            outcome, detail = proc.signal_owned_group(
+                4242, "old-owner", signal.SIGTERM)
+        self.assertEqual(outcome, "refused")
+        self.assertIn("identity changed", detail)
+        sent.assert_called_once_with(4242, 0)
+        with mock.patch.object(proc, "signal_group") as sent, \
+                mock.patch.object(proc, "process_identity",
+                                  return_value="owner"):
+            self.assertEqual(
+                proc.signal_owned_group(4242, "owner", signal.SIGTERM)[0],
+                "signalled")
+        self.assertEqual(
+            [call.args for call in sent.call_args_list],
+            [(4242, 0), (4242, signal.SIGTERM)])
 
     def test_windows_taskkill_is_already_forceful(self) -> None:
         calls = []

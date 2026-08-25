@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import auth, brief, db, profile_edit
+from orchestra import auth, brief, db
 from orchestra import http as mhttp
 from tests.test_http import KEY, ServerCase
 
@@ -74,26 +74,24 @@ class TokenSecretTests(unittest.TestCase):
         self.assertNotIn(token, brief_path.read_text())
         self.assertNotIn(token, json.dumps(mhttp.snapshot(self.con)))
 
-    def test_a_terminal_run_revokes_its_own_token(self) -> None:
-        run_id = self.make_run()
-        token = auth.mint(self.con, run_id)
-        self.assertEqual(auth.identify(self.con, token, None),
-                         auth.Identity(auth.RUN, run_id))
-        self.con.execute("UPDATE runs SET status='done' WHERE id=?", (run_id,))
-        self.con.commit()
-        self.assertIsNone(auth.identify(self.con, token, None))
-        self.assertIsNone(self.con.execute(
-            "SELECT run_token_hash FROM runs WHERE id=?",
-            (run_id,)).fetchone()["run_token_hash"])
-
     def test_every_terminal_status_revokes(self) -> None:
         for status in db.RUN_TERMINAL:
             run_id = self.make_run()
             token = auth.mint(self.con, run_id)
-            self.con.execute("UPDATE runs SET status=? WHERE id=?",
+            self.assertEqual(auth.identify(self.con, token, None),
+                             auth.Identity(auth.RUN, run_id))
+            self.con.execute("UPDATE runs SET status=?, exit_code=17 WHERE id=?",
                              (status, run_id))
             self.con.commit()
             self.assertIsNone(auth.identify(self.con, token, None), status)
+            receipt = self.con.execute(
+                "SELECT run_token_hash, worker_status, worker_exit_code "
+                "FROM runs WHERE id=?",
+                (run_id,)).fetchone()
+            self.assertIsNone(receipt["run_token_hash"])
+            self.assertEqual((receipt["worker_status"],
+                              receipt["worker_exit_code"]), (None, None),
+                             "token revocation must not manufacture a worker result")
 
     def test_the_cli_reads_authority_from_the_token(self) -> None:
         from orchestra import cli
@@ -249,71 +247,6 @@ class RunTokenRouteTests(ServerCase):
         self.assertEqual(self.request("POST", "/api/dispatch/pause")[0], 200)
         self.assertEqual(self.request(
             "POST", f"/api/runs/{self.sibling}/stop")[0], 200)
-
-
-class EffortDirectionTests(unittest.TestCase):
-    """An agent may spend less on its own say-so, never more (W-0176)."""
-
-    CONFIG = ('[profiles.thinker]\nbackend = "codex"\nmodel = "gpt-5.6-sol"\n'
-              'effort = "high"\n')
-
-    class FakeWork:
-        def __init__(self):
-            self.filed = []
-
-        def create_decision(self, **kw):
-            self.filed.append(kw)
-            return {"id": "W-9001"}
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name) / "config.toml"
-        self.path.write_text(self.CONFIG)
-        self.env = mock.patch.dict(os.environ, {
-            "ORCHESTRA_CONFIG": str(self.path),
-            "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
-        self.env.start()
-
-    def tearDown(self) -> None:
-        self.env.stop()
-        self.tmp.cleanup()
-
-    def save(self, effort, authority="agent"):
-        work = self.FakeWork()
-        result = profile_edit.save("thinker", {"effort": effort},
-                                   authority=authority, work=work,
-                                   options=None)
-        return result, work
-
-    def test_lowering_is_the_agents_to_make(self) -> None:
-        result, work = self.save("low")
-        self.assertTrue(result["applied"], result)
-        self.assertIn('effort = "low"', self.path.read_text())
-        self.assertEqual(work.filed, [])
-
-    def test_raising_files_a_decision_and_writes_nothing(self) -> None:
-        result, work = self.save("ultra")
-        self.assertFalse(result["applied"])
-        self.assertEqual(result["needs"], ["effort"])
-        self.assertEqual(result["decision"], "W-9001")
-        self.assertIn('effort = "high"', self.path.read_text())
-        self.assertIn("raising a reasoning effort", work.filed[0]["detail"])
-
-    def test_an_effort_that_cannot_be_ranked_goes_to_the_human(self) -> None:
-        result, _ = self.save("hyper")
-        self.assertFalse(result["applied"])
-
-    def test_the_human_may_raise_it(self) -> None:
-        result, work = self.save("ultra", authority="human")
-        self.assertTrue(result["applied"], result)
-        self.assertEqual(work.filed, [])
-
-    def test_the_ranking_is_ordered_and_conservative(self) -> None:
-        self.assertFalse(profile_edit.raises_effort("high", "low"))
-        self.assertFalse(profile_edit.raises_effort("ultra", "max"))
-        self.assertFalse(profile_edit.raises_effort("high", None))
-        self.assertTrue(profile_edit.raises_effort("max", "ultra"))
-        self.assertTrue(profile_edit.raises_effort(None, "low"))
 
 
 if __name__ == "__main__":

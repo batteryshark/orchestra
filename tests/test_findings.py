@@ -4,10 +4,12 @@ Covers the two required fields, the protocol failure an absent one is, the
 fingerprint dedup, verb 5 with its goal-parent gate, and the tripwires that
 force human review whatever a planner would have said.
 """
+import json
 import unittest
 from unittest import mock
 
 from orchestra import db, findings
+from orchestra.work_client import WorkClient, WorkError
 from tests.fake_work import FakeWork
 from tests.test_sweeper import PROJECT_ID, SweeperFixture
 
@@ -130,13 +132,28 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
 
     def run_at_completion(self, text, status="done", run_id=7, **cfg_settings):
         con = db.connect()
+        log_path = self.tmp_path / f"run-{run_id}.jsonl"
+        log_path.write_text(json.dumps({"type": "result", "result": text}) + "\n")
+        con.execute("UPDATE runs SET status=?, log_path=? WHERE id=?",
+                    (status, str(log_path), run_id))
+        con.commit()
         run = dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
         cfg = dict(self.cfg)
         if cfg_settings:
             cfg["settings"] = {**cfg.get("settings", {}), **cfg_settings}
-        result = findings.at_completion(con, cfg, run, text, status)
+        result = findings.at_completion(con, cfg, run)
         con.close()
         return result
+
+    def add_run(self, run_id: int) -> None:
+        con = db.connect()
+        con.execute(
+            "INSERT INTO runs(id, slug, profile, backend, requested_by, workdir, "
+            "project_id, work_item, status, started_at) "
+            "VALUES(?, ?, 'stub', 'opencode', 'work', ?, ?, 'W-0001', 'done', ?)",
+            (run_id, f"run_{run_id}", str(self.root), PROJECT_ID, db.now()))
+        con.commit()
+        con.close()
 
     # --- findings -----------------------------------------------------------
 
@@ -151,6 +168,30 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         self.assertIn("observed", issue["body"])
         self.assertIn("runners.py:88", issue["body"])
 
+    def test_lost_issue_response_is_recovered_by_its_run_marker(self) -> None:
+        create = WorkClient.create_issue
+
+        with mock.patch.object(
+                WorkClient, "create_issue",
+                side_effect=WorkError(503, "unavailable", "try again")):
+            unavailable = self.run_at_completion(HANDOFF % (FINDING, ""))
+        self.assertEqual(unavailable["findings"][0]["action"], "deferred")
+        self.assertIsNone(self.db_run(7)["handoff_processed_at"])
+
+        def committed_then_lost(client, *args, **kwargs):
+            create(client, *args, **kwargs)
+            return None
+
+        with mock.patch.object(WorkClient, "create_issue", committed_then_lost):
+            first = self.run_at_completion(HANDOFF % (FINDING, ""))
+        self.assertEqual(first["findings"][0]["action"], "deferred")
+        self.assertEqual(len(self.work.issues), 1)
+
+        second = self.run_at_completion(HANDOFF % (FINDING, ""))
+        self.assertEqual(second["findings"][0]["action"], "filed")
+        self.assertEqual(len(self.work.issues), 1)
+        self.assertIsNotNone(self.db_run(7)["handoff_processed_at"])
+
     def test_repeat_comments_and_counts_instead_of_filing_a_duplicate(self) -> None:
         first = self.run_at_completion(HANDOFF % (FINDING, ""))
         issue_id = first["findings"][0]["issue"]
@@ -158,7 +199,8 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         # not ours, and it is the only way to observe the comment.
         self.client.claim_issue(issue_id)
         before = len(self.work.issues)
-        again = self.run_at_completion(HANDOFF % (FINDING, ""))
+        self.add_run(8)
+        again = self.run_at_completion(HANDOFF % (FINDING, ""), run_id=8)
         self.assertEqual(len(self.work.issues), before)
         self.assertEqual(again["findings"][0]["action"], "duplicate")
         self.assertEqual(again["findings"][0]["occurrences"], 2)
@@ -166,7 +208,8 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
 
     def test_repeat_on_an_unclaimed_issue_still_counts(self) -> None:
         self.run_at_completion(HANDOFF % (FINDING, ""))
-        again = self.run_at_completion(HANDOFF % (FINDING, ""))
+        self.add_run(8)
+        again = self.run_at_completion(HANDOFF % (FINDING, ""), run_id=8)
         self.assertEqual(again["findings"][0]["occurrences"], 2)
         self.assertEqual(again["findings"][0]["comment_skipped"], "issue_not_claimed")
 
@@ -199,6 +242,29 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual([t for t in self.work.tasks.values()
                           if t["parentId"] == "W-0001"], [])
 
+    def test_lost_decision_response_is_recovered_by_its_run_marker(self) -> None:
+        create = WorkClient.create_decision
+
+        with mock.patch.object(
+                WorkClient, "create_decision",
+                side_effect=WorkError(503, "unavailable", "try again")):
+            unavailable = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        self.assertEqual(unavailable["proposals"][0]["action"], "deferred")
+        self.assertIsNone(self.db_run(7)["handoff_processed_at"])
+
+        def committed_then_lost(client, *args, **kwargs):
+            create(client, *args, **kwargs)
+            return None
+
+        with mock.patch.object(WorkClient, "create_decision", committed_then_lost):
+            first = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        self.assertEqual(first["proposals"][0]["action"], "deferred")
+        self.assertEqual(len(self.work.decisions), 1)
+
+        second = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        self.assertEqual(second["proposals"][0]["action"], "decision")
+        self.assertEqual(len(self.work.decisions), 1)
+
     def test_aligned_proposal_lands_as_a_child_task_plus_one_comment(self) -> None:
         planner = lambda **kw: {"verdict": "aligned", "rationale": "same goal"}
         with mock.patch.object(findings, "PLANNER", planner):
@@ -211,6 +277,45 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         comments = [e for e in self.work.tasks["W-0001"]["log"]
                     if "added child" in e["message"]]
         self.assertEqual(len(comments), 1)
+
+    def test_lost_child_response_is_recovered_by_its_run_marker(self) -> None:
+        planner = lambda **kw: {"verdict": "aligned", "rationale": "same goal"}
+        create = WorkClient.create_task
+
+        def committed_then_lost(client, *args, **kwargs):
+            create(client, *args, **kwargs)
+            return None
+
+        with mock.patch.object(findings, "PLANNER", planner), \
+                mock.patch.object(WorkClient, "create_task", committed_then_lost):
+            first = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        self.assertEqual(first["proposals"][0]["action"], "deferred")
+
+        with mock.patch.object(findings, "PLANNER", planner):
+            second = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        children = [task for task in self.work.tasks.values()
+                    if task["parentId"] == "W-0001"]
+        self.assertEqual(second["proposals"][0]["action"], "child")
+        self.assertEqual(len(children), 1)
+
+    def test_lost_child_comment_response_does_not_repeat_the_comment(self) -> None:
+        planner = lambda **kw: {"verdict": "aligned", "rationale": "same goal"}
+        post = WorkClient.log_task
+
+        def committed_then_lost(client, item_id, body):
+            reply = post(client, item_id, body)
+            return None if " proposal:1 added child " in body else reply
+
+        with mock.patch.object(findings, "PLANNER", planner), \
+                mock.patch.object(WorkClient, "log_task", committed_then_lost):
+            first = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        self.assertEqual(first["proposals"][0]["action"], "deferred")
+
+        with mock.patch.object(findings, "PLANNER", planner):
+            second = self.run_at_completion(HANDOFF % ("", PROPOSAL))
+        self.assertEqual(second["proposals"][0]["action"], "child")
+        comments = [entry["message"] for entry in self.work.tasks["W-0001"]["log"]]
+        self.assertEqual(sum(" proposal:1 added child " in note for note in comments), 1)
 
     def test_own_project_is_resolved_so_it_is_not_a_cross_project_proposal(self) -> None:
         """The run's project comes from the projectId cache; a cold cache
@@ -284,9 +389,14 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
     def test_work_disabled_still_enforces_the_protocol_locally(self) -> None:
         cfg = dict(self.cfg, work={**self.cfg["work"], "enabled": False})
         con = db.connect()
+        log_path = self.tmp_path / "run-7.jsonl"
+        log_path.write_text(json.dumps({"type": "result",
+                                        "result": "no block"}) + "\n")
+        con.execute("UPDATE runs SET log_path=? WHERE id=7", (str(log_path),))
+        con.commit()
         run = dict(con.execute("SELECT * FROM runs WHERE id=7").fetchone())
         with mock.patch.object(FakeWork, "now", side_effect=AssertionError):
-            result = findings.at_completion(con, cfg, run, "no block", "done")
+            result = findings.at_completion(con, cfg, run)
         con.close()
         self.assertIn("no handoff block", result["problems"][0])
         self.assertEqual(result["findings"], [])

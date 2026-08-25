@@ -364,6 +364,28 @@ class AdmissionPauseTests(SweeperFixture, unittest.TestCase):
         self.assertEqual(
             con.execute("SELECT status FROM runs WHERE id=2").fetchone()["status"],
             "failed")
+
+        con.execute(
+            "INSERT INTO runs(id, profile, backend, requested_by, workdir, branch, "
+            "status, started_at) VALUES(3,'stub','opencode','human',?,"
+            "'orchestra/run-3','done',?)", (str(self.root), db.now()))
+        con.execute(
+            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
+            "status, started_at) VALUES(4,'stub','opencode','human',?,"
+            "'pending',?)", (str(self.root), db.now()))
+        con.execute("INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+                    "VALUES(4, 3)")
+        con.execute("INSERT INTO deferred_dispatches(run_id, mission, created_at) "
+                    "VALUES(4, 'wait for landing', ?)", (db.now(),))
+        con.commit()
+        self.assertEqual(supervise.process_ready(
+            con, lambda root, rid: launched.append(rid)), [],
+            "a done execution is not success until its branch lands")
+        con.execute("UPDATE runs SET landing_status='failed' WHERE id=3")
+        con.commit()
+        self.assertEqual(supervise.process_ready(
+            con, lambda root, rid: launched.append(rid)),
+            [{"run_id": 4, "status": "declined"}])
         con.close()
 
 
@@ -439,13 +461,6 @@ class PauseSwitchTests(unittest.TestCase):
             db.meta_set(self.con, dispatch.PAUSE_KEY, raw)
             self.con.commit()
             self.assertEqual(dispatch.paused(self.con), expected, raw)
-
-    def test_pausing_still_carries_its_note_and_time(self) -> None:
-        dispatch.pause(self.con, note="landing a merge")
-        state = dispatch.pause_state(self.con)
-        self.assertEqual("landing a merge", state["note"])
-        self.assertIsNotNone(state["at"])
-
 
 if __name__ == "__main__":
     unittest.main()

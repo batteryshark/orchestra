@@ -76,8 +76,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from orchestra import (auth, config, db, dispatch, paths, proc, profile_edit,
-                         profiles, project, runway, supervise, traces)
+from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
+                         profile_edit, profiles, project, runway, supervise,
+                         traces)
 
 # Bumped by ANY change to the snapshot payload (DESIGN §3 acceptance).
 # v3 (W-0178): the run rows carry what the dashboard's detail pane shows —
@@ -1000,16 +1001,30 @@ def stop_run(con, run_id: int) -> dict:
     con.execute("UPDATE deferred_dispatches SET status='cancelled', "
                 "processed_at=? WHERE run_id=? AND status='pending'",
                 (db.now(), run_id))
-    con.execute(f"UPDATE runs SET status='killed', finished_at=? WHERE id=? "
-                f"AND status NOT IN {db.TERMINAL_SQL}", (db.now(), run_id))
+    changed = con.execute(
+        f"UPDATE runs SET status='killed', worker_status=COALESCE(worker_status, "
+        f"'killed'), finished_at=? WHERE id=? "
+        f"AND status NOT IN {db.TERMINAL_SQL}", (db.now(), run_id))
     con.commit()
+    if changed.rowcount != 1:
+        latest = _run_row(con, run_id)
+        return {"run": run_id, "status": latest["status"], "changed": False}
     signalled = False
-    if r["pid"]:
-        try:
-            proc.signal_group(r["pid"], signal.SIGTERM)
-            signalled = True
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    has_worker = r["pid"] is not None
+    signal_outcome = "gone" if not has_worker else "refused"
+    if has_worker:
+        signal_outcome, detail = proc.signal_owned_group(
+            r["pid"], r["pid_identity"], signal.SIGTERM)
+        signalled = signal_outcome == "signalled"
+        if signal_outcome == "refused":
+            print(f"orchestra http: run {run_id} not signalled: {detail}",
+                  file=sys.stderr)
+    try:
+        supervise.finalize_if_unowned(
+            con, run_id, worker_gone=signal_outcome == "gone")
+    except Exception as exc:
+        print(f"orchestra http: run {run_id} cleanup deferred: {exc}",
+              file=sys.stderr)
     # Dependents of a killed prerequisite are declined by the daemon's next
     # tick (supervise.process_ready) — spawning supervisors from an HTTP
     # thread would race the loop for no gain.
@@ -1032,22 +1047,21 @@ def tell_run(con, run_id: int, text: str, now: bool = False) -> dict:
         return {"error": f"run {run_id}'s session isn't identified yet "
                          "(~10s after spawn) — retry in a moment"}
     try:
-        offset = Path(r["log_path"]).stat().st_size
-    except (OSError, TypeError):
-        offset = 0
-    con.execute(
-        "INSERT INTO messages(run_id, sender, body, kind, created_at, "
-        "delivery_offset) VALUES(?,?,?, 'interrupt', ?, ?)",
-        (run_id, "dashboard", text, db.now(), offset))
+        messaging.queue_tell(con, run_id, "dashboard", text, r["log_path"])
+    except messaging.RunClosed:
+        latest = _run_row(con, run_id)
+        return {"error": f"run {run_id} already {latest['status']} — dispatch a "
+                         "fresh run instead"}
     if now:
         con.execute(f"UPDATE runs SET status='interrupt' WHERE id=? "
                     f"AND status NOT IN {db.TERMINAL_SQL}", (run_id,))
     con.commit()
     if now and r["pid"]:
-        try:
-            proc.signal_group(r["pid"], signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        outcome, detail = proc.signal_owned_group(
+            r["pid"], r["pid_identity"], signal.SIGTERM)
+        if outcome == "refused":
+            print(f"orchestra http: run {run_id} not signalled: {detail}",
+                  file=sys.stderr)
     return {"run": run_id, "queued": True, "immediate": bool(now)}
 
 

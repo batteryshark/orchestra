@@ -82,6 +82,49 @@ class DbTests(unittest.TestCase):
         db.connect(legacy).close()  # reconnect adds nothing twice
         con.close()
 
+    def test_v15_database_only_settles_completed_terminal_rows(self) -> None:
+        """An ambiguous old terminal row must not gain fictional receipts."""
+        legacy = self.root / "v15.db"
+        v15 = db.SCHEMA
+        for name, sql_type in db.RUNS_V16_COLUMNS:
+            v15 = v15.replace(f",\n  {name} {sql_type}", "")
+        old = sqlite3.connect(legacy)
+        old.executescript(v15)
+        insert = (
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "started_at, finished_at) VALUES('a','codex','human','/p',?,?,?)")
+        old.execute(insert, ("done", "started", "done-at"))
+        old.execute(insert, ("failed", "started", "failed-at"))
+        old.execute(insert, ("running", "started", None))
+        old.execute(
+            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+            "VALUES(1, 'orchestra', 'finished', 'completion', 'done-at')")
+        old.commit()
+        old.close()
+
+        con = db.connect(legacy)
+        rows = list(con.execute(
+            "SELECT status, landing_status, handoff_processed_at, work_reported_at, "
+            "worker_status, worker_exit_code FROM runs ORDER BY id"))
+        self.assertEqual(
+            [(row["status"], row["landing_status"], row["handoff_processed_at"],
+              row["work_reported_at"])
+            for row in rows],
+            [("done", "ok", "done-at", "done-at"),
+             ("failed", None, None, None),
+             ("running", None, None, None)])
+        self.assertEqual(
+            [(row["worker_status"], row["worker_exit_code"]) for row in rows],
+            [(None, None), (None, None), (None, None)],
+            "migration must not manufacture replay receipts for history")
+        db.connect(legacy).close()
+        again = con.execute(
+            "SELECT landing_status, handoff_processed_at FROM runs WHERE status='done'"
+        ).fetchone()
+        self.assertEqual((again["landing_status"], again["handoff_processed_at"]),
+                         ("ok", "done-at"))
+        con.close()
+
     def test_run_round_trip(self) -> None:
         cur = self.con.execute(
             "INSERT INTO runs(slug, profile, backend, model, title, requested_by, "
@@ -93,6 +136,13 @@ class DbTests(unittest.TestCase):
         self.assertEqual(run["profile"], "codex")
         self.assertEqual(run["status"], "spawning")
         self.assertIsNone(run["finished_at"])
+        self.assertIsNone(run["landing_status"])
+        self.assertIsNone(run["handoff_processed_at"])
+        self.assertIsNone(run["pid_identity"])
+        self.assertIsNone(run["supervisor_pid_identity"])
+        self.assertIsNone(run["worker_status"])
+        self.assertIsNone(run["worker_exit_code"])
+        self.assertIsNone(run["work_claim_status"])
 
     def test_slug_unique(self) -> None:
         insert = ("INSERT INTO runs(slug, profile, backend, requested_by, workdir, "

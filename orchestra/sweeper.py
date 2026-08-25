@@ -21,8 +21,8 @@ import datetime
 import time
 from pathlib import Path
 
-from orchestra import (brief, config, db, dispatch, paths, project,
-                         router, supervise, traces, verify)
+from orchestra import (brief, config, db, dispatch, messaging, paths, project,
+                         router, supervise, traces, verify, work_client)
 from orchestra.work_client import WorkClient, WorkError, fact_line, from_cfg
 
 CURSOR_KEYS = {"task": "work_cursor_tasks", "issue": "work_cursor_issues"}
@@ -163,14 +163,14 @@ def _last_session_run(con, item_id: str):
 
 def _insert_run(con, proj, profile_name: str, profile: dict, title: str,
                 item_id: str, seen_ts: str | None,
-                routed_reason: str | None = None):
+                routed_reason: str | None = None, *, commit: bool = True):
     """Reserve one fresh Work run through the common admission boundary."""
     return supervise.create_run(
         con, profile=profile_name, backend=profile["backend"],
         model=profile.get("model"), title=title, requested_by="work",
         workdir=str(proj.path), project_id=proj.project_id,
         work_item=item_id, work_seen_ts=seen_ts,
-        routed_reason=routed_reason)
+        routed_reason=routed_reason, commit=commit)
 
 
 # --- seams (W-0099, the conductor) ------------------------------------------
@@ -197,17 +197,28 @@ def _completion_outcome(run) -> tuple[bool, str]:
     this pass posts carries it to the board.
     """
     summary = (run["summary"] or "").strip()
-    return run["status"] == "done", summary or f"run {run['id']} {run['status']}"
+    landing_failed = run["status"] == "done" \
+        and run["landing_status"] == "failed"
+    if landing_failed:
+        reason = next((line.strip() for line in summary.splitlines()
+                       if line.strip().startswith(("Merge escalated", "Merge failed"))),
+                      None)
+        summary = reason or summary
+    return run["status"] == "done" and not landing_failed, \
+        summary or f"run {run['id']} {run['status']}"
 
 
 def _headline(run, summary: str) -> str:
     """One board-readable line: what happened and why."""
     first = (summary or "").strip().splitlines()[0] if summary else ""
     reason = f": {first}" if first and not first.startswith(f"run {run['id']}") else ""
-    return f"run {run['id']} {run['status']}{reason}"[:300]
+    outcome = ("landing failed" if run["status"] == "done"
+               and run["landing_status"] == "failed" else run["status"])
+    return f"run {run['id']} {outcome}{reason}"[:300]
 
 
-def _decline_unaccounted(client: WorkClient, item_id: str, run, tag: str) -> int:
+def _decline_unaccounted(client: WorkClient, item_id: str, run,
+                         tag: str) -> int | None:
     """Answer, on the run's behalf, every criterion it left open, and say so.
     Runs before the terminal fact: Work refuses a landing with anything
     unaccounted."""
@@ -219,64 +230,122 @@ def _decline_unaccounted(client: WorkClient, item_id: str, run, tag: str) -> int
     return declined
 
 
+def _report_ready(con, result) -> bool:
+    """True once this is the Work item's latest settled result."""
+    if not result["handoff_processed_at"]:
+        return False
+    completed = con.execute(
+        "SELECT 1 FROM messages WHERE run_id=? AND kind='completion' LIMIT 1",
+        (result["id"],)).fetchone()
+    if completed is None:
+        return False
+    newer = con.execute(
+        "SELECT 1 FROM runs WHERE work_item=? AND layer IS NULL AND id>? LIMIT 1",
+        (result["work_item"], result["id"])).fetchone()
+    if newer is not None:
+        return False
+    retry = con.execute(
+        "SELECT action FROM observations WHERE run_id=? AND layer='retry' "
+        "ORDER BY id DESC LIMIT 1", (result["id"],)).fetchone()
+    if retry is not None and retry["action"] == "deferred":
+        return False
+    if result["status"] == "done" and result["branch"] \
+            and result["landing_status"] not in ("ok", "failed"):
+        return False
+    return True
+
+
+def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
+    """Report one terminal run result.
+
+    ``(False, None)`` asks the batch to retry after Work is available;
+    ``(True, None)`` means no append is due; ``(True, action)`` is an appended
+    report.
+    """
+    if not result["work_item"]:
+        return True, None
+    if not _report_ready(con, result):
+        return True, None
+    item_id, kind = result["work_item"], item_kind(result["work_item"])
+    success, summary = _completion_outcome(result)
+    tag = f"[{client.identity}/{result['slug'] or result['id']}]"
+    comment = (f"{tag} run {result['id']} finished: {result['status']}\n\n"
+               f"{summary}")[:19000]
+    target = ("review" if success else "blocked") if kind == "task" \
+        else ("closed" if success else "needs_human")
+    verb = ("landed" if success else
+            "halted" if result["status"] == "halted"
+            or result["landing_status"] == "failed" else "failed") \
+        if kind == "task" else ("resolved" if success else "needs_human")
+    fact = (fact_line(
+        tag, verb,
+        reason=None if success else _headline(result, summary))
+        if kind == "task" else fact_line(
+            tag, verb,
+            **({"summary": summary} if success else {"reason": summary})))
+    try:
+        remote = (client.task(item_id) if kind == "task"
+                  else client.issue(item_id))
+        if remote is None:
+            return False, None
+        entries = (remote.get("log") if kind == "task"
+                   else remote.get("messages")) or []
+        sent = {entry.get("message" if kind == "task" else "body")
+                for entry in entries}
+        fact_prefix = f"{tag} fact: {verb}"
+        if any(message == fact_prefix or (message or "").startswith(fact_prefix + " ")
+               for message in sent):
+            _mark_reported(con, result)
+            return True, {"action": "report", "item": item_id,
+                          "run": result["id"], "to": target}
+        if kind == "task":
+            if comment not in sent and client.log_task(item_id, comment) is None:
+                return False, None
+            if _decline_unaccounted(client, item_id, result, tag) is None:
+                return False, None
+            posted = client.log_task(item_id, fact)
+        else:
+            # Work collapsed "resolved" into "closed" (2026-08-14): a
+            # resolved fact reads closed with its summary; humans reopen.
+            if comment not in sent and client.reply_issue(item_id, comment) is None:
+                return False, None
+            posted = client.reply_issue(item_id, fact)
+        if posted is None:  # Work went away mid-pass; retry next pass
+            return False, None
+    except WorkError as exc:
+        if work_client.retryable(exc):
+            print(f"orchestra sweep: report {item_id} temporarily refused ({exc})")
+            return False, None
+        # Terminal: Work refused the append on its own authority (a human
+        # closed the issue, the id is not a work item). The outcome is
+        # settled without us, so the report stamps reported and never
+        # retries — retrying forever turned two closed issues into
+        # permanent sweep noise (2026-08-20).
+        print(f"orchestra sweep: report {item_id} refused ({exc}) — "
+              f"marked reported")
+        _mark_reported(con, result)
+        return True, None
+    _mark_reported(con, result)
+    return True, {"action": "report", "item": item_id,
+                  "run": result["id"], "to": target}
+
+
 def _report(con, client: WorkClient, actions: list) -> bool:
     ok = True
     rows = list(con.execute(
         f"SELECT * FROM runs WHERE work_item IS NOT NULL AND status IN {db.TERMINAL_SQL} "
         "AND work_reported_at IS NULL ORDER BY id"))
-    for run in rows:
-        item_id, kind = run["work_item"], item_kind(run["work_item"])
-        success, summary = _completion_outcome(run)
-        tag = f"[{client.identity}/{run['slug'] or run['id']}]"
-        comment = (f"{tag} run {run['id']} finished: {run['status']}\n\n"
-                   f"{summary}")[:19000]
-        try:
-            if kind == "task":
-                target = "review" if success else "blocked"
-                posted = client.log_task(item_id, comment)
-                if posted is not None:
-                    _decline_unaccounted(client, item_id, run, tag)
-                    # `halted` is the run saying it stopped and needs the
-                    # human; `failed` is it saying it died. The reason is the
-                    # line the human reads on the board, so it says what
-                    # happened. A landing has no reason to give; merge.py owns
-                    # the sha when there is one.
-                    posted = client.log_task(item_id, fact_line(
-                        tag, "landed" if success else
-                        "halted" if run["status"] == "halted" else "failed",
-                        reason=None if success else _headline(run, summary)))
-            else:
-                # Work collapsed "resolved" into "closed" (2026-08-14): a
-                # resolved fact reads closed with its summary; humans reopen.
-                target = "closed" if success else "needs_human"
-                posted = client.reply_issue(item_id, comment)
-                if posted is not None:
-                    posted = client.reply_issue(item_id, fact_line(
-                        tag, "resolved" if success else "needs_human",
-                        **({"summary": summary} if success
-                           else {"reason": summary})))
-            if posted is None:  # Work went away mid-pass; retry next pass
-                ok = False
-                continue
-        except WorkError as exc:
-            # Terminal: Work refused the append on its own authority (a human
-            # closed the issue, the id is not a work item). The outcome is
-            # settled without us, so the report stamps reported and never
-            # retries — retrying forever turned two closed issues into
-            # permanent sweep noise (2026-08-20).
-            print(f"orchestra sweep: report {item_id} refused ({exc}) — "
-                  f"marked reported")
-            _mark_reported(con, run)
-            continue
-        _mark_reported(con, run)
-        actions.append({"action": "report", "item": item_id,
-                        "run": run["id"], "to": target})
+    for result in rows:
+        settled, action = report_result(con, client, result)
+        ok &= settled
+        if action is not None:
+            actions.append(action)
     return ok
 
 
 def _mark_reported(con, run) -> None:
     """Once only, however it ended (DESIGN: a report is never posted twice)."""
-    con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
+    con.execute("UPDATE runs SET work_reported_at=COALESCE(work_reported_at, ?) WHERE id=?",
                 (db.now(), run["id"]))
     con.commit()
 
@@ -293,6 +362,171 @@ def _dep_lookup(client: WorkClient):
     return lookup
 
 
+def _mark_claim_pending(con, run):
+    """Commit the local reservation and its remote-claim phase together."""
+    try:
+        changed = con.execute(
+            "UPDATE runs SET status='pending', work_claim_status='pending' "
+            "WHERE id=?", (run["id"],))
+        if changed.rowcount != 1:
+            raise RuntimeError(f"run {run['id']} disappeared during claim reservation")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    return con.execute("SELECT * FROM runs WHERE id=?", (run["id"],)).fetchone()
+
+
+def _claim_state(kind: str, item: dict, client: WorkClient, run) -> str:
+    """Return ``claimed``, ``retry``, or ``stale`` from authoritative Work data."""
+    if not is_delegated(item, client.identity):
+        return "stale"
+    if kind == "task":
+        expected = fact_line(
+            f"[{client.identity}/{run['slug']}]", "claimed", run=int(run["id"]))
+        present = any(entry.get("message") == expected
+                      for entry in item.get("log") or [])
+        if present:
+            return "claimed" if item.get("status") == "in_progress" else "stale"
+        return "retry" if item.get("status") == "ready" else "stale"
+    owner = item.get("claimedBy") or {}
+    if owner.get("kind") == "agent" and owner.get("name") == client.identity:
+        return "claimed" if item.get("state") == "in_progress" else "stale"
+    return "retry" if item.get("state") == "queued" and not owner else "stale"
+
+
+def _confirm_claim(con, client: WorkClient, kind: str, item: dict, run) -> str:
+    """Reconcile before mutating; a lost response leaves the same row pending."""
+    state = _claim_state(kind, item, client, run)
+    if state == "stale":
+        return state
+    if state == "retry":
+        if kind == "task":
+            tag = f"[{client.identity}/{run['slug']}]"
+            claimed = client.log_task(
+                item["id"], fact_line(tag, "claimed", run=int(run["id"])))
+        else:
+            claimed = client.claim_issue(item["id"])
+        if claimed is None:
+            return "deferred"
+    con.execute(
+        "UPDATE runs SET status='spawning', started_at=? WHERE id=? "
+        "AND work_claim_status='pending' AND status IN ('pending','spawning')",
+        (db.now(), run["id"]))
+    con.commit()
+    return "claimed"
+
+
+def _thread_contains(item: dict, kind: str, body: str) -> bool:
+    entries = item.get("log") if kind == "task" else item.get("messages")
+    field = "message" if kind == "task" else "body"
+    return any(entry.get(field) == body for entry in entries or [])
+
+
+def _abandon_claim(con, run) -> None:
+    """Drop an unprepared refusal, or cleanly terminalize prepared residue."""
+    current = con.execute("SELECT * FROM runs WHERE id=?", (run["id"],)).fetchone()
+    if current is None:
+        return
+    if current["brief_path"] is None:
+        con.execute("DELETE FROM runs WHERE id=?", (current["id"],))
+    else:
+        reason = "Work claim no longer authorizes launch"
+        con.execute(
+            "UPDATE runs SET status='killed', "
+            "worker_status=COALESCE(worker_status, 'killed'), "
+            "work_claim_status='abandoned', "
+            "work_reported_at=COALESCE(work_reported_at, ?), "
+            "summary=?, finished_at=COALESCE(finished_at, ?) WHERE id=?",
+            (db.now(), reason, db.now(), current["id"]))
+        con.commit()
+        supervise.fail_launch(
+            con, project.root_for(con, current), int(current["id"]),
+            reason, prefix="Work claim abandoned")
+        # The brief was written for a launch that will never happen; residue
+        # of an abandoned claim leaves no file behind.
+        Path(current["brief_path"]).unlink(missing_ok=True)
+    con.commit()
+
+
+def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
+                  launcher, actions: list) -> str:
+    """Finish one reserved claim. Returns dispatched, deferred, or stale."""
+    claim = _confirm_claim(con, client, kind, item, run)
+    if claim != "claimed":
+        return claim
+
+    run_id = int(run["id"])
+    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    root = project.root_for(con, run)
+    pcfg = config.load(run["project_id"])
+    prior = (con.execute("SELECT * FROM runs WHERE id=?", (run["parent_run"],)).fetchone()
+             if run["parent_run"] is not None else None)
+    try:
+        if run["brief_path"] is None:
+            if prior is not None:
+                news = _new_human_comments(
+                    item, kind, prior["work_seen_ts"], client.identity)
+                text = _comments_text(news, item["id"]) or \
+                    f"Work {kind} {item['id']} was handed back; continue the mission."
+                supervise.prepare_followup(con, root, prior, run, text)
+            else:
+                supervise.prepare_launch(
+                    con, root, pcfg, run, mission=_mission(item, kind),
+                    use_worktree=bool(work_cfg(pcfg).get("worktree", True)),
+                    work_snapshot=render_snapshot(item, kind))
+        con.execute(
+            "UPDATE runs SET work_seen_ts=? WHERE id=?",
+            (item.get("updatedAt") or db.now(), run_id))
+        con.commit()
+    except (Exception, SystemExit) as exc:
+        error = str(exc)[:1000] or exc.__class__.__name__
+        if prior is None:
+            supervise.fail_launch(con, root, run_id, error)
+        con.execute("UPDATE runs SET work_claim_status='claimed' WHERE id=?",
+                    (run_id,))
+        con.commit()
+        print(f"orchestra sweep: {item['id']} launch setup failed: {error}")
+        actions.append({"action": "launch_failed", "item": item["id"],
+                        "run": run_id, "reason": error})
+        _report(con, client, actions)
+        return "failed"
+
+    tag = f"[{client.identity}/{run['slug'] or run_id}]"
+    note = f"{tag} dispatched run {run_id}" + \
+        (" (session resumed)" if prior is not None else "")
+    if run["routed_reason"]:
+        note += f"\nstaffing: {run['routed_reason']}"
+    if not _thread_contains(item, kind, note):
+        try:
+            posted = (client.log_task(item["id"], note) if kind == "task" else
+                      client.reply_issue(item["id"], note))
+            if posted is None:
+                print(f"orchestra sweep: dispatch note for {item['id']} deferred")
+        except WorkError as exc:
+            print(f"orchestra sweep: dispatch note for {item['id']} rejected: {exc}")
+    try:
+        launcher(root, run_id)
+    except BaseException as exc:
+        error = str(exc)[:1000] or exc.__class__.__name__
+        supervise.fail_launch(con, root, run_id, error)
+        con.execute("UPDATE runs SET work_claim_status='claimed' WHERE id=?",
+                    (run_id,))
+        con.commit()
+        actions.append({"action": "launch_failed", "item": item["id"],
+                        "run": run_id, "reason": error})
+        _report(con, client, actions)
+        return "failed"
+    # A crash before this receipt may start another detached supervisor, but
+    # supervise() admits exactly one of them before either can start a worker.
+    con.execute("UPDATE runs SET work_claim_status='claimed' WHERE id=?",
+                (run_id,))
+    con.commit()
+    actions.append({"action": "dispatch", "item": item["id"], "run": run_id,
+                    "resumed": prior is not None})
+    return "dispatched"
+
+
 def _claim(con, cfg: dict, client: WorkClient, items: list,
            launcher, actions: list) -> bool:
     """Dispatch every claimable item. No cap of any kind gates this loop
@@ -300,6 +534,26 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
     for the items that *cannot* go — blocked by a dependency, or held behind
     the pause switch."""
     ok = True
+    by_id = {item["id"]: (kind, item) for kind, item in items}
+    pending = list(con.execute(
+        f"SELECT * FROM runs WHERE work_claim_status='pending' "
+        f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id"))
+    for run in pending:
+        found = by_id.get(run["work_item"])
+        if found is None:
+            ok = False
+            continue
+        kind, item = found
+        try:
+            outcome = _finish_claim(con, client, kind, item, run,
+                                    launcher, actions)
+        except WorkError as exc:
+            print(f"orchestra sweep: claim {item['id']} rejected: {exc}")
+            outcome = "deferred" if work_client.retryable(exc) else "stale"
+        if outcome == "stale":
+            _abandon_claim(con, run)
+        if outcome not in {"dispatched", "failed"}:
+            ok = False
     queued = dispatch.waiting_ids(con)
     candidates = []
     for lane, (kind, item) in enumerate(items):
@@ -359,50 +613,12 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             ok = False
             continue
         routed = None
+        run = None
         try:
             prior = _last_session_run(con, item_id)
             if prior:
                 run, blocked = supervise.reserve_followup(
-                    con, root, prior, "work", title=prior["title"])
-                if run is None:
-                    if blocked == "paused":
-                        late_pause = dispatch.pause_state(con) or {}
-                        if dispatch.hold(con, item_id, kind, _lane, "paused",
-                                         late_pause.get("note")):
-                            actions.append({"action": "hold", "item": item_id,
-                                            "reason": "paused",
-                                            "detail": late_pause.get("note")})
-                    continue
-                run_id, slug = int(run["id"]), run["slug"]
-                tag = f"[{client.identity}/{slug}]"
-                try:
-                    claimed = (client.claim_issue(item_id) if kind == "issue" else
-                               client.log_task(item_id, fact_line(
-                                   tag, "claimed", run=run_id)))
-                except WorkError:
-                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
-                    con.commit()
-                    raise
-                if claimed is None:
-                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
-                    con.commit()
-                    ok = False
-                    continue
-                news = _new_human_comments(item, kind, prior["work_seen_ts"],
-                                           client.identity)
-                text = _comments_text(news, item_id) or \
-                    f"Work {kind} {item_id} was handed back; continue the mission."
-                try:
-                    supervise.prepare_followup(con, root, prior, run, text)
-                except (Exception, SystemExit) as exc:
-                    error = str(exc)[:1000] or exc.__class__.__name__
-                    print(f"orchestra sweep: {item_id} launch setup failed: {error}")
-                    actions.append({"action": "launch_failed", "item": item_id,
-                                    "run": run_id, "reason": error})
-                    if not _report(con, client, actions):
-                        ok = False
-                    ok = False
-                    continue
+                    con, root, prior, "work", title=prior["title"], commit=False)
             else:
                 # SEAM (W-0183): the staffing turn. A fresh dispatch is the
                 # one moment a profile is CHOSEN — a continuation above keeps
@@ -425,86 +641,27 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                 run, blocked = _insert_run(
                     con, proj, profile_name, profile,
                     (item.get("title") or item_id)[:80], item_id,
-                    item.get("updatedAt"), routed)
-                if run is None:
-                    if blocked == "paused":
-                        late_pause = dispatch.pause_state(con) or {}
-                        if dispatch.hold(con, item_id, kind, _lane, "paused",
-                                         late_pause.get("note")):
-                            actions.append({"action": "hold", "item": item_id,
-                                            "reason": "paused",
-                                            "detail": late_pause.get("note")})
-                    continue
-                run_id, slug = int(run["id"]), run["slug"]
-                tag = f"[{client.identity}/{slug}]"
-                try:
-                    claimed = (client.log_task(
-                        item_id, fact_line(tag, "claimed", run=run_id))
-                        if kind == "task" else client.claim_issue(item_id))
-                except WorkError:
-                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
-                    con.commit()
-                    raise
-                if claimed is None:
-                    # No Work admission means no run. Retrying the same ready
-                    # item later is safer than manufacturing terminal rows
-                    # whose facts Work will ignore without a claim window.
-                    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
-                    con.commit()
-                    ok = False
-                    continue
-                # Swept runs are isolated by default. A project may explicitly
-                # opt into the shared checkout, but an isolation failure never
-                # silently changes the execution mode.
-                isolate = bool(work_cfg(pcfg).get("worktree", True))
-                try:
-                    supervise.prepare_launch(
-                        con, root, pcfg, run, mission=_mission(item, kind),
-                        use_worktree=isolate,
-                        work_snapshot=render_snapshot(item, kind))
-                except (Exception, SystemExit) as exc:
-                    error = str(exc)[:1000] or exc.__class__.__name__
-                    supervise.fail_launch(con, root, run_id, error)
-                    print(f"orchestra sweep: {item_id} launch setup failed: {error}")
-                    actions.append({"action": "launch_failed", "item": item_id,
-                                    "run": run_id, "reason": error})
-                    _report(con, client, actions)
-                    ok = False
-                    continue
-            con.execute("UPDATE runs SET work_item=?, work_seen_ts=?, "
-                        "routed_reason=COALESCE(routed_reason, ?) WHERE id=?",
-                        (item_id, item.get("updatedAt") or db.now(), routed, run_id))
-            con.commit()
-            tag = f"[{client.identity}/{slug or run_id}]"
-            note = f"{tag} dispatched run {run_id}" + (" (session resumed)" if prior else "")
-            # The board says WHY a heavy model was chosen, not just that one
-            # was. Absent when routing is off — there is no decision to report.
-            if routed:
-                note += f"\nstaffing: {routed}"
-            try:
-                posted = (client.log_task(item_id, note) if kind == "task" else
-                          client.reply_issue(item_id, note))
-                if posted is None:
-                    print(f"orchestra sweep: dispatch note for {item_id} deferred")
-            except WorkError as exc:
-                # The claim is the authority boundary; this line is only an
-                # informational note and must never strand a prepared run.
-                print(f"orchestra sweep: dispatch note for {item_id} rejected: {exc}")
-            try:
-                launcher(root, run_id)
-            except BaseException as exc:
-                error = str(exc)[:1000] or exc.__class__.__name__
-                supervise.fail_launch(con, root, run_id, error)
-                actions.append({"action": "launch_failed", "item": item_id,
-                                "run": run_id, "reason": error})
-                if not _report(con, client, actions):
-                    ok = False
-                ok = False
+                    item.get("updatedAt"), routed, commit=False)
+            if run is None:
+                if blocked == "paused":
+                    late_pause = dispatch.pause_state(con) or {}
+                    if dispatch.hold(con, item_id, kind, _lane, "paused",
+                                     late_pause.get("note")):
+                        actions.append({"action": "hold", "item": item_id,
+                                        "reason": "paused",
+                                        "detail": late_pause.get("note")})
                 continue
-            actions.append({"action": "dispatch", "item": item_id, "run": run_id,
-                            "resumed": bool(prior)})
+            run = _mark_claim_pending(con, run)
+            outcome = _finish_claim(
+                con, client, kind, item, run, launcher, actions)
+            if outcome == "stale":
+                _abandon_claim(con, run)
+            if outcome not in {"dispatched", "failed"}:
+                ok = False
         except WorkError as exc:
             print(f"orchestra sweep: claim {item_id} rejected: {exc}")
+            if run is not None and not work_client.retryable(exc):
+                _abandon_claim(con, run)
             ok = False
     return ok
 
@@ -514,23 +671,23 @@ def _ferry(con, client: WorkClient, items: list, actions: list) -> bool:
         run = _live_run(con, item["id"])
         if not run or run["work_seen_ts"] is None:
             continue
+        # A claim still pending confirmation never receives tells: nothing has
+        # launched, and _finish_claim folds these same comments into the
+        # mission it launches with — ferrying now would deliver them twice.
+        if run["work_claim_status"] == "pending":
+            continue
         news = _new_human_comments(item, kind, run["work_seen_ts"], client.identity)
         if not news:
             continue
         if not run["session_ref"]:
             continue  # not resumable yet; the next pass retries
         try:
-            offset = Path(run["log_path"]).stat().st_size
-        except (OSError, TypeError):
-            offset = 0
-        con.execute(
-            "INSERT INTO messages(run_id, sender, body, kind, created_at, "
-            "delivery_offset) VALUES(?,?,?, 'interrupt', ?, ?)",
-            (run["id"], f"work:{item['id']}", _comments_text(news, item["id"]),
-             db.now(), offset))
-        con.execute("UPDATE runs SET work_seen_ts=? WHERE id=?",
-                    (max(n["at"] for n in news), run["id"]))
-        con.commit()
+            messaging.queue_tell(
+                con, run["id"], f"work:{item['id']}",
+                _comments_text(news, item["id"]), run["log_path"],
+                work_seen_ts=max(n["at"] for n in news))
+        except messaging.RunClosed:
+            continue
         actions.append({"action": "ferry", "item": item["id"], "run": run["id"],
                         "comments": len(news)})
     return True
@@ -590,7 +747,11 @@ def sweep(cfg: dict, client: WorkClient,
         # anything waits — or dispatch is paused, which makes waiters — the
         # pass reads the whole board. That read is also what supplies
         # ready-lane order, since Work serves the lane in board order.
-        full = dispatch.paused(con) or bool(dispatch.waiting_ids(con))
+        unresolved_claim = con.execute(
+            f"SELECT 1 FROM runs WHERE work_claim_status='pending' "
+            f"AND status NOT IN {db.TERMINAL_SQL} LIMIT 1").fetchone()
+        full = (dispatch.paused(con) or bool(dispatch.waiting_ids(con))
+                or unresolved_claim is not None)
         for kind, lister in (("task", client.tasks), ("issue", client.issues)):
             since = db.meta_get(con, CURSOR_KEYS[kind])
             got = lister(updated_since=None if full else since)

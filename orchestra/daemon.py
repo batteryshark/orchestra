@@ -18,8 +18,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import (conductor, config, db, http, nod, observer, proc, project,
-                         supervise, runway, sweeper, work_client, worktree)
+from orchestra import (conductor, config, db, findings, http, merge, nod, observer,
+                         proc, project, supervise, runway, sweeper, work_client,
+                         worktree)
 
 DEFAULT_INTERVAL = 60
 SUPERVISOR_HANDOFF_GRACE_SECONDS = 300
@@ -53,6 +54,59 @@ def _alive(pid: int) -> bool:
     return proc.alive(pid)
 
 
+def _supervisor_owns(run) -> bool:
+    """Keep live or unverifiable supervisors; reject a proven PID reuse."""
+    try:
+        pid = int(run["supervisor_pid"])
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or not _alive(pid):
+        return False
+    expected = run["supervisor_pid_identity"]
+    if not expected:
+        # A supervisor started before the identity column was introduced may
+        # still be live. Recovering its run would race its real finalizer.
+        return True
+    actual = proc.process_identity(pid)
+    # Identity lookup can fail transiently. Only a readable mismatch proves
+    # that the recorded PID has been reused and no longer owns this run.
+    return actual is None or actual == expected
+
+
+def _stop_worker_group(pid: int, expected_identity: str | None) -> tuple[bool, str]:
+    """Stop a proven-owned worker group, or explain why it was left alone."""
+    def alive():
+        try:
+            proc.signal_group(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (OSError, ValueError):
+            return None
+        return True
+
+    state = alive()
+    if state is False:
+        return True, "already gone"
+    if state is None:
+        return False, f"worker group {pid} could not be inspected"
+    if not expected_identity:
+        return False, f"worker group {pid} has no recorded process identity"
+    actual_identity = proc.process_identity(pid)
+    if actual_identity is None:
+        return False, f"worker group {pid} identity could not be read"
+    if actual_identity != expected_identity:
+        return (False, f"worker group {pid} identity changed; refusing to signal "
+                       "a possibly unrelated process")
+    proc.terminate_group(pid, force=True)
+    for _ in range(10):
+        time.sleep(0.1)
+        state = alive()
+        if state is not True:
+            return ((True, "stopped") if state is False else
+                    (False, f"worker group {pid} could not be inspected after stop"))
+    return False, f"worker group {pid} did not stop"
+
+
 def _launch_started_at(value: str | None) -> datetime | None:
     try:
         started = datetime.fromisoformat(value)
@@ -61,31 +115,66 @@ def _launch_started_at(value: str | None) -> datetime | None:
     return started.replace(tzinfo=timezone.utc) if started.tzinfo is None else started
 
 
-def _reap_orphans(con) -> list[int]:
+def _reap_orphans(con, launcher=None) -> list[int]:
     """A supervisor that died without writing a terminal status leaves a run
     that nothing will ever finish. Mark it, so the board stops lying."""
     reaped = []
-    rows = con.execute(
-        f"SELECT id, supervisor_pid FROM runs WHERE status NOT IN {db.TERMINAL_SQL} "
-        "AND supervisor_pid IS NOT NULL")
-    for row in list(rows):
-        if _alive(int(row["supervisor_pid"])):
+    launch_failures = {}
+    rows = list(con.execute(
+        f"SELECT id, supervisor_pid, supervisor_pid_identity, pid, pid_identity, "
+        "worker_status, worker_exit_code FROM runs "
+        f"WHERE status NOT IN {db.TERMINAL_SQL} "
+        "AND supervisor_pid IS NOT NULL ORDER BY id"))
+    dead = []
+    for row in rows:
+        if _supervisor_owns(row):
             continue
-        changed = con.execute(
-            "UPDATE runs SET status='failed', finished_at=?, "
-            "summary=COALESCE(summary || char(10), '') || ? "
-            f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
-            (db.now(), f"Supervisor process {row['supervisor_pid']} vanished.",
-             row["id"]))
-        if changed.rowcount == 1:
-            reaped.append(int(row["id"]))
-    con.commit()  # a lost CAS still opened a write transaction
+        if row["pid"] is not None:
+            worker_pid = int(row["pid"])
+            stopped, reason = ((False, f"invalid worker pid {worker_pid}")
+                               if worker_pid <= 0 else
+                               _stop_worker_group(worker_pid, row["pid_identity"]))
+            if not stopped:
+                print(f"orchestra daemon: run {row['id']}: {reason}; "
+                      "leaving run active", file=sys.stderr)
+                continue
+        dead.append(row)
+    if dead:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for row in dead:
+                worker_status = row["worker_status"]
+                if worker_status in db.RUN_TERMINAL:
+                    changed = con.execute(
+                        "UPDATE runs SET status=?, exit_code=COALESCE(exit_code, ?), "
+                        "finished_at=COALESCE(finished_at, ?) "
+                        f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
+                        (worker_status, row["worker_exit_code"], db.now(), row["id"]))
+                else:
+                    changed = con.execute(
+                        "UPDATE runs SET status='failed', "
+                        "worker_status=COALESCE(worker_status, 'failed'), "
+                        "finished_at=?, "
+                        "summary=COALESCE(summary || char(10), '') || ? "
+                        f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
+                        (db.now(),
+                         f"Supervisor process {row['supervisor_pid']} vanished.",
+                         row["id"]))
+                if changed.rowcount == 1:
+                    run_id = int(row["id"])
+                    observer.defer_retry(con, run_id)
+                    reaped.append(run_id)
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
 
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=SUPERVISOR_HANDOFF_GRACE_SECONDS)
     candidates = list(con.execute(
         "SELECT * FROM runs WHERE status='spawning' "
-        "AND supervisor_pid IS NULL ORDER BY id"))
+        "AND supervisor_pid IS NULL "
+        "AND COALESCE(work_claim_status, '')!='pending' ORDER BY id"))
     for candidate in candidates:
         started = _launch_started_at(candidate["started_at"])
         if started is not None and started > cutoff:
@@ -95,40 +184,166 @@ def _reap_orphans(con) -> list[int]:
         # worker. Preparation may also refresh started_at after the scan, so
         # freshness is judged again while holding the write lock.
         con.execute("BEGIN IMMEDIATE")
-        current = con.execute(
-            "SELECT started_at FROM runs WHERE id=? AND status='spawning' "
-            "AND supervisor_pid IS NULL", (int(candidate["id"]),)).fetchone()
-        if current is None:
+        try:
+            current = con.execute(
+                "SELECT started_at FROM runs WHERE id=? AND status='spawning' "
+                "AND supervisor_pid IS NULL", (int(candidate["id"]),)).fetchone()
+            if current is None:
+                con.rollback()
+                continue
+            started = _launch_started_at(current["started_at"])
+            if started is not None and started > cutoff:
+                con.rollback()
+                continue
+            reason = (f"no supervisor claimed run within "
+                      f"{SUPERVISOR_HANDOFF_GRACE_SECONDS}s" if started is not None
+                      else "invalid start time and no supervisor claimed run")
+            claimed = con.execute(
+                "UPDATE runs SET status='failed', "
+                "worker_status=COALESCE(worker_status, 'failed'), "
+                "finished_at=?, summary=? "
+                "WHERE id=? AND status='spawning' AND supervisor_pid IS NULL",
+                (db.now(), f"Launch setup failed: {reason}", int(candidate["id"])))
+            if claimed.rowcount == 1:
+                run_id = int(candidate["id"])
+                con.execute(
+                    "UPDATE deferred_dispatches SET status='failed', processed_at=?, "
+                    "error=? WHERE run_id=? AND status IN ('pending','processing','fired')",
+                    (db.now(), reason, run_id))
+                observer.defer_retry(con, run_id)
+            con.commit()
+        except BaseException:
             con.rollback()
-            continue
-        started = _launch_started_at(current["started_at"])
-        if started is not None and started > cutoff:
-            con.rollback()
-            continue
-        reason = (f"no supervisor claimed run within "
-                  f"{SUPERVISOR_HANDOFF_GRACE_SECONDS}s" if started is not None
-                  else "invalid start time and no supervisor claimed run")
-        claimed = con.execute(
-            "UPDATE runs SET status='failed', finished_at=?, summary=? "
-            "WHERE id=? AND status='spawning' AND supervisor_pid IS NULL",
-            (db.now(), f"Launch setup failed: {reason}", int(candidate["id"])))
-        if claimed.rowcount == 1:
-            con.execute(
-                "UPDATE deferred_dispatches SET status='failed', processed_at=?, "
-                "error=? WHERE run_id=? AND status IN ('pending','processing','fired')",
-                (db.now(), reason, int(candidate["id"])))
-        con.commit()
+            raise
         if claimed.rowcount != 1:
             continue
-        run_id = int(candidate["id"])
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         root = project.root_for(con, run)
         if run["branch"]:
             root = worktree.main_root(Path(run["workdir"])) or root
-        supervise.fail_launch(
-            con, root, run_id, reason)
+        launch_failures[run_id] = (root, reason)
         reaped.append(run_id)
+
+    # A crash after the terminal row and retry hold commit, but before result
+    # enrichment, leaves a durable signature that the next tick can finish.
+    # Limit recovery to summaries written above; old failures are not ours.
+    recovered = [int(row["id"]) for row in con.execute(
+        "SELECT r.id FROM runs r WHERE r.status='failed' AND ("
+        "r.summary LIKE ? OR r.summary LIKE ? OR r.summary=? OR r.summary=?) "
+        "AND EXISTS (SELECT 1 FROM observations o WHERE o.run_id=r.id "
+        "AND o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
+        "SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
+        "AND newer.layer='retry' AND newer.id>o.id)) "
+        "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.run_id=r.id "
+        "AND m.kind='completion') ORDER BY r.id",
+        ("Supervisor process % vanished.",
+         "%\nSupervisor process % vanished.",
+         f"Launch setup failed: no supervisor claimed run within "
+         f"{SUPERVISOR_HANDOFF_GRACE_SECONDS}s",
+         "Launch setup failed: invalid start time and no supervisor claimed run"))]
+    reaped = sorted(set(reaped).union(recovered))
+
+    for run_id in reaped:
+        try:
+            launch_failure = launch_failures.get(run_id)
+            if launch_failure is not None:
+                root, reason = launch_failure
+                supervise.fail_launch(con, root, run_id, reason)
+            elif con.execute(
+                    "SELECT 1 FROM messages WHERE run_id=? AND kind='completion'",
+                    (run_id,)).fetchone() is None:
+                run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+                supervise.finalize_run(con, run, run["status"], run["exit_code"])
+        except Exception as exc:
+            # The core result commits before checkout cleanup. If cleanup was
+            # the failure, the policy recovery pass below gets another turn.
+            print(f"orchestra daemon: run {run_id} result recovery failed: {exc}",
+                  file=sys.stderr)
     return reaped
+
+
+def _resume_terminal_results(con) -> list[int]:
+    """Finalize terminal worker rows only after their process owner is gone."""
+    rows = list(con.execute(
+        "SELECT * FROM runs r WHERE r.layer IS NULL "
+        f"AND r.status IN {db.TERMINAL_SQL} "
+        f"AND r.worker_status IN {db.TERMINAL_SQL} "
+        "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.run_id=r.id "
+        "AND m.kind='completion') ORDER BY r.id"))
+    resumed = []
+    for run in rows:
+        if _supervisor_owns(run):
+            continue
+        if run["pid"] is not None:
+            worker_pid = int(run["pid"])
+            stopped, reason = ((False, f"invalid worker pid {worker_pid}")
+                               if worker_pid <= 0 else
+                               _stop_worker_group(worker_pid, run["pid_identity"]))
+            if not stopped:
+                print(f"orchestra daemon: run {run['id']}: {reason}; "
+                      "leaving terminal result unfinalized", file=sys.stderr)
+                continue
+        try:
+            status = (run["worker_status"]
+                      if run["worker_status"] in db.RUN_TERMINAL else run["status"])
+            exit_code = (run["worker_exit_code"]
+                         if run["worker_exit_code"] is not None else run["exit_code"])
+            supervise.finalize_run(
+                con, run, status, exit_code)
+            resumed.append(int(run["id"]))
+        except Exception as exc:
+            print(f"orchestra daemon: run {run['id']} result recovery failed: {exc}",
+                  file=sys.stderr)
+    return resumed
+
+
+def _append_result_note(con, run_id: int, note: str | None) -> None:
+    if not note:
+        return
+    row = con.execute("SELECT summary FROM runs WHERE id=?", (run_id,)).fetchone()
+    summary = row["summary"] if row else None
+    if note in (summary or ""):
+        return
+    summary = (f"{summary}\n\n{note}" if summary else note)[:2000]
+    con.execute("UPDATE runs SET summary=? WHERE id=?", (summary, run_id))
+    con.commit()
+
+
+def _resume_result_policies(con) -> list[int]:
+    """Replay consumers left between the durable result and policy stamps."""
+    rows = list(con.execute(
+        "SELECT * FROM runs r WHERE r.layer IS NULL "
+        f"AND r.status IN {db.TERMINAL_SQL} "
+        "AND EXISTS (SELECT 1 FROM messages m WHERE m.run_id=r.id "
+        "AND m.kind='completion') "
+        "AND (r.landing_status IS NULL OR r.handoff_processed_at IS NULL) "
+        "ORDER BY r.id"))
+    resumed = []
+    for candidate in rows:
+        if _supervisor_owns(candidate):
+            continue  # the owning supervisor may still be between consumers
+        run_id = int(candidate["id"])
+        try:
+            run = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                   (run_id,)).fetchone())
+            # Landing cannot delete a checked-out branch. A core-only result
+            # therefore replays checkout cleanup before any policy consumer.
+            _append_result_note(
+                con, run_id, supervise.release_worktree(con, run, run["status"]))
+            run = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                   (run_id,)).fetchone())
+            cfg = config.load(run["project_id"])
+            if run.get("landing_status") is None:
+                _append_result_note(con, run_id, merge.at_completion(con, cfg, run))
+                run = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                       (run_id,)).fetchone())
+            if run.get("handoff_processed_at") is None:
+                findings.at_completion(con, cfg, run)
+            resumed.append(run_id)
+        except Exception as exc:
+            print(f"orchestra daemon: run {run_id} policy recovery failed: {exc}",
+                  file=sys.stderr)
+    return resumed
 
 
 RUNWAY_EVERY_SECONDS = 300
@@ -181,12 +396,15 @@ def tick() -> dict:
     """One pass. Returns a small report; never raises for a Work-side fault."""
     cfg = config.load()
     report = {"swept": [], "conducted": [], "released": [], "reaped": [],
+              "recovered_results": [], "resumed_results": [],
               "resumed_retries": [], "resumed_judgments": [],
               "paused": False, "runway": 0, "nod_answers": []}
     con = db.connect()
     try:
         _harvest_children()
         report["reaped"] = _reap_orphans(con)
+        report["recovered_results"] = _resume_terminal_results(con)
+        report["resumed_results"] = _resume_result_policies(con)
         report["paused"] = http.dispatch_paused(con)
         if not report["paused"]:
             report["resumed_retries"] = observer.resume_deferred_retries(

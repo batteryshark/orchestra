@@ -3,6 +3,7 @@
 Nothing here starts a daemon or talks to the real launchd: `launchctl` is
 patched out and the plist is written under ORCHESTRA_LAUNCH_AGENTS.
 """
+import io
 import os
 import plistlib
 import signal
@@ -42,30 +43,163 @@ class DaemonTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def _run(self, status="running", supervisor_pid=None) -> int:
+    def _run(self, status="running", supervisor_pid=None,
+             supervisor_pid_identity=None) -> int:
         return int(self.con.execute(
             "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
-            "supervisor_pid, project_id, started_at) VALUES('p','codex','human','/p',"
-            "?,?,?,?)", (status, supervisor_pid, PROJECT_ID, db.now())).lastrowid)
+            "supervisor_pid, supervisor_pid_identity, project_id, started_at) "
+            "VALUES('p','codex','human','/p',?,?,?,?,?)",
+            (status, supervisor_pid, supervisor_pid_identity,
+             PROJECT_ID, db.now())).lastrowid)
 
     def test_tick_reaps_a_run_whose_supervisor_vanished(self) -> None:
         # PID 1 exists (launchd) and is not ours -> alive; a free high pid is not.
+        lifecycle = []
+        recovered_pid = _free_pid()
+        recovered = self._run(supervisor_pid=recovered_pid)
+        self.con.execute(
+            "UPDATE runs SET status='failed', finished_at=?, summary=? WHERE id=?",
+            (db.now(), f"Supervisor process {recovered_pid} vanished.", recovered))
+        daemon.observer.defer_retry(self.con, recovered)
+        lifecycle.append(("defer", recovered, self.con.in_transaction, "failed"))
+        self.con.commit()  # simulate a crash before result enrichment
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (recovered,)).fetchone()[0], 0)
+
         dead = self._run(supervisor_pid=_free_pid())
-        alive = self._run(supervisor_pid=os.getpid())
+        stopped_worker_pid = 98001
+        stopped_worker = self._run(supervisor_pid=_free_pid())
+        stuck_worker_pid = 98002
+        stuck_worker = self._run(supervisor_pid=_free_pid())
+        reused_worker_pid = 98003
+        reused_worker = self._run(supervisor_pid=_free_pid())
+        legacy_worker_pid = 98004
+        legacy_worker = self._run(supervisor_pid=_free_pid())
+        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
+                         (stopped_worker_pid, "stopped-owner", stopped_worker))
+        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
+                         (stuck_worker_pid, "stuck-owner", stuck_worker))
+        self.con.execute("UPDATE runs SET pid=?, pid_identity=? WHERE id=?",
+                         (reused_worker_pid, "original-owner", reused_worker))
+        self.con.execute("UPDATE runs SET pid=? WHERE id=?",
+                         (legacy_worker_pid, legacy_worker))
+        alive_identity = proc.process_identity(os.getpid())
+        alive = self._run(supervisor_pid=os.getpid(),
+                          supervisor_pid_identity=alive_identity)
         stale = self._run(status="spawning")
+        pending_claim = self._run(status="spawning")
         fresh = self._run(status="spawning")
         malformed = self._run(status="spawning")
         self.con.execute("UPDATE runs SET started_at='2000-01-01T00:00:00+00:00' "
                          "WHERE id=?", (stale,))
+        self.con.execute(
+            "UPDATE runs SET started_at='2000-01-01T00:00:00+00:00', "
+            "work_claim_status='pending' WHERE id=?", (pending_claim,))
         self.con.execute("UPDATE runs SET started_at='not-a-time' WHERE id=?",
                          (malformed,))
         self.con.commit()
-        report = daemon.tick()
-        self.assertEqual(report["reaped"], [dead, stale, malformed])
+        real_defer = daemon.observer.defer_retry
+        real_finalize = daemon.supervise.finalize_run
+        real_signal_group = daemon.proc.signal_group
+        worker_alive = {stopped_worker_pid: True, stuck_worker_pid: True,
+                        reused_worker_pid: True, legacy_worker_pid: True}
+        worker_identities = {stopped_worker_pid: "stopped-owner",
+                             stuck_worker_pid: "stuck-owner",
+                             reused_worker_pid: "new-unrelated-owner",
+                             legacy_worker_pid: "legacy-process",
+                             os.getpid(): alive_identity}
+
+        def defer_retry(con, run_id):
+            status = con.execute("SELECT status FROM runs WHERE id=?",
+                                 (run_id,)).fetchone()["status"]
+            lifecycle.append(("defer", run_id, con.in_transaction, status))
+            return real_defer(con, run_id)
+
+        def finalize_run(con, run, status, exit_code, **kwargs):
+            lifecycle.append(("finalize", int(run["id"]), con.in_transaction,
+                              status))
+            return real_finalize(con, run, status, exit_code, **kwargs)
+
+        def signal_group(pid, sig):
+            if pid not in worker_alive:
+                return real_signal_group(pid, sig)
+            if not worker_alive[pid]:
+                raise ProcessLookupError(pid)
+
+        def terminate_group(pid, *, force=False):
+            self.assertTrue(force)
+            if pid == stopped_worker_pid:
+                worker_alive[pid] = False
+
+        diagnostics = io.StringIO()
+        with mock.patch.object(daemon.observer, "defer_retry",
+                               side_effect=defer_retry), \
+                mock.patch.object(daemon.supervise, "finalize_run",
+                                  side_effect=finalize_run), \
+                mock.patch.object(daemon.supervise, "fail_launch",
+                                  wraps=daemon.supervise.fail_launch) as failed_launches, \
+                mock.patch.object(daemon.supervise,
+                                  "spawn_supervisor") as spawned, \
+                mock.patch.object(daemon.proc, "signal_group",
+                                  side_effect=signal_group), \
+                mock.patch.object(daemon.proc, "process_identity",
+                                  side_effect=worker_identities.get), \
+                mock.patch.object(daemon.proc, "terminate_group",
+                                  side_effect=terminate_group) as terminated, \
+                mock.patch.object(daemon.time, "sleep"), \
+                mock.patch.object(daemon.sys, "stderr", diagnostics):
+            report = daemon.tick()
+        self.assertEqual(report["reaped"],
+                         [recovered, dead, stopped_worker, stale, malformed])
+        self.assertEqual(
+            [(call.args[0], call.kwargs["force"])
+             for call in terminated.call_args_list],
+            [(stopped_worker_pid, True), (stuck_worker_pid, True)])
+        self.assertIn(f"run {stuck_worker}", diagnostics.getvalue())
+        self.assertIn(f"worker group {stuck_worker_pid}", diagnostics.getvalue())
+        self.assertIn(f"run {reused_worker}", diagnostics.getvalue())
+        self.assertIn("identity changed", diagnostics.getvalue())
+        self.assertIn(f"run {legacy_worker}", diagnostics.getvalue())
+        self.assertIn("no recorded process identity", diagnostics.getvalue())
+        self.assertEqual(
+            [event[1] for event in lifecycle if event[0] == "finalize"],
+            report["reaped"])
+        for run_id in report["reaped"]:
+            deferred_at = next(i for i, event in enumerate(lifecycle)
+                               if event[:2] == ("defer", run_id))
+            finalized_at = next(i for i, event in enumerate(lifecycle)
+                                if event[:2] == ("finalize", run_id))
+            self.assertLess(deferred_at, finalized_at)
+            self.assertEqual(lifecycle[deferred_at][2:], (True, "failed"))
+            self.assertFalse(lifecycle[finalized_at][2],
+                             "finalization must start after the reap commits")
+            actions = [row["action"] for row in self.con.execute(
+                "SELECT action FROM observations WHERE run_id=? AND layer='retry' "
+                "ORDER BY id", (run_id,))]
+            self.assertEqual(actions, ["deferred", "retry"])
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+                (run_id,)).fetchone()[0], 1)
+        self.assertEqual([call.args[2] for call in failed_launches.call_args_list],
+                         [stale, malformed])
+        retries = list(self.con.execute(
+            "SELECT id, retry_of FROM runs WHERE retry_of IS NOT NULL ORDER BY id"))
+        self.assertEqual([row["retry_of"] for row in retries], report["reaped"])
+        self.assertEqual([call.args[1] for call in spawned.call_args_list],
+                         [row["id"] for row in retries])
         rows = {r["id"]: r for r in self.con.execute("SELECT * FROM runs")}
         self.assertEqual(rows[dead]["status"], "failed")
         self.assertIn("vanished", rows[dead]["summary"])
         self.assertIsNotNone(rows[dead]["finished_at"])
+        self.assertEqual(rows[stopped_worker]["status"], "failed")
+        self.assertEqual(rows[stuck_worker]["status"], "running")
+        self.assertEqual(rows[reused_worker]["status"], "running")
+        self.assertEqual(rows[legacy_worker]["status"], "running")
+        for untouched in (stuck_worker, reused_worker, legacy_worker):
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM runs WHERE retry_of=?",
+                (untouched,)).fetchone()[0], 0)
         self.assertEqual(rows[alive]["status"], "running")
         self.assertEqual(rows[stale]["status"], "failed")
         self.assertTrue(supervise.never_started(rows[stale]))
@@ -74,11 +208,14 @@ class DaemonTests(unittest.TestCase):
                          "a delayed child must lose the terminal CAS")
         self.assertEqual(rows[fresh]["status"], "spawning",
                          "the handoff grace protects a child that may be starting")
+        self.assertEqual(rows[pending_claim]["status"], "spawning",
+                         "remote claim recovery owns pending handoffs")
         self.assertTrue(supervise.never_started(rows[malformed]))
 
         # Preparation can finish after the stale scan but before the reaper's
         # write lock. Its refreshed launch clock must win that race.
-        self.con.execute("UPDATE runs SET status='killed' WHERE id=?", (fresh,))
+        self.con.execute("UPDATE runs SET status='killed' WHERE id IN (?,?,?,?,?)",
+                         (fresh, stuck_worker, reused_worker, legacy_worker, alive))
         raced = self._run(status="spawning")
         self.con.execute("UPDATE runs SET started_at='1999-01-01T00:00:00+00:00' "
                          "WHERE id=?", (raced,))
@@ -113,13 +250,86 @@ class DaemonTests(unittest.TestCase):
         self.assertNotEqual(raced_row["started_at"],
                             "1999-01-01T00:00:00+00:00")
 
-    def test_tick_leaves_a_finished_run_alone(self) -> None:
-        done = self._run(status="done", supervisor_pid=_free_pid())
+    def test_supervisor_ownership_recovers_only_a_proven_pid_reuse(self) -> None:
+        matched = self._run(supervisor_pid=41001,
+                            supervisor_pid_identity="owner-41001")
+        legacy = self._run(supervisor_pid=41002)
+        reused = self._run(supervisor_pid=41003,
+                           supervisor_pid_identity="old-owner")
+        unreadable = self._run(supervisor_pid=41004,
+                               supervisor_pid_identity="owner-41004")
+        self.con.execute(
+            "UPDATE runs SET status='done', worker_status='done' "
+            "WHERE id IN (?,?,?,?)", (matched, legacy, reused, unreadable))
         self.con.commit()
-        self.assertEqual(daemon.tick()["reaped"], [])
-        self.assertEqual(
-            self.con.execute("SELECT status FROM runs WHERE id=?",
-                             (done,)).fetchone()["status"], "done")
+        identities = {41001: "owner-41001", 41003: "new-owner"}
+
+        with mock.patch.object(daemon, "_alive", return_value=True), \
+                mock.patch.object(daemon.proc, "process_identity",
+                                  side_effect=identities.get), \
+                mock.patch.object(daemon.proc, "signal_group") as signalled, \
+                mock.patch.object(daemon.proc, "terminate_group") as terminated, \
+                mock.patch.object(daemon.supervise, "finalize_run") as finalized:
+            recovered = daemon._resume_terminal_results(self.con)
+
+        self.assertEqual(recovered, [reused])
+        self.assertEqual([call.args[1]["id"] for call in finalized.call_args_list],
+                         [reused])
+        signalled.assert_not_called()
+        terminated.assert_not_called()
+
+    def test_tick_recovers_terminal_results_and_preserves_worker_receipt(self) -> None:
+        receipt = self._run(supervisor_pid=_free_pid())
+        self.con.execute(
+            "UPDATE runs SET worker_status='done', worker_exit_code=0 WHERE id=?",
+            (receipt,))
+        done = self._run(supervisor_pid=_free_pid())
+        live_identity = proc.process_identity(os.getpid())
+        live_owner = self._run(supervisor_pid=os.getpid(),
+                               supervisor_pid_identity=live_identity)
+        reused_pid = 98005
+        reused = self._run(supervisor_pid=_free_pid())
+        self.con.execute(
+            "UPDATE runs SET status='done', worker_status='done' WHERE id=?",
+            (done,))
+        self.con.execute(
+            "UPDATE runs SET status='killed', worker_status='killed' "
+            "WHERE id IN (?,?)", (live_owner, reused))
+        self.con.execute("UPDATE runs SET pid=?, pid_identity='original-owner' "
+                         "WHERE id=?", (reused_pid, reused))
+        self.con.commit()
+        real_signal_group = daemon.proc.signal_group
+
+        def signal_group(pid, sig):
+            if pid == reused_pid:
+                return None
+            return real_signal_group(pid, sig)
+
+        diagnostics = io.StringIO()
+        identities = {reused_pid: "new-unrelated-owner",
+                      os.getpid(): live_identity}
+        with mock.patch.object(daemon.proc, "signal_group",
+                               side_effect=signal_group), \
+                mock.patch.object(daemon.proc, "process_identity",
+                                  side_effect=identities.get), \
+                mock.patch.object(daemon.sys, "stderr", diagnostics):
+            report = daemon.tick()
+
+        self.assertIn(receipt, report["reaped"])
+        self.assertIn(done, report["recovered_results"])
+        rows = {row["id"]: row for row in self.con.execute("SELECT * FROM runs")}
+        self.assertEqual(rows[receipt]["status"], "done")
+        self.assertEqual(rows[receipt]["exit_code"], 0)
+        self.assertNotIn("vanished", rows[receipt]["summary"] or "")
+        for finalized in (receipt, done):
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+                (finalized,)).fetchone()[0], 1)
+        for untouched in (live_owner, reused):
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+                (untouched,)).fetchone()[0], 0)
+        self.assertIn("identity changed", diagnostics.getvalue())
 
     def test_tick_without_work_configured_does_not_sweep(self) -> None:
         report = daemon.tick()

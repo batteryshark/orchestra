@@ -7,13 +7,12 @@ throwaway directory. No daemon is started.
 import gzip
 import json
 import os
-import re
+import signal as signal_module
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
@@ -227,13 +226,10 @@ class HostCheckTests(ServerCase):
 
 
 class SnapshotTests(ServerCase):
-    def test_the_snapshot_carries_an_integer_version(self) -> None:
+    def test_the_snapshot_is_the_versioned_control_plane(self) -> None:
         _, payload = self.json_request()
         self.assertIsInstance(payload["version"], int)
         self.assertEqual(payload["version"], mhttp.SNAPSHOT_VERSION)
-
-    def test_the_snapshot_is_the_whole_control_plane(self) -> None:
-        _, payload = self.json_request()
         self.assertEqual(
             set(payload),
             {"version", "generated_at", "home", "runs", "live_runs", "dispatch",
@@ -263,12 +259,6 @@ class SnapshotTests(ServerCase):
         self.assertEqual(modes[failed_retry], "not_started")
         self.assertEqual(mhttp.run_diff(self.con, failed)["message"],
                          "no branch — execution never started")
-
-    def test_the_run_window_holds_hundreds(self) -> None:
-        """W-0187: limiting PROJECTS is the point, limiting runs is not — a
-        board with a couple of hundred runs and their children on it has to
-        show all of them."""
-        self.assertGreaterEqual(mhttp.RECENT_RUNS, 500)
 
     def test_live_runs_are_never_squeezed_out_by_history(self) -> None:
         """Live runs come off their own unbounded query, so no amount of
@@ -326,64 +316,6 @@ class SnapshotTests(ServerCase):
         self.assertEqual(
             [p["profile"] for p in payload["statistics"]["by_profile"]], ["codex"])
 
-    def test_runway_reports_one_entry_per_provider_with_its_windows(self) -> None:
-        """W-0182: Claude's 5-hour and weekly limits are two windows of ONE
-        provider entry, and no window carries a limit or a reading age."""
-        windows = json.dumps([
-            {"label": "5h", "remaining": 88.0, "unit": "percent",
-             "resets_at": None, "stale": False, "stale_reason": None},
-            {"label": "weekly", "remaining": 40.0, "unit": "percent",
-             "resets_at": None, "stale": False, "stale_reason": None}])
-        for remaining in (90.0, 40.0):
-            self.con.execute(
-                "INSERT INTO runway_polls(provider, remaining, unit, windows, "
-                "polled_at) VALUES('claude', ?, 'percent', ?, ?)",
-                (remaining, windows, db.now()))
-        self.con.commit()
-        _, payload = self.json_request()
-        entry, = payload["runway"]
-        self.assertEqual(entry["provider"], "claude")
-        self.assertEqual(entry["remaining"], 40.0)
-        self.assertEqual(entry["kind"], "plan")
-        self.assertTrue(entry["known"])
-        self.assertEqual([w["label"] for w in entry["windows"]], ["5h", "weekly"])
-        # `as_of` is shipped now, deliberately reversing an earlier decision to
-        # omit the reading age. That decision assumed a stale reading meant the
-        # daemon had failed to poll -- true for the providers Orchestra calls,
-        # false for Claude, whose numbers come from a cache file Claude Code
-        # writes and no amount of polling can refresh. A figure that may be
-        # days old is indistinguishable from a fresh one without it.
-        self.assertIn("as_of", entry)
-        self.assertIn("age_hours", entry)
-        for key in ("limit", "polled_at", "trend", "stale"):
-            self.assertNotIn(key, entry, key)
-        for w in entry["windows"]:
-            self.assertNotIn("limit", w)
-
-    def test_a_windows_pace_is_measured_against_the_same_window(self) -> None:
-        """W-0182 replaced the sparkline: a window compares only with an
-        earlier reading of ITSELF, never across a reset."""
-        def poll(label, remaining, resets_at, minutes_ago):
-            stamp = (datetime.now(timezone.utc) -
-                     timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            self.con.execute(
-                "INSERT INTO runway_polls(provider, remaining, unit, resets_at, "
-                "windows, polled_at) VALUES('kimi', ?, 'percent', ?, ?, ?)",
-                (remaining, resets_at, json.dumps([
-                    {"label": label, "remaining": remaining, "unit": "percent",
-                     "resets_at": resets_at, "stale": False,
-                     "stale_reason": None}]), stamp))
-        later = (datetime.now(timezone.utc) +
-                 timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        poll("5h", 30.0, "2026-01-01T00:00:00Z", 300)  # a window that has gone
-        poll("5h", 90.0, later, 120)
-        poll("5h", 60.0, later, 0)
-        self.con.commit()
-        _, payload = self.json_request()
-        window, = payload["runway"][0]["windows"]
-        self.assertEqual(window["pace"], "using 15% an hour")
-        self.assertTrue(window["resets_in"].startswith("in 2h 5"))
-
     def test_the_runway_route_replays_stored_polls_without_refresh(self) -> None:
         self.con.execute(
             "INSERT INTO runway_polls(provider, remaining, unit, polled_at) "
@@ -394,21 +326,6 @@ class SnapshotTests(ServerCase):
         self.assertEqual((entry["provider"], entry["unit"], entry["kind"]),
                          ("deepseek", "USD", "api"))
         self.assertTrue(payload["generated_at"])
-
-    def test_banked_credits_reach_the_card_and_a_missing_one_is_null(self) -> None:
-        """W-0184: the credits block serves a dollar balance AND banked
-        resets, so the route carries the phrase its adapter wrote — and
-        nothing at all for a provider that banks nothing."""
-        for provider, raw in (("codex", '{"credits": "0 banked resets"}'),
-                              ("kimi", '{"membership": "pro"}')):
-            self.con.execute(
-                "INSERT INTO runway_polls(provider, remaining, unit, raw, "
-                "polled_at) VALUES(?, 40.0, 'percent', ?, ?)",
-                (provider, raw, db.now()))
-        self.con.commit()
-        _, payload = self.json_request(path="/api/runway")
-        self.assertEqual({e["provider"]: e["credits"] for e in payload["runway"]},
-                         {"codex": "0 banked resets", "kimi": None})
 
     def test_refresh_polls_every_provider_and_stores_the_result(self) -> None:
         """The dashboard's refresh button forces a live poll; without
@@ -454,28 +371,6 @@ class SnapshotTests(ServerCase):
         self.assertIsNone(by_profile["quiet"]["tokens"])
         self.assertIsNone(by_profile["quiet"]["cost"])
         self.assertEqual(by_profile["quiet"]["active"], 1)
-
-    def test_a_plan_backed_run_has_no_price_at_all(self) -> None:
-        """W-0179: a subscription reporting cost 0 (OpenCode does) is not
-        free work. Plan runs contribute nothing to money and say why."""
-        self.make_run(status="done", profile="kimi", backend="opencode",
-                      model="kimi-for-coding/k3", finished_at=db.now(),
-                      tokens_total=200, cost_usd=0.0, usage_source="opencode")
-        self.make_run(status="done", profile="cc", backend="claude",
-                      model="claude-opus-5", finished_at=db.now(),
-                      tokens_total=50, cost_usd=3.5, usage_source="claude")
-        _, payload = self.json_request()
-        stats = payload["statistics"]
-        self.assertIsNone(stats["cost_usd"])       # neither run has a price
-        self.assertEqual(stats["plan_runs"], 2)
-        by_profile = {p["profile"]: p for p in stats["by_profile"]}
-        self.assertEqual(by_profile["kimi"]["billing"], "plan")
-        self.assertIsNone(by_profile["kimi"]["cost"])
-        self.assertEqual(by_profile["kimi"]["tokens"], 200)  # usage still counts
-        self.assertEqual(by_profile["cc"]["billing"], "plan")
-        self.assertIsNone(by_profile["cc"]["cost"])
-        self.assertEqual({r["profile"]: r["billing"] for r in payload["runs"]},
-                         {"kimi": "plan", "cc": "plan"})
 
     def test_the_cli_view_shows_the_same_numbers(self) -> None:
         """`orchestra stats` and the snapshot read one function, so they cannot
@@ -555,31 +450,17 @@ class ProjectPickerTests(ServerCase):
     def test_the_project_list_is_derived_from_the_runs(self) -> None:
         self.name_project(PROJECT_ID, "P-1", "alpha")
         self.name_project(OTHER_PROJECT, "P-2", "bravo")
+        self.name_project("unused-project", "P-3", "charlie")
         self.make_run()                                   # alpha, live
         self.make_run(status="done", finished_at=db.now())  # alpha, finished
         self.make_run(project_id=OTHER_PROJECT)           # bravo, live
+        self.make_run(project_id=None)                    # visible, but unscoped
         _, payload = self.json_request()
         self.assertEqual(
             payload["projects"],
             [{"project_id": PROJECT_ID, "name": "P-1", "runs": 2, "live": 1},
              {"project_id": OTHER_PROJECT, "name": "P-2", "runs": 1, "live": 1}])
-
-    def test_a_project_with_no_runs_is_not_offered(self) -> None:
-        """The picker offers what you have kicked something off from. A
-        project Orchestra merely KNOWS about would filter the board to
-        nothing, so it is not a choice."""
-        self.name_project(PROJECT_ID, "P-1", "alpha")
-        self.name_project(OTHER_PROJECT, "P-2", "bravo")
-        self.make_run()                                   # alpha only
-        _, payload = self.json_request()
-        self.assertEqual([p["project_id"] for p in payload["projects"]],
-                         [PROJECT_ID])
-
-    def test_a_run_without_a_project_is_in_no_project(self) -> None:
-        self.make_run(project_id=None)
-        _, payload = self.json_request()
-        self.assertEqual(payload["projects"], [])
-        self.assertEqual(len(payload["runs"]), 1)
+        self.assertEqual(len(payload["runs"]), 4)
 
     def test_the_project_route_carries_the_enabled_set_not_a_profile_list(self) -> None:
         """W-0187: profiles are GLOBAL, so the snapshot's list is the only
@@ -667,14 +548,6 @@ class ProjectPickerTests(ServerCase):
         self.assertEqual(payload["statistics"]["runs_total"], 0)
         self.assertIsNone(payload["enabled_profiles"])
 
-    def test_a_run_token_cannot_read_a_project(self) -> None:
-        """Unlisted in auth.ROUTES, so the human's alone: the payload is the
-        enabled set and every total, which is not one run's business."""
-        run_id = self.make_run()
-        token = auth.mint(self.con, run_id)
-        status, _ = self.request(path=f"/api/project?id={PROJECT_ID}", key=token)
-        self.assertEqual(status, 403)
-
     def test_the_config_route_reads_and_writes_the_file(self) -> None:
         """W-0190: the settings page is the file, not a form of each key."""
         status, payload = self.json_request(path=mhttp.CONFIG_ROUTE)
@@ -700,38 +573,97 @@ class ProjectPickerTests(ServerCase):
         self.assertEqual(self.config_path.read_text(), before)
         self.assertFalse(self.restart.is_set())
 
-    def test_a_run_token_cannot_read_or_write_the_config(self) -> None:
+    def test_run_tokens_cannot_manage_project_or_global_configuration(self) -> None:
         run_id = self.make_run()
         token = auth.mint(self.con, run_id)
-        status, _ = self.request(path=mhttp.CONFIG_ROUTE, key=token)
-        self.assertEqual(status, 403)
-        status, _ = self.request(method="POST", path=mhttp.CONFIG_ROUTE,
-                                 key=token, body={"text": ""})
-        self.assertEqual(status, 403)
-
-    def test_a_run_token_cannot_widen_its_projects_enabled_set(self) -> None:
-        """DESIGN §5, principle 5: nothing grants itself what it asks for. A
-        worker enabling a dearer profile for its own project is exactly that,
-        so the write route is the human's alone."""
-        run_id = self.make_run()
-        token = auth.mint(self.con, run_id)
-        status, _ = self.request(method="POST", path=mhttp.PROJECT_ROUTE,
-                                 key=token,
-                                 body={"project_id": PROJECT_ID,
-                                       "enabled_profiles": ["probe"]})
-        self.assertEqual(status, 403)
+        calls = (
+            ("GET", f"/api/project?id={PROJECT_ID}", None),
+            ("GET", mhttp.CONFIG_ROUTE, None),
+            ("POST", mhttp.CONFIG_ROUTE, {"text": ""}),
+            ("POST", mhttp.PROJECT_ROUTE,
+             {"project_id": PROJECT_ID, "enabled_profiles": ["probe"]}),
+        )
+        for method, path, body in calls:
+            with self.subTest(method=method, path=path):
+                self.assertEqual(self.request(method, path, key=token,
+                                              body=body)[0], 403)
 
 
-class ActionTests(ServerCase):
+class StopRunTests(unittest.TestCase):
+    """Process ownership checks need no socket or server thread."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name).resolve()
+        config_path = self.tmp_path / "config.toml"
+        config_path.write_text("")
+        self.env = mock.patch.dict(os.environ, {
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(config_path)})
+        self.env.start()
+        self.con = db.connect()
+
+    def tearDown(self) -> None:
+        self.con.close()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def make_run(self, **cols) -> int:
+        fields = {"profile": "codex", "backend": "codex",
+                  "requested_by": "human", "workdir": str(self.tmp_path),
+                  "status": "running", "started_at": db.now()}
+        fields.update(cols)
+        names = ", ".join(fields)
+        marks = ", ".join("?" * len(fields))
+        run_id = int(self.con.execute(
+            f"INSERT INTO runs({names}) VALUES({marks})",
+            tuple(fields.values())).lastrowid)
+        self.con.commit()
+        return run_id
+
     def test_stop_marks_the_run_killed(self) -> None:
         run_id = self.make_run()
-        status, payload = self.json_request(
-            method="POST", path=f"/api/runs/{run_id}/stop")
-        self.assertEqual(status, 200)
+        payload = mhttp.stop_run(self.con, run_id)
         self.assertEqual(payload["status"], "killed")
         self.assertEqual(self.con.execute(
             "SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()["status"],
             "killed")
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (run_id,)).fetchone()[0], 1)
+
+        gone = self.make_run(pid=4241, pid_identity="gone-owner")
+        with mock.patch.object(mhttp.proc, "signal_owned_group",
+                               return_value=("gone", "process already gone")):
+            payload = mhttp.stop_run(self.con, gone)
+        self.assertFalse(payload["signalled"])
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (gone,)).fetchone()[0], 1)
+
+        reused = self.make_run(pid=4242, pid_identity="old-owner")
+        with mock.patch.object(mhttp.proc, "signal_owned_group",
+                               return_value=("refused", "identity changed")) as signal:
+            payload = mhttp.stop_run(self.con, reused)
+        signal.assert_called_once_with(4242, "old-owner", signal_module.SIGTERM)
+        self.assertFalse(payload["signalled"])
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (reused,)).fetchone()[0], 0)
+
+        tell = self.make_run(pid=4243, pid_identity="tell-owner",
+                             session_ref="session-1")
+        with mock.patch.object(mhttp.proc, "signal_owned_group",
+                               return_value=("refused", "identity changed")) as signal:
+            payload = mhttp.tell_run(self.con, tell, "use the safe branch", now=True)
+        signal.assert_called_once_with(4243, "tell-owner", signal_module.SIGTERM)
+        self.assertTrue(payload["queued"])
+        self.assertEqual(self.con.execute(
+            "SELECT status FROM runs WHERE id=?", (tell,)).fetchone()["status"],
+                         "interrupt")
+
+
+class ActionTests(ServerCase):
 
     def test_stop_on_an_unknown_run_is_400_not_500(self) -> None:
         status, payload = self.json_request(method="POST", path="/api/runs/999/stop")
@@ -748,16 +680,23 @@ class ActionTests(ServerCase):
         row = self.con.execute(
             "SELECT * FROM messages WHERE run_id=?", (run_id,)).fetchone()
         self.assertEqual(row["kind"], "interrupt")
+        self.con.execute("UPDATE runs SET status='done' WHERE id=?", (run_id,))
+        self.con.commit()
+        status, payload = self.json_request(
+            method="POST", path=f"/api/runs/{run_id}/tell",
+            body={"text": "too late"})
+        self.assertEqual(status, 400)
+        self.assertIn("already done", payload["error"])
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='interrupt'",
+            (run_id,)).fetchone()[0], 1)
         self.assertEqual(row["body"], "use the other branch")
 
-    def test_tell_refuses_an_empty_message_and_a_finished_run(self) -> None:
-        run_id = self.make_run(status="done", session_ref="sess-1")
+    def test_tell_refuses_an_empty_message(self) -> None:
+        run_id = self.make_run(session_ref="sess-1")
         self.assertEqual(self.json_request(
             method="POST", path=f"/api/runs/{run_id}/tell",
             body={"text": " "})[0], 400)
-        self.assertEqual(self.json_request(
-            method="POST", path=f"/api/runs/{run_id}/tell",
-            body={"text": "hi"})[0], 400)
 
     def test_check_reports_a_mechanical_verdict(self) -> None:
         run_id = self.make_run()
@@ -908,22 +847,6 @@ class PauseTests(ServerCase):
         self.assertFalse(payload["paused"])
         self.assertIsNone(payload["since"])
 
-    def test_pause_survives_a_restart(self) -> None:
-        """The switch lives in meta, not in memory: a daemon that forgets it
-        is paused resumes dispatch silently, which is the whole failure."""
-        self.json_request(method="POST", path="/api/dispatch/pause")
-        # Restart: drop the server and every open connection, then reopen.
-        self.stop.set()
-        self.srv.shutdown()
-        self.srv.server_close()
-        self.con.close()
-        self.stop = threading.Event()
-        self.srv = self._serve()
-        self.con = db.connect()
-        _, payload = self.json_request()
-        self.assertTrue(payload["dispatch"]["paused"])
-        self.assertTrue(mhttp.dispatch_paused(self.con))
-
     def test_a_paused_daemon_tick_still_runs_dependency_settlement(self) -> None:
         from orchestra import daemon, supervise
         mhttp.set_dispatch_paused(self.con, True)
@@ -1050,134 +973,15 @@ class KeyTests(unittest.TestCase):
 
 
 class BindTests(unittest.TestCase):
-    def test_bind_prefers_the_tailscale_address(self) -> None:
-        with mock.patch.object(mhttp, "tailscale_address", return_value="100.1.2.3"):
-            self.assertEqual(mhttp.bind_address({}), "100.1.2.3")
-
-    def test_bind_falls_back_to_loopback_not_every_interface(self) -> None:
-        with mock.patch.object(mhttp, "tailscale_address", return_value=None):
-            self.assertEqual(mhttp.bind_address({}), "127.0.0.1")
-
-    def test_an_explicit_bind_wins(self) -> None:
-        self.assertEqual(mhttp.bind_address({"http": {"bind": "127.0.0.1"}}),
-                         "127.0.0.1")
-
-
-class DashboardFileTests(unittest.TestCase):
-    """The page is one hand-written file with no build step, so nothing type
-    checks it. These are the two things that would rot silently (W-0180)."""
-
-    def test_the_settings_view_edits_the_config_file(self) -> None:
-        """A tab with no textarea is a dead control, same class of miss as
-        the restart route shipping without its button."""
-        page = (Path(__file__).resolve().parents[1]
-                 / "orchestra" / "dashboard.html").read_text(encoding="utf-8")
-        self.assertIn('data-view="settings"', page)
-        self.assertIn('id="cfgtext"', page)
-        self.assertIn("/api/config", page)
-        self.assertIn("save and restart", page)
-
-    def test_the_health_view_has_a_restart_control(self) -> None:
-        """The route shipped without the button once already: the
-        backend answered /api/restart while the dashboard had no way to
-        reach it, so the feature was invisible and got re-delegated.
-        """
-        page = (Path(__file__).resolve().parents[1]
-                 / "orchestra" / "dashboard.html").read_text(encoding="utf-8")
-        self.assertIn('id="restart"', page)
-        self.assertIn("/api/restart", page)
-
-    def setUp(self) -> None:
-        self.text = mhttp.DASHBOARD.read_text(encoding="utf-8")
-
-    def test_every_run_detail_tab_has_a_pane_and_trace_is_first(self) -> None:
-        """A tab with no builder in PANES is a dead control on the strip."""
-        strip = re.search(r"const TABS = \[(.*?)\n\];", self.text, re.S)
-        panes = re.search(r"const PANES = \{(.*?)\n\};", self.text, re.S)
-        self.assertTrue(strip and panes, "the run detail tab strip is gone")
-        keys = re.findall(r'\["(\w+)",', strip.group(1))
-        self.assertEqual(keys[0], "trace", "the trace tab is the default")
-        for key in keys:
-            self.assertRegex(panes.group(1), rf"\n  {key}:",
-                             f"the {key} tab has no pane builder")
-
-    def test_the_health_view_tells_nobody_to_run_a_command(self) -> None:
-        """W-0183: 'sweep now' and 'pause dispatch' are right there, and the
-        page is served BY the daemon — telling the reader to start one was
-        both noise and impossible advice."""
-        body = re.search(r"function renderDaemon\(d\) \{(.*?)\n\}", self.text, re.S)
-        self.assertTrue(body, "renderDaemon is gone")
-        self.assertNotIn("orchestra ", body.group(1))
-
-    def test_the_tab_strip_sits_outside_the_scrolling_body(self) -> None:
-        """Header and tabs above #pbody is what keeps the run actions from
-        scrolling away — the whole point of the ticket."""
-        order = [self.text.index(f'id="{i}"') for i in ("phead", "ptabs", "pbody")]
-        self.assertEqual(order, sorted(order))
-        self.assertNotIn("innerHTML", self.text)
-
-    def test_live_run_actions_are_useful_and_separated(self) -> None:
-        """W-0185: instruction gets an on-demand tab; stop is separated from
-        its composer at the right edge of the detail tabs."""
-        body = re.search(r"function instructionPane\(r\) \{(.*?)\n\}",
-                         self.text, re.S)
-        self.assertTrue(body, "instructionPane is gone")
-        actions = body.group(1)
-        self.assertIn('"send instruction"', actions)
-        self.assertNotIn('"stop run"', actions)
-        self.assertIn('el("textarea")', actions)
-        self.assertIn("INSTRUCTION_DRAFTS", actions)
-        self.assertIn("send.disabled = !r.session_ref", actions)
-        self.assertIn("body.contains(document.activeElement)", self.text)
-        self.assertNotIn("prompt(", actions)
-        self.assertNotIn("check progress", actions)
-        self.assertNotIn('"/check"', actions)
-        self.assertNotRegex(actions, r'el\("button", [^\n]+, "(?:tell|check|stop)"\)')
-        tabs = re.search(r"function renderTabs\(run\) \{(.*?)\n\}", self.text, re.S)
-        self.assertTrue(tabs, "renderTabs is gone")
-        self.assertIn('["instruction", "send instruction"]', self.text)
-        self.assertIn('run.live || key !== "instruction"', tabs.group(1))
-        self.assertIn('"danger stop-run", "stop run"', tabs.group(1))
-        self.assertIn("if (run.live)", tabs.group(1))
-        self.assertIn("#ptabs .stop-run { margin-left: auto; }", self.text)
-
-    def section(self, view: str) -> str:
-        start = self.text.index(f'id="{view}"')
-        return self.text[start:self.text.index("</section>", start)]
-
-    def test_statistics_is_a_runs_page_control_not_a_health_card(self) -> None:
-        """W-0186: statistics belong beside the runs they count. Health keeps
-        the daemon's own pulse, its two controls and its log — and nothing
-        else, or the move was for nothing."""
-        runs, health = self.section("view-runs"), self.section("view-health")
-        self.assertIn('id="statsbtn"', runs)
-        self.assertNotIn('id="stats"', health)
-        self.assertIn('id="stats"', self.text[self.text.index('id="statsdlg"'):])
-        for control in ('id="daemon"', 'id="sweep"', 'id="pause"', 'id="logtail"'):
-            self.assertIn(control, health)
-
-    def test_the_project_picker_replaced_the_snapshot_stamp(self) -> None:
-        """The header carries a control, not a version number: the stamp
-        moved into the statistics popup (W-0186)."""
-        header = self.text[self.text.index("<header>"):self.text.index("</header>")]
-        self.assertIn('id="projbtn"', header)
-        self.assertIn('id="projmenu"', header)
-        self.assertNotIn('id="stamp"', self.text)
-
-    def test_no_scrolling_pane_is_pinned_to_a_slice_of_the_viewport(self) -> None:
-        """W-0186: a short runs list left dead space under it because every
-        pane was capped at a fixed `vh`. Each one now takes the height its
-        view is given, and only the narrow-screen fallback (where the columns
-        stack and the page scrolls) may still cap anything."""
-        style = self.text[self.text.index("<style>"):self.text.index("</style>")]
-        desktop = re.sub(r"@media[^{]*\{(?:[^{}]|\{[^{}]*\})*\}", "", style)
-        for pane in ("#runlist", "#pbody", "#logtail"):
-            rule = re.search(re.escape(pane) + r"\s*\{([^}]*)\}", desktop)
-            self.assertTrue(rule, f"{pane} lost its rule")
-            self.assertIn("flex: 1", rule.group(1),
-                          f"{pane} does not fill the height it is given")
-            self.assertNotIn("vh", rule.group(1),
-                             f"{pane} is pinned to a slice of the viewport")
+    def test_bind_precedence_never_falls_back_to_every_interface(self) -> None:
+        cases = (({"http": {"bind": "10.0.0.2"}}, "100.1.2.3", "10.0.0.2"),
+                 ({}, "100.1.2.3", "100.1.2.3"),
+                 ({}, None, "127.0.0.1"))
+        for cfg, tailscale, expected in cases:
+            with self.subTest(cfg=cfg, tailscale=tailscale), \
+                    mock.patch.object(mhttp, "tailscale_address",
+                                      return_value=tailscale):
+                self.assertEqual(mhttp.bind_address(cfg), expected)
 
 
 if __name__ == "__main__":

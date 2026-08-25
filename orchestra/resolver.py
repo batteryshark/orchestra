@@ -82,7 +82,7 @@ def retry_landing(con, cfg: dict, run_id: int) -> str:
         # The shared landing path: same guards, same report to the Work
         # thread, a fresh card if it escalates again, the stale-card
         # withdrawal if it lands. at_completion never raises.
-        return merge.at_completion(con, cfg, dict(run), "done") \
+        return merge.retry_landing(con, cfg, dict(run)) \
             or f"run {run_id} had nothing to land"
     except Exception as exc:
         return f"retry of run {run_id} failed: {exc}"

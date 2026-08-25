@@ -861,6 +861,22 @@ def _stopped_deliberately(con, run_id: int) -> bool:
         _last(con, run_id, "mechanical", "stop") is not None
 
 
+def defer_retry(con, run_id: int) -> bool:
+    """Hold dependency settlement until terminal retry policy runs.
+
+    The caller owns the transaction so the terminal run row and this marker
+    become visible together. Any existing retry decision makes this a no-op.
+    """
+    run = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+    if run is None or run["status"] not in INFRA_TERMINAL \
+            or _stopped_deliberately(con, run_id) \
+            or _last(con, run_id, "retry") is not None:
+        return False
+    record(con, run_id, "retry", "deferred",
+           "terminal result awaits retry policy")
+    return True
+
+
 def _automatic_retry_blocker(run) -> str | None:
     """A failed precondition that another identical attempt cannot change.
 
@@ -910,6 +926,37 @@ def _repoint_dependents(con, previous: int, replacement: int) -> None:
                 (previous,))
 
 
+def _current_retry_owner(con, run, winner: int) -> int:
+    """Follow retry decisions that already moved ownership past ``winner``."""
+    seen = set()
+    while winner not in seen:
+        seen.add(winner)
+        decision = con.execute(
+            "SELECT action, detail FROM observations WHERE run_id=? "
+            "AND layer='retry' AND action IN ('retry','superseded') "
+            "ORDER BY id DESC LIMIT 1", (winner,)).fetchone()
+        if decision is None:
+            break
+        try:
+            detail = json.loads(decision["detail"] or "{}")
+            replacement = int(detail[
+                "retry_run" if decision["action"] == "retry" else "winning_run"])
+        except (KeyError, TypeError, ValueError):
+            break
+        candidate = con.execute(
+            "SELECT id, layer, project_id, work_item, retry_of FROM runs WHERE id=?",
+            (replacement,)).fetchone()
+        same_scope = candidate is not None and candidate["layer"] is None \
+            and candidate["project_id"] == run["project_id"] \
+            and candidate["work_item"] == run["work_item"]
+        needs_lineage = decision["action"] == "retry" or run["work_item"] is None
+        if not same_scope or replacement <= winner or (needs_lineage and
+                candidate["retry_of"] != winner):
+            break
+        winner = replacement
+    return winner
+
+
 def _retry_row(con, run, root) -> tuple[int | None, str | None]:
     """A fresh run of the SAME brief. Not a resume: a new process, new log.
 
@@ -931,25 +978,36 @@ def _retry_row(con, run, root) -> tuple[int | None, str | None]:
         work_seen_ts=run["work_seen_ts"], retry_of=int(run["id"]),
         routed_reason=run["routed_reason"], commit=False)
     if retry is None:
-        if blocked and blocked.startswith("work_item:"):
-            winner = int(blocked.partition(":")[2])
+        kind, _, value = (blocked or "").partition(":")
+        if kind in {"work_item", "retry"} and value.isdigit():
+            winner = int(value)
             con.execute("BEGIN IMMEDIATE")
             try:
-                still_winning = con.execute(
-                    f"SELECT 1 FROM runs WHERE id=? AND work_item=? "
-                    f"AND project_id IS ? AND layer IS NULL",
-                    (winner, run["work_item"], run["project_id"])).fetchone()
+                if kind == "work_item":
+                    still_winning = con.execute(
+                        "SELECT 1 FROM runs WHERE id=? AND work_item=? "
+                        "AND project_id IS ? AND layer IS NULL",
+                        (winner, run["work_item"], run["project_id"])).fetchone()
+                else:
+                    still_winning = con.execute(
+                        "SELECT 1 FROM runs WHERE id=? AND retry_of=? "
+                        "AND layer IS NULL", (winner, int(run["id"]))).fetchone()
                 if still_winning is None:
                     con.rollback()
                     return None, blocked
+                winner = _current_retry_owner(con, run, winner)
+                reason = (f"run {winner} already owns {run['work_item']}"
+                          if kind == "work_item" else
+                          f"retry run {winner} already exists")
                 _repoint_dependents(con, int(run["id"]), winner)
                 record(con, int(run["id"]), "retry", "superseded",
-                       f"run {winner} already owns {run['work_item']}; retry skipped",
+                       f"{reason}; retry skipped",
                        {"winning_run": winner})
                 con.commit()
             except BaseException:
                 con.rollback()
                 raise
+            blocked = f"{kind}:{winner}"
         return None, blocked
     run_id = int(retry["id"])
     try:
@@ -1011,6 +1069,10 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if run is None:
         return {"action": "none", "reason": f"no run {run_id}"}
+    retry = _last(con, run_id, "retry")
+    if retry is not None and retry["action"] != "deferred":
+        return {"action": "none", "reason":
+                f"retry policy already settled as {retry['action']}"}
     stop = _last(con, run_id, "observer", "stop") or _last(con, run_id, "mechanical", "stop")
     if stop is not None:
         # The finalizer overwrote `summary` with the transcript's last words;
@@ -1023,6 +1085,9 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
         return {"action": "none", "reason": f"status {run['status']} is not "
                                             "infrastructure-shaped"}
     if _stopped_deliberately(con, run_id):
+        record(con, run_id, "retry", "cancelled",
+               "the run was stopped on judgement")
+        con.commit()
         return {"action": "none", "reason": "the run was stopped on judgement"}
     cfg = config.load(run["project_id"]) if cfg is None else cfg
     blocker = _automatic_retry_blocker(run)
@@ -1101,10 +1166,13 @@ def resume_deferred_retries(con, cfg: dict | None = None,
     if dispatch.paused(con):
         return []
     rows = list(con.execute(
-        "SELECT o.run_id FROM observations o "
+        "SELECT o.run_id FROM observations o JOIN runs r ON r.id=o.run_id "
         "WHERE o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
         " SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
-        " AND newer.layer='retry' AND newer.id>o.id) ORDER BY o.id"))
+        " AND newer.layer='retry' AND newer.id>o.id) "
+        "AND r.landing_status IS NOT NULL AND r.handoff_processed_at IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM messages m WHERE m.run_id=r.id "
+        "AND m.kind='completion') ORDER BY o.id"))
     return [after_terminal(con, int(row["run_id"]), cfg=cfg, launcher=launcher)
             for row in rows]
 

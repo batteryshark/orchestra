@@ -40,10 +40,15 @@ MAX_ASK_SECONDS = 35_400      # hook timeout (36000s) minus a 10-minute margin
 DEFAULT_ASK_SECONDS = 86_400
 
 
+class RunClosed(RuntimeError):
+    """A delivery target became terminal before message admission."""
+
+
 # --- tell -------------------------------------------------------------------
 
 def queue_tell(con: sqlite3.Connection, run_id: int, sender: str, body: str,
-               log_path: str | None, *, boundary: bool = True) -> int:
+               log_path: str | None, *, boundary: bool = True,
+               work_seen_ts: str | None = None) -> int:
     """Record a message for delivery at the run's next safe boundary.
 
     ``boundary=False`` is the ACP transport (W-0104, DESIGN §6): the run has
@@ -54,17 +59,35 @@ def queue_tell(con: sqlite3.Connection, run_id: int, sender: str, body: str,
     filters on that column) and ``traces.run_messages`` stops badging it
     ``pending_boundary``, because no boundary is pending.
     """
+    if con.in_transaction:
+        raise RuntimeError("message admission requires a clean transaction")
     offset = None
     if boundary:
         try:
             offset = os.path.getsize(log_path) if log_path else 0
         except OSError:
             offset = 0
-    cur = con.execute(
-        "INSERT INTO messages(run_id, sender, body, kind, created_at, delivery_offset) "
-        "VALUES(?,?,?,?,?,?)",
-        (run_id, sender, body, DELIVERY_KIND, db.now(), offset))
-    con.commit()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        run = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None or run["status"] in db.RUN_TERMINAL:
+            con.rollback()
+            state = run["status"] if run else "missing"
+            raise RunClosed(f"run {run_id} is {state}")
+        cur = con.execute(
+            "INSERT INTO messages(run_id, sender, body, kind, created_at, "
+            "delivery_offset) VALUES(?,?,?,?,?,?)",
+            (run_id, sender, body, DELIVERY_KIND, db.now(), offset))
+        if work_seen_ts is not None:
+            # The ferry cursor and its message are one admission. A crash can
+            # therefore cause neither a duplicate nor a lost Work comment.
+            con.execute("UPDATE runs SET work_seen_ts=? WHERE id=?",
+                        (work_seen_ts, run_id))
+        con.commit()
+    except BaseException:
+        if con.in_transaction:
+            con.rollback()
+        raise
     return int(cur.lastrowid)
 
 
@@ -92,15 +115,16 @@ def claim_pending(con: sqlite3.Connection, run_id: int) -> list:
 def mark_undeliverable(con: sqlite3.Connection, run_id: int, reason: str) -> int:
     """Mark every still-queued message for a run. Returns how many.
 
-    Called once, at finalization: the run is over, so nothing will deliver
-    these. They stay visible with their reason instead of vanishing.
+    Called during finalization: the run is over, so nothing will deliver
+    these. Replays are harmless because already-marked rows do not match.
+    The caller owns the transaction so the run result and delivery state can
+    be committed together.
     """
     cur = con.execute(
         "UPDATE messages SET undeliverable_at=?, undeliverable_reason=? "
         "WHERE run_id=? AND kind IN (?,?) AND delivered_at IS NULL "
         "AND undeliverable_at IS NULL",
         (db.now(), reason[:500], run_id, DELIVERY_KIND, ANSWER_KIND))
-    con.commit()
     return cur.rowcount
 
 
