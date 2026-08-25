@@ -4,6 +4,7 @@ DESIGN D6 budget: the fixed portion of every dispatch brief stays at or
 under 300 tokens (tested as <= 1,200 chars); the protocol card renders in
 <= 10 lines; the continuation wrapper stays ~130 tokens.
 """
+import re
 from pathlib import Path
 
 # Must stay <= 10 lines and inside the D6 budget (tests enforce both).
@@ -22,6 +23,7 @@ PROTOCOL_CARD = """\
 
 WORK_SNAPSHOT_MAX_CHARS = 2000
 RECENT_COMMITS_MAX_CHARS = 900
+POSTCOMPACT_MAX_CHARS = 5000  # about 1,000 tokens; never inject the full brief
 
 # House style for every writeback. Read from disk so an edit to the doc
 # is an edit to every brief, with no code change (W-0250).
@@ -49,6 +51,34 @@ def writeback_section() -> str:
 def _protocol_card() -> str:
     """Return the fixed protocol."""
     return PROTOCOL_CARD
+
+
+def _section(text: str, heading: str) -> str:
+    match = re.search(rf"(?ms)^## {re.escape(heading)}\s*\n(.*?)(?=^## |\Z)", text)
+    return match.group(1).strip() if match else ""
+
+
+def postcompact_context(text: str) -> str:
+    """The frozen parts of a run brief that must survive compaction."""
+    item = re.search(r"(?m)^(W-[0-9]+)\s*·\s*(.*?)\s*\[[^\n]*\]$", text)
+    identity = (f"Item: {item.group(1)}\nTitle: {item.group(2)}" if item else
+                _section(text, "Mission").split("\n\n", 1)[0])
+    checklist = re.search(
+        r"(?ms)^Before you stop, account for every requirement.*?account for it\.",
+        text)
+    writeback = re.search(r"(?ms)^## Writeback\s*$.*?(?=^## Protocol\s*$)", text)
+    protocol = re.search(r"(?ms)^## Protocol\s*$.*\Z", text)
+    rules = "\n\n".join(match.group(0).strip() for match in
+                          (checklist, writeback, protocol) if match)
+    parts = ["# Run brief after compaction", identity]
+    acceptance = _section(text, "acceptanceCriteria").split(
+        "\n\nBefore you stop", 1)[0]
+    for heading, body in (("Goal", _section(text, "goal")),
+                          ("Acceptance criteria", acceptance),
+                          ("Contract rules", rules)):
+        if body:
+            parts.append(f"## {heading}\n\n{body}")
+    return "\n\n".join(parts)[:POSTCOMPACT_MAX_CHARS]
 
 
 def compose(*, run_id: int, slug: str | None, profile: dict, mission: str,
