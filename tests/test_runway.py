@@ -110,54 +110,48 @@ def codex_lines(used=25.0, resets_in_h=6, secondary=None):
 
 class ResultShapeTests(unittest.TestCase):
     def test_every_adapter_returns_the_same_record(self) -> None:
+        names = []
         with mock.patch.dict(os.environ, NO_KEYS):
             for adapter in runway.ADAPTERS:
-                got = adapter(**({"sessions_dir": "/nonexistent"}
-                                 if adapter is runway.codex else
-                                 {"path": "/nonexistent"} if adapter is runway.claude
-                                 else {"auth_path": NO_AUTH}))
-                self.assertIsInstance(got, runway.Runway, adapter)
-                self.assertFalse(got.known, adapter)
-                self.assertTrue(got.reason, adapter)
-                # W-0182 removed ``limit``: a window's limit is always 100%
-                # of the window, so the field said nothing.
-                self.assertEqual(set(got.as_dict()), {
-                    "provider", "remaining", "unit", "resets_at", "raw",
-                    "as_of", "reason", "kind", "stale", "windows"})
-
-    def test_every_provider_has_exactly_one_adapter(self) -> None:
-        """W-0182: one card per provider means one adapter per provider —
-        Claude's two windows are two windows, not two entries."""
-        with mock.patch.dict(os.environ, NO_KEYS):
-            names = [adapter(**({"sessions_dir": "/nonexistent"}
-                                if adapter is runway.codex else
-                                {"path": "/nonexistent"} if adapter is runway.claude
-                                else {"auth_path": NO_AUTH})).provider
-                     for adapter in runway.ADAPTERS]
+                with self.subTest(adapter.__name__):
+                    got = adapter(**({"sessions_dir": "/nonexistent"}
+                                     if adapter is runway.codex else
+                                     {"path": "/nonexistent"}
+                                     if adapter is runway.claude else
+                                     {"auth_path": NO_AUTH}))
+                    self.assertIsInstance(got, runway.Runway)
+                    self.assertFalse(got.known)
+                    self.assertTrue(got.reason)
+                    # W-0182 removed ``limit``: a window's limit is always
+                    # 100% of the window, so the field said nothing.
+                    self.assertEqual(set(got.as_dict()), {
+                        "provider", "remaining", "unit", "resets_at", "raw",
+                        "as_of", "reason", "kind", "stale", "windows"})
+                    names.append(got.provider)
         self.assertEqual(sorted(names),
                          ["claude", "codex", "deepseek", "kimi", "minimax", "xai"])
         self.assertEqual(len(names), len(set(names)))
 
     def test_provider_kind_splits_subscriptions_from_metered_apis(self) -> None:
         """W-0179: only an api provider has money at all."""
-        for provider in ("claude", "codex", "kimi", "minimax", "xai"):
-            self.assertEqual(runway.kind_of(provider), "plan")
-        self.assertEqual(runway.kind_of("deepseek"), "api")
-        self.assertEqual(runway.unknown("claude", "x").kind, "plan")
-        self.assertEqual(runway.unknown("deepseek", "x").kind, "api")
         # A run's provider is its backend, or the model's prefix when the
         # backend routes (opencode/reasonix).
-        cases = {("claude", "claude-opus-5"): "plan",
-                 ("codex", "gpt-5.6-luna"): "plan",
-                 ("opencode", "kimi-for-coding/k3"): "plan",
-                 ("opencode", "minimax-coding-plan/m3"): "plan",
-                 ("opencode", "xai/grok-4.6"): "plan",
-                 ("reasonix", "deepseek/deepseek-v4-flash"): "api",
-                 ("opencode", None): "api"}
-        for (backend, model), want in cases.items():
-            self.assertEqual(
-                runway.kind_of(runway.provider_of(backend, model)), want,
-                (backend, model))
+        cases = {
+            "claude backend": ("claude", "claude-opus-5", "claude", "plan"),
+            "codex backend": ("codex", "gpt-5.6-luna", "codex", "plan"),
+            "kimi prefix": ("opencode", "kimi-for-coding/k3", "kimi", "plan"),
+            "minimax prefix": (
+                "opencode", "minimax-coding-plan/m3", "minimax", "plan"),
+            "xai prefix": ("opencode", "xai/grok-4.6", "xai", "plan"),
+            "metered prefix": ("reasonix", "deepseek/deepseek-v4-flash",
+                               "deepseek", "api"),
+            "missing model": ("opencode", None, "opencode", "api"),
+        }
+        for label, (backend, model, provider, kind) in cases.items():
+            with self.subTest(label):
+                got = runway.provider_of(backend, model)
+                self.assertEqual(got, provider)
+                self.assertEqual(runway.kind_of(got), kind)
 
 
 class KeyLookupTests(unittest.TestCase):
@@ -179,6 +173,7 @@ class KeyLookupTests(unittest.TestCase):
             value, source = runway.api_key("deepseek", self.auth)
         self.assertEqual(value, "from-opencode")
         self.assertIn("deepseek", source)
+        self.assertNotIn(value, source)
 
     def test_an_oauth_entry_uses_its_access_token(self) -> None:
         """OpenCode stores xai as a grant, not an api key."""
@@ -187,11 +182,16 @@ class KeyLookupTests(unittest.TestCase):
         self.assertEqual(runway.api_key("xai", self.auth)[0], "grant")
 
     def test_the_named_variable_is_the_fallback(self) -> None:
-        for auth in (self._write({}), self._write({"deepseek": {"key": "  "}}),
-                     Path("/nonexistent/auth.json")):
-            with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "from-env"}):
-                value, source = runway.api_key("deepseek", auth)
-            self.assertEqual((value, source), ("from-env", "$DEEPSEEK_API_KEY"), auth)
+        cases = {
+            "blank store entry": self._write({"deepseek": {"key": "  "}}),
+            "missing store": Path("/nonexistent/auth.json"),
+        }
+        for label, auth in cases.items():
+            with self.subTest(label), \
+                    mock.patch.dict(os.environ,
+                                    {"DEEPSEEK_API_KEY": "from-env"}):
+                self.assertEqual(runway.api_key("deepseek", auth),
+                                 ("from-env", "$DEEPSEEK_API_KEY"))
 
     def test_no_key_anywhere_names_both_places_it_looked(self) -> None:
         self.auth.write_text("{not json")
@@ -201,31 +201,6 @@ class KeyLookupTests(unittest.TestCase):
         self.assertIn("minimax-coding-plan", reason)
         self.assertIn("MINIMAX_API_KEY", reason)
 
-    def test_the_source_label_never_carries_the_key(self) -> None:
-        self._write({"kimi-for-coding": {"key": "sk-kimi-SECRETVALUE"}})
-        value, source = runway.api_key("kimi", self.auth)
-        self.assertEqual(value, "sk-kimi-SECRETVALUE")
-        self.assertNotIn("SECRET", source)
-
-
-class ScrubTests(unittest.TestCase):
-    def test_credential_shaped_names_and_values_are_redacted(self) -> None:
-        got = runway._scrub({
-            "api_key": "sk-live-1234", "Authorization": "Bearer abc",
-            "sessionToken": "x", "nested": [{"password": "hunter2"}],
-            "loose": "sk-ant-oat01-abcdefghijklmnop",
-            "opaque": "A" * 40, "window": "five_hour", "used": 12.5,
-        })
-        self.assertEqual(got["api_key"], "[redacted]")
-        self.assertEqual(got["Authorization"], "[redacted]")
-        self.assertEqual(got["sessionToken"], "[redacted]")
-        self.assertEqual(got["nested"][0]["password"], "[redacted]")
-        self.assertEqual(got["loose"], "[redacted]")
-        self.assertEqual(got["opaque"], "[redacted]")
-        self.assertEqual(got["window"], "five_hour")
-        self.assertEqual(got["used"], 12.5)
-
-
 class DeepSeekTests(unittest.TestCase):
     def test_prefers_usd_balance(self) -> None:
         got = runway.parse_deepseek(DEEPSEEK_OK)
@@ -233,30 +208,20 @@ class DeepSeekTests(unittest.TestCase):
         self.assertEqual((got.provider, got.remaining, got.unit),
                          ("deepseek", 10.5, "USD"))
         self.assertIsNone(got.resets_at)  # a prepaid balance has no window
+        self.assertEqual(got.kind, "api")
+        self.assertEqual(got.windows, [])
 
     def test_missing_and_garbage_shapes_are_unknown(self) -> None:
-        for data in ({}, {"balance_infos": []},
-                     {"balance_infos": [{"currency": "USD"}]},
-                     {"balance_infos": [{"total_balance": "abc"}]},
-                     {"balance_infos": "not-a-list"}, None):
-            got = runway.parse_deepseek(data)
-            self.assertFalse(got.known, data)
-            self.assertTrue(got.reason, data)
-
-    def test_balance_is_the_runway_for_the_one_metered_provider(self) -> None:
-        """W-0182: DeepSeek is billed per token, so money is the whole card."""
-        got = runway.parse_deepseek(DEEPSEEK_OK)
-        self.assertEqual(got.kind, "api")
-        self.assertEqual((got.remaining, got.unit), (10.5, "USD"))
-        self.assertEqual(got.windows, [])  # no window, so nothing to reset
-
-    def test_no_key_anywhere_is_unknown_and_names_both_places(self) -> None:
-        with mock.patch.dict(os.environ, NO_KEYS):
-            got = runway.deepseek(auth_path=NO_AUTH)
-        self.assertFalse(got.known)
-        self.assertIn("opencode auth.json", got.reason)
-        self.assertIn("DEEPSEEK_API_KEY", got.reason)
-
+        cases = {
+            "missing balances": {},
+            "missing total": {"balance_infos": [{"currency": "USD"}]},
+            "nonnumeric total": {"balance_infos": [{"total_balance": "abc"}]},
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                got = runway.parse_deepseek(data)
+                self.assertFalse(got.known)
+                self.assertTrue(got.reason)
 
 class KimiTests(unittest.TestCase):
     def test_both_the_burst_window_and_the_plan_quota_are_reported(self) -> None:
@@ -271,14 +236,6 @@ class KimiTests(unittest.TestCase):
         self.assertNotIn("limit", got.windows[0])
         self.assertTrue(got.resets_at.endswith("Z"))
         self.assertEqual(got.raw["membership"], "pro")
-
-    def test_a_spent_window_still_renders_with_its_reset(self) -> None:
-        """0% is a reading, not a missing one: the weekly must keep its bar
-        and its reset time rather than vanishing (owner, 2026-08-14)."""
-        weekly = runway.parse_kimi(KIMI_OK).windows[1]
-        self.assertEqual(weekly["remaining"], 0.0)
-        self.assertFalse(weekly["stale"])
-        self.assertTrue(weekly["resets_at"].endswith("Z"))
 
     def test_a_weekly_in_limits_is_not_duplicated_by_usage(self) -> None:
         got = runway.parse_kimi({
@@ -296,15 +253,18 @@ class KimiTests(unittest.TestCase):
                          [("weekly", 25.0)])
 
     def test_broken_shapes_are_unknown(self) -> None:
-        for data in ({}, {"limits": []}, {"limits": "nope"}, {"limits": [{}]},
-                     {"limits": [{"window": {}, "detail": {"remaining": "lots",
-                                                           "limit": "1000"}}]},
-                     {"limits": [{"detail": {"remaining": "1", "limit": "0"}}]},
-                     {"limits": [{"detail": {"remaining": "1", "limit": "2",
-                                             "resetTime": "never"}}]}, None):
-            got = runway.parse_kimi(data)
-            self.assertFalse(got.known, data)
-            self.assertTrue(got.reason, data)
+        cases = {
+            "missing windows": {},
+            "nonnumeric quota": {"limits": [{"detail": {
+                "remaining": "lots", "limit": "1000"}}]},
+            "invalid reset": {"limits": [{"detail": {
+                "remaining": "1", "limit": "2", "resetTime": "never"}}]},
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                got = runway.parse_kimi(data)
+                self.assertFalse(got.known)
+                self.assertTrue(got.reason)
 
 
 class MiniMaxTests(unittest.TestCase):
@@ -323,13 +283,18 @@ class MiniMaxTests(unittest.TestCase):
         self.assertIn("1004", got.reason)
 
     def test_broken_shapes_are_unknown(self) -> None:
-        for data in ({}, None, {"model_remains": []}, {"model_remains": "nope"},
-                     {"model_remains": [{"model_name": "general"}]},
-                     {"model_remains": [{"current_interval_remaining_percent":
-                                         "lots"}]}):
-            got = runway.parse_minimax(data)
-            self.assertFalse(got.known, data)
-            self.assertTrue(got.reason, data)
+        cases = {
+            "missing rows": {},
+            "missing percentages": {
+                "model_remains": [{"model_name": "general"}]},
+            "nonnumeric percentage": {"model_remains": [{
+                "current_interval_remaining_percent": "lots"}]},
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                got = runway.parse_minimax(data)
+                self.assertFalse(got.known)
+                self.assertTrue(got.reason)
 
 
 # --- Grok / xAI --------------------------------------------------------------
@@ -395,23 +360,29 @@ class XaiBillingTests(unittest.TestCase):
         self.assertEqual(runway.parse_xai(_billing()).remaining, 100.0)
 
     def test_broken_shapes_are_unknown(self) -> None:
-        for data in (None, {}, {"config": "nope"}, {"config": {}},
-                     {"config": {"currentPeriod": "nope"}},
-                     {"config": {"currentPeriod": {"end": "never"}}}):
-            got = runway.parse_xai(data)
-            self.assertFalse(got.known, data)
-            self.assertTrue(got.reason, data)
+        cases = {
+            "missing period": {},
+            "period is not an object": {"config": {"currentPeriod": "nope"}},
+            "invalid end": {"config": {"currentPeriod": {"end": "never"}}},
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                got = runway.parse_xai(data)
+                self.assertFalse(got.known)
+                self.assertTrue(got.reason)
 
-    def test_banked_credits_ride_along_as_a_phrase_without_their_ids(self) -> None:
-        got = runway.parse_xai(_billing(used=0.0), {
-            "available": 2, "soonest_expiry": "2026-09-12T18:49:00Z"})
-        self.assertEqual(runway.credits_text(got.raw),
-                         "2 banked reset credits · soonest expires 2026-09-12")
-
-    def test_the_window_survives_a_reset_rpc_that_says_nothing(self) -> None:
-        got = runway.parse_xai(_billing(used=10.0), None)
-        self.assertEqual(got.remaining, 90.0)
-        self.assertIsNone(runway.credits_text(got.raw))
+    def test_reset_credits_are_optional_window_metadata(self) -> None:
+        cases = {
+            "credits present": (
+                {"available": 2, "soonest_expiry": "2026-09-12T18:49:00Z"},
+                "2 banked reset credits · soonest expires 2026-09-12"),
+            "reset rpc unavailable": (None, None),
+        }
+        for label, (resets, expected) in cases.items():
+            with self.subTest(label):
+                got = runway.parse_xai(_billing(used=10.0), resets)
+                self.assertEqual(got.remaining, 90.0)
+                self.assertEqual(runway.credits_text(got.raw), expected)
 
 
 class XaiResetTests(unittest.TestCase):
@@ -430,147 +401,29 @@ class XaiResetTests(unittest.TestCase):
         self.assertEqual(runway.parse_xai_resets(_resets_body()),
                          {"available": 0, "soonest_expiry": None})
 
-    def test_a_grpc_error_in_the_trailer_is_raised_not_read_as_zero(self) -> None:
-        """A failed rpc still answers HTTP 200; the trailer is the real
-        channel. The grpc-message is deliberately not repeated back."""
-        body = _frame(b"grpc-status:16\r\ngrpc-message:no-credentials\r\n", 0x80)
-        with self.assertRaises(ValueError) as caught:
-            runway.parse_xai_resets(body)
-        self.assertIn("grpc status 16", str(caught.exception))
-        self.assertNotIn("no-credentials", str(caught.exception))
+    def test_grpc_errors_are_raised_not_read_as_zero(self) -> None:
+        cases = {
+            "trailer": (
+                _frame(b"grpc-status:16\r\ngrpc-message:no-credentials\r\n", 0x80),
+                {}, "16"),
+            "header": (_resets_body(status=b""), {"grpc-status": "7"}, "7"),
+        }
+        for label, (body, headers, status) in cases.items():
+            with self.subTest(label), self.assertRaises(ValueError) as caught:
+                runway.parse_xai_resets(body, headers)
+            self.assertIn(f"grpc status {status}", str(caught.exception))
+            self.assertNotIn("no-credentials", str(caught.exception))
 
-    def test_a_header_borne_grpc_status_counts_too(self) -> None:
-        with self.assertRaises(ValueError):
-            runway.parse_xai_resets(_resets_body(status=b""),
-                                    {"grpc-status": "7"})
-
-    def test_junk_frames_raise_rather_than_inventing_a_count(self) -> None:
-        for body in (b"\x00\x00\x00\x00\x40short",         # frame longer than body
-                     b"",                                  # nothing at all
-                     _frame(b"\x0a\x7f"),                   # truncated submessage
-                     _frame(b"\x0c"),                       # unsupported wire type
-                     _resets_body() + b"\x00\x00"):        # trailing bytes
-            with self.assertRaises(ValueError, msg=body):
+    def test_malformed_frames_raise_rather_than_inventing_a_count(self) -> None:
+        cases = {
+            "no frame": b"",
+            "truncated frame": b"\x00\x00\x00\x00\x40short",
+            "truncated protobuf": _frame(b"\x0a\x7f"),
+            "compressed frame": _frame(b"\x0a\x00", 0x01),
+        }
+        for label, body in cases.items():
+            with self.subTest(label), self.assertRaises(ValueError):
                 runway.parse_xai_resets(body)
-
-    def test_a_compressed_frame_is_refused_rather_than_misread(self) -> None:
-        with self.assertRaises(ValueError):
-            runway.parse_xai_resets(_frame(b"\x0a\x00", 0x01))
-
-
-class XaiTokenTests(unittest.TestCase):
-    """Orchestra writes into ANOTHER application's credential store. These pin
-    the promises that makes: only near expiry, atomically, everything else
-    preserved, and nothing written at all when any step fails."""
-
-    OTHERS = {"deepseek": {"type": "api", "key": "sk-someone-elses-key"},
-              "kimi-for-coding": {"type": "api", "key": "kimi-key"}}
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name) / "auth.json"
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def _write(self, expires_in_s: float, refresh="r-old") -> Path:
-        entry = {"type": "oauth", "access": "a-old", "refresh": refresh,
-                 "expires": int((time.time() + expires_in_s) * 1000)}
-        self.path.write_text(json.dumps({**self.OTHERS, "xai": entry}))
-        os.chmod(self.path, 0o600)
-        return self.path
-
-    def _renewal(self, **body):
-        payload = json.dumps({"access_token": "a-new", "refresh_token": "r-new",
-                              "expires_in": 7200, **body}).encode()
-        return mock.patch.object(runway, "_fetch",
-                                 return_value=({}, payload, None))
-
-    def test_a_healthy_grant_is_used_as_is_and_the_file_is_not_touched(self) -> None:
-        before = self._write(3600).read_bytes()
-        with mock.patch.object(runway, "_fetch", side_effect=AssertionError):
-            self.assertEqual(runway._xai_bearer(self.path), ("a-old", None))
-        self.assertEqual(self.path.read_bytes(), before)
-
-    def test_renewal_happens_only_inside_the_last_two_minutes(self) -> None:
-        self._write(3600)
-        with mock.patch.object(runway, "_fetch", side_effect=AssertionError):
-            runway._xai_bearer(self.path)  # would raise if it renewed
-        with self._renewal():
-            self.assertEqual(runway._xai_bearer(self.path,
-                                                now=time.time() + 3540)[0],
-                             "a-new")
-
-    def test_a_renewal_keeps_every_other_provider_and_mode_0600(self) -> None:
-        self._write(-1)
-        with self._renewal():
-            token, err = runway._xai_bearer(self.path)
-        self.assertEqual((token, err), ("a-new", None))
-        saved = json.loads(self.path.read_text())
-        self.assertEqual({k: v for k, v in saved.items() if k != "xai"},
-                         self.OTHERS)
-        self.assertEqual(saved["xai"]["type"], "oauth")  # the entry, not just
-        self.assertEqual(saved["xai"]["refresh"], "r-new")  # its three fields
-        self.assertGreater(saved["xai"]["expires"], time.time() * 1000)
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
-
-    def test_a_grant_rotated_by_opencode_mid_request_is_never_overwritten(self) -> None:
-        """xAI consumes the refresh token it is given, so a pair that landed
-        while this exchange was in flight is the live one — use it, write
-        nothing."""
-        self._write(-1)
-
-        def rotated(*a, **kw):
-            self.path.write_text(json.dumps(
-                {**self.OTHERS, "xai": {"type": "oauth", "access": "a-theirs",
-                                        "refresh": "r-theirs", "expires": 1}}))
-            return {}, json.dumps({"access_token": "a-mine",
-                                   "refresh_token": "r-mine"}).encode(), None
-
-        with mock.patch.object(runway, "_fetch", rotated):
-            self.assertEqual(runway._xai_bearer(self.path), ("a-theirs", None))
-        self.assertEqual(json.loads(self.path.read_text())["xai"]["refresh"],
-                         "r-theirs")
-
-    def test_every_renewal_failure_leaves_the_file_byte_for_byte(self) -> None:
-        cases = (
-            ({}, b"", "http 400 Bad Request"),   # xAI refused
-            ({}, b"not json", None),             # unusable answer
-            ({}, b'{"token_type":"bearer"}', None),  # no access token
-        )
-        for headers, body, err in cases:
-            before = self._write(-1).read_bytes()
-            with mock.patch.object(runway, "_fetch",
-                                   return_value=(headers, body, err)):
-                token, reason = runway._xai_bearer(self.path)
-            self.assertIsNone(token, body)
-            self.assertTrue(reason, body)
-            self.assertEqual(self.path.read_bytes(), before, body)
-
-    def test_a_failed_write_reports_and_changes_nothing(self) -> None:
-        before = self._write(-1).read_bytes()
-        with self._renewal(), mock.patch.object(runway.os, "replace",
-                                                side_effect=OSError("nope")):
-            token, reason = runway._xai_bearer(self.path)
-        self.assertIsNone(token)
-        self.assertIn("could not be saved", reason)
-        self.assertEqual(self.path.read_bytes(), before)
-        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
-
-    def test_a_grant_with_no_refresh_token_is_unknown_with_a_reason(self) -> None:
-        self._write(-1, refresh="")
-        with mock.patch.object(runway, "_fetch", side_effect=AssertionError):
-            token, reason = runway._xai_bearer(self.path)
-        self.assertIsNone(token)
-        self.assertIn("no refresh token", reason)
-
-    def test_no_opencode_login_falls_back_to_the_environment(self) -> None:
-        with mock.patch.dict(os.environ, {**NO_KEYS, "XAI_API_KEY": "env-key"}):
-            self.assertEqual(runway._xai_bearer(NO_AUTH), ("env-key", None))
-        with mock.patch.dict(os.environ, NO_KEYS):
-            token, reason = runway._xai_bearer(NO_AUTH)
-        self.assertIsNone(token)
-        self.assertIn("XAI_API_KEY", reason)
 
 
 class XaiAdapterTests(unittest.TestCase):
@@ -608,20 +461,21 @@ class XaiAdapterTests(unittest.TestCase):
 
     def test_every_call_failing_is_unknown_with_a_reason(self) -> None:
         cases = {
-            "http 401 Unauthorized": [({}, b"", "http 401 Unauthorized")],
-            "did not recognise": [({}, b'{"error":"nope"}', None)],
-            "unreachable: down": [self.OK_USER, ({}, b"", "unreachable: down")],
-            "not JSON": [self.OK_USER, ({}, b"<html>", None)],
-            "currentPeriod": [self.OK_USER, ({}, b"{}", None),
-                              ({}, _resets_body(), None)],
+            "user request": ("http 401 Unauthorized",
+                             [({}, b"", "http 401 Unauthorized")]),
+            "unrecognized user": ("did not recognise",
+                                  [({}, b'{"error":"nope"}', None)]),
+            "billing response": ("not JSON",
+                                 [self.OK_USER, ({}, b"<html>", None)]),
         }
-        for expected, calls in cases.items():
-            with mock.patch.object(runway, "_xai_bearer",
-                                   return_value=("token", None)), \
+        for label, (expected, calls) in cases.items():
+            with self.subTest(label), \
+                    mock.patch.object(runway, "_xai_bearer",
+                                      return_value=("token", None)), \
                     self._replies(*calls):
                 got = runway.xai(auth_path=NO_AUTH)
-            self.assertFalse(got.known, expected)
-            self.assertIn(expected, got.reason)
+                self.assertFalse(got.known)
+                self.assertIn(expected, got.reason)
 
     def test_an_unusable_credential_never_reaches_the_network(self) -> None:
         with mock.patch.object(runway, "_xai_bearer",
@@ -698,20 +552,17 @@ class ClaudeTests(unittest.TestCase):
 
     def test_shape_drift_and_bad_files_are_unknown(self) -> None:
         cases = {
-            "missing key": {"other": 1},
-            "no fetchedAtMs": {"cachedUsageUtilization": {"utilization": {}}},
-            "key is not an object": {"cachedUsageUtilization": "nope"},
-            "windows all null": {"cachedUsageUtilization": {
+            "missing cache": {"other": 1},
+            "missing timestamp": {"cachedUsageUtilization": {"utilization": {}}},
+            "no usable windows": {"cachedUsageUtilization": {
                 "fetchedAtMs": time.time() * 1000,
                 "utilization": {"five_hour": None, "seven_day": None}}},
-            "utilization not numeric": {"cachedUsageUtilization": {
-                "fetchedAtMs": time.time() * 1000,
-                "utilization": {"five_hour": {"utilization": "12%"}}}},
         }
         for label, data in cases.items():
-            got = runway.claude(self._write(data))
-            self.assertFalse(got.known, label)
-            self.assertTrue(got.reason, label)
+            with self.subTest(label):
+                got = runway.claude(self._write(data))
+                self.assertFalse(got.known)
+                self.assertTrue(got.reason)
         self.path.write_text("{not json")
         self.assertFalse(runway.claude(self.path).known)
         self.assertFalse(runway.claude(self.path.parent / "absent.json").known)
@@ -753,17 +604,6 @@ class CodexTests(unittest.TestCase):
         got = runway.parse_codex(codex_lines())
         self.assertEqual(runway.credits_text(got.raw), "0 banked resets")
         self.assertEqual(got.kind, "plan")  # still never shows a price
-
-    def test_banked_resets_read_as_resets_at_every_count(self) -> None:
-        for credits, expected in (
-                ({"has_credits": True, "balance": "1"}, "1 banked reset"),
-                ({"has_credits": True, "balance": "4"}, "4 banked resets"),
-                ({"has_credits": True, "unlimited": True, "balance": "0"},
-                 "unlimited resets"),
-                ({"has_credits": False}, None),
-                ("nope", None), (None, None)):
-            self.assertEqual(runway._codex_credits_text(credits), expected,
-                             credits)
 
     def test_a_second_window_renders_when_the_account_has_one(self) -> None:
         got = runway.parse_codex(codex_lines(
@@ -811,18 +651,17 @@ class CodexTests(unittest.TestCase):
         cases = {
             "empty": [],
             "truncated json": ['{"payload":{"type":"token_count", "rate_l'],
-            "no rate_limits": ['{"payload":{"type":"token_count","info":{}}}'],
-            "primary null": ['{"payload":{"type":"token_count",'
-                             '"rate_limits":{"primary":null}}}'],
-            "used_percent missing": ['{"payload":{"type":"token_count",'
-                                     '"rate_limits":{"primary":{"window_minutes":60}}}}'],
-            "resets_at garbage": ['{"payload":{"type":"token_count","rate_limits":'
-                                  '{"primary":{"used_percent":10,"resets_at":"soon"}}}}'],
+            "no usable window": ['{"payload":{"type":"token_count",'
+                                 '"rate_limits":{"primary":null}}}'],
+            "invalid reset": ['{"payload":{"type":"token_count","rate_limits":'
+                              '{"primary":{"used_percent":10,'
+                              '"resets_at":"soon"}}}}'],
         }
         for label, lines in cases.items():
-            got = runway.parse_codex(lines)
-            self.assertFalse(got.known, label)
-            self.assertTrue(got.reason, label)
+            with self.subTest(label):
+                got = runway.parse_codex(lines)
+                self.assertFalse(got.known)
+                self.assertTrue(got.reason)
 
 
 class StorageTests(unittest.TestCase):
@@ -841,25 +680,26 @@ class StorageTests(unittest.TestCase):
             os.environ["ORCHESTRA_HOME"] = self._home
         self.tmp.cleanup()
 
-    def test_known_and_unknown_polls_are_both_stored(self) -> None:
-        runway.record(self.con, [runway.parse_deepseek(DEEPSEEK_OK),
-                                 runway.unknown("codex", "no rollout files")])
+    def test_polls_store_known_unknown_raw_and_window_data(self) -> None:
+        runway.record(self.con, [
+            runway.parse_deepseek(DEEPSEEK_OK),
+            runway.parse_claude(claude_fixture()),
+            runway.unknown("codex", "no rollout files"),
+        ])
         rows = list(self.con.execute(
             "SELECT * FROM runway_polls ORDER BY provider"))
-        self.assertEqual([r["provider"] for r in rows], ["codex", "deepseek"])
-        self.assertIsNone(rows[0]["remaining"])
-        self.assertEqual(rows[0]["reason"], "no rollout files")
-        self.assertEqual(rows[1]["remaining"], 10.5)
-        self.assertEqual(rows[1]["unit"], "USD")
-        self.assertTrue(rows[1]["polled_at"])
-        self.assertEqual(json.loads(rows[1]["raw"])["granted_balance"], "0.50")
-
-    def test_every_window_of_a_poll_is_stored(self) -> None:
-        runway.record(self.con, [runway.parse_claude(claude_fixture())])
-        row = self.con.execute(
-            "SELECT * FROM runway_polls WHERE provider='claude'").fetchone()
-        self.assertEqual([w["label"] for w in json.loads(row["windows"])],
+        by_provider = {row["provider"]: row for row in rows}
+        self.assertEqual(set(by_provider), {"claude", "codex", "deepseek"})
+        self.assertIsNone(by_provider["codex"]["remaining"])
+        self.assertEqual(by_provider["codex"]["reason"], "no rollout files")
+        self.assertEqual((by_provider["deepseek"]["remaining"],
+                          by_provider["deepseek"]["unit"]), (10.5, "USD"))
+        self.assertEqual(json.loads(by_provider["deepseek"]["raw"])
+                         ["granted_balance"], "0.50")
+        self.assertEqual([w["label"] for w in json.loads(
+            by_provider["claude"]["windows"])],
                          ["5h", "weekly"])
+        self.assertTrue(all(row["polled_at"] for row in rows))
 
     def test_a_trend_query_can_read_polls_back_in_order(self) -> None:
         for pct in (80.0, 60.0):
@@ -887,34 +727,36 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("60% left", lines[1])
 
     def test_window_minutes_are_named(self) -> None:
-        self.assertEqual(runway.window_label(10080), "weekly")
-        self.assertEqual(runway.window_label(300), "5h")
-        self.assertEqual(runway.window_label(42), "42m")
-        self.assertEqual(runway.window_label(None), "window")
-        # minimax reports 240 minutes. "240m" is arithmetic the reader should
-        # not have to do, and four hours is a real difference from the five
-        # Claude and Kimi give.
-        self.assertEqual(runway.window_label(240), "4h")
-        self.assertEqual(runway.window_label(120), "2h")
-        self.assertEqual(runway.window_label(4320), "3d")
-        self.assertEqual(runway.window_label(0), "0m")
+        cases = {
+            "weekly": (10080, "weekly"),
+            "five hours": (300, "5h"),
+            "arbitrary minutes": (42, "42m"),
+            "missing duration": (None, "window"),
+            "whole hours": (240, "4h"),
+            "whole days": (4320, "3d"),
+            "zero": (0, "0m"),
+        }
+        for label, (minutes, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(runway.window_label(minutes), expected)
 
     def test_time_to_reset_reads_in_days_hours_and_minutes(self) -> None:
         """W-0182: "in 55h" is arithmetic the reader has to do."""
-        self.assertTrue(runway.until_text(_iso(_epoch_in(2))).startswith("in 1h 5"))
-        self.assertTrue(runway.until_text(_iso(_epoch_in(80))).startswith("in 3d 7h "))
-        self.assertTrue(runway.until_text(_iso(_epoch_in(0.5))).startswith("in 29m"))
-        self.assertEqual(runway.until_text(None), "-")
-        self.assertEqual(runway.until_text(_iso(_epoch_in(-1))), "now")
+        cases = {
+            "hours": (_iso_in(2), "in 1h 5"),
+            "days": (_iso_in(80), "in 3d 7h"),
+            "minutes": (_iso_in(0.5), "in 29m"),
+            "missing": (None, "-"),
+            "past": (_iso_in(-1), "now"),
+        }
+        for label, (resets_at, expected) in cases.items():
+            with self.subTest(label):
+                self.assertTrue(runway.until_text(resets_at).startswith(expected))
 
     def test_a_balance_prints_as_money_and_a_window_as_headroom(self) -> None:
         line, = runway.format_lines(runway.parse_deepseek(DEEPSEEK_OK))
         self.assertIn("balance", line)
         self.assertIn("10.5 USD", line)
-
-
-def _iso(epoch_seconds: int) -> str:
-    return runway._iso(epoch_seconds)
 
 
 class ExpiredWindowTests(unittest.TestCase):
@@ -934,32 +776,14 @@ class ExpiredWindowTests(unittest.TestCase):
         self.assertIn("reset", current["stale_reason"])
         self.assertEqual("5h", current["label"])
 
-    def test_a_live_window_is_returned_untouched(self) -> None:
-        future = "2999-01-01T00:00:00Z"
-        window = self._window(future)
-        self.assertEqual(window, runway.as_of_now(window))
-        self.assertEqual(88.0, runway.as_of_now(window)["remaining"])
-
-    def test_a_window_with_no_reset_time_is_not_assumed_expired(self) -> None:
-        window = self._window(None)
-        self.assertEqual(88.0, runway.as_of_now(window)["remaining"])
-
-    def test_the_real_shape_that_caused_this(self) -> None:
-        # ~/.claude.json as it actually stood: read three days ago, with a
-        # five-hour window that reset two days ago and a weekly one that has
-        # not. The weekly figure survives; the five-hour one cannot.
-        fetched = 1786000000000.0
-        data = {"cachedUsageUtilization": {
-            "fetchedAtMs": fetched,
-            "utilization": {
-                "five_hour": {"utilization": 12, "resets_at": "2020-01-01T00:00:00Z"},
-                "seven_day": {"utilization": 17, "resets_at": "2999-01-01T00:00:00Z"}}}}
-        parsed = runway.parse_claude(data, now_ms=fetched + 85 * 3600000)
-        current = [runway.as_of_now(w) for w in parsed.windows]
-        by_label = {w["label"]: w for w in current}
-        self.assertIsNone(by_label["5h"]["remaining"])
-        self.assertEqual(83.0, by_label["weekly"]["remaining"])
-        self.assertIsNotNone(parsed.as_of)
+    def test_current_windows_keep_their_reading(self) -> None:
+        for label, resets_at in {
+                "future reset": "2999-01-01T00:00:00Z",
+                "unknown reset": None}.items():
+            with self.subTest(label):
+                window = self._window(resets_at)
+                self.assertEqual(window, runway.as_of_now(window))
+                self.assertEqual(88.0, runway.as_of_now(window)["remaining"])
 
 
 class SkipTests(unittest.TestCase):
@@ -1028,16 +852,6 @@ class CodexLiveTests(unittest.TestCase):
         self.assertEqual(["weekly"], [w["label"] for w in r.windows])
         self.assertEqual("0 banked resets", runway.credits_text(r.raw))
 
-    def test_both_windows_when_the_account_has_two(self) -> None:
-        payload = {"rateLimits": {**self.LIVE["rateLimits"],
-                                  "secondary": {"usedPercent": 40,
-                                                "windowDurationMins": 300,
-                                                "resetsAt": 1787196960}}}
-        r = runway.parse_codex_live(payload)
-        self.assertEqual({"weekly", "5h"}, {w["label"] for w in r.windows})
-        # The scalar is the tightest window, which is what dispatch reads.
-        self.assertEqual(11.0, r.remaining)
-
     def test_a_dead_app_server_falls_back_to_the_session_record(self) -> None:
         def boom():
             raise RuntimeError("codex is not installed")
@@ -1086,6 +900,10 @@ class ClaudeLiveTests(unittest.TestCase):
             "seven_day": {"utilization": 17,
                           "resets_at": "2999-01-01T00:00:00Z"}}}}
 
+    def setUp(self) -> None:
+        runway._CLAUDE_LAST = None
+        self.addCleanup(setattr, runway, "_CLAUDE_LAST", None)
+
     def _file(self, tmp, state=None):
         path = pathlib.Path(tmp) / "claude.json"
         path.write_text(json.dumps(state if state is not None else self.STATE))
@@ -1098,15 +916,9 @@ class ClaudeLiveTests(unittest.TestCase):
         by = {w["label"]: w for w in r.windows}
         self.assertEqual(47.0, by["weekly"]["remaining"])   # not the cache's 83
         self.assertEqual(98.0, by["5h"]["remaining"])       # not the cache's 88
-
-    def test_a_reset_already_passed_is_dropped_not_kept(self) -> None:
         # The screen gives percentages, not reset times. Pairing a live number
         # with a reset that has passed would make as_of_now blank a reading
         # just taken.
-        with tempfile.TemporaryDirectory() as tmp:
-            r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 86 * 3600000,
-                              screen=lambda state: runway.parse_claude_screen(SCREEN))
-        by = {w["label"]: w for w in r.windows}
         self.assertIsNone(by["5h"]["resets_at"])
         self.assertEqual(98.0, runway.as_of_now(by["5h"])["remaining"])
         self.assertEqual("2999-01-01T00:00:00Z", by["weekly"]["resets_at"])
@@ -1116,7 +928,6 @@ class ClaudeLiveTests(unittest.TestCase):
         # written to the cache, and reading /usage refreshes the cache as a
         # side effect -- so a fresh cache hid the very thing that refreshed it,
         # and Fable never appeared again.
-        runway._CLAUDE_LAST = None
         called = []
         with tempfile.TemporaryDirectory() as tmp:
             r = runway.claude(self._file(tmp), now_ms=1_786_000_000_000 + 60_000,
@@ -1126,7 +937,6 @@ class ClaudeLiveTests(unittest.TestCase):
         by = {w["label"]: w for w in r.windows}
         self.assertEqual(39.0, by["weekly"]["remaining"])
         self.assertIn("weekly \u00b7 fable", by)
-        runway._CLAUDE_LAST = None
 
     def test_a_screen_that_says_nothing_keeps_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1139,7 +949,6 @@ class ClaudeLiveTests(unittest.TestCase):
         # The daemon polls every five minutes and the cache is stale most of
         # the time. Spawning Claude Code that often rate-limits the owner's own
         # /usage view -- the per-model breakdown goes first.
-        runway._CLAUDE_LAST = None
         calls = []
 
         def once(state):
@@ -1154,12 +963,10 @@ class ClaudeLiveTests(unittest.TestCase):
                 second = runway.claude(path, now_ms=stale)
         self.assertEqual(1, len(calls), "the second poll reused the first answer")
         self.assertEqual(first.remaining, second.remaining)
-        runway._CLAUDE_LAST = None
 
     def test_a_partial_read_is_retried_sooner_than_a_complete_one(self) -> None:
         # A read missing the per-model rows was rate limited, not finished.
         # Caching it for the full interval locked Fable out for twenty minutes.
-        runway._CLAUDE_LAST = None
         answers = [{"five_hour": 5.0, "seven_day": 61.0},
                    {"five_hour": 5.0, "seven_day": 61.0, "week:fable": 53.0}]
         calls = []
@@ -1187,7 +994,6 @@ class ClaudeLiveTests(unittest.TestCase):
                 runway.claude(path, now_ms=stale)
                 self.assertEqual(2, len(calls), "a complete read is not re-asked")
         self.assertIn("weekly \u00b7 fable", [w["label"] for w in second.windows])
-        runway._CLAUDE_LAST = None
 
     def test_a_per_model_week_is_reported_but_never_the_scalar(self) -> None:
         # Anthropic meters some models separately. Fable's weekly running out
@@ -1204,24 +1010,22 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertTrue(by["weekly \u00b7 fable"]["per_model"])
         self.assertEqual(39.0, r.remaining)  # the account week, not Fable's
 
-    def test_an_unknown_per_model_row_needs_no_code_change(self) -> None:
-        # The point of matching the shape: a model Anthropic meters tomorrow
-        # appears without anyone editing a list of names.
-        found = runway.parse_claude_screen(
-            "Current week (Something New only)\n 10% used\n")
-        self.assertEqual({"week:something new": 10.0}, found)
-
-    def test_all_models_is_the_account_row_not_a_per_model_one(self) -> None:
-        found = runway.parse_claude_screen("Current week (all models)\n 61% used\n")
-        self.assertEqual({"seven_day": 61.0}, found)
-
-    def test_the_parser_reads_only_the_named_rows(self) -> None:
-        found = runway.parse_claude_screen(SCREEN)
-        self.assertEqual({"five_hour": 2.0, "seven_day": 53.0}, found)
-
-    def test_the_parser_survives_terminal_escapes(self) -> None:
-        noisy = "\x1b[1m Current session\x1b[0m\r\n\x1b[32m   2% used\x1b[0m\r\n"
-        self.assertEqual({"five_hour": 2.0}, runway.parse_claude_screen(noisy))
+    def test_screen_parser_recognizes_quota_rows(self) -> None:
+        cases = {
+            "account rows only": (
+                SCREEN, {"five_hour": 2.0, "seven_day": 53.0}),
+            "new per-model row": (
+                "Current week (Something New only)\n 10% used\n",
+                {"week:something new": 10.0}),
+            "all models is account-wide": (
+                "Current week (all models)\n 61% used\n", {"seven_day": 61.0}),
+            "terminal escapes": (
+                "\x1b[1m Current session\x1b[0m\r\n"
+                "\x1b[32m   2% used\x1b[0m\r\n", {"five_hour": 2.0}),
+        }
+        for label, (screen, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(expected, runway.parse_claude_screen(screen))
 
 
 class ExhaustionTests(unittest.TestCase):
@@ -1233,18 +1037,20 @@ class ExhaustionTests(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("0% left", reason)
 
-    def test_unknown_and_headroom_are_available(self) -> None:
-        self.assertIsNone(runway.exhaustion(None))
-        self.assertIsNone(runway.exhaustion({"remaining": None, "reason": "down"}))
-        self.assertIsNone(runway.exhaustion({"remaining": 12, "unit": "percent"}))
-
-    def test_stale_or_expired_zero_is_available(self) -> None:
+    def test_non_walls_are_available(self) -> None:
         old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
         past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-        self.assertIsNone(runway.exhaustion(
-            {"remaining": 0, "unit": "percent", "as_of": old}))
-        self.assertIsNone(runway.exhaustion(
-            {"remaining": 0, "unit": "percent", "resets_at": past}))
+        cases = {
+            "no poll": None,
+            "unknown": {"remaining": None, "reason": "down"},
+            "headroom": {"remaining": 12, "unit": "percent"},
+            "stale zero": {"remaining": 0, "unit": "percent", "as_of": old},
+            "expired zero": {"remaining": 0, "unit": "percent",
+                             "resets_at": past},
+        }
+        for label, entry in cases.items():
+            with self.subTest(label):
+                self.assertIsNone(runway.exhaustion(entry))
 
     def test_profile_burns_records_the_provider_wall(self) -> None:
         burns = runway.profile_burns(

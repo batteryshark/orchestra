@@ -265,7 +265,7 @@ class FakeWork:
         handler = _make_handler(self)
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self._thread = threading.Thread(target=self._server.serve_forever,
-                                        daemon=True)
+                                        args=(0.01,), daemon=True)
         self._thread.start()
         return f"http://127.0.0.1:{self._server.server_address[1]}"
 
@@ -340,6 +340,8 @@ def _make_handler(state: FakeWork):
                         "updatedAt": d["updatedAt"]}
                        for d in state.decisions.values() if d["status"] == "open"])
                 return self._send(200, {"entries": entries})
+            if path == "/api/decisions":
+                return self._send(200, {"decisions": list(state.decisions.values())})
             m = re.fullmatch(r"/api/tasks/([^/]+)", path)
             if m:
                 task = state.tasks.get(m.group(1))
