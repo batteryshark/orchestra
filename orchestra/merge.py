@@ -653,19 +653,26 @@ def _recovered_landing(root: Path, cfg: dict, run: dict) -> dict | None:
     return result
 
 
-def _record_landing(con, run: dict, status: str, note: str | None = None) -> None:
-    """Stamp the landing receipt and keep its human reason on the result row."""
+def _record_landing(con, run: dict, status: str | None,
+                    note: str | None = None) -> None:
+    """Stamp the landing receipt and keep its human reason on the result row.
+
+    ``status=None`` records the note WITHOUT closing the receipt: an
+    exception is not a landing verdict, but its reason still belongs on the
+    row the reader gets."""
     row = con.execute("SELECT summary FROM runs WHERE id=?", (run["id"],)).fetchone()
     if row is None:
         return
     summary = row["summary"]
     if note and note not in (summary or ""):
-        if status == "failed":
+        if status != "ok":
             summary = f"{note}\n\n{summary}" if summary else note
         else:
             summary = f"{summary}\n\n{note}" if summary else note
-    con.execute("UPDATE runs SET landing_status=?, summary=? WHERE id=?",
-                (status, (summary or "")[:2000] or None, run["id"]))
+    con.execute(
+        "UPDATE runs SET landing_status=COALESCE(?, landing_status), "
+        "summary=? WHERE id=?",
+        (status, (summary or "")[:2000] or None, run["id"]))
     con.commit()
 
 
@@ -684,6 +691,11 @@ def _consume_landing(con, cfg: dict, result, status: str) -> str | None:
         # This was not a deliberate landing verdict. The base may already
         # have moved before an after-step failed, so leave the receipt open;
         # daemon replay can prove success from Git or retry the unsettled step.
+        # The reason still lands on the row, where the result reader is.
+        try:
+            _record_landing(con, run, None, note)
+        except Exception:
+            pass
         return note
 
 
@@ -776,7 +788,11 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
     _thread(con, int(run["id"]), report)
     work_settled = _post_to_work(con, cfg, run, result, report)
     note = _note(run, result, request_id)
-    if work_settled:
+    # A failed verdict is deliberate and final — the receipt closes now, and
+    # sweeper.report_result carries it to Work once Work is reachable. A
+    # success with Work unreachable leaves the receipt open instead: daemon
+    # replay re-proves the landing from Git and redelivers the report.
+    if work_settled or not result["ok"]:
         _record_landing(con, run, "ok" if result["ok"] else "failed", note)
     return note
 
