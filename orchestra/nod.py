@@ -406,8 +406,11 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
     phone, and Nod's server-side dedupe must not eat it. An open, un-acted
     escalation still dedupes exactly as before.
     """
-    _assert_actionable(kind, options)
+    # Routing first: an unknown kind is the caller's bug and its error names
+    # the known kinds; judging the options of a card that can go nowhere
+    # would report the wrong defect.
     client = client_for_kind(target, kind)
+    _assert_actionable(kind, options)
     if dedupe_key is None:
         dedupe_key = ":".join(
             str(p) for p in ("orchestra", kind, run_id, work_item) if p is not None)

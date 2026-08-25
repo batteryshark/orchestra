@@ -116,6 +116,20 @@ def profile_name(cfg: dict) -> str:
     if len(mid) == 1:
         return mid[0]
     if not mid:
+        # Two different absences, two different fixes: a mid-tier profile
+        # that exists but this project disabled is the project's edit to
+        # make, and the error has to name the project or the reader fixes
+        # the wrong table.
+        offstage = sorted(name for name, p in configured.items()
+                          if config.tier_of(p.get("tier")) == PLANNER_TIER)
+        if offstage:
+            project_id = cfg.get("project_id") or "(no project)"
+            raise PlannerUnconfigured(
+                f"no planner profile: project {project_id} has not enabled "
+                f"a mid-tier profile (tier 2 but not enabled: "
+                f"{', '.join(offstage)}). Add one to enabled_profiles in "
+                f'[project."{project_id}"], or set [settings] '
+                f'planner_profile = "NAME", in {paths.global_config_path()}')
         raise PlannerUnconfigured(
             "no planner profile: the conductor needs a mid-tier model to take "
             "planner turns with, and there are no default profiles. Set "
