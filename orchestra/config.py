@@ -173,6 +173,11 @@ worktree = true
 [verify]
 # enabled = true
 # profile = "judge"
+# A second voice makes needs-judgment criteria judgeable (W-0307): unset,
+# the dialogue is off. Caps are enforced in code, not hoped for.
+# second_opinion = "judge2"
+# dialogue_messages = 4
+# dialogue_budget = 8000
 
 # --- Optional Nod notification adapter -----------------------------------
 # Escalations are delivered as Nod request cards. Off unless enabled.

@@ -208,6 +208,7 @@ SEATS = {
     "planner": ("[settings]", "planner_profile"),
     "router": ("[work]", "router"),
     "verify": ("[verify]", "profile"),
+    "second_opinion": ("[verify]", "second_opinion"),
     "resolver": ("[merge]", "resolver_profile"),
 }
 
@@ -218,6 +219,7 @@ def seats_payload() -> dict:
               "planner": cfg.get("settings") or {},
               "router": cfg.get("work") or {},
               "verify": cfg.get("verify") or {},
+              "second_opinion": cfg.get("verify") or {},
               "resolver": cfg.get("merge") or {}}
     return {
         "seats": {seat: str(tables[seat].get(key) or "") or None
