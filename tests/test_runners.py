@@ -123,6 +123,23 @@ class BackendEnvTests(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertIs(runners.apply_backend_env(profile, env), env)
 
+    def test_profile_env_points_a_base_url_and_leaves_other_vars(self) -> None:
+        env = {"KEEP": "1", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+        out = runners.apply_backend_env(
+            {"backend": "claude",
+             "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8080"}},
+            env)
+        self.assertEqual(out["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8080")
+        self.assertEqual(out["KEEP"], "1")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.anthropic.com")
+        stripped = runners.apply_backend_env(
+            {"backend": "claude", "lane": "quota",
+             "env": {"ANTHROPIC_API_KEY": "from-profile",
+                     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080"}},
+            {"ANTHROPIC_API_KEY": "from-process", "KEEP": "1"})
+        self.assertNotIn("ANTHROPIC_API_KEY", stripped)
+        self.assertEqual(stripped["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8080")
+
 
 class LogParsingTests(unittest.TestCase):
     def write_log(self, lines: list) -> tuple[tempfile.TemporaryDirectory, Path]:

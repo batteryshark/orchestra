@@ -535,8 +535,10 @@ def model_turn(profile: dict, prompt: str, *, timeout: int = TURN_TIMEOUT,
     con = db.connect() if own else con
     try:
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                                  stdin=subprocess.DEVNULL)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                stdin=subprocess.DEVNULL,
+                env=runners.apply_backend_env(profile, os.environ))
             stdout = proc.stdout
         except FileNotFoundError as exc:
             if layer:
