@@ -18,6 +18,7 @@ HTTP seam (DESIGN §3, item W-0100): ``http.py`` calls
 ``run_messages()`` from here. Nothing in this module imports http.
 """
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,15 @@ MAX_CHUNK = 4_000_000       # bytes read per ingest pass
 DEFAULT_RAW_RETENTION_DAYS = 30
 SSE_RETRY_MS = 3000
 DAEMON_LOGS = ("daemon.out.log", "daemon.err.log")
+
+_WAIT_PATTERNS = (
+    ("sleep", re.compile(r"(?:^|[;&|]\s*)sleep(?:\s|$)", re.I)),
+    ("ci_poll", re.compile(
+        r"\bgh\s+(?:pr\s+checks|run\s+(?:watch|view))\b", re.I)),
+    ("record_poll", re.compile(
+        r"(?:^|[;&|]\s*)(?:work\s+(?:show|get|list)|"
+        r"orchestra\s+(?:show|runs|status))(?:\s|$)", re.I)),
+)
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -580,6 +590,41 @@ def events_for_run(con, run_id: int, after_id: int = 0,
     return [_as_dict(r) for r in con.execute(
         "SELECT * FROM events WHERE run_id=? AND id>? ORDER BY id LIMIT ?",
         (run_id, after_id, limit))]
+
+
+def wait_audit(con, since: str) -> list[dict]:
+    """List worker tool calls that wait for CI or poll durable records."""
+    findings = []
+    rows = con.execute(
+        "SELECT e.id, e.run_id, e.name, e.payload, e.created_at, r.slug "
+        "FROM events e JOIN runs r ON r.id=e.run_id "
+        "WHERE e.kind='tool_call' AND e.created_at>=? ORDER BY e.id", (since,))
+    for row in rows:
+        command = _tool_command(row["payload"])
+        if not command:
+            continue
+        for category, pattern in _WAIT_PATTERNS:
+            if pattern.search(command):
+                findings.append({
+                    "category": category, "run_id": int(row["run_id"]),
+                    "slug": row["slug"], "event_id": int(row["id"]),
+                    "at": row["created_at"], "tool": row["name"],
+                    "command": command[:500],
+                })
+                break
+    return findings
+
+
+def _tool_command(payload: str) -> str:
+    try:
+        value = json.loads(payload)
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(value, list):
+        return " ".join(str(part) for part in value)
+    if isinstance(value, str):
+        return value
+    return runners._find_command(value) or ""
 
 
 def expand(con, event_id: int) -> dict:

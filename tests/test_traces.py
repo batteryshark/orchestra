@@ -173,6 +173,22 @@ class ParserTests(TraceTestCase):
         self.assertEqual(self.kinds(run_id), ["lifecycle"])
 
 
+class WaitAuditTests(TraceTestCase):
+    def test_audit_lists_waiting_and_record_polling_tool_calls(self) -> None:
+        run_id = self.make_run("codex", self.dir / "audit.jsonl")
+        for command in ("sleep 30", "gh pr checks 42 --watch",
+                        "work show W-0300", "pytest -q"):
+            traces._record_synthetic(
+                self.con, run_id,
+                traces._ev("tool_call", "exec", {"command": command}))
+
+        rows = traces.wait_audit(self.con, "2000-01-01T00:00:00+00:00")
+
+        self.assertEqual([row["category"] for row in rows],
+                         ["sleep", "ci_poll", "record_poll"])
+        self.assertFalse(any("pytest" in row["command"] for row in rows))
+
+
 class NoiseTests(TraceTestCase):
     """Machine chatter is dropped at ingest, not stored (W-0303).
 

@@ -14,6 +14,7 @@ PROTOCOL_CARD = """\
 - Never run git write commands. Orchestra checkpoints isolated runs and may land their branches.
 - Sandbox: working directory yes, .git host-owned, /tmp yes. Leave files; do not work around it.
 - Operator messages may arrive between actions; apply them, then continue the mission.
+- Never wait or poll for external state. The daemon delivers relevant events as messages.
 - Your final message is the handoff: what changed, how you verified it, what remains.
 - End it with a ```json block: {"findings": [], "proposals": []} — both keys required, [] is fine. "halt": "reason" marks the run halted.
 - finding: {claim, where, confidence: observed|suspected, why_not_fixed}. proposal: {title, why}.

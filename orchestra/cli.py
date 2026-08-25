@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from orchestra import (acp, auth, conductor, config, daemon, db, dispatch,
@@ -1065,6 +1066,20 @@ def cmd_traces(args):
         con.close()
         print(json.dumps(rows, indent=2))
         return
+    if args.action == "audit":
+        since = args.since or datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).astimezone(timezone.utc).isoformat()
+        rows = traces.wait_audit(con, since)
+        con.close()
+        if args.json:
+            print(json.dumps({"since": since, "findings": rows}, indent=2))
+            return
+        for row in rows:
+            print(f"run {row['run_id']} event {row['event_id']} "
+                  f"{row['category']}: {row['command']}")
+        print(f"traces: {len(rows)} wait/poll tool call(s) since {since}")
+        return
     days = args.days if args.days is not None else traces.retention_days(config.load())
     pruned = traces.prune_raw_logs(con, days=days, dry_run=args.dry_run)
     con.close()
@@ -1399,6 +1414,11 @@ def main():
                                           "queued/delivered/answered")
     tm.add_argument("run_id", type=int)
     tm.set_defaults(days=None, dry_run=False)
+    ta = tsub.add_parser("audit", help="list run tool calls that sleep, wait "
+                                         "for CI, or poll durable records")
+    ta.add_argument("--since", help="inclusive ISO-8601 timestamp; default today")
+    ta.add_argument("--json", action="store_true")
+    ta.set_defaults(run_id=None, days=None, dry_run=False)
 
     s = sub.add_parser("_supervise")  # internal: detached supervisor entry
     s.add_argument("run_id", type=int)
