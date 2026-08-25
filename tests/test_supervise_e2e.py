@@ -23,6 +23,32 @@ def _git(root, *args) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True,
                    capture_output=True)
 
+
+def _seed_repo(tmp: str) -> Path:
+    """A committed git repo for the follow-up tests to stand in."""
+    root = Path(tmp) / "project"
+    root.mkdir()
+    _git(root, "init", "-q", ".")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "t")
+    (root / "a.txt").write_text("x\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "init")
+    return root
+
+
+def _finished_parent(con, root: Path, requested_by: str):
+    """A completed parent run whose worktree is already gone."""
+    cur = con.execute(
+        "INSERT INTO runs(profile, backend, requested_by, workdir, "
+        "branch, status, started_at, session_ref) "
+        "VALUES('p','codex',?,?,?, 'done', ?, 'sess-1')",
+        (requested_by, str(root / "gone"), "orchestra/run-1", db.now()))
+    parent = con.execute("SELECT * FROM runs WHERE id=?",
+                         (cur.lastrowid,)).fetchone()
+    con.commit()
+    return parent
+
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
 STUB = """\
@@ -50,7 +76,7 @@ for _ in range(int(os.environ.get("STUB_STEPS", "0"))):
         "type": "step-finish", "cost": 0.01,
         "tokens": {"total": 1100, "input": 1000, "output": 100,
                    "reasoning": 0, "cache": {"read": 0, "write": 0}}}}), flush=True)
-    time.sleep(0.3)
+    time.sleep(float(os.environ.get("STUB_STEP_SLEEP", "0")))
 print(json.dumps({"type": "text", "text": "stub work complete"}), flush=True)
 sys.exit(int(os.environ.get("STUB_EXIT", "0")))
 """
@@ -83,6 +109,7 @@ class E2ETestCase(unittest.TestCase):
             "ORCHESTRA_ROOT": str(self.root),
             "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
             "STUB_SLEEP": "0",
+            "STUB_STEP_SLEEP": "0",
             "STUB_STEPS": "0",
             "STUB_EXIT": "0",
             "STUB_SESSION_GONE": "",
@@ -118,89 +145,120 @@ class E2ETestCase(unittest.TestCase):
         con.close()
         return rc, run
 
-    def test_dispatch_supervise_complete(self) -> None:
-        run_id, _ = self._dispatch(mission="write the fix")
-        rc, run = self._run(run_id)
-        self.assertEqual(rc, 0)
-        self.assertEqual(run["status"], "done")
-        self.assertEqual(run["exit_code"], 0)
-        self.assertEqual(run["session_ref"], "stub-session-1")
-        self.assertIsNotNone(run["pid_identity"])
-        # The stub hands off no findings/proposals block, so the completion
-        # seam (DESIGN §9) records a protocol failure on top of the summary.
-        self.assertTrue(run["summary"].startswith("stub work complete"))
-        self.assertIn("handoff protocol failure", run["summary"])
-        self.assertIsNotNone(run["finished_at"])
-        brief_text = Path(run["brief_path"]).read_text()
-        self.assertIn("write the fix", brief_text)
-        self.assertIn("## Protocol", brief_text)
+    def _run_field(self, run_id: int, field: str):
         con = db.connect()
-        note = con.execute(
-            "SELECT body FROM messages WHERE run_id=? AND kind='completion'",
-            (run_id,)).fetchone()
-        # Recovery may replay the result seam. The durable decision wins and
-        # the completion notice remains one fact, not one row per replay.
-        con.execute("UPDATE runs SET tokens_in=11, tokens_out=7, tokens_total=18, "
-                    "cost_usd=0.25, usage_source='preserved' WHERE id=?", (run_id,))
-        con.commit()
-        result = supervise.finalize_run(
-            con, {**dict(run), "log_path": None}, "failed", 99)
-        completions = con.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE run_id=? "
-            "AND kind='completion'", (run_id,)).fetchone()["n"]
-        con.close()
-        self.assertIn("finished: done", note["body"])
-        self.assertEqual((result["status"], result["exit_code"]), ("done", 0))
-        self.assertEqual(completions, 1)
-        self.assertEqual((result["tokens_in"], result["tokens_out"],
-                          result["tokens_total"], result["cost_usd"],
-                          result["usage_source"]),
-                         (11, 7, 18, 0.25, "preserved"))
+        try:
+            return con.execute(f"SELECT {field} FROM runs WHERE id=?",
+                               (run_id,)).fetchone()[field]
+        finally:
+            con.close()
 
-    def test_the_worker_carries_a_run_token_that_dies_with_the_run(self) -> None:
-        """W-0176: minted at launch into the worker's environment, revoked
-        when the run turns terminal, and in no file anybody reads."""
+    def _wait_until(self, probe, done=bool, timeout: float = 10.0):
+        """Bounded wait: poll ``probe`` until ``done(value)`` or the deadline.
+
+        Returns the last observed value either way, so the caller's assert
+        fails naming the observed state instead of a timing guess."""
+        deadline = time.monotonic() + timeout
+        value = probe()
+        while not done(value) and time.monotonic() < deadline:
+            time.sleep(0.01)
+            value = probe()
+        return value
+
+    def _supervise_bg(self, run_id: int) -> threading.Thread:
+        thread = threading.Thread(target=supervise.supervise,
+                                  args=(self.root, run_id))
+        thread.start()
+        return thread
+
+    def test_dispatch_supervise_complete(self) -> None:
+        """One default run, asserted in phases; the subTest names what broke.
+
+        W-0176 phase: minted at launch into the worker's environment, revoked
+        when the run turns terminal, and in no file anybody reads.
+        DESIGN §7 phase: the supervisor's own tail is what fills the events
+        table — no second tailer, no separate pass.
+        Null-usage phase: the stub emits no step tokens here, which is exactly
+        what a backend whose usage we cannot read looks like."""
         from orchestra import auth
         sink = self.tmp_path / "token-seen.txt"
         os.environ["ORCHESTRA_TEST_ENV_SINK"] = str(sink)
-        run_id, _ = self._dispatch()
-        con = db.connect()
-        self.assertIsNone(con.execute(
-            "SELECT run_token_hash FROM runs WHERE id=?",
-            (run_id,)).fetchone()["run_token_hash"], "not minted before launch")
-        con.close()
+        run_id, _ = self._dispatch(mission="write the fix")
+        self.assertIsNone(self._run_field(run_id, "run_token_hash"),
+                          "not minted before launch")
+        rc, run = self._run(run_id)
 
-        _, run = self._run(run_id)
-        self.assertEqual(run["status"], "done")
-        token = sink.read_text()
-        self.assertTrue(token, "the worker's environment carried no token")
-        con = db.connect()
-        try:
-            self.assertIsNone(auth.identify(con, token, None))
-            self.assertEqual(con.execute(
-                "SELECT COUNT(*) AS n FROM runs WHERE run_token_hash=?",
-                (auth.hashed(token),)).fetchone()["n"], 0)
-        finally:
+        with self.subTest("the run completes"):
+            self.assertEqual(rc, 0)
+            self.assertEqual(run["status"], "done")
+            self.assertEqual(run["exit_code"], 0)
+            self.assertEqual(run["session_ref"], "stub-session-1")
+            self.assertIsNotNone(run["pid_identity"])
+            # The stub hands off no findings/proposals block, so the completion
+            # seam (DESIGN §9) records a protocol failure on top of the summary.
+            self.assertTrue(run["summary"].startswith("stub work complete"))
+            self.assertIn("handoff protocol failure", run["summary"])
+            self.assertIsNotNone(run["finished_at"])
+            brief_text = Path(run["brief_path"]).read_text()
+            self.assertIn("write the fix", brief_text)
+            self.assertIn("## Protocol", brief_text)
+
+        with self.subTest("a run without usage records null not zero"):
+            self.assertIsNone(run["tokens_total"])
+            self.assertIsNone(run["cost_usd"])
+            self.assertIsNone(run["usage_source"])
+
+        with self.subTest("supervision normalizes the trace"):
+            con = db.connect()
+            events = traces.events_for_run(con, run_id)
+            cursor = traces.cursor(con, run_id)
             con.close()
-        self.assertNotIn(token, Path(run["log_path"]).read_text())
-        self.assertNotIn(token, Path(run["brief_path"]).read_text())
-        self.assertNotIn(token, run["summary"] or "")
+            self.assertIn(
+                "stub work complete",
+                [e["payload"] for e in events if e["kind"] == "assistant_text"])
+            self.assertIn("lifecycle", {e["kind"] for e in events})
+            self.assertEqual(cursor["byte_offset"],
+                             Path(self.tmp_path / "home" / "logs" /
+                                  f"run-{run_id}.jsonl").stat().st_size)
 
-    def test_supervision_normalizes_the_trace(self) -> None:
-        """DESIGN §7: the supervisor's own tail is what fills the events
-        table — no second tailer, no separate pass."""
-        run_id, _ = self._dispatch()
-        self._run(run_id)
-        con = db.connect()
-        events = traces.events_for_run(con, run_id)
-        cursor = traces.cursor(con, run_id)
-        con.close()
-        self.assertIn("stub work complete",
-                      [e["payload"] for e in events if e["kind"] == "assistant_text"])
-        self.assertIn("lifecycle", {e["kind"] for e in events})
-        self.assertEqual(cursor["byte_offset"],
-                         Path(self.tmp_path / "home" / "logs" /
-                              f"run-{run_id}.jsonl").stat().st_size)
+        with self.subTest("the run token dies with the run"):
+            token = sink.read_text()
+            self.assertTrue(token, "the worker's environment carried no token")
+            con = db.connect()
+            try:
+                self.assertIsNone(auth.identify(con, token, None))
+                self.assertEqual(con.execute(
+                    "SELECT COUNT(*) AS n FROM runs WHERE run_token_hash=?",
+                    (auth.hashed(token),)).fetchone()["n"], 0)
+            finally:
+                con.close()
+            self.assertNotIn(token, Path(run["log_path"]).read_text())
+            self.assertNotIn(token, Path(run["brief_path"]).read_text())
+            self.assertNotIn(token, run["summary"] or "")
+
+        with self.subTest("finalize replay keeps the durable decision"):
+            con = db.connect()
+            note = con.execute(
+                "SELECT body FROM messages WHERE run_id=? AND kind='completion'",
+                (run_id,)).fetchone()
+            # Recovery may replay the result seam. The durable decision wins and
+            # the completion notice remains one fact, not one row per replay.
+            con.execute("UPDATE runs SET tokens_in=11, tokens_out=7, tokens_total=18, "
+                        "cost_usd=0.25, usage_source='preserved' WHERE id=?", (run_id,))
+            con.commit()
+            result = supervise.finalize_run(
+                con, {**dict(run), "log_path": None}, "failed", 99)
+            completions = con.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE run_id=? "
+                "AND kind='completion'", (run_id,)).fetchone()["n"]
+            con.close()
+            self.assertIn("finished: done", note["body"])
+            self.assertEqual((result["status"], result["exit_code"]), ("done", 0))
+            self.assertEqual(completions, 1)
+            self.assertEqual((result["tokens_in"], result["tokens_out"],
+                              result["tokens_total"], result["cost_usd"],
+                              result["usage_source"]),
+                             (11, 7, 18, 0.25, "preserved"))
 
     def test_completion_stamps_tokens_and_cost_on_the_run_row(self) -> None:
         """DESIGN §11: the numbers land at completion, so the dashboard is a
@@ -213,16 +271,6 @@ class E2ETestCase(unittest.TestCase):
         self.assertEqual(run["tokens_total"], 2200)
         self.assertEqual(run["cost_usd"], 0.02)
         self.assertEqual(run["usage_source"], "opencode")
-
-    def test_a_run_without_usage_records_null_not_zero(self) -> None:
-        """The stub emits no step tokens here, which is exactly what a
-        backend whose usage we cannot read looks like."""
-        run_id, _ = self._dispatch()
-        _, run = self._run(run_id)
-        self.assertIsNone(run["tokens_total"])
-        self.assertIsNone(run["cost_usd"])
-        self.assertIsNone(run["usage_source"])
-        self.assertEqual(run["status"], "done")   # capture never fails a run
 
     def test_a_merge_failure_never_breaks_finalization(self) -> None:
         """W-0174: the landing seam runs at finalization, after the worktree
@@ -325,20 +373,13 @@ class E2ETestCase(unittest.TestCase):
         self.assertEqual(deferred["status"], "declined")
 
     def test_interrupt_delivered_at_safe_boundary_then_resumed(self) -> None:
-        os.environ["STUB_STEPS"] = "40"  # ~12s of step_finish boundaries
+        os.environ["STUB_STEPS"] = "40"
+        os.environ["STUB_STEP_SLEEP"] = "0.3"  # ~12s of step_finish boundaries
         run_id, _ = self._dispatch()
-        thread = threading.Thread(target=supervise.supervise, args=(self.root, run_id))
-        thread.start()
+        thread = self._supervise_bg(run_id)
         try:
-            con = db.connect()
-            deadline = time.time() + 10
-            session_ref = None
-            while time.time() < deadline and not session_ref:
-                session_ref = con.execute(
-                    "SELECT session_ref FROM runs WHERE id=?",
-                    (run_id,)).fetchone()["session_ref"]
-                time.sleep(0.1)
-            con.close()
+            session_ref = self._wait_until(
+                lambda: self._run_field(run_id, "session_ref"))
             self.assertTrue(session_ref, "session ref never captured")
             cli.cmd_interrupt(Namespace(run_id=run_id, message=["use", "tabs"],
                                         message_file=None, now=False))
@@ -360,17 +401,10 @@ class E2ETestCase(unittest.TestCase):
     def test_kill_terminates_run(self) -> None:
         os.environ["STUB_SLEEP"] = "30"
         run_id, _ = self._dispatch()
-        thread = threading.Thread(target=supervise.supervise, args=(self.root, run_id))
-        thread.start()
+        thread = self._supervise_bg(run_id)
         try:
-            con = db.connect()
-            deadline = time.time() + 10
-            status = None
-            while time.time() < deadline and status != "running":
-                status = con.execute("SELECT status FROM runs WHERE id=?",
-                                     (run_id,)).fetchone()["status"]
-                time.sleep(0.1)
-            con.close()
+            status = self._wait_until(lambda: self._run_field(run_id, "status"),
+                                      done=lambda s: s == "running")
             self.assertEqual(status, "running")
             cli.cmd_kill(Namespace(run_id=run_id))
         finally:
@@ -454,9 +488,6 @@ class E2ETestCase(unittest.TestCase):
                          "the resume, then exactly one fresh attempt")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class FollowupAfterCleanupTests(unittest.TestCase):
     """A follow-up to finished work must not inherit a released worktree.
 
@@ -478,27 +509,13 @@ class FollowupAfterCleanupTests(unittest.TestCase):
 
     def test_a_gone_worktree_is_replaced_not_inherited(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "project"
-            root.mkdir()
-            _git(root, "init", "-q", ".")
-            _git(root, "config", "user.email", "t@example.com")
-            _git(root, "config", "user.name", "t")
-            (root / "a.txt").write_text("x\n")
-            _git(root, "add", "-A")
-            _git(root, "commit", "-qm", "init")
+            root = _seed_repo(tmp)
             (root / ".codex").mkdir()
             (root / ".codex" / "context.txt").write_text("codex context\n")
 
             con = db.connect()
             try:
-                cur = con.execute(
-                    "INSERT INTO runs(profile, backend, requested_by, workdir, "
-                    "branch, status, started_at, session_ref) "
-                    "VALUES('p','codex','human',?,?, 'done', ?, 'sess-1')",
-                    (str(root / "gone"), "orchestra/run-1", db.now()))
-                parent = con.execute("SELECT * FROM runs WHERE id=?",
-                                     (cur.lastrowid,)).fetchone()
-                con.commit()
+                parent = _finished_parent(con, root, "human")
                 self.assertFalse(Path(parent["workdir"]).exists())
 
                 run_id = supervise.create_followup(
@@ -519,14 +536,7 @@ class FollowupAfterCleanupTests(unittest.TestCase):
 
     def test_launch_setup_failure_discards_its_new_worktree_and_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "project"
-            root.mkdir()
-            _git(root, "init", "-q", ".")
-            _git(root, "config", "user.email", "t@example.com")
-            _git(root, "config", "user.name", "t")
-            (root / "a.txt").write_text("x\n")
-            _git(root, "add", "-A")
-            _git(root, "commit", "-qm", "init")
+            root = _seed_repo(tmp)
             con = db.connect()
             try:
                 cur = con.execute(
@@ -566,24 +576,10 @@ class FollowupAfterCleanupTests(unittest.TestCase):
 
     def test_a_gone_isolated_worktree_never_falls_back_to_shared(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "project"
-            root.mkdir()
-            _git(root, "init", "-q", ".")
-            _git(root, "config", "user.email", "t@example.com")
-            _git(root, "config", "user.name", "t")
-            (root / "seed.txt").write_text("seed\n")
-            _git(root, "add", "-A")
-            _git(root, "commit", "-qm", "init")
+            root = _seed_repo(tmp)
             con = db.connect()
             try:
-                cur = con.execute(
-                    "INSERT INTO runs(profile, backend, requested_by, workdir, "
-                    "branch, status, started_at, session_ref) "
-                    "VALUES('p','codex','work',?,?, 'done', ?, 'sess-1')",
-                    (str(root / "gone"), "orchestra/run-1", db.now()))
-                parent = con.execute("SELECT * FROM runs WHERE id=?",
-                                     (cur.lastrowid,)).fetchone()
-                con.commit()
+                parent = _finished_parent(con, root, "work")
                 before = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
                 with mock.patch.object(worktree, "create",
                                        side_effect=SystemExit("cannot isolate")), \
@@ -606,3 +602,7 @@ class FollowupAfterCleanupTests(unittest.TestCase):
                 self.assertTrue(Path(resumed["workdir"]).exists())
             finally:
                 con.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

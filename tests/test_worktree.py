@@ -18,6 +18,28 @@ def write(path: Path, text: str) -> None:
     path.write_text(text)
 
 
+def git(*args: str, root: Path) -> str:
+    r = subprocess.run(["git", "-C", str(root), *args],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def init_repo(root: Path) -> None:
+    """A throwaway repository on main whose only tracked file is README.md,
+    so harness dirs stay untracked."""
+    root.mkdir(parents=True, exist_ok=True)
+    git("init", "--quiet", root=root)
+    git("symbolic-ref", "HEAD", "refs/heads/main", root=root)
+    for pair in (("user.email", "t@t"), ("user.name", "t"),
+                 ("commit.gpgsign", "false")):
+        git("config", *pair, root=root)
+    write(root / "README.md", "r")
+    git("add", "README.md", root=root)
+    git("commit", "--quiet", "-m", "init", root=root)
+
+
 class SyncSkillsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -82,12 +104,7 @@ class SyncSkillsTests(unittest.TestCase):
                 self.assertEqual(landed.read_text(), "project")
 
     def test_create_scopes_the_worktree_to_the_run_backend(self) -> None:
-        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
-        write(self.root / "README.md", "r")  # harness dirs stay untracked
-        for cmd in (["config", "user.email", "t@t"], ["config", "user.name", "t"],
-                    ["add", "README.md"], ["commit", "-qm", "init"]):
-            subprocess.run(["git", "-C", str(self.root), *cmd], check=True,
-                           capture_output=True)
+        init_repo(self.root)
         wt, branch = worktree.create(self.root, 7, "proj-uuid", backend="codex")
         self.assertEqual(branch, "orchestra/run-7")
         self.assertFalse((wt / ".claude").exists())
@@ -120,24 +137,19 @@ class WorktreeRemovalTests(unittest.TestCase):
             "ORCHESTRA_CONFIG": str(base / "absent.toml")})
         self.env.start()
         self.addCleanup(self.env.stop)
-        self.root.mkdir(parents=True)
-        self.git("init", "--quiet")
-        self.git("symbolic-ref", "HEAD", "refs/heads/main")
-        for pair in (("user.email", "t@t"), ("user.name", "t"),
-                     ("commit.gpgsign", "false")):
-            self.git("config", *pair)
-        write(self.root / "README.md", "r")
-        self.git("add", "README.md")
-        self.git("commit", "--quiet", "-m", "init")
+        init_repo(self.root)
         self.con = db.connect()
         self.addCleanup(self.con.close)
 
     def git(self, *args: str, root: Path | None = None) -> str:
-        r = subprocess.run(["git", "-C", str(root or self.root), *args],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            raise AssertionError(f"git {' '.join(args)}: {r.stderr.strip()}")
-        return r.stdout.strip()
+        return git(*args, root=root or self.root)
+
+    def run_row(self, run_id: int) -> dict:
+        return dict(self.con.execute("SELECT * FROM runs WHERE id=?",
+                                     (run_id,)).fetchone())
+
+    def release(self, run_id: int, status: str) -> str | None:
+        return supervise.release_worktree(self.con, self.run_row(run_id), status)
 
     def make_run(self, run_id: int, status: str, commit: bool = True) -> Path:
         """A run row plus its worktree, as dispatch would leave them."""
@@ -162,9 +174,8 @@ class WorktreeRemovalTests(unittest.TestCase):
 
     def test_terminal_run_loses_its_worktree_and_the_branch_is_deletable(self):
         wt = self.make_run(1, "done")
-        run = self.con.execute("SELECT * FROM runs WHERE id=1").fetchone()
 
-        note = supervise.release_worktree(self.con, dict(run), "done")
+        note = self.release(1, "done")
 
         self.assertIsNone(note)
         self.assertFalse(wt.exists())
@@ -180,9 +191,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         write(wt / ".claude" / "settings.json", "{}")
         self.assertIn("?? .claude/", worktree.status(wt))
 
-        supervise.release_worktree(
-            self.con, dict(self.con.execute("SELECT * FROM runs WHERE id=2"
-                                            ).fetchone()), "failed")
+        self.release(2, "failed")
 
         self.assertFalse(wt.exists())
 
@@ -196,9 +205,7 @@ class WorktreeRemovalTests(unittest.TestCase):
             (str(wt), self.PROJECT, db.now()))
         self.con.commit()
 
-        supervise.release_worktree(
-            self.con, dict(self.con.execute("SELECT * FROM runs WHERE id=3"
-                                            ).fetchone()), "done")
+        self.release(3, "done")
 
         self.assertTrue(wt.exists())
 
@@ -206,7 +213,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         """W-0259: the host owns the commit, even when the backend could."""
         wt = self.make_run(80, "done", commit=False)
         write(wt / "feature.py", "x = 1\n")
-        run = dict(self.con.execute("SELECT * FROM runs WHERE id=80").fetchone())
+        run = self.run_row(80)
         run["base_commit"] = worktree.head(wt)
 
         sha = supervise._checkpoint_commit(run, "done")
@@ -228,7 +235,7 @@ class WorktreeRemovalTests(unittest.TestCase):
             "UPDATE runs SET base_commit=?, log_path=? WHERE id=80",
             (run["base_commit"], str(log)))
         self.con.commit()
-        persisted = self.con.execute("SELECT * FROM runs WHERE id=80").fetchone()
+        persisted = self.run_row(80)
         with mock.patch.object(supervise, "release_worktree",
                                side_effect=RuntimeError("release crashed")), \
                 self.assertRaisesRegex(RuntimeError, "release crashed"):
@@ -245,8 +252,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         # durable pointer. It may retry checkout release, but the result still
         # owns exactly the commit recorded before the crash.
         write(wt / "late-human-edit.py", "leave me alone\n")
-        recovered = self.con.execute(
-            "SELECT * FROM runs WHERE id=80").fetchone()
+        recovered = self.run_row(80)
         with mock.patch.object(supervise, "_checkpoint_commit") as checkpoint, \
                 mock.patch.object(supervise, "release_worktree", return_value=None):
             result = supervise.finalize_run(self.con, recovered, "done", 0)
@@ -258,7 +264,7 @@ class WorktreeRemovalTests(unittest.TestCase):
     def test_checkpoint_records_a_legacy_agent_commit(self):
         """Older runs committed themselves. Checkpoint still points at HEAD."""
         wt = self.make_run(81, "done", commit=True)
-        run = dict(self.con.execute("SELECT * FROM runs WHERE id=81").fetchone())
+        run = self.run_row(81)
         run["base_commit"] = self.git("rev-parse", "main")
 
         sha = supervise._checkpoint_commit(run, "done")
@@ -267,7 +273,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         self.assertNotEqual(sha, run["base_commit"])
 
         clean = self.make_run(82, "done", commit=False)
-        clean_run = dict(self.con.execute("SELECT * FROM runs WHERE id=82").fetchone())
+        clean_run = self.run_row(82)
         clean_run["base_commit"] = worktree.head(clean)
         self.assertEqual(supervise._checkpoint_commit(clean_run, "done"),
                          clean_run["base_commit"],
@@ -277,9 +283,7 @@ class WorktreeRemovalTests(unittest.TestCase):
         wt = self.make_run(5, "failed")
         write(wt / "README.md", "half-finished\n")
 
-        note = supervise.release_worktree(
-            self.con, dict(self.con.execute("SELECT * FROM runs WHERE id=5"
-                                            ).fetchone()), "failed")
+        note = self.release(5, "failed")
 
         self.assertTrue(wt.exists())
         self.assertIn("Worktree kept", note)
@@ -342,41 +346,34 @@ class WorktreeRemovalTests(unittest.TestCase):
         self.assertIn("scratch.py", kept[str(dirty)])
         self.assertIn("1 commit(s) on orchestra/run-31 not on main", kept[str(unmerged)])
 
-    def test_force_removes_them_and_reports_what_it_discarded(self):
+    def test_force_reports_what_it_discarded_but_never_touches_a_live_run(self):
         dirty = self.make_run(40, "failed", commit=False)
         write(dirty / "scratch.py", "unsaved\n")
+        running = self.make_run(50, "running", commit=False)
 
         report = worktree.prune(self.con, force=True)
 
         self.assertFalse(dirty.exists())
+        self.assertTrue(running.exists())
         entry = next(r for r in report["worktrees"] if r["workdir"] == str(dirty))
         self.assertTrue(entry["removed"])
         self.assertIn("1 uncommitted change(s)", "; ".join(entry["discarded"]))
         self.assertIn("scratch.py", "; ".join(entry["discarded"]))
 
-    def test_force_still_refuses_to_touch_a_live_run(self):
-        running = self.make_run(50, "running", commit=False)
-
-        worktree.prune(self.con, force=True)
-
-        self.assertTrue(running.exists())
-
-    def test_prune_removes_the_empty_project_directory_it_leaves(self):
+    def test_prune_removes_the_project_directory_only_once_it_is_empty(self):
         wt = self.make_run(60, "done", commit=False)
+        self.make_run(70, "running", commit=False)
         project_dir = wt.parent
 
         report = worktree.prune(self.con)
+        self.assertTrue(project_dir.is_dir())  # the live run keeps it
+        self.assertEqual([], report["dirs"])
 
+        self.con.execute("UPDATE runs SET status='done' WHERE id=70")
+        self.con.commit()
+        report = worktree.prune(self.con)
         self.assertFalse(project_dir.exists())
         self.assertEqual([str(project_dir)], report["dirs"])
-
-    def test_prune_keeps_the_project_directory_of_a_live_run(self):
-        wt = self.make_run(70, "running", commit=False)
-
-        report = worktree.prune(self.con)
-
-        self.assertTrue(wt.parent.is_dir())
-        self.assertEqual([], report["dirs"])
 
 
 if __name__ == "__main__":
