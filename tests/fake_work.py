@@ -10,7 +10,9 @@ work-management's local-api.mjs that the sweeper depends on:
   status, exactly as Work's own bridge does.
 - agents may bridge a task move only from in_progress / review / blocked
   (403); a verifier identity (``verify/`` prefix, W-0269) may also send done
-- agents may never PATCH a task (403)
+- agents may never PATCH a task (403) — except while the item carries the
+  human's ``refine`` tag, which allows the six sections plus one ``tags``
+  update whose only change is dropping that tag (W-0309)
 - only a queued issue can be claimed; state changes require the claimant
 - agents may set issue state only to in_progress / needs_human / resolved
   (resolved requires a resolutionSummary); done/closed are human verbs
@@ -30,6 +32,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # The transition an old client sends, and the fact it really means.
 AGENT_MOVE_FACT = {"in_progress": "claimed", "review": "landed",
                    "blocked": "halted"}
+# The tag-scoped edit allowance (W-0309): the human's `refine` tag is the
+# request, and it is the only state in which an agent identity may PATCH a
+# task. It buys the six sections and one tags update that drops the tag.
+REFINE_TAG = "refine"
+REFINE_FIELDS = {"description", "goal", "requirements", "acceptanceCriteria",
+                 "plan", "notes"}
 # Work collapsed "resolved" into "closed" (2026-08-14); the API still accepts
 # "resolved" as an alias and stores "closed".
 AGENT_ISSUE_STATES = {"in_progress", "needs_human", "closed"}
@@ -354,10 +362,46 @@ def _make_handler(state: FakeWork):
 
         def do_PATCH(self):
             state.requests.append(("PATCH", self.path))
-            if re.fullmatch(r"/api/tasks/[^/]+", self.path) and self._agent():
+            m = re.fullmatch(r"/api/tasks/([^/]+)", self.path)
+            if m and self._agent():
+                task = state.tasks.get(m.group(1))
+                if not task:
+                    return self._error(404, "not_found")
+                return self._refine_edit(task, self._body())
+            self._error(404, "not_found")
+
+        def _refine_edit(self, task, body):
+            """Work's one carve-out (W-0309): while an item carries the
+            `refine` tag, an agent identity may rewrite the six sections and
+            send `tags` once with only `refine` dropped. Every other field,
+            and every edit once the tag is gone, is refused as before."""
+            if REFINE_TAG not in (task.get("tags") or []):
                 return self._error(403, "agent_task_edit_forbidden",
                                    "Agents cannot edit tasks.")
-            self._error(404, "not_found")
+            if set(body) - REFINE_FIELDS - {"tags"}:
+                return self._error(403, "agent_task_edit_forbidden",
+                                   "Refining may not touch these fields.")
+            if "tags" in body and set(body["tags"]) != \
+                    set(task["tags"]) - {REFINE_TAG}:
+                return self._error(403, "agent_task_edit_forbidden",
+                                   "A refining tags update may only drop "
+                                   "`refine`.")
+            for field in REFINE_FIELDS & set(body):
+                if field in ("requirements", "acceptanceCriteria"):
+                    texts = [str(text) for text in body[field]]
+                    # A replaced checklist loses its ticks — Work's rule, and
+                    # the reason the brief says to resend every kept item.
+                    task[field] = [{"checked": False, "declined": False,
+                                    "reason": "", "text": text}
+                                   for text in texts]
+                    task["sections"][field] = "\n".join(
+                        f"- [ ] {text}" for text in texts)
+                else:
+                    task["sections"][field] = body[field]
+            if "tags" in body:
+                task["tags"] = list(body["tags"])
+            task["updatedAt"] = state.now()
+            return self._send(200, state._rederive_task(task))
 
         def do_POST(self):
             state.requests.append(("POST", self.path))
