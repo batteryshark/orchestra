@@ -73,6 +73,45 @@ class AutoVerifyTests(SweeperFixture, unittest.TestCase):
         self.assertEqual(len(halted), 1)
         self.assertIn("failed verification", halted[0])
 
+    def test_a_prose_method_is_judged_by_nobody_and_vetoes_nothing(self) -> None:
+        """2026-08-25: "harness fixture test" and "click through" were exec'd
+        as commands, failed with ENOENT, and blocked two green items. Prose
+        is not runnable: the pass reports it needs judgment, ticks nothing,
+        posts NO fact, and the item stays in review for the human."""
+        self._land("the flow feels right — click through")
+        actions = self.sweep()
+        verify = [a for a in actions if isinstance(a, dict)
+                  and a.get("action") == "verify"]
+        self.assertEqual([a.get("to") for a in verify], [None])
+        run = self._verify_run()
+        self.assertEqual(run["status"], "done")
+        self.assertIn("Inconclusive", run["summary"])
+        task = self.work.tasks["W-0001"]
+        self.assertNotEqual(task["status"], "blocked")
+        messages = [e["message"] for e in task["log"]]
+        self.assertTrue(any("needs judgment" in m for m in messages))
+        self.assertFalse(any("fact: halted" in m for m in messages))
+        self.assertFalse(any("fact: verified" in m for m in messages))
+
+    def test_a_real_failure_still_blocks_even_beside_prose(self) -> None:
+        """Prose softens nothing about a mechanical failure: one failed
+        method halts the item exactly as before."""
+        self.work.add_task("W-0001", "swept item", delegated=True,
+                           acceptance=("the seed is there — read missing.txt",
+                                       "the flow feels right — click through"))
+        self.sweep()
+        worker = self.db_run()
+        self.client.check_task_item("W-0001", "acceptance", 0, checked=True)
+        self.client.check_task_item("W-0001", "acceptance", 1, checked=True)
+        self.finish_run(worker["id"], "done", "Shipped.")
+        self.sweep()
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
+        halted = [e["message"] for e in self.work.tasks["W-0001"]["log"]
+                  if "fact: halted" in e["message"]]
+        self.assertEqual(len(halted), 1)
+        self.assertIn("read missing.txt", halted[0])
+        self.assertNotIn("click through", halted[0])
+
     def test_verify_enabled_false_turns_the_pass_off(self) -> None:
         self.global_config.write_text(
             self.global_config.read_text() + '\n[verify]\nenabled = false\n')

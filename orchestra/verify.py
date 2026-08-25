@@ -12,9 +12,15 @@ The facts belong to the WORKER's claim window: a sign-off never claims, so a
 human move made in the meantime dismisses this run's narrative too.
 
 ponytail: stated methods are mechanical (command / grep / test / read), so
-code runs them. A model turn waits until a criterion needs judgment.
+code runs them. A prose method — one whose first word is no executable —
+is NOT run and NOT a veto: it reports as needing judgment and the item
+stays in review for the human. On 2026-08-25 "harness fixture test" and
+"click through" were exec'd as commands, failed with ENOENT, and blocked
+two items whose work was green — the exact damage a read-and-report
+verifier must never do. A model turn for judged criteria still waits.
 """
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -99,11 +105,18 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
                           timeout=client.timeout)
     try:
         results = _execute(verifier, item_id, root)
-        failed = [r for r in results if not r["ok"]]
-        _writeback(verifier, item_id, run_id, results, failed)
-        status = "done" if not failed else "failed"
-        summary = _summary(item_id, results, failed)
-        target = "done" if not failed else "blocked"
+        failed = [r for r in results if r["ok"] is False]
+        unchecked = [r for r in results if r["ok"] is None]
+        _writeback(verifier, item_id, run_id, results, failed, unchecked)
+        # What code cannot check, code must not veto: unchecked criteria
+        # leave the item in review for the human, with no fact either way.
+        if failed:
+            status, target = "failed", "blocked"
+        elif unchecked:
+            status, target = "done", None
+        else:
+            status, target = "done", "done"
+        summary = _summary(item_id, results, failed, unchecked)
     except Exception as exc:
         status, summary, target = "failed", str(exc)[:300], None
         print(f"orchestra verify: {item_id} aborted: {exc}")
@@ -120,9 +133,14 @@ def stated_method(text: str) -> str:
     return text.strip()
 
 
-def run_method(root: Path, method: str) -> tuple[bool, str]:
-    """Execute one stated method against landed main. Returns (ok, one-line note)."""
+def run_method(root: Path, method: str) -> tuple[bool | None, str]:
+    """Execute one stated method against landed main.
+
+    Returns ``(ok, one-line note)`` — ``ok`` is None for a prose method,
+    which code can neither pass nor fail."""
     kind, arg = _classify(method)
+    if kind == "prose":
+        return None, f"{method}: not a mechanical method — needs judgment"
     root = Path(root).resolve()
     if kind == "read":
         path = (root / arg).resolve()
@@ -151,7 +169,15 @@ def _classify(method: str) -> tuple[str, str]:
         return "grep", method.split(None, 1)[1]
     if low == "test" or low.startswith("test "):
         return "test", method.split(None, 1)[1] if " " in method else ""
-    return "command", method
+    # A method is a command only when its first word IS one; anything else
+    # is prose and gets judgment, not execution.
+    try:
+        head = shlex.split(method)[0] if method.strip() else ""
+    except ValueError:
+        return "prose", method
+    if head and (shutil.which(head) or Path(head).is_file()):
+        return "command", method
+    return "prose", method
 
 
 def _command(root: Path, cmd: list[str], label: str) -> tuple[bool, str]:
@@ -174,7 +200,7 @@ def _execute(client: WorkClient, item_id: str, root: Path) -> list[dict]:
         text = (entry.get("text") or "").strip()
         method = stated_method(text)
         if not method:
-            ok, note = False, f"{text or '(empty)'}: no stated method"
+            ok, note = None, f"{text or '(empty)'}: no stated method — needs judgment"
         else:
             try:
                 ok, note = run_method(root, method)
@@ -187,30 +213,42 @@ def _execute(client: WorkClient, item_id: str, root: Path) -> list[dict]:
     return results
 
 
-def _summary(item_id: str, results: list[dict], failed: list[dict]) -> str:
-    if not failed:
-        return f"Verified. {item_id} is done."
-    names_ = ", ".join(r["text"] or f"AC{r['index']}" for r in failed)
-    return f"Blocked. {item_id} failed: {names_}"[:300]
+def _summary(item_id: str, results: list[dict], failed: list[dict],
+             unchecked: list[dict]) -> str:
+    if failed:
+        names_ = ", ".join(r["text"] or f"AC{r['index']}" for r in failed)
+        return f"Blocked. {item_id} failed: {names_}"[:300]
+    if unchecked:
+        return (f"Inconclusive. {item_id}: {len(unchecked)} criteria have no "
+                "mechanical method; left in review for judgment.")[:300]
+    return f"Verified. {item_id} is done."
 
 
 def _writeback(client: WorkClient, item_id: str, run_id: int,
-               results: list[dict], failed: list[dict]) -> None:
+               results: list[dict], failed: list[dict],
+               unchecked: list[dict]) -> None:
     tag = f"[{client.identity}/{run_id}]"
-    if not failed:
-        body = (f"{tag} Verified. {item_id} is done.\n\n"
-                + ("\n".join(r["note"] for r in results) or "No acceptance criteria.")
-                + "\n\nNothing waits.")
-        fact = fact_line(tag, "verified")
-    else:
+    if failed:
         named = "\n".join(f"- {r['text']}: {r['note']}" for r in failed)
         body = (f"{tag} Blocked. {item_id} failed verification.\n\n"
                 f"{named}\n\nOpen the blocked lane.")
         fact = fact_line(tag, "halted", reason=(
             f"{item_id} failed verification: " + ", ".join(
                 r["text"] or f"AC{r['index']}" for r in failed))[:300])
+    elif unchecked:
+        named = "\n".join(f"- {r['text']}: {r['note']}" for r in unchecked)
+        body = (f"{tag} Inconclusive. {item_id}: these criteria carry no "
+                f"mechanical method, so this pass judged nothing.\n\n"
+                f"{named}\n\nThe item stays in review; sign-off is yours.")
+        fact = None
+    else:
+        body = (f"{tag} Verified. {item_id} is done.\n\n"
+                + ("\n".join(r["note"] for r in results) or "No acceptance criteria.")
+                + "\n\nNothing waits.")
+        fact = fact_line(tag, "verified")
     client.log_task(item_id, body[:19000])
-    client.log_task(item_id, fact)
+    if fact:
+        client.log_task(item_id, fact)
 
 
 def _insert(con, worker, root: Path, profile_name: str, profile: dict,
