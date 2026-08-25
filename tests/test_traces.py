@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -490,6 +491,37 @@ class SseTests(TraceTestCase):
         for raw, expected in cases:
             with self.subTest(cursor=raw):
                 self.assertEqual(traces.parse_daemon_cursor(raw), expected)
+
+
+class ProgressTests(TraceTestCase):
+    """The one line the board shows for a live run (I-0121)."""
+
+    def test_the_note_ages_the_trace_so_a_hang_is_visible(self) -> None:
+        """A count alone cannot separate a healthy run from a stuck one: a
+        run stuck on its first tool repeats "1 tool call" for as long as it
+        hangs. The age of the last trace write is what differs."""
+        log = write_jsonl(self.dir / "claude.jsonl", CLAUDE)
+        self.assertIn("log written just now", traces.progress(str(log), "claude"))
+
+        stuck = time.time() - 40 * 60
+        os.utime(log, (stuck, stuck))
+        self.assertIn("log written 40m ago", traces.progress(str(log), "claude"))
+
+    def test_the_note_stays_one_line(self) -> None:
+        """Backends run heredocs and `python -c` scripts; their newlines
+        must not break the board's one-line note into a block."""
+        log = write_jsonl(self.dir / "multiline.jsonl", [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                 "input": {"command": "python -c '\nimport os\nprint(os)\n'"}}]}},
+        ])
+        note = traces.progress(str(log), "claude")
+        self.assertEqual(note.splitlines(), [note])
+        self.assertIn("Bash python -c ' import os print(os) '", note)
+
+    def test_no_trace_yet_reports_nothing(self) -> None:
+        self.assertIsNone(traces.progress(str(self.dir / "absent.jsonl"), "claude"))
+        self.assertIsNone(traces.progress(None, "claude"))
 
 
 if __name__ == "__main__":
