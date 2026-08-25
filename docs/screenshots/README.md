@@ -8,7 +8,7 @@ The dashboard shots come from Chrome at 1440–1600 CSS px.
 
 | File | Shows | Caption |
 | --- | --- | --- |
-| `statistics.png` | RUNS view, statistics popup | What the fleet has cost: worker time, tokens and money, totalled and broken out per profile. |
+| `statistics.png` | RUNS view, statistics popup | What the runs have cost: worker time, tokens and money, totalled and broken out per profile. |
 | `runway.png` | RUNWAY view | How much quota is left at each provider, per rolling window, so the dispatcher knows what it can still afford to run. |
 
 ## What is deliberately absent
