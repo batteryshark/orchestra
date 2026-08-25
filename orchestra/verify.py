@@ -36,7 +36,9 @@ from pathlib import Path
 from orchestra import config, db, observer, project, supervise
 from orchestra.work_client import WorkClient, fact_line, verifier_identity
 
-METHOD_TIMEOUT = 60
+# The full suite is a legitimate stated method and takes ~70s on this
+# machine; 60s manufactured a false verification failure (W-0308, run 45).
+METHOD_TIMEOUT = 600
 REQUESTED_BY = "verify"
 VERIFY_TIER = 1  # workhorse — the "cheaper model" the default promises (W-0299)
 # The dialogue's hard caps (W-0307). Configurable via [verify]
