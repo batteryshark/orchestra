@@ -8,8 +8,9 @@ chat. The sign-off gates themselves (review, checklist accounted,
 dependencies settled) are Work's and stay exactly as they are.
 """
 import unittest
+from unittest import mock
 
-from orchestra import config, db
+from orchestra import config, db, verify
 from tests.test_sweeper import SweeperFixture
 
 
@@ -111,6 +112,82 @@ class AutoVerifyTests(SweeperFixture, unittest.TestCase):
         self.assertEqual(len(halted), 1)
         self.assertIn("read missing.txt", halted[0])
         self.assertNotIn("click through", halted[0])
+
+    def test_an_out_of_repo_read_is_declined_not_failed(self) -> None:
+        """W-0310: a read whose path escapes the checkout is declined with
+        a reason — no halted fact, the item stays in review."""
+        self._land("the spec is there — read ../elsewhere/spec.md")
+        self.sweep()
+        task = self.work.tasks["W-0001"]
+        self.assertNotEqual(task["status"], "blocked")
+        criterion = task["acceptanceCriteria"][0]
+        self.assertTrue(criterion["declined"])
+        self.assertIn("outside this checkout", criterion["reason"])
+        messages = [e["message"] for e in task["log"]]
+        self.assertFalse(any("fact: halted" in m for m in messages))
+        self.assertFalse(any("fact: verified" in m for m in messages))
+
+    def test_an_absent_test_target_runs_no_test_process(self) -> None:
+        """W-0310, the run 54 class: the named test file lives in another
+        repository — the criterion is declined, and no test process starts."""
+        self._land("the guard holds — test tests/test_refine.py")
+        with mock.patch.object(verify.subprocess, "run") as proc:
+            self.sweep()
+        proc.assert_not_called()
+        task = self.work.tasks["W-0001"]
+        self.assertNotEqual(task["status"], "blocked")
+        criterion = task["acceptanceCriteria"][0]
+        self.assertTrue(criterion["declined"])
+        self.assertIn("not in this checkout", criterion["reason"])
+        run = self._verify_run()
+        self.assertIn("Inconclusive", run["summary"])
+
+    def test_a_mixed_pass_names_only_the_in_repo_failure(self) -> None:
+        """W-0310: a real in-repo failure still blocks, and the halted fact
+        blames only it — the out-of-reach criterion sits declined beside it."""
+        self.work.add_task("W-0001", "swept item", delegated=True,
+                           acceptance=("the seed is there — read missing.txt",
+                                       "the guard holds — test tests/test_refine.py"))
+        self.sweep()
+        worker = self.db_run()
+        self.client.check_task_item("W-0001", "acceptance", 0, checked=True)
+        self.client.check_task_item("W-0001", "acceptance", 1, checked=True)
+        self.finish_run(worker["id"], "done", "Shipped.")
+        self.sweep()
+        task = self.work.tasks["W-0001"]
+        self.assertEqual(task["status"], "blocked")
+        halted = [e["message"] for e in task["log"]
+                  if "fact: halted" in e["message"]]
+        self.assertEqual(len(halted), 1)
+        self.assertIn("read missing.txt", halted[0])
+        self.assertNotIn("test_refine", halted[0])
+        self.assertTrue(task["acceptanceCriteria"][1]["declined"])
+
+    def test_a_worker_decline_is_respected_not_rerun(self) -> None:
+        """Run 54 re-ran a criterion the worker had declined and failed it
+        in the wrong checkout. A decline on the record stays the answer:
+        nothing runs, nothing blocks, no fact certifies what nobody saw."""
+        (self.root / "seed.txt").write_text("ok\n")
+        self.work.add_task("W-0001", "swept item", delegated=True,
+                           acceptance=("the seed is there — read seed.txt",
+                                       "the other repo holds — test"))
+        self.sweep()
+        worker = self.db_run()
+        self.client.check_task_item("W-0001", "acceptance", 0, checked=True)
+        self.client.check_task_item("W-0001", "acceptance", 1,
+                                    reason="not attempted, other repository")
+        self.finish_run(worker["id"], "done", "Shipped.")
+        with mock.patch.object(verify.subprocess, "run") as proc:
+            self.sweep()
+        proc.assert_not_called()
+        task = self.work.tasks["W-0001"]
+        self.assertNotEqual(task["status"], "blocked")
+        criterion = task["acceptanceCriteria"][1]
+        self.assertTrue(criterion["declined"])
+        self.assertEqual(criterion["reason"], "not attempted, other repository")
+        messages = [e["message"] for e in task["log"]]
+        self.assertFalse(any("fact: verified" in m for m in messages))
+        self.assertTrue(any("left as recorded" in m for m in messages))
 
     def test_verify_enabled_false_turns_the_pass_off(self) -> None:
         self.global_config.write_text(

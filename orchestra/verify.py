@@ -26,6 +26,17 @@ per-turn timeout enforced in code, the yeschef rooms lesson (W-0306) —
 recorded as `dialogue` control turns. The verdict is advisory: it may
 tick a criterion, never fail one, and a dialogue that settles every open
 criterion completes the pass exactly as an all-mechanical one would.
+
+Evidence this checkout does not hold is declined, never failed (W-0310):
+a read or test method whose explicit target resolves outside the run
+workdir — or a test file the checkout does not contain — is not run; the
+criterion is declined through Work with the reason, and a criterion the
+worker already declined stays as the worker recorded it. Run 54 executed
+Orchestra test methods inside the Work checkout, read exit 5 as failure,
+and blocked a verified item. Declined criteria join no dialogue (the
+second voice cannot see another repository either) and, like unchecked
+ones, leave the item in review with no fact: the pass certifies only
+evidence it inspected.
 """
 import shlex
 import shutil
@@ -121,7 +132,9 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
     try:
         results = _execute(verifier, item_id, root)
         failed = [r for r in results if r["ok"] is False]
-        unchecked = [r for r in results if r["ok"] is None]
+        declined = [r for r in results if r.get("declined")]
+        unchecked = [r for r in results
+                     if r["ok"] is None and not r.get("declined")]
         dialogue_reason = None
         # A mechanical failure already halts; spending model turns arguing
         # about the rest would decorate a blocked item. Judgment only when
@@ -143,18 +156,19 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
                                      "second-opinion dialogue")
                         r["ok"] = True
                         r["note"] = "judged met by the second-opinion dialogue"
-                unchecked = [r for r in results if r["ok"] is None]
+                unchecked = [r for r in results
+                             if r["ok"] is None and not r.get("declined")]
         _writeback(verifier, item_id, run_id, results, failed, unchecked,
-                   dialogue_reason)
-        # What code cannot check, code must not veto: unchecked criteria
-        # leave the item in review for the human, with no fact either way.
+                   declined, dialogue_reason)
+        # What code cannot check, code must not veto: unchecked and declined
+        # criteria leave the item in review for the human, with no fact.
         if failed:
             status, target = "failed", "blocked"
-        elif unchecked:
+        elif unchecked or declined:
             status, target = "done", None
         else:
             status, target = "done", "done"
-        summary = _summary(item_id, results, failed, unchecked)
+        summary = _summary(item_id, results, failed, unchecked, declined)
     except Exception as exc:
         status, summary, target = "failed", str(exc)[:300], None
         print(f"orchestra verify: {item_id} aborted: {exc}")
@@ -231,14 +245,59 @@ def _command(root: Path, cmd: list[str], label: str) -> tuple[bool, str]:
     return r.returncode == 0, f"{label}: exit {r.returncode}"
 
 
+def _external_target(root: Path, method: str) -> str | None:
+    """The decline reason when the method's explicit evidence target is not
+    under ``root``, else None (W-0310).
+
+    Only read and test methods name a target code can resolve; grep
+    patterns, bare ``test``, and generic commands stay ambiguous and run as
+    before — a decline is reserved for evidence provably elsewhere. A read
+    target that is inside but absent stays a failure: presence IS what a
+    read asserts. A test target that is absent is declined: the criterion
+    asserts the tests pass, and this checkout does not hold them.
+    """
+    kind, arg = _classify(method)
+    if kind not in ("read", "test") or not arg:
+        return None
+    try:
+        target = shlex.split(arg)[0] if kind == "test" else arg
+    except (ValueError, IndexError):
+        return None
+    if kind == "test" and target == "discover":
+        return None
+    rel = (target if kind == "read" or "/" in target or target.endswith(".py")
+           else target.replace(".", "/"))
+    root = Path(root).resolve()
+    path = (root / rel).resolve()
+    if not path.is_relative_to(root):
+        return f"{method}: {target} resolves outside this checkout — not attempted"
+    if kind == "test" and not (path.exists() or path.with_suffix(".py").exists()):
+        return (f"{method}: {target} is not in this checkout — "
+                "the evidence lives in another repository")
+    return None
+
+
 def _execute(client: WorkClient, item_id: str, root: Path) -> list[dict]:
     task = client.task(item_id) or {}
     results = []
     for index, entry in enumerate(task.get("acceptanceCriteria") or []):
         text = (entry.get("text") or "").strip()
         method = stated_method(text)
-        if not method:
+        declined = False
+        if entry.get("declined"):
+            # The worker answered this one on the record: declined, with a
+            # reason. Run 54 re-ran such a criterion in the wrong checkout
+            # and failed it — a decline stays the answer (W-0310).
+            declined = True
+            ok, note = None, (f"{text}: declined by the worker "
+                              f"({entry.get('reason') or 'no reason'}) — left as recorded")
+        elif not method:
             ok, note = None, f"{text or '(empty)'}: no stated method — needs judgment"
+        elif reason := _external_target(root, method):
+            declined = True
+            ok, note = None, reason
+            client.check_task_item(item_id, "acceptance", index,
+                                   reason=reason[:1000])
         else:
             try:
                 ok, note = run_method(root, method)
@@ -247,7 +306,8 @@ def _execute(client: WorkClient, item_id: str, root: Path) -> list[dict]:
         client.log_task(item_id, note[:19000])
         if ok:
             client.check_task_item(item_id, "acceptance", index, checked=True)
-        results.append({"index": index, "text": text, "ok": ok, "note": note})
+        results.append({"index": index, "text": text, "ok": ok, "note": note,
+                        "declined": declined})
     return results
 
 
@@ -339,19 +399,25 @@ def _dialogue(con, pcfg: dict, item: dict, unchecked: list[dict], worker,
 
 
 def _summary(item_id: str, results: list[dict], failed: list[dict],
-             unchecked: list[dict]) -> str:
+             unchecked: list[dict], declined: list[dict]) -> str:
     if failed:
         names_ = ", ".join(r["text"] or f"AC{r['index']}" for r in failed)
         return f"Blocked. {item_id} failed: {names_}"[:300]
-    if unchecked:
-        return (f"Inconclusive. {item_id}: {len(unchecked)} criteria have no "
-                "mechanical method; left in review for judgment.")[:300]
+    if unchecked or declined:
+        parts = []
+        if unchecked:
+            parts.append(f"{len(unchecked)} criteria have no mechanical method")
+        if declined:
+            parts.append(f"{len(declined)} criteria's evidence is not in "
+                         "this checkout")
+        return (f"Inconclusive. {item_id}: " + "; ".join(parts)
+                + "; left in review for judgment.")[:300]
     return f"Verified. {item_id} is done."
 
 
 def _writeback(client: WorkClient, item_id: str, run_id: int,
                results: list[dict], failed: list[dict],
-               unchecked: list[dict],
+               unchecked: list[dict], declined: list[dict],
                dialogue_reason: str | None = None) -> None:
     tag = f"[{client.identity}/{run_id}]"
     if failed:
@@ -361,11 +427,12 @@ def _writeback(client: WorkClient, item_id: str, run_id: int,
         fact = fact_line(tag, "halted", reason=(
             f"{item_id} failed verification: " + ", ".join(
                 r["text"] or f"AC{r['index']}" for r in failed))[:300])
-    elif unchecked:
-        named = "\n".join(f"- {r['text']}: {r['note']}" for r in unchecked)
+    elif unchecked or declined:
+        named = "\n".join(f"- {r['text']}: {r['note']}"
+                          for r in unchecked + declined)
         judged = f"\n\n{dialogue_reason}." if dialogue_reason else ""
-        body = (f"{tag} Inconclusive. {item_id}: these criteria carry no "
-                f"mechanical method, so this pass judged nothing.\n\n"
+        body = (f"{tag} Inconclusive. {item_id}: this pass could not judge "
+                f"these criteria.\n\n"
                 f"{named}{judged}\n\nThe item stays in review; sign-off is yours.")
         fact = None
     else:
