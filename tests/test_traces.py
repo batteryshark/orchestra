@@ -519,6 +519,23 @@ class ProgressTests(TraceTestCase):
         self.assertEqual(note.splitlines(), [note])
         self.assertIn("Bash python -c ' import os print(os) '", note)
 
+    def test_the_age_survives_an_overlong_label(self) -> None:
+        """The 400-char cap must never cut the age off: the age is the hang
+        signal, the label is only detail. A long command that would blow
+        the cap is trimmed from the head, and the age stays intact."""
+        long = "x" * 500
+        log = write_jsonl(self.dir / "long.jsonl", [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                 "input": {"command": long}}]}},
+        ])
+        note = traces.progress(str(log), "claude")
+        self.assertTrue(note.startswith("1 tool call; last: Bash "))
+        self.assertIn("log written just now", note)
+        self.assertLessEqual(len(note), 400)
+        self.assertTrue(note.endswith("log written just now"))
+        self.assertNotIn("x" * 200, note)  # the label was trimmed, not the age
+
     def test_no_trace_yet_reports_nothing(self) -> None:
         self.assertIsNone(traces.progress(str(self.dir / "absent.jsonl"), "claude"))
         self.assertIsNone(traces.progress(None, "claude"))
