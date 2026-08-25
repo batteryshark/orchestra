@@ -932,6 +932,22 @@ class AuthOutageTurnTests(ObserverCase):
         self.assertEqual(self._turn('{"profile": "a"}'), '{"profile": "a"}')
         self.assertFalse(db.meta_get(self.con, "auth_outage:claude"))
 
+    def test_a_control_turn_inherits_profile_env(self) -> None:
+        proc = mock.Mock(returncode=0, stdout="{}", stderr="")
+        profile = {
+            "name": "proxy", "backend": "claude",
+            "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8080"},
+        }
+        with mock.patch.object(observer.subprocess, "run",
+                               return_value=proc) as run, \
+             mock.patch.object(observer.runners, "parse_log",
+                               return_value=(None, "ok")):
+            observer.model_turn(profile, "judge this",
+                                layer="observer", con=self.con)
+        self.assertEqual(
+            run.call_args.kwargs["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:8080")
+
 
 class SupervisedRunTests(unittest.TestCase):
     """The seams as the supervisor actually reaches them, against a stub
