@@ -17,7 +17,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
 
-from orchestra import auth, config, db, runway
+from orchestra import auth, config, db, observer, runway
 from orchestra import http as mhttp
 
 KEY = "test-secret-value"
@@ -937,6 +937,56 @@ class SseSeamTests(ServerCase):
                     self.assertEqual(
                         self.request(path=path, key="not-the-key")[0], 401)
         seam.assert_not_called()
+
+
+class SeatsAndOutageTests(ServerCase):
+    """The seats picker and the auth-outage feed (2026-08-25): an expired
+    Claude OAuth ran the router and observer blind for hours — the judgment
+    layers' profiles were invisible and nothing on the dashboard said so."""
+
+    def test_seats_round_trip_preserves_the_config_comments(self) -> None:
+        self.config_path.write_text(
+            '# the probe fleet\n[profiles.probe]\nbackend = "codex"\n')
+        status, data = self.json_request(path="/api/seats")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["profiles"], ["probe"])
+        self.assertEqual(data["seats"], {seat: None for seat in mhttp.SEATS})
+
+        status, data = self.json_request(
+            method="POST", path="/api/seats",
+            body={"seat": "verify", "profile": "probe"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["seats"]["verify"], "probe")
+        text = self.config_path.read_text()
+        self.assertIn("# the probe fleet", text)
+        self.assertIn('profile = "probe"', text)
+
+        status, data = self.json_request(
+            method="POST", path="/api/seats",
+            body={"seat": "verify", "profile": None})
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["seats"]["verify"])
+        self.assertNotIn('profile = "probe"', self.config_path.read_text())
+
+    def test_a_seat_refuses_what_the_config_does_not_hold(self) -> None:
+        for body in ({"seat": "conductor", "profile": "probe"},
+                     {"seat": "verify", "profile": "ghost"}):
+            with self.subTest(body=body):
+                status, _ = self.request(
+                    method="POST", path="/api/seats", body=body)
+                self.assertEqual(status, 400)
+
+    def test_an_auth_outage_rides_the_snapshot_until_cleared(self) -> None:
+        observer.note_auth_outage(
+            self.con, "claude", "Failed to authenticate: OAuth expired")
+        status, snap = self.json_request()
+        self.assertEqual(status, 200)
+        outages = snap["daemon"]["outages"]
+        self.assertEqual([o["backend"] for o in outages], ["claude"])
+        self.assertIn("at", outages[0])
+        observer.clear_auth_outage(self.con, "claude")
+        status, snap = self.json_request()
+        self.assertEqual(snap["daemon"]["outages"], [])
 
 
 class KeyTests(unittest.TestCase):
