@@ -1421,7 +1421,11 @@ async function loadTurns() {
 // accepting a value the launch would drop.
 let OPTIONS = null, PROFILES = [], EDITING = null, DRAFT = {};
 
-function backends() { return Object.keys(OPTIONS || {}); }
+// Entries marked `local` are a discovery SOURCE (local inference servers,
+// W-0306), not a harness — they never belong in the harness picker.
+function backends() {
+  return Object.keys(OPTIONS || {}).filter((b) => !(OPTIONS[b] || {}).local);
+}
 
 async function loadOptions(refreshNow) {
   try {
@@ -1584,6 +1588,23 @@ function opts(backend) {
   return (OPTIONS && OPTIONS[backend]) || {models: [], supports_effort: true};
 }
 
+// Models the local inference server probe found (W-0306 idea 3): Ollama,
+// LM Studio, vLLM on their default localhost ports. Empty on a machine
+// without them.
+function localModels() {
+  return ((OPTIONS || {}).local || {}).models || [];
+}
+
+// True when the draft's model is a discovered-local one, or the id itself
+// names a localhost endpoint or a local provider prefix.
+function looksLocal(model) {
+  const m = String(model || "").toLowerCase();
+  if (!m) return false;
+  return m.indexOf("localhost") >= 0 || m.indexOf("127.0.0.1") >= 0 ||
+         /^(ollama|lmstudio|vllm)\//.test(m) ||
+         localModels().some((x) => x.id === model);
+}
+
 function drawEditor() {
   const box = $("editor");
   const existing = PROFILES.find((p) => p.name === EDITING) || {};
@@ -1624,6 +1645,7 @@ function drawEditor() {
   // model and effort share one line: they are one decision, and the effort a
   // model declares only means anything next to the model it came from.
   const pair = el("div", "row");
+  const locals = localModels();
   let modelNode, modelHint = "";
   if (o.free_model) {
     modelNode = input("model");
@@ -1633,6 +1655,22 @@ function drawEditor() {
     modelHint = models.length + " reported by discovery";
   } else {
     modelNode = input("model");
+  }
+  if (locals.length && modelNode.tagName === "INPUT") {
+    // A typed model box gets the probed local names as SUGGESTIONS, never
+    // as the list (W-0306 idea 3): a hosted id still types the same way.
+    const dl = el("datalist");
+    dl.id = "localmodels";
+    locals.forEach((m) => {
+      const op = el("option");
+      op.value = m.id;
+      op.label = m.source + " · local";
+      dl.appendChild(op);
+    });
+    modelNode.setAttribute("list", dl.id);
+    pair.append(dl);
+    modelHint = locals.length + " local model" + (locals.length === 1 ? "" : "s")
+      + " found on this machine" + (modelHint ? " · " + modelHint : "");
   }
   pair.append(modelNode);
 
@@ -1654,6 +1692,17 @@ function drawEditor() {
     DRAFT.effort = "";
   }
   add("model / effort", pair, effortHint);
+
+  // The honesty ledger on local profiles (W-0306 idea 2): one dim line of
+  // the trade, drawn only when the model is local. It tracks the typed box
+  // live so the line does not wait for a redraw.
+  const ledger = el("div", "hint",
+    "This model runs locally: slower per token, wins on bounded verifiable "
+    + "jobs, costs electricity instead of API dollars.");
+  ledger.hidden = !looksLocal(DRAFT.model);
+  box.append(ledger);
+  modelNode.addEventListener("input",
+    () => { ledger.hidden = !looksLocal(DRAFT.model); });
 
   if (DRAFT.backend === "opencode") add("variant", input("variant"));
 

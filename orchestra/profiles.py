@@ -12,6 +12,7 @@ it is never injected into worker briefs.
 import json
 import subprocess
 import tomllib
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -114,6 +115,52 @@ def discover(runner=_run, reasonix_config: Path = REASONIX_CONFIG) -> dict:
     results["claude"] = {"data": None,
                          "error": "no model listing command; set model on the profile"}
     return results
+
+
+# --- local inference servers (W-0306 idea 3) --------------------------------
+
+# Default localhost ports only: Ollama's own listing, and the OpenAI-style
+# /v1/models that LM Studio and vLLM serve. The probe exists so a local-model
+# profile can be assembled without remembering a model id no harness CLI
+# lists (docs/investigations/W-0306-yeschef.md).
+LOCAL_SERVERS = (
+    ("ollama", "http://127.0.0.1:11434/api/tags"),
+    ("lmstudio", "http://127.0.0.1:1234/v1/models"),
+    ("vllm", "http://127.0.0.1:8000/v1/models"),
+)
+LOCAL_TIMEOUT = 1  # seconds per probe; a closed local port refuses at once
+
+
+def _fetch_json(url: str):
+    with urllib.request.urlopen(url, timeout=LOCAL_TIMEOUT) as res:
+        return json.loads(res.read().decode("utf-8", "replace"))
+
+
+def parse_local_models(source: str, data) -> list[str]:
+    """Model names from one server's listing: Ollama's ``/api/tags`` is
+    ``{"models": [{"name": …}]}``, the OpenAI shape is ``{"data": [{"id": …}]}``."""
+    key = "name" if source == "ollama" else "id"
+    rows = data.get("models" if source == "ollama" else "data") or []
+    return [r[key] for r in rows
+            if isinstance(r, dict) and isinstance(r.get(key), str)]
+
+
+def discover_local(fetch=None, servers=None) -> list[dict]:
+    """``[{"id", "source"}]`` from whatever local inference servers answer.
+
+    Every failure is silence, never an error entry: on most machines every
+    probe hits a closed port, and that is not news. A machine without these
+    servers must see nothing new (W-0306 idea 3).
+    """
+    fetch = fetch or _fetch_json
+    found: list[dict] = []
+    for source, url in (LOCAL_SERVERS if servers is None else servers):
+        try:
+            names = parse_local_models(source, fetch(url))
+        except Exception:  # silent by contract: absent, refused, or garbage
+            continue
+        found.extend({"id": name, "source": source} for name in names)
+    return found
 
 
 # --- display ----------------------------------------------------------------
