@@ -25,7 +25,7 @@ import hashlib
 import json
 import re
 
-from orchestra import db, project, work_client
+from orchestra import db, project, runners, work_client
 from orchestra.work_client import WorkError
 
 CONFIDENCE = ("observed", "suspected")
@@ -167,8 +167,13 @@ def _tag(client, run) -> str:
     return f"[{client.identity}/{run['slug'] or run['id']}]"
 
 
-def _issue_body(tag: str, run, finding: dict) -> str:
-    return (f"{tag} filed by run {run['id']} — not delegated, for triage.\n\n"
+def _record_with(records: list[dict], marker: str) -> dict | None:
+    return next((record for record in records
+                 if marker in json.dumps(record, sort_keys=True)), None)
+
+
+def _issue_body(marker: str, run, finding: dict) -> str:
+    return (f"{marker} filed by run {run['id']} — not delegated, for triage.\n\n"
             f"**Claim.** {finding['claim']}\n\n"
             f"- where: `{finding['where']}`\n"
             f"- confidence: {finding['confidence']}\n"
@@ -179,21 +184,42 @@ def file_findings(con, client, run, entries: list[dict],
                   project_path: str | None) -> list[dict]:
     """One Work issue per new finding; a repeat comments on the original."""
     results = []
+    remote_issues = None
     for finding in entries:
         fp = fingerprint(run["project_id"], finding["where"], finding["claim"])
         tag = _tag(client, run)
+        marker = f"{tag} finding:{fp}"
         row = _seen(con, fp)
         if row is not None:
-            count = _bump(con, fp, run["id"])
+            count = (int(row["occurrences"]) if row["last_run"] == run["id"]
+                     else _bump(con, fp, run["id"]))
+            if row["first_run"] == run["id"]:
+                results.append({"action": "filed", "fingerprint": fp,
+                                "issue": row["issue_id"],
+                                "confidence": finding["confidence"]})
+                continue
             note = None
             if row["issue_id"]:
+                repeat = (f"{tag} run {run['id']} hit this again (occurrence {count}) "
+                          f"at `{finding['where']}` — {finding['confidence']}.")
                 try:
-                    posted = client.reply_issue(
-                        row["issue_id"],
-                        f"{tag} run {run['id']} hit this again (occurrence {count}) "
-                        f"at `{finding['where']}` — {finding['confidence']}.")
-                    note = None if posted is not None else "work unreachable"
+                    issue = client.issue(row["issue_id"])
+                    if issue is None:
+                        results.append({"action": "deferred", "fingerprint": fp,
+                                        "occurrences": count})
+                        continue
+                    messages = [m.get("body") for m in issue.get("messages") or []]
+                    if repeat not in messages:
+                        posted = client.reply_issue(row["issue_id"], repeat)
+                        if posted is None:
+                            results.append({"action": "deferred", "fingerprint": fp,
+                                            "occurrences": count})
+                            continue
                 except WorkError as exc:
+                    if work_client.retryable(exc):
+                        results.append({"action": "deferred", "fingerprint": fp,
+                                        "occurrences": count})
+                        continue
                     # An issue nobody claimed (or a closed one) refuses agent
                     # replies. The occurrence count is still recorded, which is
                     # the part a duplicate issue would have destroyed.
@@ -204,16 +230,27 @@ def file_findings(con, client, run, entries: list[dict],
             continue
         title = finding["claim"].splitlines()[0][:120]
         try:
-            created = client.create_issue(_issue_body(tag, run, finding),
-                                          title=title, project_path=project_path)
+            if remote_issues is None:
+                remote_issues = client.issues()
+            if remote_issues is None:
+                results.append({"action": "deferred", "fingerprint": fp})
+                continue
+            created = _record_with(remote_issues, marker)
+            if created is None:
+                created = client.create_issue(
+                    _issue_body(marker, run, finding), title=title,
+                    project_path=project_path)
         except WorkError as exc:
-            results.append({"action": "rejected", "fingerprint": fp, "error": exc.code})
+            action = "deferred" if work_client.retryable(exc) else "rejected"
+            results.append({"action": action, "fingerprint": fp,
+                            "error": exc.code})
             continue
         if created is None:  # Work unreachable: no fingerprint, so a retry files it
             results.append({"action": "deferred", "fingerprint": fp})
             continue
         issue_id = created.get("id") if isinstance(created, dict) else None
         _remember(con, fp, run, finding, issue_id)
+        remote_issues.append(created)
         results.append({"action": "filed", "fingerprint": fp, "issue": issue_id,
                         "confidence": finding["confidence"]})
     return results
@@ -269,19 +306,23 @@ def tripwires(proposal: dict, *, project_path: str | None, child_count: int,
 
 # --- proposals ---------------------------------------------------------------
 
-def _child_count(client, goal_id: str) -> int:
-    # ponytail: one whole-board GET per completion that proposes; Work has no
-    # children-of route, so ask for one when it grows one.
-    tasks = client.tasks()
+def _child_count(tasks: list[dict], goal_id: str) -> int:
     return sum(1 for t in (tasks or []) if t.get("parentId") == goal_id)
 
 
 def _decision(client, run, goal_id: str, proposal: dict, tag: str,
-              reasons: list[str], verdict: dict | None) -> dict:
+              reasons: list[str], verdict: dict | None, marker: str,
+              decisions: list[dict]) -> dict:
     """A proposal the human must rule on: a Work decision in needs-you."""
+    existing = _record_with(decisions, marker)
+    if existing is not None:
+        return {"action": "decision", "reasons": reasons,
+                "verdict": (verdict or {}).get("verdict"),
+                "decision": existing.get("id")}
     # The options say what actually HAPPENS, not what it is called. "Add as a
     # child" told the owner nothing: the choice is whether a new task exists.
-    detail = [f"{tag} run {run['id']} proposed: {proposal.get('why') or '(no rationale given)'}",
+    detail = [marker,
+              f"{tag} run {run['id']} proposed: {proposal.get('why') or '(no rationale given)'}",
               f"Choosing to create it files a NEW backlog task titled "
               f"\u201c{proposal['title']}\u201d, parented to {goal_id}. "
               f"Declining creates nothing and records that it was proposed."]
@@ -305,12 +346,37 @@ def _decision(client, run, goal_id: str, proposal: dict, tag: str,
                                    "recommendation."),
             refs=[goal_id], project_path=proposal.get("project"))
     except WorkError as exc:
-        return {"action": "rejected", "stage": "decision", "error": exc.code}
+        return {"action": ("deferred" if work_client.retryable(exc)
+                           else "rejected"),
+                "stage": "decision", "error": exc.code}
     if created is None:
         return {"action": "deferred", "stage": "decision"}
+    decisions.append(created)
     return {"action": "decision", "reasons": reasons,
             "verdict": (verdict or {}).get("verdict"),
             "decision": created.get("id") if isinstance(created, dict) else None}
+
+
+def _child_result(client, goal_id: str, marker: str, title: str,
+                  verdict: dict, child: dict) -> dict:
+    """Finish the one informational parent comment without repeating it."""
+    child_id = child.get("id") if isinstance(child, dict) else None
+    note = (f"{marker} added child {child_id or ''} — {title} "
+            f"(aligned: {verdict['rationale']})").strip()[:19000]
+    try:
+        goal = client.task(goal_id)
+        if goal is None:
+            return {"action": "deferred", "stage": "child_comment"}
+        comments = [entry.get("message") for entry in goal.get("log") or []]
+        if not any(marker in (comment or "") for comment in comments) \
+                and client.log_task(goal_id, note) is None:
+            return {"action": "deferred", "stage": "child_comment"}
+    except WorkError as exc:
+        if work_client.retryable(exc):
+            return {"action": "deferred", "stage": "child_comment"}
+        return {"action": "child", "task": child_id, "verdict": "aligned",
+                "comment_skipped": exc.code}
+    return {"action": "child", "task": child_id, "verdict": "aligned"}
 
 
 def file_proposals(con, client, run, entries: list[dict], project_path: str | None,
@@ -320,7 +386,8 @@ def file_proposals(con, client, run, entries: list[dict], project_path: str | No
     goal_id = run["work_item"] if (run["work_item"] or "").startswith("W-") else None
     tag = _tag(client, run)
     children = None
-    for raw in entries:
+    tasks = decisions = None
+    for index, raw in enumerate(entries, 1):
         title = str(raw.get("title") or "").strip()
         if not title:
             results.append({"action": "dropped", "reason": "proposal has no `title`"})
@@ -331,21 +398,49 @@ def file_proposals(con, client, run, entries: list[dict], project_path: str | No
             # issue (or nothing) has no goal, so there is nothing to parent to.
             results.append({"action": "dropped", "reason": "run serves no goal task"})
             continue
+        if tasks is None or decisions is None:
+            tasks, decisions = client.tasks(), client.decisions()
+            if tasks is None or decisions is None:
+                results.append({"action": "deferred", "stage": "preflight"})
+                continue
+        marker = f"{tag} proposal:{index}"
+        existing = next((task for task in tasks
+                         if task.get("parentId") == goal_id
+                         and marker in json.dumps(task, sort_keys=True)), None)
+        if existing is not None:
+            verdict = {"verdict": "aligned", "rationale": "already created"}
+            results.append(_child_result(client, goal_id, marker, title,
+                                         verdict, existing))
+            continue
+        existing = _record_with(decisions, marker)
+        if existing is not None:
+            results.append({"action": "decision", "reasons": [],
+                            "verdict": None, "decision": existing.get("id")})
+            continue
         if children is None:
-            children = _child_count(client, goal_id)
-        goal = client.task(goal_id) or {"id": goal_id}
+            children = _child_count(tasks, goal_id)
+        goal = client.task(goal_id)
+        if goal is None:
+            results.append({"action": "deferred", "stage": "goal"})
+            continue
         fired = tripwires(proposal, project_path=project_path,
                           child_count=children, ceiling=ceiling)
         verdict = evaluate_alignment(goal, proposal, run)
         if fired or verdict is None or verdict["verdict"] == "pivot":
-            results.append(_decision(client, run, goal_id, proposal, tag, fired, verdict))
+            results.append(_decision(client, run, goal_id, proposal, tag, fired,
+                                     verdict, marker, decisions))
             continue
         try:
             created = client.create_task(
                 title=title, parent_id=goal_id, project_path=project_path,
-                description=(f"{tag} proposed by run {run['id']} under {goal_id}.\n\n"
+                description=(f"{marker}\n\n{tag} proposed by run {run['id']} "
+                             f"under {goal_id}.\n\n"
                              f"{proposal.get('why') or ''}").strip()[:19000])
         except WorkError as exc:
+            if work_client.retryable(exc):
+                results.append({"action": "deferred", "stage": "create_task",
+                                "error": exc.code})
+                continue
             # Work's gate (W-0158) refuses an agent task with no delegated goal
             # parent. That is Orchestra proposing wrongly, not a human decision:
             # record it, never retry blind, never fall back to top-level.
@@ -357,11 +452,9 @@ def file_proposals(con, client, run, entries: list[dict], project_path: str | No
             results.append({"action": "deferred", "stage": "create_task"})
             continue
         children += 1
-        child_id = created.get("id") if isinstance(created, dict) else None
-        client.log_task(goal_id, f"{tag} added child {child_id or ''} — {title} "
-                                 f"(aligned: {verdict['rationale']})".strip()[:19000])
-        results.append({"action": "child", "task": child_id,
-                        "verdict": "aligned"})
+        tasks.append(created)
+        results.append(_child_result(client, goal_id, marker, title,
+                                     verdict, created))
     return results
 
 
@@ -372,25 +465,49 @@ def _record_problems(con, run_id: int, problems: list[str]) -> None:
     thread and on the run summary the sweeper posts to the Work item."""
     body = ("handoff protocol failure:\n"
             + "\n".join(f"- {p}" for p in problems))
-    con.execute("INSERT INTO messages(run_id, sender, body, kind, created_at) "
-                "VALUES(?, 'orchestra', ?, 'protocol', ?)", (run_id, body, db.now()))
+    con.execute(
+        "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+        "SELECT ?, 'orchestra', ?, 'protocol', ? WHERE NOT EXISTS ("
+        "SELECT 1 FROM messages WHERE run_id=? AND kind='protocol' AND body=?)",
+        (run_id, body, db.now(), run_id, body))
     row = con.execute("SELECT summary FROM runs WHERE id=?", (run_id,)).fetchone()
-    summary = ((row["summary"] + "\n\n") if row and row["summary"] else "") + body
-    con.execute("UPDATE runs SET summary=? WHERE id=?", (summary[:2000], run_id))
+    summary = row["summary"] if row else None
+    if body not in (summary or ""):
+        summary = ((summary + "\n\n") if summary else "") + body
+        con.execute("UPDATE runs SET summary=? WHERE id=?", (summary[:2000], run_id))
     con.commit()
 
 
-def at_completion(con, cfg: dict, run, final_text: str | None,
-                  status: str) -> dict:
+def _mark_processed(con, run_id: int) -> None:
+    """Durably settle this consumer without rewriting an earlier stamp."""
+    con.execute(
+        "UPDATE runs SET handoff_processed_at=COALESCE(handoff_processed_at, ?) "
+        "WHERE id=?", (db.now(), run_id))
+    con.commit()
+
+
+def _settled(entries: list[dict]) -> bool:
+    """False only when Work was unreachable and a later tick should retry."""
+    return all(entry.get("action") != "deferred" for entry in entries)
+
+
+def at_completion(con, cfg: dict, run_result) -> dict:
     """The one seam ``supervise.py`` calls at finalization.
 
-    Parses the handoff, records any protocol failure, and files what the run
-    handed off. A run that did not finish cleanly never had a handoff turn,
-    so it is not held to the protocol.
+    The terminal run row is the contract; the raw log holds its handoff.
+    Parses that handoff, records any protocol failure, and files what the run
+    handed off. A run that did not finish cleanly never had a handoff turn, so
+    it is not held to the protocol.
     """
     result = {"parsed": False, "problems": [], "findings": [], "proposals": []}
-    if status != "done":
+    run = dict(run_result)
+    if run.get("handoff_processed_at"):
         return result
+    if run["status"] != "done":
+        _mark_processed(con, run["id"])
+        return result
+    _, final_text = (runners.parse_log(run["log_path"])
+                     if run.get("log_path") else (None, None))
     handoff, problems = parse_handoff(final_text)
     entries = clean_findings(handoff["findings"], problems)
     result["parsed"] = True
@@ -399,6 +516,7 @@ def at_completion(con, cfg: dict, run, final_text: str | None,
         _record_problems(con, run["id"], problems)
     client = work_client.from_cfg(cfg)
     if client is None:
+        _mark_processed(con, run["id"])
         return result  # Work off: the protocol is still enforced, locally
     hit = project.by_id(con, run["project_id"])
     if hit is None and project.refresh(con, cfg):  # a supervisor may hold a cold cache
@@ -409,4 +527,6 @@ def at_completion(con, cfg: dict, run, final_text: str | None,
                                               DEFAULT_CHILD_CEILING))
     result["proposals"] = file_proposals(con, client, run, handoff["proposals"],
                                          project_path, ceiling=ceiling)
+    if _settled(result["findings"]) and _settled(result["proposals"]):
+        _mark_processed(con, run["id"])
     return result

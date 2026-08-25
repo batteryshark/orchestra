@@ -233,6 +233,14 @@ class HookRuntimeTests(HookFixture):
         with self.as_run():
             self.assertIsNone(hooks.run_hook("claude", {"hook_event_name": "Stop"}))
 
+        self.con.execute("UPDATE runs SET title='caller-owned' WHERE id=1")
+        with self.assertRaisesRegex(RuntimeError, "clean transaction"):
+            messaging.queue_tell(
+                self.con, 1, "human", "do not commit my transaction", str(self.log))
+        self.assertTrue(self.con.in_transaction)
+        self.con.rollback()
+        self.assertIsNone(self.run_row()["title"])
+
     def test_stop_leaves_a_terminal_run_alone(self) -> None:
         messaging.queue_tell(self.con, 1, "human", "too late", str(self.log))
         self.con.execute("UPDATE runs SET status='killed' WHERE id=1")
@@ -317,6 +325,9 @@ class UndeliverableTests(HookFixture):
                              str(self.log))
         marked = messaging.mark_undeliverable(self.con, 1, "run ended (killed)")
         self.assertEqual(marked, 1)
+        self.assertTrue(self.con.in_transaction,
+                        "the finalizer owns the delivery-state commit")
+        self.con.commit()
         # Still there, with its reason, badged for the dashboard.
         row = messaging.undeliverable(self.con)[0]
         self.assertEqual(row["body"], "stop touching auth.py")
@@ -339,6 +350,13 @@ class UndeliverableTests(HookFixture):
         self.assertEqual(messaging.mark_undeliverable(self.con, 1, "second"), 0)
         self.assertEqual(messaging.undeliverable(self.con)[0]["undeliverable_reason"],
                          "first")
+        self.con.execute("UPDATE runs SET status='failed' WHERE id=1")
+        self.con.commit()
+        with self.assertRaises(messaging.RunClosed):
+            messaging.queue_tell(self.con, 1, "human", "too late", str(self.log))
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=1 AND body='too late'"
+        ).fetchone()[0], 0)
 
     def test_a_delivered_message_is_never_marked(self) -> None:
         messaging.queue_tell(self.con, 1, "human", "landed", str(self.log))

@@ -38,7 +38,7 @@ import threading
 import time
 
 from orchestra import config, db, harnesses, messaging, observer, runners, traces
-from orchestra.proc import resolve_cmd, session_kwargs
+from orchestra.proc import process_identity, resolve_cmd, session_kwargs
 
 # Verified live (2026-08): `reasonix acp` and `opencode acp` both answer
 # initialize + session/new with loadSession: true.
@@ -442,6 +442,16 @@ def _handshake(con, peer, run, profile: dict, run_id: int) -> str:
     """initialize + session/new (or session/load on a resume). Raises on any
     failure — a half-open peer is not a run."""
     peer.start()
+    worker = peer.proc
+    if worker is None:
+        raise AcpError("peer started without a process")
+    claimed = con.execute(
+        "UPDATE runs SET pid=?, pid_identity=? "
+        f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
+        (worker.pid, process_identity(worker.pid), run_id))
+    con.commit()
+    if claimed.rowcount != 1:
+        raise AcpError("run ended before the peer process was claimed")
     init = peer.call("initialize", {
         "protocolVersion": PROTOCOL_VERSION,
         # ponytail: no client fs/terminal capabilities, so the agent uses its
@@ -491,13 +501,12 @@ def _turns(con, peer, run, profile, session_id: str, *, prompt: str,
            stall_timeout: int | None) -> tuple[str, int | None]:
     """Prompt, watch, deliver, repeat until the mission ends."""
     spin = observer.Watcher(run_id, run["project_id"])
-    # The peer's pid on the row keeps `orchestra kill` and the daemon's orphan
-    # reap working unchanged. A kill is still a kill; `tell --now` takes the
-    # graceful session/cancel path instead.
+    # The handshake records the peer's pid and kernel identity immediately;
+    # only the lifecycle transition remains here.
     con.execute(
-        "UPDATE runs SET pid=?, status='running' "
+        "UPDATE runs SET status='running' "
         f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
-        (peer.proc.pid if peer.proc else None, run_id))
+        (run_id,))
     con.commit()
     text = prompt
     while True:

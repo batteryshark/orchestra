@@ -183,6 +183,7 @@ class WorkContract(unittest.TestCase):
         self.assertIn(task["id"], [t["id"] for t in self.client.tasks()])
         self.assertIsInstance(self.client.issues(), list)
         self.assertIsInstance(self.client.needs_you(), list)
+        self.assertIsInstance(self.client.decisions(), list)
         self.assertIsInstance(self.client.projects(), list)
         self.assertEqual(Path(self.client.workspace_root()).resolve(),
                          self.root.resolve())

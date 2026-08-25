@@ -106,10 +106,108 @@ def alive(pid: int) -> bool:
         return True
     except OSError:
         return False
-    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                         capture_output=True, text=True)
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                             capture_output=True, text=True)
+    except OSError:
+        return True  # liveness is unproven; recovery must fail closed
     state = (out.stdout or "").strip()
     return not state.startswith("Z")
+
+
+def process_identity(pid: int) -> str | None:
+    """Kernel-backed identity for a process-group leader, or ``None``.
+
+    A PID alone is not durable: after reuse it may name an unrelated process,
+    and ``killpg`` would then target that process's group. The launch path
+    records this token beside the PID; crash recovery must match both before
+    signaling. Unsupported or unreadable platforms fail closed.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if IS_WIN:
+        created = _win_creation_time(pid)
+        return f"win:{created}" if created is not None else None
+    if sys.platform == "darwin":
+        info = _darwin_process_info(pid)
+        if info is None:
+            return None
+        pgid, seconds, microseconds = info
+        return (f"darwin:{seconds}:{microseconds}"
+                if pgid == pid else None)
+    if sys.platform.startswith("linux"):
+        return _linux_process_identity(pid)
+    return None
+
+
+def _darwin_process_info(pid: int) -> tuple[int, int, int] | None:
+    """Return (process group, start seconds, start microseconds) via libproc."""
+    import ctypes
+
+    class ProcBSDInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        call = libproc.proc_pidinfo
+        call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                         ctypes.c_void_p, ctypes.c_int]
+        call.restype = ctypes.c_int
+        info = ProcBSDInfo()
+        size = ctypes.sizeof(info)
+        read = call(pid, 3, 0, ctypes.byref(info), size)  # PROC_PIDTBSDINFO
+    except (AttributeError, OSError):
+        return None
+    if read != size or info.pbi_pid != pid:
+        return None
+    return (int(info.pbi_pgid), int(info.pbi_start_tvsec),
+            int(info.pbi_start_tvusec))
+
+
+def _linux_process_identity(pid: int) -> str | None:
+    """Boot id + kernel start ticks, while proving ``pid`` leads its group."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip()
+        closing = raw.rfind(")")
+        if closing < 0:
+            return None
+        fields = raw[closing + 2:].split()
+        pgid = int(fields[2])       # proc(5) field 5; fields starts at field 3
+        started = fields[19]        # proc(5) field 22
+    except (OSError, ValueError, IndexError):
+        return None
+    if not boot or pgid != pid:
+        return None
+    return f"linux:{boot}:{started}"
 
 
 def _win_alive(pid: int) -> bool:
@@ -123,6 +221,29 @@ def _win_alive(pid: int) -> bool:
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
             return False
         return code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _win_creation_time(pid: int) -> int | None:
+    """The process creation FILETIME, stable across PID reuse."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED
+    if not handle:
+        return None
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created),
+                                        ctypes.byref(exited), ctypes.byref(kernel),
+                                        ctypes.byref(user)):
+            return None
+        return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
     finally:
         kernel32.CloseHandle(handle)
 
@@ -190,6 +311,43 @@ def signal_group(pid: int, sig: int) -> None:
     if sig == 0:
         return
     terminate_group(pid)
+
+
+def signal_owned_group(pid: int, expected_identity: str | None,
+                       sig: int) -> tuple[str, str]:
+    """Signal a process group only while its durable identity still matches.
+
+    Returns ``(outcome, detail)`` where outcome is ``signalled``, ``gone``,
+    or ``refused``. A missing or unreadable identity fails closed: a stored
+    PID is not ownership proof after it may have been reused.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return "refused", f"invalid worker pid {pid}"
+    if pid <= 0:
+        return "refused", f"invalid worker pid {pid}"
+    try:
+        signal_group(pid, 0)
+    except ProcessLookupError:
+        return "gone", "process already gone"
+    except (OSError, ValueError):
+        return "refused", f"worker group {pid} could not be inspected"
+    if not expected_identity:
+        return "refused", f"worker group {pid} has no recorded process identity"
+    actual_identity = process_identity(pid)
+    if actual_identity is None:
+        return "refused", f"worker group {pid} identity could not be read"
+    if actual_identity != expected_identity:
+        return ("refused", f"worker group {pid} identity changed; refusing to "
+                "signal a possibly unrelated process")
+    try:
+        signal_group(pid, sig)
+    except ProcessLookupError:
+        return "gone", "process already gone"
+    except (OSError, ValueError):
+        return "refused", f"worker group {pid} could not be signalled"
+    return "signalled", f"signalled worker group {pid}"
 
 
 def chmod(path, mode: int) -> None:

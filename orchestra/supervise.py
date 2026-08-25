@@ -30,7 +30,8 @@ from pathlib import Path
 from orchestra import (acp, auth, brief, config, db, dispatch, findings,
                          merge, messaging, names, observer, paths, project,
                          runners, traces, worktree)
-from orchestra.proc import enrich_path, resolve_cmd, session_kwargs, terminate_group
+from orchestra.proc import (enrich_path, process_identity, resolve_cmd,
+                            session_kwargs, terminate_group)
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 POLL_INTERVAL = 0.5
@@ -68,10 +69,19 @@ def create_run(con, *, profile: str, backend: str, requested_by: str,
         if pause_gate and dispatch.paused(con):
             blocked = "paused"
         elif work_item:
-            active = con.execute(
-                f"SELECT id FROM runs WHERE work_item=? AND layer IS NULL "
-                f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
-                (work_item,)).fetchone()
+            if retry_of is not None:
+                # A delayed retry may wake after a newer attempt already
+                # settled. That newer result owns the item; repeating stale
+                # work would be a regression, not resilience.
+                active = con.execute(
+                    "SELECT id FROM runs WHERE work_item=? AND layer IS NULL "
+                    "AND id>? ORDER BY id DESC LIMIT 1",
+                    (work_item, int(retry_of))).fetchone()
+            else:
+                active = con.execute(
+                    f"SELECT id FROM runs WHERE work_item=? AND layer IS NULL "
+                    f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
+                    (work_item,)).fetchone()
             if active is not None:
                 blocked = f"work_item:{active['id']}"
         if blocked is None and session_ref:
@@ -143,7 +153,9 @@ def admit_pending(con, run_id: int) -> tuple[sqlite3.Row | None, str | None]:
             "WHERE d.run_id=? AND d.status='pending' AND r.status='pending' "
             "AND NOT EXISTS (SELECT 1 FROM dispatch_dependencies e "
             "JOIN runs p ON p.id=e.depends_on_run WHERE e.run_id=d.run_id "
-            "AND p.status!='done')", (int(run_id),)).fetchone()
+            "AND NOT (p.status='done' AND "
+            "(p.branch IS NULL OR p.landing_status='ok')))",
+            (int(run_id),)).fetchone()
         if req is None:
             con.rollback()
             return None, "not_ready"
@@ -277,7 +289,7 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
 
 def fail_launch(con, root: Path, run_id: int, error: BaseException | str,
                 prefix: str = "Launch setup failed") -> dict:
-    """Terminalize a prepared run that never reached a supervisor."""
+    """Finalize a prepared run that never reached a supervisor."""
     root = Path(root)
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     cleanup = None
@@ -301,11 +313,11 @@ def fail_launch(con, root: Path, run_id: int, error: BaseException | str,
     reason = str(error)[:1000] or error.__class__.__name__
     con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
                 (workdir, branch, base_commit, run_id))
-    con.execute(
-        "UPDATE runs SET status='failed', summary=?, finished_at=? WHERE id=? "
-        f"AND status NOT IN {db.TERMINAL_SQL}",
-        (f"{prefix}: {reason}", db.now(), run_id))
     con.commit()
+    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if run is not None:
+        finalize_run(con, run, "failed", None,
+                     restart_note=f"{prefix}: {reason}")
     return cleanup or {"removed": False, "branch_deleted": False, "error": None}
 
 
@@ -357,7 +369,7 @@ def rehome(con, root: Path, previous, run_id: int) \
 
 
 def reserve_followup(con, root: Path, parent, requester: str,
-                     title: str | None = None):
+                     title: str | None = None, *, commit: bool = True):
     """Reserve a continuation before any Work claim or filesystem setup."""
     return create_run(
         con, profile=parent["profile"], backend=parent["backend"],
@@ -366,7 +378,7 @@ def reserve_followup(con, root: Path, parent, requester: str,
         requested_by=requester, workdir=str(root),
         project_id=parent["project_id"], parent_run=int(parent["id"]),
         session_ref=parent["session_ref"], work_item=parent["work_item"],
-        work_seen_ts=parent["work_seen_ts"])
+        work_seen_ts=parent["work_seen_ts"], commit=commit)
 
 
 def prepare_followup(con, root: Path, parent, run, text: str) -> int:
@@ -537,9 +549,9 @@ def _run_proc(con, run, cmd, env, log_path, run_id, deadline,
             stderr=subprocess.STDOUT, cwd=run["workdir"],
             env=env, **session_kwargs())
     cur = con.execute(
-        "UPDATE runs SET pid=?, status='running' "
+        "UPDATE runs SET pid=?, pid_identity=?, status='running' "
         f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
-        (proc.pid, run_id))
+        (proc.pid, process_identity(proc.pid), run_id))
     con.commit()
     if cur.rowcount == 0:  # killed before we could claim it
         _terminate_process_group(proc.pid)
@@ -662,8 +674,9 @@ def _checkpoint_commit(run: dict, terminal_status: str) -> str | None:
             if committed.returncode != 0:
                 raise RuntimeError(
                     f"automatic checkpoint commit failed: {committed.stderr.strip()}")
-    head = worktree.head(workdir)
-    return head if head != run.get("base_commit") else None
+    # HEAD is also the durable "checkpoint attempted" receipt when there was
+    # no diff. NULL means finalization never reached this boundary.
+    return worktree.head(workdir)
 
 
 def release_worktree(con, run: dict, status: str) -> str | None:
@@ -688,21 +701,209 @@ def release_worktree(con, run: dict, status: str) -> str | None:
     if not report["removed"]:
         return f"Worktree at {workdir} could not be removed: {report['error']}"
     return None
+
+
 def record_usage(con, run_id: int, backend: str, log_path: str | None) -> None:
     """DESIGN §11 seam: stamp the run row with the backend's own token/cost
     totals at completion, so the dashboard is a query and not a re-parse.
     Uncapturable usage writes nulls — it never blocks finalization.
-
-    ponytail: only this path stamps usage, so a run finalized by the daemon's
-    orphan reap (a supervisor that died) keeps nulls. Call this from the reap
-    too if abandoned runs ever hold enough spend to matter.
     """
     usage = runners.parse_usage(log_path, backend) if log_path else runners.EMPTY_USAGE
     con.execute(
-        "UPDATE runs SET tokens_in=?, tokens_out=?, tokens_total=?, cost_usd=?, "
-        "usage_source=? WHERE id=?",
+        "UPDATE runs SET tokens_in=COALESCE(?, tokens_in), "
+        "tokens_out=COALESCE(?, tokens_out), "
+        "tokens_total=COALESCE(?, tokens_total), "
+        "cost_usd=COALESCE(?, cost_usd), "
+        "usage_source=COALESCE(?, usage_source) WHERE id=?",
         (usage["tokens_in"], usage["tokens_out"], usage["tokens_total"],
          usage["cost_usd"], usage["usage_source"], run_id))
+
+
+def finalize_run(con, run, status: str, exit_code: int | None, *,
+                 last_msg_file: str | None = None,
+                 restart_note: str | None = None) -> dict:
+    """Persist one terminal worker result and return its refreshed run row.
+
+    The terminal row, checkpoint identity, usage, delivery state, completion
+    notice, and retry hold become visible together before checkout release.
+    Repeating finalization enriches an existing terminal row without reopening
+    its outcome, checkpointing later edits, or duplicating its completion notice.
+    """
+    run = dict(run)
+    run_id = int(run["id"])
+    log_path = run.get("log_path")
+    preferred_text = None
+    preferred_output = None
+    preferred_durable = False
+
+    # Record what the worker returned before parsing, trace enrichment, or Git
+    # can fail. This is not the public terminal result; it is the receipt an
+    # orphan recovery pass uses to finish the same outcome instead of guessing
+    # `failed` merely because the supervisor died during finalization.
+    con.execute(
+        "UPDATE runs SET worker_status=COALESCE(worker_status, ?), "
+        "worker_exit_code=COALESCE(worker_exit_code, ?) WHERE id=?",
+        (status, exit_code, run_id))
+    con.commit()
+
+    # Codex's -o file is the authoritative last message. Preserve a preferred
+    # copy in the raw JSONL before the final ingest so every later consumer can
+    # derive the same result from result["log_path"].
+    if last_msg_file and Path(last_msg_file).is_file():
+        output = Path(last_msg_file)
+        preferred_output = output
+        try:
+            preferred_text = output.read_text(
+                encoding="utf-8", errors="replace").strip() or None
+            _, logged_text = runners.parse_log(log_path) if log_path else (None, None)
+            if not preferred_text or preferred_text == (logged_text or "").strip():
+                preferred_durable = True
+            elif log_path:
+                event = json.dumps({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": preferred_text},
+                    "_orchestra": {"source": "codex-last-message"},
+                }, ensure_ascii=False).encode("utf-8") + b"\n"
+                with Path(log_path).open("ab+") as log:
+                    log.seek(0, os.SEEK_END)
+                    if log.tell():
+                        log.seek(-1, os.SEEK_END)
+                        if log.read(1) not in (b"\n", b"\r"):
+                            event = b"\n" + event
+                    log.write(event)
+                preferred_durable = True
+        except OSError as exc:
+            print(f"orchestra: run {run_id} could not preserve final output; "
+                  f"retained {output}: {exc}", file=sys.stderr)
+
+    if log_path:
+        traces.ingest(con, run_id, log_path, run["backend"])
+        session_ref, last_text = runners.parse_log(log_path)
+    else:
+        session_ref, last_text = None, preferred_text
+    if preferred_text and preferred_text != (last_text or "").strip():
+        # Even when the raw append failed, this process still has Codex's
+        # authoritative answer and can persist the terminal summary.
+        last_text = preferred_text
+    latest = con.execute(
+        "SELECT status, exit_code, summary, finished_at, checkpoint_commit, "
+        "EXISTS(SELECT 1 FROM messages WHERE run_id=runs.id "
+        "AND kind='completion') AS finalized FROM runs WHERE id=?",
+        (run_id,)).fetchone()
+    if latest is None:
+        raise RuntimeError(f"run {run_id} disappeared during finalization")
+    already_terminal = latest["status"] in db.RUN_TERMINAL
+    if already_terminal:
+        status = latest["status"]
+        if latest["exit_code"] is not None or status in ("killed", "halted"):
+            exit_code = latest["exit_code"]
+    if latest["summary"] and (
+            (status == "timeout" and latest["summary"].startswith("Stalled:"))
+            or latest["summary"].startswith(acp.FAILURE_PREFIX)):
+        last_text = latest["summary"]
+
+    summary = (last_text or "").strip()[:2000] or None
+    reason = findings.halt_reason(last_text)
+    if reason and not already_terminal and status != "killed":
+        status = "halted"
+        summary = reason
+    if status != "done" and not summary:
+        summary = runners.parse_failure(log_path) if log_path else None
+    if restart_note and not already_terminal:
+        summary = (f"{summary}\n\n{restart_note}" if summary else restart_note)[:2000]
+
+    checkpoint_commit = latest["checkpoint_commit"]
+    checkpoint_note = None
+    if checkpoint_commit is None and not latest["finalized"]:
+        try:
+            checkpoint_commit = _checkpoint_commit(run, status)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            if status == "done":
+                status, exit_code = "failed", exit_code or 1
+            checkpoint_note = f"Checkpoint error: {exc}"
+
+    # The result must exist before any external cleanup. A process death after
+    # this commit leaves one terminal fact the daemon can safely replay from;
+    # it must never infer an outcome from a vanished checkout.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        current = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if current is None:
+            raise RuntimeError(f"run {run_id} disappeared during finalization")
+        if current["status"] in db.RUN_TERMINAL:
+            status = current["status"]
+            if current["exit_code"] is not None or status in ("killed", "halted"):
+                exit_code = current["exit_code"]
+            if current["summary"]:
+                summary = current["summary"]
+        if checkpoint_note and checkpoint_note not in (summary or ""):
+            summary = (f"{summary}\n\n{checkpoint_note}"
+                       if summary else checkpoint_note)[:2000]
+
+        con.execute(
+            "UPDATE runs SET status=?, exit_code=?, "
+            "session_ref=COALESCE(?, session_ref), summary=?, "
+            "checkpoint_commit=COALESCE(checkpoint_commit, ?), "
+            "finished_at=COALESCE(finished_at, ?) WHERE id=?",
+            (status, exit_code, session_ref, summary, checkpoint_commit,
+             db.now(), run_id))
+        observer.defer_retry(con, run_id)
+        stranded = messaging.mark_undeliverable(
+            con, run_id,
+            f"run ended ({status}) before the message reached a boundary")
+        record_usage(con, run_id, run["backend"], run["log_path"])
+        body = (f"run {run_id} finished: {status}"
+                + (f" (exit {exit_code})" if exit_code not in (None, 0) else "")
+                + (f"\n{stranded} message(s) were never delivered — see "
+                   f"`orchestra show {run_id}`" if stranded else "")
+                + (f"\n{summary[:800]}" if summary else ""))
+        con.execute(
+            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+            "SELECT ?, 'orchestra', ?, 'completion', ? WHERE NOT EXISTS ("
+            "SELECT 1 FROM messages WHERE run_id=? AND kind='completion')",
+            (run_id, body, db.now(), run_id))
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+
+    if preferred_output is not None and preferred_durable:
+        try:
+            preferred_output.unlink()
+        except OSError:
+            pass
+
+    # Cleanup is a consequence of the durable result. It is intentionally
+    # outside the transaction and may be retried by daemon policy recovery.
+    kept = release_worktree(con, run, status)
+    if kept:
+        current = con.execute("SELECT summary FROM runs WHERE id=?", (run_id,)).fetchone()
+        current_summary = current["summary"] if current else None
+        if kept not in (current_summary or ""):
+            current_summary = (f"{current_summary}\n\n{kept}"
+                               if current_summary else kept)[:2000]
+            con.execute("UPDATE runs SET summary=? WHERE id=?",
+                        (current_summary, run_id))
+            con.commit()
+    return dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+
+
+def finalize_if_unowned(con, run_id: int, *, worker_gone: bool = False) -> bool:
+    """Finish a terminal row that has no process left to own finalization.
+
+    ``worker_gone`` is proof from the process-group probe, not an inference
+    from a stored PID. A live supervisor still owns finalization either way.
+    """
+    run = con.execute(
+        "SELECT *, EXISTS(SELECT 1 FROM messages WHERE run_id=runs.id "
+        "AND kind='completion') AS finalized FROM runs WHERE id=?",
+        (run_id,)).fetchone()
+    if run is None or run["status"] not in db.RUN_TERMINAL or run["finalized"] \
+            or run["supervisor_pid"] is not None \
+            or (run["pid"] is not None and not worker_gone):
+        return False
+    finalize_run(con, run, run["status"], run["exit_code"])
+    return True
 
 
 def process_ready(con, launcher) -> list[dict]:
@@ -725,7 +926,8 @@ def process_ready(con, launcher) -> list[dict]:
                 "JOIN dispatch_dependencies e ON e.run_id=d.run_id "
                 "JOIN runs p ON p.id=e.depends_on_run "
                 "WHERE d.status='pending' AND e.kind='requires_success' "
-                f"AND p.status IN {db.TERMINAL_SQL} AND p.status != 'done' "
+                f"AND p.status IN {db.TERMINAL_SQL} AND (p.status != 'done' "
+                "OR (p.branch IS NOT NULL AND p.landing_status='failed')) "
                 "AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.run_id=p.id "
                 "AND o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
                 "SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
@@ -751,7 +953,8 @@ def process_ready(con, launcher) -> list[dict]:
         "WHERE d.status='pending' AND r.status='pending' AND NOT EXISTS ("
         "  SELECT 1 FROM dispatch_dependencies e "
         "  JOIN runs p ON p.id=e.depends_on_run "
-        "  WHERE e.run_id=d.run_id AND p.status!='done') "
+        "  WHERE e.run_id=d.run_id AND NOT (p.status='done' AND "
+        "  (p.branch IS NULL OR p.landing_status='ok'))) "
         "ORDER BY d.run_id"))
     for req in ready:
         run_id = int(req["run_id"])
@@ -793,8 +996,9 @@ def supervise(root: Path, run_id: int) -> int:
     # before the completion UPDATE leaves a detectable orphan.
     supervisor_pid = os.getpid()
     claimed = con.execute(
-        "UPDATE runs SET supervisor_pid=? WHERE id=? AND status='spawning' "
-        "AND supervisor_pid IS NULL", (supervisor_pid, run_id))
+        "UPDATE runs SET supervisor_pid=?, supervisor_pid_identity=? "
+        "WHERE id=? AND status='spawning' AND supervisor_pid IS NULL",
+        (supervisor_pid, process_identity(supervisor_pid), run_id))
     con.commit()
     if claimed.rowcount != 1:
         con.close()
@@ -923,75 +1127,22 @@ def supervise(root: Path, run_id: int) -> int:
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
 
     # --- finalization ---
-    latest = con.execute("SELECT status, summary FROM runs WHERE id=?",
-                         (run_id,)).fetchone()
-    if latest and latest["status"] in ("killed", "halted"):
-        status, exit_code = latest["status"], None
-    traces.ingest(con, run_id, run["log_path"], run["backend"])  # final tail
-    session_ref, last_text = runners.parse_log(run["log_path"])
-    if latest and latest["summary"] and (
-            (status == "timeout" and latest["summary"].startswith("Stalled:"))
-            # SEAM (W-0104): same rule for the ACP transport's own reason. A
-            # dead peer produced no assistant text, so the last line in the
-            # log is not what went wrong — the recorded reason is.
-            or latest["summary"].startswith(acp.FAILURE_PREFIX)):
-        last_text = latest["summary"]
-    if last_msg_file and Path(last_msg_file).is_file():
-        txt = Path(last_msg_file).read_text(encoding="utf-8", errors="replace").strip()
-        if txt:
-            last_text = txt
-        os.unlink(last_msg_file)
-    summary = (last_text or "").strip()[:2000] or None
-    reason = findings.halt_reason(last_text)
-    if reason and status != "killed":
-        status = "halted"
-        summary = reason
-    if status != "done" and not summary:
-        # A backend that dies before speaking (revoked auth, dead quota) still
-        # logs why. Without this the human sees "failed" and nothing else.
-        summary = runners.parse_failure(run["log_path"])
-    if restart_note:
-        # The transcript's last words say nothing about the session that was
-        # missing, so the row a human reads first has to carry it.
-        summary = (f"{summary}\n\n{restart_note}" if summary else restart_note)[:2000]
-    checkpoint_commit = None
-    try:
-        checkpoint_commit = _checkpoint_commit(dict(run), status)
-    except RuntimeError as exc:
-        if status == "done":
-            status, exit_code = "failed", exit_code or 1
-        note = f"Checkpoint error: {exc}"
-        summary = (f"{summary}\n\n{note}" if summary else note)[:2000]
-    kept = release_worktree(con, dict(run), status)
-    if kept:
-        summary = (f"{summary}\n\n{kept}" if summary else kept)[:2000]
-    # SEAM (W-0174): DESIGN §9 — the supervisor lands a verified run's branch.
-    # Strictly after release_worktree: git refuses to delete a branch a
-    # worktree still holds. It reports itself and never raises.
-    landed = merge.at_completion(con, cfg, dict(run), status)
+    result = finalize_run(
+        con, run, status, exit_code, last_msg_file=last_msg_file,
+        restart_note=restart_note)
+    status = result["status"]
+
+    # Optional policy consumes the durable result. Landing remains strictly
+    # after release_worktree, which finalize_run owns.
+    landed = merge.at_completion(con, cfg, result)
     if landed:
+        summary = result["summary"]
         summary = (f"{summary}\n\n{landed}" if summary else landed)[:2000]
-    con.execute(
-        "UPDATE runs SET status=?, exit_code=?, session_ref=COALESCE(?, session_ref), "
-        "summary=?, checkpoint_commit=?, finished_at=? WHERE id=?",
-        (status, exit_code, session_ref, summary, checkpoint_commit, db.now(), run_id))
-    # W-0098 seam: the run is over, so anything still queued for it will never
-    # arrive. Mark it with the reason and surface it; never move it to a later
-    # run, which would hand a correction to a run that never saw the context.
-    stranded = messaging.mark_undeliverable(
-        con, run_id, f"run ended ({status}) before the message reached a boundary")
-    record_usage(con, run_id, run["backend"], run["log_path"])
-    body = (f"run {run_id} finished: {status}"
-            + (f" (exit {exit_code})" if exit_code not in (None, 0) else "")
-            + (f"\n{stranded} message(s) were never delivered — see "
-               f"`orchestra show {run_id}`" if stranded else "")
-            + (f"\n{summary[:800]}" if summary else ""))
-    con.execute(
-        "INSERT INTO messages(run_id, sender, body, kind, created_at) "
-        "VALUES(?, 'orchestra', ?, 'completion', ?)", (run_id, body, db.now()))
-    con.commit()
+        con.execute("UPDATE runs SET summary=? WHERE id=?", (summary, run_id))
+        con.commit()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
     try:  # DESIGN §9: code files the handoff, never the agent
-        findings.at_completion(con, cfg, dict(run), last_text, status)
+        findings.at_completion(con, cfg, result)
     except Exception as exc:  # filing must never break finalization
         print(f"orchestra: run {run_id} handoff filing failed: {exc}", file=sys.stderr)
 

@@ -420,17 +420,24 @@ def cmd_interrupt(args):
     # on the same session (OpenCode). The row carries no delivery_offset, so
     # the delivery state stops claiming a pending boundary.
     live = acp.run_transport(cfg, r["profile"]) == "acp"
-    messaging.queue_tell(con, args.run_id, _requester(cfg), body, r["log_path"],
-                         boundary=not live)
+    try:
+        messaging.queue_tell(con, args.run_id, _requester(cfg), body, r["log_path"],
+                             boundary=not live)
+    except messaging.RunClosed:
+        latest = _fetch_run(con, args.run_id)
+        con.close()
+        raise SystemExit(f"orchestra: run {args.run_id} already {latest['status']} — "
+                         f"use `orchestra reply {args.run_id} \"...\"` instead")
     if args.now:
         con.execute(f"UPDATE runs SET status='interrupt' WHERE id=? "
                     f"AND status NOT IN {db.TERMINAL_SQL}", (args.run_id,))
         con.commit()
         if r["pid"] and not live:
-            try:
-                proc.signal_group(r["pid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            outcome, detail = proc.signal_owned_group(
+                r["pid"], r["pid_identity"], signal.SIGTERM)
+            if outcome == "refused":
+                print(f"orchestra: run {args.run_id} not signalled: {detail}",
+                      file=sys.stderr)
         how = ("the worker's turn is cancelled gracefully over ACP and the same "
                "session continues with the message" if live else
                "the worker resumes its session with the message and continues "
@@ -522,18 +529,37 @@ def cmd_kill(args):
     con.execute(
         "UPDATE deferred_dispatches SET status='cancelled', processed_at=? "
         "WHERE run_id=? AND status='pending'", (db.now(), args.run_id))
-    con.execute(
-        f"UPDATE runs SET status='killed', finished_at=? WHERE id=? "
+    changed = con.execute(
+        f"UPDATE runs SET status='killed', worker_status=COALESCE(worker_status, "
+        f"'killed'), finished_at=? WHERE id=? "
         f"AND status NOT IN {db.TERMINAL_SQL}", (db.now(), args.run_id))
     con.commit()
-    if r["pid"]:
-        try:
-            proc.signal_group(r["pid"], signal.SIGTERM)
+    if changed.rowcount != 1:
+        latest = _fetch_run(con, args.run_id)
+        print(f"run {args.run_id} already {latest['status']}")
+        con.close()
+        return
+    has_worker = r["pid"] is not None
+    signal_outcome = "gone" if not has_worker else "refused"
+    signal_detail = None
+    if has_worker:
+        signal_outcome, signal_detail = proc.signal_owned_group(
+            r["pid"], r["pid_identity"], signal.SIGTERM)
+        if signal_outcome == "signalled":
             print(f"sent SIGTERM to run {args.run_id} (pid {r['pid']})")
-        except ProcessLookupError:
+        elif signal_outcome == "gone":
             print(f"run {args.run_id} marked killed (process already gone)")
+        else:
+            print(f"orchestra: run {args.run_id} not signalled: {signal_detail}",
+                  file=sys.stderr)
     else:
         print(f"run {args.run_id} marked killed")
+    try:
+        supervise.finalize_if_unowned(
+            con, args.run_id, worker_gone=signal_outcome == "gone")
+    except Exception as exc:
+        print(f"orchestra: run {args.run_id} cleanup deferred: {exc}",
+              file=sys.stderr)
     # Dependents of a killed prerequisite are declined synchronously; no
     # supervisor may exist to do it for a pending run.
     supervise.process_ready(con, supervise.spawn_supervisor)

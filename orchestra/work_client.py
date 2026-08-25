@@ -28,6 +28,11 @@ class WorkError(Exception):
         self.code = code
 
 
+def retryable(error: WorkError) -> bool:
+    """Whether Work asked us to retry rather than settle an authority refusal."""
+    return error.status >= 500 or error.status in (408, 429)
+
+
 class WorkClient:
     def __init__(self, api_url: str, identity: str = "orchestra",
                  timeout: float = DEFAULT_TIMEOUT):
@@ -86,6 +91,10 @@ class WorkClient:
         got = self._call("GET", "/api/needs-you")
         return None if got is None else got.get("entries", [])
 
+    def decisions(self) -> list | None:
+        got = self._call("GET", "/api/decisions")
+        return None if got is None else got.get("decisions", [])
+
     def projects(self) -> list | None:
         """Work's project list: id, projectId, name, path, aliasPaths. Paths
         are relative to the workspace root."""
@@ -106,7 +115,7 @@ class WorkClient:
                 else {"section": section, "index": index, "checked": checked})
         return self._call("POST", f"/api/tasks/{task_id}/checklist", body)
 
-    def decline_unaccounted(self, task_id: str, reason: str) -> int:
+    def decline_unaccounted(self, task_id: str, reason: str) -> int | None:
         """Decline, on a run's behalf, every criterion it left open.
 
         CONTRACT §3 verb 2: no task leaves an agent's hands with a criterion
@@ -120,16 +129,18 @@ class WorkClient:
         """
         task = self.task(task_id)
         if task is None:
-            return 0
+            return None
         declined = 0
         for section, key in (("requirements", "requirements"),
                              ("acceptance", "acceptanceCriteria")):
             for index, entry in enumerate(task.get(key) or []):
                 if entry.get("checked") or entry.get("declined"):
                     continue
-                if self.check_task_item(task_id, section, index,
-                                        reason=reason[:2000]) is not None:
-                    declined += 1
+                posted = self.check_task_item(task_id, section, index,
+                                              reason=reason[:2000])
+                if posted is None:
+                    return None
+                declined += 1
         return declined
 
     def log_task(self, task_id: str, message: str):

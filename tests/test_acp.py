@@ -336,6 +336,7 @@ class AcpEndToEndTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["session_ref"], "stub-acp-session-1")
+        self.assertIsNotNone(run["pid_identity"])
         # The prompt the peer echoed back is the composed brief, so the run
         # really did go through prepare_launch and not some ACP-only path.
         self.assertIn("stub acp turn complete", run["summary"])

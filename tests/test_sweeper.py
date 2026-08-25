@@ -156,10 +156,19 @@ class SweeperFixture:
     def finish_run(self, run_id, status="done", summary="all good",
                    session_ref=None):
         con = db.connect()
+        finished = db.now()
         con.execute(
             "UPDATE runs SET status=?, summary=?, finished_at=?, "
             "session_ref=COALESCE(?, session_ref) WHERE id=?",
-            (status, summary, db.now(), session_ref, run_id))
+            (status, summary, finished, session_ref, run_id))
+        if status in db.RUN_TERMINAL:
+            con.execute("UPDATE runs SET handoff_processed_at=? WHERE id=?",
+                        (finished, run_id))
+            con.execute(
+                "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+                "SELECT ?, 'orchestra', ?, 'completion', ? WHERE NOT EXISTS ("
+                "SELECT 1 FROM messages WHERE run_id=? AND kind='completion')",
+                (run_id, f"run {run_id} finished: {status}", finished, run_id))
         con.commit()
         con.close()
 
@@ -220,6 +229,109 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(run["work_item"], "issue_auth_timeout")
         self.assertIn("Login hangs on retry.",
                       Path(run["brief_path"]).read_text())
+
+    def test_lost_task_claim_response_reuses_the_reserved_run(self) -> None:
+        self.work.add_task("W-0001", "claim once", delegated=True)
+        post = self.client.log_task
+
+        with mock.patch.object(
+                self.client, "log_task",
+                side_effect=WorkError(503, "unavailable", "try again")):
+            self.assertEqual(self.sweep(), [])
+        pending = self.db_run()
+        self.assertEqual(pending["work_claim_status"], "pending")
+
+        def committed_then_lost(item_id, body):
+            result = post(item_id, body)
+            return None if " fact: claimed" in body else result
+
+        with mock.patch.object(self.client, "log_task", committed_then_lost):
+            self.assertEqual(self.sweep(), [])
+        still_pending = self.db_run()
+        self.assertEqual(still_pending["id"], pending["id"])
+        self.assertEqual(still_pending["status"], "pending")
+        self.assertEqual(still_pending["work_claim_status"], "pending")
+        self.assertIsNone(still_pending["brief_path"])
+        self.assertEqual(self.launched, [])
+
+        actions = self.sweep()
+        self.assertEqual(actions, [{"action": "dispatch", "item": "W-0001",
+                                    "run": pending["id"], "resumed": False}])
+        settled = self.db_run()
+        self.assertEqual(settled["id"], pending["id"])
+        self.assertEqual(settled["work_claim_status"], "claimed")
+        self.assertEqual(self.launched, [(self.root, pending["id"])])
+        claim = f"fact: claimed run={pending['id']}"
+        self.assertEqual(sum(claim in entry["message"]
+                             for entry in self.work.tasks["W-0001"]["log"]), 1)
+        self.sweep()
+        self.assertEqual(self.launched, [(self.root, pending["id"])])
+
+    def test_human_override_settles_a_prepared_pending_claim(self) -> None:
+        self.work.add_task("W-0001", "do not launch stale work", delegated=True)
+        post = self.client.log_task
+
+        def committed_then_lost(item_id, body):
+            result = post(item_id, body)
+            return None if " fact: claimed" in body else result
+
+        with mock.patch.object(self.client, "log_task", committed_then_lost):
+            self.assertEqual(self.sweep(), [])
+        pending = self.db_run()
+        con = db.connect()
+        self.assertEqual(sweeper._confirm_claim(
+            con, self.client, "task", self.work.tasks["W-0001"], pending),
+            "claimed")
+        supervise.prepare_launch(
+            con, self.root, self.cfg, pending, mission="prepared before crash",
+            use_worktree=False,
+            work_snapshot=sweeper.render_snapshot(
+                self.work.tasks["W-0001"], "task"))
+        con.commit()
+        prepared = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                    (pending["id"],)).fetchone())
+        con.close()
+        self.assertTrue(Path(prepared["brief_path"]).exists())
+
+        self.work.human_move("W-0001", "backlog")
+        self.assertEqual(self.sweep(), [])
+        abandoned = self.db_run(pending["id"])
+        self.assertEqual(abandoned["status"], "killed")
+        self.assertEqual(abandoned["work_claim_status"], "abandoned")
+        self.assertFalse(Path(prepared["brief_path"]).exists())
+        con = db.connect()
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM observations WHERE run_id=? AND layer='retry'",
+            (pending["id"],)).fetchone()[0], 0)
+        con.close()
+
+    def test_lost_issue_claim_response_reconciles_claimed_by(self) -> None:
+        self.work.add_issue("issue_once", "claim once", delegated=True)
+        claim = self.client.claim_issue
+
+        def committed_then_lost(item_id):
+            claim(item_id)
+            return None
+
+        with mock.patch.object(self.client, "claim_issue", committed_then_lost):
+            self.assertEqual(self.sweep(), [])
+        pending = self.db_run()
+        self.assertEqual((pending["status"], pending["work_claim_status"]),
+                         ("pending", "pending"))
+        self.assertEqual(self.work.issues["issue_once"]["claimedBy"],
+                         {"kind": "agent", "name": "orchestra"})
+        self.assertEqual(self.launched, [])
+
+        actions = self.sweep()
+        self.assertEqual(actions, [{"action": "dispatch", "item": "issue_once",
+                                    "run": pending["id"], "resumed": False}])
+        self.assertEqual(self.db_run()["id"], pending["id"])
+        self.assertEqual(self.db_run()["work_claim_status"], "claimed")
+        bodies = [entry["body"]
+                  for entry in self.work.issues["issue_once"]["messages"]]
+        self.assertEqual(sum("fact: claimed" in body for body in bodies), 1)
+        self.sweep()
+        self.assertEqual(self.launched, [(self.root, pending["id"])])
 
     def test_unassigned_or_wrong_state_items_are_untouched(self) -> None:
         self.work.add_task("W-0001", "not ours", agents=["someone_else"])
@@ -316,16 +428,167 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         actions = self.sweep()  # run has no session_ref yet
         self.assertNotIn("ferry", [a["action"] for a in actions])
 
+    def test_ferry_losing_the_terminal_race_is_a_no_op(self) -> None:
+        self.work.add_task("W-0001", "late comment", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        con = db.connect()
+        con.execute("UPDATE runs SET status='running', session_ref='sess-1' WHERE id=?",
+                    (run["id"],))
+        con.commit()
+        con.close()
+        self.work.human_log("W-0001", "too late")
+        with mock.patch.object(sweeper.messaging, "queue_tell",
+                               side_effect=sweeper.messaging.RunClosed("done")):
+            actions = self.sweep()
+        self.assertNotIn("ferry", [action["action"] for action in actions])
+
     # --- report -------------------------------------------------------------
+
+    def test_report_waits_for_completion_and_handoff_receipts(self) -> None:
+        self.work.add_task("W-0001", "not finalized yet", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        con = db.connect()
+        con.execute("UPDATE runs SET status='done', summary='done', finished_at=? "
+                    "WHERE id=?", (db.now(), run["id"]))
+        con.commit()
+        before = self.work.mutation_count()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone())
+        self.assertEqual(sweeper.report_result(con, self.client, result), (True, None))
+        con.execute(
+            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+            "VALUES(?, 'orchestra', 'finished', 'completion', ?)",
+            (run["id"], db.now()))
+        con.commit()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone())
+        self.assertEqual(sweeper.report_result(con, self.client, result), (True, None))
+        con.execute("UPDATE runs SET handoff_processed_at=? WHERE id=?",
+                    (db.now(), run["id"]))
+        con.commit()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone())
+        settled, action = sweeper.report_result(con, self.client, result)
+        con.close()
+        self.assertTrue(settled)
+        self.assertEqual(action["action"], "report")
+        self.assertGreater(self.work.mutation_count(), before)
+
+    def test_lost_report_comment_response_does_not_duplicate_the_comment(self) -> None:
+        self.work.add_task("W-0001", "ambiguous comment", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.finish_run(run["id"], "done", "Shipped once.")
+        con = db.connect()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone())
+        post = self.client.log_task
+
+        with mock.patch.object(
+                self.client, "task",
+                side_effect=WorkError(503, "unavailable", "try again")):
+            self.assertEqual(sweeper.report_result(con, self.client, result),
+                             (False, None))
+        self.assertIsNone(con.execute(
+            "SELECT work_reported_at FROM runs WHERE id=?", (run["id"],)
+        ).fetchone()["work_reported_at"])
+
+        def committed_then_lost(item_id, body):
+            reply = post(item_id, body)
+            return None if " finished: " in body else reply
+
+        with mock.patch.object(self.client, "log_task", committed_then_lost):
+            self.assertEqual(sweeper.report_result(con, self.client, result),
+                             (False, None))
+        settled, _ = sweeper.report_result(con, self.client, result)
+        con.close()
+        self.assertTrue(settled)
+        messages = [entry["message"] for entry in self.work.tasks["W-0001"]["log"]]
+        self.assertEqual(sum(" finished: done" in message for message in messages), 1)
+
+    def test_lost_report_fact_response_is_reconciled_before_retry(self) -> None:
+        self.work.add_task("W-0001", "ambiguous fact", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.finish_run(run["id"], "done", "Shipped once.")
+        con = db.connect()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone())
+        post = self.client.log_task
+
+        def committed_then_lost(item_id, body):
+            reply = post(item_id, body)
+            return None if " fact: landed" in body else reply
+
+        with mock.patch.object(self.client, "log_task", committed_then_lost):
+            self.assertEqual(sweeper.report_result(con, self.client, result),
+                             (False, None))
+        settled, action = sweeper.report_result(con, self.client, result)
+        con.close()
+        self.assertTrue(settled)
+        self.assertEqual(action["action"], "report")
+        messages = [entry["message"] for entry in self.work.tasks["W-0001"]["log"]]
+        self.assertEqual(sum(" fact: landed" in message for message in messages), 1)
+
+    def test_lost_issue_fact_response_is_reconciled_after_close(self) -> None:
+        self.work.add_issue("issue_once", "ambiguous issue fact", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.finish_run(run["id"], "done", "Resolved once.")
+        con = db.connect()
+        result = dict(con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run["id"],)).fetchone())
+        post = self.client.reply_issue
+
+        def committed_then_lost(item_id, body):
+            reply = post(item_id, body)
+            return None if " fact: resolved" in body else reply
+
+        with mock.patch.object(self.client, "reply_issue", committed_then_lost):
+            self.assertEqual(sweeper.report_result(con, self.client, result),
+                             (False, None))
+        settled, action = sweeper.report_result(con, self.client, result)
+        con.close()
+        self.assertTrue(settled)
+        self.assertEqual(action["to"], "closed")
+        messages = [entry["body"] for entry in self.work.issues["issue_once"]["messages"]]
+        self.assertEqual(sum(" fact: resolved" in message for message in messages), 1)
 
     def test_completed_run_reports_a_landed_fact_and_writes_no_status(self) -> None:
         self.work.add_task("W-0001", "finishes well", delegated=True)
         self.sweep()
         run = self.db_run()
         self.finish_run(run["id"], "done", "Shipped the fix; tests pass.")
-        actions = self.sweep()
-        self.assertIn({"action": "report", "item": "W-0001", "run": run["id"],
-                       "to": "review"}, actions)
+        finalizer = db.connect()
+        finalizer.execute("UPDATE runs SET branch='orchestra/run-race' WHERE id=?",
+                          (run["id"],))
+        finalizer.execute(
+            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+            "VALUES(?, 'orchestra', 'old readiness signal', 'merge', ?)",
+            (run["id"], db.now()))
+        finalizer.commit()
+        before = self.work.mutation_count()
+        self.assertEqual(self.sweep(), [], "a terminal row is not a landing")
+        self.assertEqual(self.work.mutation_count(), before)
+        self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
+        finalizer.execute("UPDATE runs SET landing_status='ok' WHERE id=?",
+                          (run["id"],))
+        finalizer.commit()
+        finalizer.close()
+
+        result = dict(self.db_run(run["id"]))
+        con = db.connect()
+        with mock.patch.object(self.client, "log_task", return_value=None):
+            self.assertEqual(sweeper.report_result(con, self.client, result),
+                             (False, None))
+        self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
+        settled, action = sweeper.report_result(con, self.client, result)
+        con.close()
+        self.assertTrue(settled)
+        self.assertEqual(action, {"action": "report", "item": "W-0001",
+                                  "run": run["id"], "to": "review"})
         task = self.work.tasks["W-0001"]
         self.assertEqual(task["status"], "review")
         # Derived, never written: the human's own status never moved.
@@ -342,13 +605,40 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.sweep()
         run = self.db_run()
         self.finish_run(run["id"], "failed", "Cannot find the config file.")
+        policy = db.connect()
+        policy.execute(
+            "INSERT INTO observations(run_id, layer, action, reason, created_at) "
+            "VALUES(?, 'retry', 'deferred', 'retry policy pending', ?)",
+            (run["id"], db.now()))
+        policy.commit()
+        before = self.work.mutation_count()
+        self.assertEqual(self.sweep(), [])
+        self.assertEqual(self.work.mutation_count(), before,
+                         "a deferred retry must not publish a failure")
+
+        newer, blocked = supervise.create_run(
+            policy, profile=run["profile"], backend=run["backend"],
+            requested_by="retry", workdir=run["workdir"],
+            project_id=run["project_id"], work_item=run["work_item"])
+        self.assertIsNone(blocked)
+        policy.execute(
+            "INSERT INTO observations(run_id, layer, action, reason, created_at) "
+            "VALUES(?, 'retry', 'retry', 'newer attempt owns the item', ?)",
+            (run["id"], db.now()))
+        policy.commit()
+        policy.close()
+        self.finish_run(newer["id"], "failed",
+                        "Retry could not find the config file.")
         self.sweep()
         self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
         # The board shows the fact's reason, so it must ride along --
         # "blocked" with no cause tells the human nothing.
         notes = " ".join(str(entry) for entry in self.work.tasks["W-0001"].get("log", []))
         self.assertIn("fact: failed reason=", notes)
-        self.assertIn("Cannot find the config file.", notes)
+        self.assertIn("Retry could not find the config file.", notes)
+        self.assertNotIn(f"run {run['id']} finished: failed", notes)
+        self.assertIsNone(self.db_run(run["id"])["work_reported_at"])
+        self.assertIsNotNone(self.db_run(newer["id"])["work_reported_at"])
 
     def test_the_brief_tells_a_task_run_to_account_for_every_criterion(self) -> None:
         self.work.add_task("W-0001", "gated job", delegated=True,
@@ -465,9 +755,14 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.work.add_task("W-0002", "failed isolated job", delegated=True)
         actions = self.sweep()
         failed = self.db_run()
-        self.assertEqual([a["action"] for a in actions],
-                         ["launch_failed", "report"])
+        self.assertEqual([a["action"] for a in actions], ["launch_failed"])
         self.assertEqual(failed["status"], "failed")
+        self.assertIsNone(failed["work_reported_at"])
+        con = db.connect()
+        self.assertEqual(con.execute(
+            "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
+            (failed["id"],)).fetchone()["action"], "deferred")
+        con.close()
         self.assertEqual(failed["workdir"], str(self.root))
         self.assertIsNone(failed["branch"])
         self.assertIn("supervisor absent", failed["summary"])
@@ -490,15 +785,19 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         actions = self.sweep()
         run = self.db_run()
         self.assertEqual(actions[0]["action"], "launch_failed")
-        self.assertEqual(actions[1]["action"], "report")
+        self.assertEqual(len(actions), 1)
         self.assertEqual(run["workdir"], str(self.root))
         self.assertEqual(run["status"], "failed")
         self.assertIn("--worktree needs", run["summary"])
-        self.assertEqual(self.work.tasks["W-0001"]["status"], "blocked")
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+        self.assertIsNone(run["work_reported_at"])
         self.assertEqual(self.launched, [])
         self.assertEqual(self.sweep(), [])
         con = db.connect()
         self.assertEqual(con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"], 1)
+        self.assertEqual(con.execute(
+            "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
+            (run["id"],)).fetchone()["action"], "deferred")
         con.close()
 
     def test_progress_heartbeat_posts_then_rate_limits(self) -> None:
@@ -625,12 +924,15 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         run = self.db_run()
         self.work.human_close_issue("issue_x", summary="I did it myself")
         self.finish_run(run["id"], "done", "Root cause fixed.")
-        actions = self.sweep()
+        con = db.connect()
+        refused = sweeper.report_result(con, self.client,
+                                        dict(self.db_run(run["id"])))
+        con.close()
 
         issue = self.work.issues["issue_x"]
         self.assertEqual(issue["state"], "closed")
         self.assertEqual(issue["resolutionSummary"], "I did it myself")
-        self.assertEqual([a for a in actions if a["action"] == "report"], [])
+        self.assertEqual(refused, (True, None))
         self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
         before = self.work.mutation_count()
         self.sweep()
@@ -685,6 +987,37 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         con.close()
         self.assertEqual(children, 1)
 
+    def test_lost_continuation_claim_keeps_its_atomic_reservation(self) -> None:
+        self.work.add_task("W-0001", "needs an answer", delegated=True)
+        self.sweep()
+        first = self.db_run()
+        self.finish_run(first["id"], "failed", "Which provider?",
+                        session_ref="sess-42")
+        self.sweep()
+        self.work.human_log("W-0001", "Use Okta.")
+        self.work.human_move("W-0001", "ready")
+        post = self.client.log_task
+
+        def committed_then_lost(item_id, body):
+            result = post(item_id, body)
+            return None if " fact: claimed" in body else result
+
+        with mock.patch.object(self.client, "log_task", committed_then_lost):
+            self.assertEqual(self.sweep(), [])
+        pending = self.db_run()
+        self.assertEqual(pending["parent_run"], first["id"])
+        self.assertEqual(pending["session_ref"], "sess-42")
+        self.assertEqual((pending["status"], pending["work_claim_status"]),
+                         ("pending", "pending"))
+
+        actions = self.sweep()
+        self.assertEqual(actions, [{"action": "dispatch", "item": "W-0001",
+                                    "run": pending["id"], "resumed": True}])
+        resumed = self.db_run()
+        self.assertEqual(resumed["id"], pending["id"])
+        self.assertEqual(resumed["work_claim_status"], "claimed")
+        self.assertIn("Use Okta.", Path(resumed["brief_path"]).read_text())
+
     def test_failed_issue_continuation_releases_ownership_to_the_human(self) -> None:
         self.work.add_issue("issue_x", "needs an answer", delegated=True)
         self.sweep()
@@ -698,13 +1031,19 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                                side_effect=SystemExit("cannot compose")):
             actions = self.sweep()
         self.assertEqual(actions[0]["action"], "launch_failed")
-        self.assertEqual(self.work.issues["issue_x"]["state"], "needs_human")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(self.work.issues["issue_x"]["state"], "in_progress")
         failed = self.db_run()
         self.assertGreater(failed["id"], before)
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["work_item"], "issue_x")
         self.assertIn("cannot compose", failed["summary"])
-        self.assertIsNotNone(failed["work_reported_at"])
+        self.assertIsNone(failed["work_reported_at"])
+        con = db.connect()
+        self.assertEqual(con.execute(
+            "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
+            (failed["id"],)).fetchone()["action"], "deferred")
+        con.close()
         self.assertEqual(self.sweep(), [])
 
     def test_a_halted_run_blocks_the_item_with_its_reason(self) -> None:

@@ -5,6 +5,7 @@ backend does (session id, step_finish boundaries, text output), so the
 whole dispatch -> supervise -> finalize path runs unmodified.
 """
 import os
+import signal as signal_module
 import tempfile
 import threading
 import time
@@ -124,6 +125,7 @@ class E2ETestCase(unittest.TestCase):
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["exit_code"], 0)
         self.assertEqual(run["session_ref"], "stub-session-1")
+        self.assertIsNotNone(run["pid_identity"])
         # The stub hands off no findings/proposals block, so the completion
         # seam (DESIGN §9) records a protocol failure on top of the summary.
         self.assertTrue(run["summary"].startswith("stub work complete"))
@@ -136,8 +138,24 @@ class E2ETestCase(unittest.TestCase):
         note = con.execute(
             "SELECT body FROM messages WHERE run_id=? AND kind='completion'",
             (run_id,)).fetchone()
+        # Recovery may replay the result seam. The durable decision wins and
+        # the completion notice remains one fact, not one row per replay.
+        con.execute("UPDATE runs SET tokens_in=11, tokens_out=7, tokens_total=18, "
+                    "cost_usd=0.25, usage_source='preserved' WHERE id=?", (run_id,))
+        con.commit()
+        result = supervise.finalize_run(
+            con, {**dict(run), "log_path": None}, "failed", 99)
+        completions = con.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE run_id=? "
+            "AND kind='completion'", (run_id,)).fetchone()["n"]
         con.close()
         self.assertIn("finished: done", note["body"])
+        self.assertEqual((result["status"], result["exit_code"]), ("done", 0))
+        self.assertEqual(completions, 1)
+        self.assertEqual((result["tokens_in"], result["tokens_out"],
+                          result["tokens_total"], result["cost_usd"],
+                          result["usage_source"]),
+                         (11, 7, 18, 0.25, "preserved"))
 
     def test_the_worker_carries_a_run_token_that_dies_with_the_run(self) -> None:
         """W-0176: minted at launch into the worker's environment, revoked
@@ -230,6 +248,27 @@ class E2ETestCase(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(run["status"], "failed")
         self.assertEqual(run["exit_code"], 3)
+
+        # A reaper has no worker log to parse, but it still gets a completion
+        # record and a retry hold in the same terminal transaction.
+        con = db.connect()
+        orphan_id = int(con.execute(
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "summary, started_at, finished_at) VALUES("
+            "'stub','opencode','human',?,'failed','supervisor vanished',?,?)",
+            (str(self.root), db.now(), db.now())).lastrowid)
+        con.commit()
+        orphan = con.execute("SELECT * FROM runs WHERE id=?", (orphan_id,)).fetchone()
+        result = supervise.finalize_run(con, orphan, "failed", None)
+        self.assertEqual(result["summary"], "supervisor vanished")
+        self.assertIsNone(result["log_path"])
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE run_id=? AND kind='completion'",
+            (orphan_id,)).fetchone()["n"], 1)
+        self.assertEqual(con.execute(
+            "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
+            (orphan_id,)).fetchone()["action"], "deferred")
+        con.close()
 
     def test_stalled_worker_is_timed_out(self) -> None:
         self.global_config.write_text(CONFIG + "stall_timeout = 1\n")
@@ -339,9 +378,36 @@ class E2ETestCase(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         con = db.connect()
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        completion = con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (run_id,)).fetchone()[0]
         con.close()
         self.assertEqual(run["status"], "killed")
         self.assertIsNotNone(run["finished_at"])
+        self.assertEqual(completion, 1)
+
+        con = db.connect()
+        reused = int(con.execute(
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "pid, pid_identity, started_at) VALUES"
+            "('stub','opencode','human',?,'running',4242,'old-owner',?)",
+            (str(self.root), db.now())).lastrowid)
+        con.commit()
+        con.close()
+        with mock.patch.object(cli.proc, "signal_owned_group",
+                               return_value=("refused", "identity changed")) as signal:
+            cli.cmd_kill(Namespace(run_id=reused))
+        signal.assert_called_once_with(4242, "old-owner", signal_module.SIGTERM)
+        con = db.connect()
+        reused_row = con.execute(
+            "SELECT status, worker_status FROM runs WHERE id=?", (reused,)).fetchone()
+        completion = con.execute(
+            "SELECT COUNT(*) FROM messages WHERE run_id=? AND kind='completion'",
+            (reused,)).fetchone()[0]
+        con.close()
+        self.assertEqual((reused_row["status"], reused_row["worker_status"]),
+                         ("killed", "killed"))
+        self.assertEqual(completion, 0)
 
     # --- a resume that cannot resume (W-0191) -------------------------------
 

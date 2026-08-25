@@ -27,7 +27,8 @@ optional policy rather than the definition of a run.
 Each run has a durable numeric id. A profile selects its harness, model, effort,
 and launch settings. As work proceeds, the run record accumulates raw output,
 normalized events, messages, usage when available, and a terminal summary.
-These remain separate records; there is no single `RunResult` type.
+At completion, the refreshed run row is the result contract. Orchestra does not
+copy the same state into a second `RunResult` model.
 
 The twelve sections retain the old DESIGN section numbers because source
 comments use them as architectural signposts. Their content now describes
@@ -233,18 +234,23 @@ repository contains zero third-party Python runtime dependencies.
 
 ## Result and policy boundary
 
-Supervisor finalization records the outcome and may checkpoint changes, release
-a worktree, land a branch, report to Work or Nod, file findings, retry an
-infrastructure failure, or release dependencies. Optional policy ownership is
-currently tangled with the execution result.
+On entry, supervisor finalization records the worker's outcome so a crash during
+enrichment cannot change success into an inferred failure. It then ingests the
+last trace, checkpoints isolated changes, and atomically records the terminal
+row, usage, message delivery state, completion notice, and any retry hold. That
+commit precedes worktree release. The refreshed row is the result.
 
-W-0295 tracks separating this boundary: supervision records a durable outcome,
-then landing and external adapters consume it.
+Landing, findings, retry handling, dependency release, and Work reporting then
+consume it. Landing and handoff completion leave structured receipts on the same
+row; the daemon replays any missing consumer after proving the old supervisor
+and worker are gone. Work reporting waits for completion, landing, handoff, and
+retry policy to settle, so an execution outcome cannot be mistaken for a landed
+result or a failure that is already being retried.
 
 ## Non-goals
 
 - Rebuilding the legacy Operator, immutable contracts, councils, rosters,
-  staffing teams, capacity budgets, or replay machinery.
+  staffing teams, capacity budgets, or a general event-replay engine.
 - Making harness-native tools look identical.
 - A dynamic harness plug-in system before another real adapter needs it.
 - Process-level containment or distributed multi-machine scheduling.

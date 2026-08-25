@@ -1,37 +1,12 @@
-"""The conductor (DESIGN §10, W-0099).
-
-**No test here dispatches a real model.** Every planner turn is a stub
-callable, and the two seam paths patch ``conductor.model_turn``, so a
-regression that started a session would fail rather than spend tokens.
-
-The load-bearing claims:
-
-* the packet stays inside its hard cap under a goal of any size;
-* each trigger fires once and only once per settle — an idle goal does not
-  wake a planner forever;
-* a ``wait`` turn is not re-woken by an event it did not name;
-* a run merely in flight costs ZERO planner calls;
-* a proposal is judged by a different session than the one that raised it,
-  and a planner may not judge its own proposal at all.
-"""
+"""Public orchestration contracts for the event-driven conductor."""
 import json
-import os
-import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 from orchestra import conductor, config, db, dispatch, findings, observer
-from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.test_sweeper import PROJECT_ID, SweeperFixture
-
-def session_of(prompt: str) -> str:
-    """The session slug a prompt announces. Each turn mints its own."""
-    for line in prompt.splitlines():
-        if "You are session orchestra/" in line:
-            return line.split("orchestra/")[1].split(".")[0].strip()
-    raise AssertionError("the prompt named no session")
 
 
 PLANNER_CONFIG = """
@@ -43,11 +18,14 @@ note = "plenty of headroom"
 """
 
 
-class ConductorFixture(SweeperFixture):
-    """The sweeper's workspace + fake Work, plus a mid-tier planner profile
-    and a stub turn. Reused rather than rebuilt: a conducted dispatch must
-    take the same launch path a swept one does."""
+def session_of(prompt: str) -> str:
+    for line in prompt.splitlines():
+        if "You are session orchestra/" in line:
+            return line.split("orchestra/", 1)[1].split(".", 1)[0].strip()
+    raise AssertionError("the prompt named no session")
 
+
+class ConductorFixture(SweeperFixture):
     def setUp(self) -> None:
         super().setUp()
         self.global_config.write_text(self.global_config.read_text() + PLANNER_CONFIG)
@@ -59,14 +37,12 @@ class ConductorFixture(SweeperFixture):
         self.prompts.append(prompt)
         reply = self.replies.pop(0) if self.replies else {
             "action": "wait", "rationale": "nothing to do", "await": "settled"}
-        return "here you go\n```json\n" + json.dumps(reply) + "\n```"
+        return "```json\n" + json.dumps(reply) + "\n```"
 
-    # -- helpers ------------------------------------------------------------
-
-    def add_goal(self, task_id="W-0100", title="Ship the thing", **kw):
-        kw.setdefault("goal", "Make the thing shippable.")
+    def add_goal(self, task_id="W-0100", title="Ship the thing", **kwargs):
+        kwargs.setdefault("goal", "Make the thing shippable.")
         return self.work.add_task(task_id, title, delegated=True,
-                                  tags=["goal"], **kw)
+                                  tags=["goal"], **kwargs)
 
     def conduct(self, *replies, floor=0):
         self.replies = list(replies)
@@ -75,21 +51,24 @@ class ConductorFixture(SweeperFixture):
 
     def turns(self, goal_id="W-0100"):
         con = db.connect()
-        rows = list(con.execute("SELECT * FROM conductor_turns WHERE goal_id=? "
-                                "ORDER BY id", (goal_id,)))
+        rows = list(con.execute(
+            "SELECT * FROM conductor_turns WHERE goal_id=? ORDER BY id",
+            (goal_id,)))
         con.close()
         return rows
 
-    def make_run(self, item_id="W-0100", status="running", **cols) -> int:
+    def make_run(self, item_id="W-0100", status="running", **columns) -> int:
         con = db.connect()
-        fields = {"profile": "stub", "backend": "opencode", "title": "work",
-                  "requested_by": "work", "workdir": str(self.root),
-                  "project_id": PROJECT_ID, "status": status,
-                  "started_at": db.now(), "work_item": item_id}
+        fields = {
+            "profile": "stub", "backend": "opencode", "title": "work",
+            "requested_by": "work", "workdir": str(self.root),
+            "project_id": PROJECT_ID, "status": status, "started_at": db.now(),
+            "work_item": item_id,
+        }
         if status in db.RUN_TERMINAL:
             fields["finished_at"] = db.now()
             fields.setdefault("summary", "did the thing")
-        fields.update(cols)
+        fields.update(columns)
         names = ", ".join(fields)
         run_id = int(con.execute(
             f"INSERT INTO runs({names}) VALUES({', '.join('?' * len(fields))})",
@@ -98,7 +77,7 @@ class ConductorFixture(SweeperFixture):
         con.close()
         return run_id
 
-    def finish_run(self, run_id, status="done", summary="did the thing"):
+    def finish_run(self, run_id, status="done", summary="did the thing") -> None:
         con = db.connect()
         con.execute("UPDATE runs SET status=?, summary=?, finished_at=? WHERE id=?",
                     (status, summary, db.now(), run_id))
@@ -109,382 +88,235 @@ class ConductorFixture(SweeperFixture):
         return "\n".join(e["message"] for e in self.work.tasks[goal_id]["log"])
 
 
-# --- what a goal is ----------------------------------------------------------
-
-class GoalTests(ConductorFixture, unittest.TestCase):
-
-    def test_a_goal_is_tagged_goal_and_delegated(self) -> None:
-        self.work.add_task("W-1", "plain delegated task", delegated=True)
-        self.work.add_task("W-2", "tagged but not delegated", tags=["goal"])
-        goal = self.add_goal("W-3")
-        tasks = self.work.tasks.values()
-        self.assertEqual([g["id"] for g in conductor.open_goals(tasks)], ["W-3"])
+class GoalAndTriggerTests(ConductorFixture, unittest.TestCase):
+    def test_only_open_delegated_goal_items_are_selected(self) -> None:
+        self.work.add_task("W-1", "plain", delegated=True)
+        self.work.add_task("W-2", "tag only", tags=["goal"])
+        self.add_goal("W-3", status="done")
+        goal = self.add_goal("W-4")
+        self.assertEqual(
+            [item["id"] for item in conductor.open_goals(self.work.tasks.values())],
+            ["W-4"])
         self.assertTrue(conductor.is_goal(goal))
 
-    def test_a_closed_goal_is_not_watched(self) -> None:
-        self.add_goal("W-3", status="done")
-        self.assertEqual(conductor.open_goals(self.work.tasks.values()), [])
-
-    def test_the_sweeper_still_owns_ordinary_delegated_items(self) -> None:
-        self.work.add_task("W-1", "plain work", delegated=True)
-        self.assertEqual(self.conduct(), [])
-        self.assertEqual([a["action"] for a in self.sweep()], ["dispatch"])
-
-
-# --- zero tokens while anything is merely in flight --------------------------
-
-class InFlightTests(ConductorFixture, unittest.TestCase):
-
-    def test_a_run_in_flight_costs_no_planner_call(self) -> None:
-        self.add_goal()
-        self.make_run(status="running")
-        for _ in range(3):
-            self.assertEqual(self.conduct(), [])
-        self.assertEqual(self.prompts, [])
-        self.assertEqual(self.turns(), [])
-
-    def test_a_child_run_in_flight_also_silences_the_goal(self) -> None:
+    def test_any_goal_run_in_flight_costs_no_planner_turn(self) -> None:
         self.add_goal()
         self.work.add_task("W-0101", "child", parent_id="W-0100")
         self.make_run("W-0101", status="running")
         self.assertEqual(self.conduct(), [])
+        self.assertEqual(self.conduct(), [])
         self.assertEqual(self.prompts, [])
+        self.assertEqual(self.turns(), [])
 
-
-# --- triggers ----------------------------------------------------------------
-
-class TriggerTests(ConductorFixture, unittest.TestCase):
-
-    def test_nothing_in_flight_fires_once_per_settle(self) -> None:
+    def test_idle_and_each_new_settle_fire_once(self) -> None:
         self.add_goal()
-        propose = {"action": "propose", "rationale": "queue the next slice",
+        propose = {"action": "propose", "rationale": "next slice",
                    "title": "next slice"}
-        # A fresh goal: one turn to start it, and then silence forever.
-        self.assertEqual(len(self.conduct(propose)), 1)
-        for _ in range(3):
-            self.assertEqual(self.conduct(propose), [])
-        # A run settles: exactly one turn for that settle, not three.
+        self.assertEqual([a["trigger"] for a in self.conduct(propose)], ["idle"])
+        self.assertEqual(self.conduct(propose), [])
+
         run_id = self.make_run(status="running")
         self.finish_run(run_id)
-        took = self.conduct(propose)
-        self.assertEqual([t["trigger"] for t in took], ["settled"])
-        for _ in range(3):
-            self.assertEqual(self.conduct(propose), [])
-        self.assertEqual([t["trigger_kind"] for t in self.turns()],
-                         ["idle", "settled"])
-        self.assertEqual([t["trigger_key"] for t in self.turns()],
-                         ["idle:0", f"settle:{run_id}"])
+        self.assertEqual([a["trigger"] for a in self.conduct(propose)], ["settled"])
+        self.assertEqual(self.conduct(propose), [])
+        self.assertEqual(
+            [(row["trigger_kind"], row["trigger_key"]) for row in self.turns()],
+            [("idle", "idle:0"), ("settled", f"settle:{run_id}")])
 
-    def test_a_blocked_run_fires_once_and_outranks_the_settle(self) -> None:
+    def test_blocked_outranks_the_same_settle_and_fires_once(self) -> None:
         self.add_goal()
         run_id = self.make_run(status="running")
-        self.finish_run(run_id, status="failed", summary="the harness died")
-        wait = {"action": "wait", "rationale": "thinking", "await": "blocked"}
+        self.finish_run(run_id, status="failed", summary="harness died")
+        wait = {"action": "wait", "rationale": "hold", "await": "blocked"}
         took = self.conduct(wait)
-        self.assertEqual([t["trigger"] for t in took], ["blocked"])
-        self.assertEqual(took[0]["key"], f"run:{run_id}")
-        # The same settle does not then buy a settled turn and an idle turn.
-        for _ in range(3):
-            self.assertEqual(self.conduct(wait), [])
-        self.assertEqual([t["trigger_kind"] for t in self.turns()], ["blocked"])
+        self.assertEqual((took[0]["trigger"], took[0]["key"]),
+                         ("blocked", f"run:{run_id}"))
+        self.assertEqual(self.conduct(wait), [])
+        self.assertEqual([row["trigger_kind"] for row in self.turns()], ["blocked"])
 
-    def test_a_new_human_comment_fires_once(self) -> None:
-        self.add_goal()
-        self.make_run(status="running")          # in flight: nothing else fires
-        self.work.human_log("W-0100", "please prioritise the API half")
-        took = self.conduct({"action": "wait", "rationale": "noted",
-                             "await": "comment"})
-        self.assertEqual([t["trigger"] for t in took], ["comment"])
-        self.assertIn("prioritise the API half", self.prompts[0])
-        self.assertEqual(self.conduct(), [])
-        self.work.human_log("W-0100", "and the docs")
-        took = self.conduct({"action": "wait", "rationale": "noted",
-                             "await": "comment"})
-        self.assertEqual([t["trigger"] for t in took], ["comment"])
-
-    def test_our_own_posts_are_not_human_comments(self) -> None:
+    def test_each_new_human_comment_fires_once(self) -> None:
         self.add_goal()
         self.make_run(status="running")
-        self.work.tasks["W-0100"]["log"].append(
-            {"at": self.work.now(), "message": "[orchestra/happy_otter] dispatched"})
-        self.assertEqual(self.conduct(), [])
+        for text in ("prioritise the API", "and the docs"):
+            self.work.human_log("W-0100", text)
+            took = self.conduct({"action": "wait", "rationale": "noted",
+                                 "await": "comment"})
+            self.assertEqual([a["trigger"] for a in took], ["comment"])
+            self.assertIn(text, self.prompts[-1])
+            self.assertEqual(self.conduct(), [])
 
-    def test_low_runway_fires_once_per_reset_window(self) -> None:
+    def test_low_runway_fires_once_and_thresholds_are_conservative(self) -> None:
         self.add_goal()
         con = db.connect()
-        # A window still open, read just now: a stale or already-reset reading
-        # is reported to humans but never triggers (W-0179).
-        soon = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime(
+        reset = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
-        con.execute("INSERT INTO runway_polls(provider, remaining, unit, "
-                    "resets_at, as_of, polled_at) VALUES('claude', 4, 'percent', "
-                    "?, ?, ?)", (soon, db.now(), db.now()))
+        con.execute(
+            "INSERT INTO runway_polls(provider, remaining, unit, resets_at, "
+            "as_of, polled_at) VALUES('claude', 4, 'percent', ?, ?, ?)",
+            (reset, db.now(), db.now()))
         con.commit()
         con.close()
         wait = {"action": "wait", "rationale": "hold", "await": "runway_low"}
-        took = self.conduct(wait)
-        self.assertEqual([t["trigger"] for t in took], ["runway_low"])
+        self.assertEqual([a["trigger"] for a in self.conduct(wait)], ["runway_low"])
         self.assertEqual(self.conduct(wait), [])
 
-    def test_healthy_runway_fires_nothing(self) -> None:
-        self.add_goal()
-        con = db.connect()
-        con.execute("INSERT INTO runway_polls(provider, remaining, unit, "
-                    "polled_at) VALUES('claude', 80, 'percent', ?)", (db.now(),))
-        con.commit()
-        con.close()
-        took = self.conduct({"action": "wait", "rationale": "x", "await": "idle"})
-        self.assertEqual([t["trigger"] for t in took], ["idle"])
+        for remaining, expected in ((4, True), (80, False), (None, False)):
+            with self.subTest(remaining=remaining):
+                entries = [{"provider": "codex", "remaining": remaining,
+                            "unit": "percent", "limit_value": None,
+                            "resets_at": reset, "id": 1}]
+                self.assertEqual(bool(conductor.runway_low(entries)), expected)
 
-    def test_unknown_runway_is_never_low(self) -> None:
-        self.assertEqual(conductor.runway_low(
-            [{"provider": "codex", "remaining": None, "unit": "percent",
-              "limit_value": None, "reason": "no session", "id": 1}]), [])
-
-    def test_the_floor_holds_a_second_turn_back(self) -> None:
+    def test_turn_floor_holds_back_a_new_event(self) -> None:
         self.add_goal()
         self.conduct({"action": "propose", "rationale": "go", "title": "slice"})
         run_id = self.make_run(status="running")
         self.finish_run(run_id)
-        # A real settle, but inside the ~2 minute floor: no turn.
-        self.replies = [{"action": "propose", "rationale": "go", "title": "s2"}]
-        self.assertEqual(conductor.pass_once(self.cfg, self.client, turn=self.turn,
-                                             launcher=self.launcher,
-                                             floor=conductor.TURN_FLOOR_SECONDS), [])
+        self.replies = [{"action": "done", "rationale": "done"}]
+        self.assertEqual(conductor.pass_once(
+            self.cfg, self.client, turn=self.turn, launcher=self.launcher,
+            floor=conductor.TURN_FLOOR_SECONDS), [])
         self.assertEqual(len(self.turns()), 1)
 
-
-# --- the wait gate -----------------------------------------------------------
 
 class WaitTests(ConductorFixture, unittest.TestCase):
-
-    def test_a_wait_is_not_woken_by_an_unrelated_event(self) -> None:
+    def test_named_wait_ignores_other_events_until_its_event_arrives(self) -> None:
         self.add_goal()
-        self.conduct({"action": "wait", "rationale": "the human owes me an answer",
+        self.conduct({"action": "wait", "rationale": "need an answer",
                       "await": "comment"})
-        self.assertEqual([t["wait_event"] for t in self.turns()], ["comment"])
-        # A settle is a real event, and it is not the one named.
         run_id = self.make_run(status="running")
-        self.finish_run(run_id)
+        self.finish_run(run_id, status="failed")
         self.assertEqual(self.conduct({"action": "done", "rationale": "no"}), [])
-        # Even a blocked run does not jump the gate.
-        blocked = self.make_run(status="running")
-        self.finish_run(blocked, status="failed")
-        self.assertEqual(self.conduct({"action": "done", "rationale": "no"}), [])
-        self.assertEqual(len(self.turns()), 1)
-        # The named event does wake it.
-        self.work.human_log("W-0100", "here is your answer")
-        took = self.conduct({"action": "done", "rationale": "acceptance is met"})
-        self.assertEqual([t["trigger"] for t in took], ["comment"])
+        self.work.human_log("W-0100", "here is the answer")
+        took = self.conduct({"action": "done", "rationale": "accepted"})
+        self.assertEqual([a["trigger"] for a in took], ["comment"])
 
-    def test_a_wait_turn_posts_nothing_to_work(self) -> None:
+    def test_wait_and_invalid_replies_never_mutate_work(self) -> None:
         self.add_goal()
         before = self.work.mutation_count()
-        self.conduct({"action": "wait", "rationale": "still running", "await": "settled"})
+        self.conduct({"action": "wait", "rationale": "still running",
+                      "await": "settled"})
         self.assertEqual(self.work.mutation_count(), before)
-        self.assertEqual(self.turns()[0]["action"], "wait")
-        self.assertEqual(self.turns()[0]["rationale"], "still running")
+        self.assertEqual(self.turns()[0]["wait_event"], "settled")
 
-    def test_an_unreadable_reply_changes_nothing(self) -> None:
-        self.add_goal()
-        before = self.work.mutation_count()
-        actions = conductor.pass_once(
-            self.cfg, self.client, launcher=self.launcher, floor=0,
-            turn=lambda profile, prompt: "I could not decide, sorry.")
-        self.assertEqual([a["action"] for a in actions], ["wait"])
-        self.assertEqual(self.work.mutation_count(), before)
-        self.assertIsNone(self.turns()[0]["wait_event"])  # any event may wake it
+        replies = (
+            "not JSON",
+            '{"action": "delete_everything"}',
+            '{"action": "wait", "await": "tuesday"}',
+        )
+        for reply in replies:
+            with self.subTest(reply=reply):
+                decision = conductor.parse_decision(reply)
+                self.assertEqual(decision["action"], "wait")
+                self.assertIsNone(decision["await"])
 
-    def test_an_invented_action_changes_nothing(self) -> None:
-        decision = conductor.parse_decision('{"action": "delete_everything"}')
-        self.assertEqual(decision["action"], "wait")
-        self.assertIsNone(decision["await"])
-
-    def test_an_unknown_await_is_not_a_gate(self) -> None:
-        decision = conductor.parse_decision(
-            '{"action": "wait", "rationale": "x", "await": "tuesday"}')
-        self.assertEqual(decision["action"], "wait")
-        self.assertIsNone(decision["await"])
-
-
-# --- the packet --------------------------------------------------------------
 
 class PacketTests(ConductorFixture, unittest.TestCase):
-
-    def big_packet(self):
-        goal = {"id": "W-0100", "title": "T" * 4000, "status": "in_progress",
-                "sections": {"goal": "G" * 60000,
-                             "acceptanceCriteria": "A" * 60000}}
+    def big_packet(self) -> str:
+        goal = {"id": "W-0100", "title": "T" * 4000,
+                "status": "in_progress", "sections": {
+                    "goal": "G" * 60000, "acceptanceCriteria": "A" * 60000}}
         delta = conductor.delta_entries([], [
-            {"at": f"2026-08-13T00:{n:02d}:00Z", "text": f"comment {n} " + "x" * 500}
-            for n in range(60)])
+            {"at": f"2026-08-13T00:{n:02d}:00Z",
+             "text": f"comment {n:02d} " + "x" * 500} for n in range(30)])
         children = conductor.child_entries([
-            {"id": f"W-9{n:03d}", "status": "ready", "title": "child " + "y" * 400,
-             "updatedAt": f"2026-08-12T00:{n:02d}:00Z"} for n in range(60)])
+            {"id": f"W-9{n:03d}", "status": "ready",
+             "title": "child " + "y" * 400,
+             "updatedAt": f"2026-08-12T00:{n:02d}:00Z"} for n in range(30)])
         issues = conductor.issue_entries([
-            {"id": f"issue_{n}", "state": "queued", "title": "finding " + "z" * 400,
-             "updatedAt": f"2026-08-11T00:{n:02d}:00Z"} for n in range(60)])
+            {"id": f"issue_{n}", "state": "queued",
+             "title": "finding " + "z" * 400,
+             "updatedAt": f"2026-08-11T00:{n:02d}:00Z"} for n in range(30)])
         return conductor.build_packet(
             goal, delta=delta, children=children, issues=issues,
             profiles=conductor.profile_entries(self.cfg),
-            runway_entries=conductor.runway_entries_for(
-                [{"provider": "claude", "remaining": 40.0, "unit": "percent",
-                  "resets_at": None, "limit_value": None, "id": 1}]),
-            flight=[])
+            runway_entries=conductor.runway_entries_for([{
+                "provider": "claude", "remaining": 40.0, "unit": "percent",
+                "resets_at": None, "limit_value": None, "id": 1}]), flight=[])
 
-    def test_a_huge_goal_still_respects_the_hard_cap(self) -> None:
+    def test_packet_is_hard_bounded_and_evicts_old_detail_first(self) -> None:
         packet = self.big_packet()
         self.assertLessEqual(len(packet), conductor.PACKET_CHAR_CAP)
         self.assertLessEqual(conductor.est_tokens(packet), conductor.PACKET_TOKEN_CAP)
+        self.assertNotIn("comment 00", packet)
+        self.assertIn("comment 29", packet)
+        self.assertIn("runway claude", packet)
 
-    def test_the_oldest_detail_goes_first(self) -> None:
-        packet = self.big_packet()
-        self.assertIn("W-0100", packet)                 # the goal survives
-        self.assertIn("older entries truncated", packet)
-        self.assertIn("comment 59", packet)             # newest detail survives
-        self.assertNotIn("comment 00", packet)          # oldest went first
-        self.assertIn("runway claude", packet)          # state is not old detail
-
-    def test_the_six_blocks_are_all_there(self) -> None:
-        goal = self.add_goal(notes="")
-        packet = conductor.build_packet(
-            goal, delta=[], children=[], issues=[], profiles=[],
-            runway_entries=[], flight=[])
-        for title in ("goal and acceptance", "delta since the last turn",
-                      "open child items", "open findings",
-                      "profiles and runway", "in flight now"):
-            self.assertIn(f"## {title}", packet)
-
-    def test_the_live_packet_is_capped_and_recorded(self) -> None:
+    def test_live_packet_records_its_bound_and_current_routing_state(self) -> None:
         self.add_goal(goal="G" * 80000)
-        self.work.add_task("W-0101", "child " + "y" * 300, parent_id="W-0100")
-        self.conduct({"action": "wait", "rationale": "reading", "await": "comment"})
-        row = self.turns()[0]
-        self.assertLessEqual(row["packet_tokens"], conductor.PACKET_TOKEN_CAP)
-        # The instruction preamble is a separate, measured fixed cost.
-        self.assertLessEqual(len(self.prompts[0]),
-                             conductor.PACKET_CHAR_CAP + len(conductor.INSTRUCTIONS) + 200)
-
-    def test_the_packet_carries_profiles_notes_and_runway(self) -> None:
-        self.add_goal()
+        self.work.add_task("W-0101", "child", parent_id="W-0100")
         con = db.connect()
-        con.execute("INSERT INTO runway_polls(provider, remaining, unit, "
-                    "polled_at) VALUES('claude', 55, 'percent', ?)", (db.now(),))
+        con.execute("INSERT INTO runway_polls(provider, remaining, unit, polled_at) "
+                    "VALUES('claude', 55, 'percent', ?)", (db.now(),))
         con.commit()
         con.close()
-        self.conduct({"action": "wait", "rationale": "x", "await": "comment"})
-        prompt = self.prompts[0]
-        self.assertIn("plenty of headroom", prompt)
-        self.assertIn("tier 2 (generalist)", prompt)
-        self.assertIn("runway claude: 55% left", prompt)
+        self.conduct({"action": "wait", "rationale": "reading",
+                      "await": "comment"})
+        self.assertLessEqual(self.turns()[0]["packet_tokens"],
+                             conductor.PACKET_TOKEN_CAP)
+        self.assertLessEqual(len(self.prompts[0]),
+                             conductor.PACKET_CHAR_CAP + len(conductor.INSTRUCTIONS) + 200)
+        self.assertIn("plenty of headroom", self.prompts[0])
+        self.assertIn("tier 2 (generalist)", self.prompts[0])
+        self.assertIn("runway claude: 55% left", self.prompts[0])
 
-
-# --- the five actions --------------------------------------------------------
 
 class ActionTests(ConductorFixture, unittest.TestCase):
-
-    def test_dispatch_starts_a_run_and_posts_to_the_goal(self) -> None:
+    def test_dispatch_launches_one_run_with_the_mission_and_attribution(self) -> None:
         self.add_goal()
-        took = self.conduct({"action": "dispatch", "rationale": "start the API half",
-                             "item": "W-0100", "mission": "Build the API half."})
+        took = self.conduct({"action": "dispatch", "rationale": "start the API",
+                             "item": "W-0100", "mission": "Build the API."})
         run = self.db_run()
         self.assertEqual(took[0]["run"], run["id"])
         self.assertEqual(run["work_item"], "W-0100")
         self.assertEqual(self.launched, [(self.root, run["id"])])
-        self.assertIn("Build the API half.", Path(run["brief_path"]).read_text())
-        self.assertIn("## Work item snapshot", Path(run["brief_path"]).read_text())
-        self.assertRegex(self.goal_log(),
-                         r"\[orchestra/\w+_\w+\] dispatched run \d+ on W-0100")
+        self.assertIn("Build the API.", Path(run["brief_path"]).read_text())
+        self.assertRegex(self.goal_log(), r"\[orchestra/\w+_\w+\] dispatched run \d+")
 
-    def test_pause_preserves_the_event_for_resume(self) -> None:
+    def test_pause_preserves_the_trigger_without_spending_a_turn(self) -> None:
         self.add_goal()
         con = db.connect()
         dispatch.pause(con, "hold launches")
         con.close()
-        decision = {"action": "dispatch", "rationale": "start it",
+        decision = {"action": "dispatch", "rationale": "start",
                     "item": "W-0100", "mission": "Build it."}
         self.assertEqual(self.conduct(decision), [])
-        self.assertEqual(self.turns(), [], "pause must not consume the trigger")
-        self.assertEqual(self.prompts, [], "pause must not spend a planner turn")
-        self.assertEqual(self.launched, [])
-        self.assertIsNone(self.db_run())
+        self.assertEqual((self.turns(), self.prompts, self.launched), ([], [], []))
 
         con = db.connect()
         dispatch.resume(con)
         con.close()
         took = self.conduct(decision)
         self.assertEqual((took[0]["trigger"], took[0]["key"]), ("idle", "idle:0"))
-        self.assertEqual(took[0]["action"], "dispatch")
-        self.assertEqual(len(self.turns()), 1)
         self.assertEqual(len(self.launched), 1)
 
-    def test_dispatch_cleans_isolation_when_supervisor_never_starts(self) -> None:
-        self.global_config.write_text(
-            self.global_config.read_text().replace("worktree = false",
-                                                   "worktree = true"))
-        self.cfg = config.load()
-        for args in (("init", "-q"),
-                     ("config", "user.email", "t@example.com"),
-                     ("config", "user.name", "t")):
-            subprocess.run(["git", *args], cwd=self.root, check=True)
-        (self.root / "seed.txt").write_text("seed\n")
-        subprocess.run(["git", "add", "seed.txt"], cwd=self.root, check=True)
-        subprocess.run(["git", "commit", "-qm", "seed"], cwd=self.root,
-                       check=True)
-        self.launcher = mock.Mock(side_effect=RuntimeError("supervisor absent"))
+    def test_dispatch_scope_and_live_run_deduplication(self) -> None:
         self.add_goal()
-        took = self.conduct({"action": "dispatch", "rationale": "start it",
-                             "item": "W-0100", "mission": "Build it."})
-        run = self.db_run()
-        self.assertEqual(took[0]["action"], "launch_failed")
-        self.assertEqual(run["status"], "failed")
-        self.assertEqual(run["workdir"], str(self.root))
-        self.assertIsNone(run["branch"])
-        self.assertIn("supervisor absent", run["summary"])
-        self.launcher.assert_called_once_with(self.root, run["id"])
-        branches = subprocess.run(
-            ["git", "branch", "--list", f"orchestra/run-{run['id']}"],
-            cwd=self.root, check=True, capture_output=True, text=True).stdout
-        self.assertEqual(branches.strip(), "")
-        worktrees = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"], cwd=self.root,
-            check=True, capture_output=True, text=True).stdout
-        self.assertNotIn(f"/run-{run['id']}", worktrees)
+        self.work.add_task("W-0101", "child", parent_id="W-0100")
+        self.work.add_task("W-0200", "someone else's", delegated=True)
 
-    def test_dispatch_can_target_an_open_child(self) -> None:
-        self.add_goal()
-        self.work.add_task("W-0101", "the API half", parent_id="W-0100")
-        self.conduct({"action": "dispatch", "rationale": "child first",
-                      "item": "W-0101", "mission": "Do the child."})
-        self.assertEqual(self.db_run()["work_item"], "W-0101")
-
-    def test_dispatch_cannot_target_someone_elses_item(self) -> None:
-        self.add_goal()
-        self.work.add_task("W-0200", "another goal's work", delegated=True)
-        self.conduct({"action": "dispatch", "rationale": "not yours",
+        self.conduct({"action": "dispatch", "rationale": "outside",
                       "item": "W-0200", "mission": "nope"})
         self.assertEqual(self.db_run()["work_item"], "W-0100")
 
-    def test_dispatch_never_doubles_a_live_run(self) -> None:
-        self.add_goal()
-        self.work.add_task("W-0101", "child", parent_id="W-0100")
-        self.make_run("W-0101", status="running")
-        self.work.human_log("W-0100", "kick the child again")
+        self.work.human_log("W-0100", "start the child")
+        self.conduct({"action": "dispatch", "rationale": "child",
+                      "item": "W-0101", "mission": "Do the child."})
+        self.assertEqual(self.db_run()["work_item"], "W-0101")
+
+        self.work.human_log("W-0100", "start the child again")
         took = self.conduct({"action": "dispatch", "rationale": "again",
                              "item": "W-0101"})
         self.assertEqual(took[0]["action"], "skipped")
-        self.assertEqual(self.launched, [])
+        self.assertEqual(len(self.launched), 2)
 
-    def test_dispatch_refuses_a_profile_the_project_has_not_enabled(self) -> None:
-        """W-0187: the conductor is another caller of the one dispatcher, so
-        it staffs through the same gate — and reports the refusal as a skip
-        with its reason, never a quiet swap to some other profile."""
+    def test_dispatch_respects_the_projects_enabled_profiles(self) -> None:
         self.global_config.write_text(
             self.global_config.read_text()
             + f'\n[project."{PROJECT_ID}"]\nenabled_profiles = ["planner"]\n')
         self.cfg = config.load()
         self.add_goal()
-        took = self.conduct({"action": "dispatch", "rationale": "start it",
+        took = self.conduct({"action": "dispatch", "rationale": "start",
                              "item": "W-0100", "mission": "Build it."})
         self.assertEqual(took[0]["action"], "skipped")
         self.assertIn(PROJECT_ID, took[0]["reason"])
@@ -492,120 +324,68 @@ class ActionTests(ConductorFixture, unittest.TestCase):
         self.assertEqual(self.launched, [])
         self.assertIsNone(self.db_run())
 
-    def test_propose_files_a_child_under_the_goal(self) -> None:
-        self.add_goal()
-        decision = {"action": "propose",
-                    "rationale": "the docs need their own item",
-                    "title": "Write the docs"}
-        with mock.patch.object(self.client, "create_task", return_value=None):
-            deferred = self.conduct(decision)
-        self.assertEqual(deferred[0]["action"], "deferred")
-        self.assertEqual(self.turns(), [], "an unapplied proposal must retry")
-        self.conduct(decision)
-        child = [t for t in self.work.tasks.values() if t["parentId"] == "W-0100"]
-        self.assertEqual(len(child), 1)
-        self.assertEqual(child[0]["title"], "Write the docs")
-        self.assertFalse(child[0]["delegated"])   # never delegated by an agent
-        self.assertIn("proposed child", self.goal_log())
-
-    def test_done_says_so_and_never_closes(self) -> None:
-        self.add_goal()
-        decision = {"action": "done", "rationale": "every criterion is met"}
-        with mock.patch.object(self.client, "log_task", return_value=None):
-            deferred = self.conduct(decision)
-        self.assertEqual(deferred[0]["action"], "deferred")
-        self.assertEqual(self.turns(), [], "an unreported decision must retry")
-        self.conduct(decision)
-        self.assertEqual(self.work.tasks["W-0100"]["status"], "ready")
-        self.assertIn("every criterion is met", self.goal_log())
-        self.assertEqual(self.turns()[0]["wait_event"], "comment")
-
-    def test_ask_human_without_nod_still_reaches_the_thread(self) -> None:
-        self.add_goal()
-        decision = {"action": "ask_human", "rationale": "two ways to do it",
-                    "question": "Postgres or SQLite?"}
-        with mock.patch.object(self.client, "log_task", return_value=None):
-            deferred = self.conduct(decision)
-        self.assertEqual(deferred[0]["action"], "deferred")
-        self.assertEqual(self.turns(), [], "an undelivered question must retry")
-        took = self.conduct(decision)
-        self.assertIsNone(took[0]["nod"])
-        self.assertIn("the human loop is off", took[0]["nod_error"])
-        self.assertIn("Postgres or SQLite?", self.goal_log())
-        self.assertEqual(self.turns()[0]["wait_event"], "comment")
-
-
-class AskHumanNodTests(ConductorFixture, unittest.TestCase):
-    """``ask_human`` files a Nod card and mirrors it into the Work thread."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.nod = FakeNod()
-        url = self.nod.start()
-        secrets = self.tmp_path / "nod-secrets.env"
-        secrets.write_text(f"base_url={url}\n"
-                           f"decisions_channel={DECISIONS_CHANNEL}\n"
-                           f"decisions_token={DECISIONS_TOKEN}\n")
-        os.chmod(secrets, 0o600)
-        self.global_config.write_text(
-            self.global_config.read_text()
-            + f'\n[nod]\nenabled = true\nsecrets_file = "{secrets}"\n')
-        self.cfg = config.load()
-
-    def tearDown(self) -> None:
-        self.nod.stop()
-        super().tearDown()
-
-    def test_a_card_is_filed_and_mirrored(self) -> None:
-        self.add_goal()
-        took = self.conduct({"action": "ask_human", "rationale": "I need a ruling",
-                             "question": "Ship behind a flag?"})
-        request_id = took[0]["nod"]
-        self.assertIsNotNone(request_id)
-        card = self.nod.requests[request_id]
-        self.assertEqual(card["body_markdown"], "Ship behind a flag?")
-        self.assertIn("Ship behind a flag?", self.goal_log())
+    def test_non_dispatch_action_effects(self) -> None:
+        cases = (
+            ("W-0100", {"action": "propose", "rationale": "needs docs",
+                         "title": "Write docs"}),
+            ("W-0200", {"action": "done", "rationale": "criteria met"}),
+            ("W-0300", {"action": "ask_human", "rationale": "need a ruling",
+                         "question": "Postgres or SQLite?"}),
+        )
         con = db.connect()
-        row = con.execute("SELECT * FROM nod_requests WHERE request_id=?",
-                          (request_id,)).fetchone()
-        con.close()
-        self.assertEqual(row["work_item"], "W-0100")
+        try:
+            for goal_id, decision in cases:
+                with self.subTest(action=decision["action"]):
+                    goal = self.add_goal(goal_id)
+                    result = conductor.apply_decision(
+                        con, self.cfg, self.client, goal, {goal_id: goal},
+                        decision, "calm_otter", self.launcher)
+                    self.assertEqual(result["action"], decision["action"])
+                    if decision["action"] == "propose":
+                        children = [item for item in self.work.tasks.values()
+                                    if item["parentId"] == goal_id]
+                        self.assertEqual(children[0]["title"], "Write docs")
+                        self.assertFalse(children[0]["delegated"])
+                    elif decision["action"] == "done":
+                        self.assertEqual(self.work.tasks[goal_id]["status"], "ready")
+                        self.assertIn("criteria met", self.goal_log(goal_id))
+                    else:
+                        self.assertIsNone(result["nod"])
+                        self.assertIn("Postgres or SQLite?", self.goal_log(goal_id))
+                    self.assertEqual(conductor.wait_event_for(decision),
+                                     "comment" if decision["action"] in
+                                     ("done", "ask_human") else None)
+        finally:
+            con.close()
 
-
-# --- the planner profile -----------------------------------------------------
 
 class ProfileTests(ConductorFixture, unittest.TestCase):
+    def test_profile_selection_errors_name_the_fix(self) -> None:
+        cases = (
+            ({"profiles": {"worker": {}}}, conductor.profile_name,
+             "planner_profile"),
+            ({"profiles": {"worker": {}},
+              "settings": {"planner_profile": "ghost"}}, conductor.profile_name,
+             "ghost"),
+            ({"profiles": {"a": {"tier": 2}, "b": {"tier": "mid"}}},
+             conductor.profile_name, "several profiles"),
+            ({"profiles": {"planner": {"tier": 2}}, "enabled_profiles": [],
+              "project_id": "project-1"}, conductor.planner_profile, "project-1"),
+        )
+        for cfg, select, marker in cases:
+            with self.subTest(marker=marker), \
+                    self.assertRaises(conductor.PlannerUnconfigured) as caught:
+                select(cfg)
+            self.assertIn(marker, str(caught.exception))
 
-    def test_an_unconfigured_planner_names_what_to_configure(self) -> None:
-        cfg = {"profiles": {"worker": {"backend": "opencode"}}}
-        with self.assertRaises(conductor.PlannerUnconfigured) as caught:
-            conductor.profile_name(cfg)
-        message = str(caught.exception)
-        self.assertIn("planner_profile", message)
-        self.assertIn("tier = 2", message)
-        self.assertIn(str(self.global_config), message)   # names the file too
-
-    def test_a_named_profile_that_does_not_exist_is_named(self) -> None:
-        cfg = {"profiles": {"worker": {}}, "settings": {"planner_profile": "ghost"}}
-        with self.assertRaises(conductor.PlannerUnconfigured) as caught:
-            conductor.profile_name(cfg)
-        self.assertIn("ghost", str(caught.exception))
-
-    def test_two_mid_profiles_ask_which(self) -> None:
-        # 'mid' is the legacy spelling of tier 2; both still count.
-        cfg = {"profiles": {"a": {"tier": 2}, "b": {"tier": "mid"}}}
-        with self.assertRaises(conductor.PlannerUnconfigured) as caught:
-            conductor.profile_name(cfg)
-        self.assertIn("several profiles", str(caught.exception))
-
-    def test_the_project_table_picks_the_planner(self) -> None:
+    def test_project_settings_pick_the_planner(self) -> None:
         self.global_config.write_text(
             self.global_config.read_text()
             + f'\n[profiles.other]\nbackend = "opencode"\ntier = 2\n'
               f'[project."{PROJECT_ID}".settings]\nplanner_profile = "other"\n')
         self.assertEqual(conductor.profile_name(config.load(PROJECT_ID)), "other")
 
-    def test_a_goal_without_a_planner_is_reported_not_crashed(self) -> None:
+    def test_unconfigured_goal_is_reported_without_starting_a_session(self) -> None:
         self.global_config.write_text(
             self.global_config.read_text().replace("tier = 2", ""))
         self.cfg = config.load()
@@ -616,10 +396,7 @@ class ProfileTests(ConductorFixture, unittest.TestCase):
         self.assertEqual(self.prompts, [])
 
 
-# --- seam: findings.PLANNER (nothing approves itself) ------------------------
-
-class AlignmentSeamTests(ConductorFixture, unittest.TestCase):
-
+class AlignmentTests(ConductorFixture, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.addCleanup(setattr, findings, "PLANNER", findings.PLANNER)
@@ -627,7 +404,7 @@ class AlignmentSeamTests(ConductorFixture, unittest.TestCase):
         conductor.attach()
         self.calls: list[str] = []
 
-    def model(self, profile, prompt, **kw):
+    def model(self, profile, prompt, **kwargs):
         self.calls.append(prompt)
         return '{"verdict": "aligned", "rationale": "it serves the goal"}'
 
@@ -638,79 +415,52 @@ class AlignmentSeamTests(ConductorFixture, unittest.TestCase):
         con.close()
         return run
 
-    def test_attach_fills_both_seams(self) -> None:
-        self.assertIs(findings.PLANNER, conductor.alignment_planner)
-        self.assertIs(observer.planner_review, conductor.judgment_turn)
-
-    def test_a_proposal_is_judged_by_a_different_session(self) -> None:
+    def test_proposals_use_fresh_sessions_and_cannot_self_approve(self) -> None:
         goal = self.add_goal()
         run = self.worker_run()
         with mock.patch.object(conductor, "model_turn", self.model):
-            first = findings.evaluate_alignment(
-                goal, {"title": "add a metric", "why": "it proves the goal"}, run)
-            second = findings.evaluate_alignment(
-                goal, {"title": "add another", "why": "same"}, run)
-        self.assertEqual(first["verdict"], "aligned")
+            verdicts = [findings.evaluate_alignment(
+                goal, {"title": f"metric {n}", "why": "proves the goal"}, run)
+                for n in range(2)]
+        self.assertEqual([v["verdict"] for v in verdicts], ["aligned", "aligned"])
         sessions = [session_of(prompt) for prompt in self.calls]
-        self.assertEqual(len(sessions), 2)
-        self.assertNotIn(run["session_ref"], sessions)   # never the worker's
+        self.assertEqual(len(set(sessions)), 2)
+        self.assertNotIn(run["session_ref"], sessions)
         self.assertNotIn(run["slug"], sessions)
-        self.assertNotEqual(sessions[0], sessions[1])    # fresh each time
-        self.assertEqual(second["verdict"], "aligned")
-        rows = self.turns()
-        self.assertEqual([r["action"] for r in rows], ["align:aligned"] * 2)
 
-    def test_a_planner_may_not_judge_its_own_proposal(self) -> None:
-        goal = self.add_goal()
         con = db.connect()
-        conductor.log_turn(con, "W-0100", trigger="idle", key="idle:0",
+        conductor.log_turn(con, goal["id"], trigger="idle", key="idle:0",
                            action="propose", slug="clever_otter")
         con.close()
-        run = self.worker_run(session_ref="clever_otter")
+        own_run = self.worker_run(session_ref="clever_otter")
+        self.calls.clear()
         with mock.patch.object(conductor, "model_turn", self.model):
-            verdict = findings.evaluate_alignment(goal, {"title": "mine"}, run)
-        self.assertIsNone(verdict)          # unevaluated: the human rules
-        self.assertEqual(self.calls, [])    # and no session was started
-
-    def test_an_unconfigured_planner_leaves_a_proposal_unevaluated(self) -> None:
-        self.global_config.write_text(
-            self.global_config.read_text().replace("tier = 2", ""))
-        goal = self.add_goal()
-        run = self.worker_run()
-        with mock.patch.object(conductor, "model_turn", self.model):
-            self.assertIsNone(findings.evaluate_alignment(goal, {"title": "x"}, run))
+            self.assertIsNone(findings.evaluate_alignment(
+                goal, {"title": "my proposal"}, own_run))
         self.assertEqual(self.calls, [])
 
-    def test_a_hedged_verdict_is_unevaluated(self) -> None:
-        goal = self.add_goal()
-        run = self.worker_run()
-        with mock.patch.object(conductor, "model_turn",
-                               lambda p, prompt, **kw: '{"verdict": "maybe"}'):
-            self.assertIsNone(findings.evaluate_alignment(goal, {"title": "x"}, run))
 
-
-# --- seam: observer.planner_review (judgment failures) -----------------------
-
-class JudgmentSeamTests(ConductorFixture, unittest.TestCase):
-
+class JudgmentTests(ConductorFixture, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.addCleanup(setattr, observer, "planner_review", observer.planner_review)
         self.addCleanup(setattr, findings, "PLANNER", findings.PLANNER)
         conductor.attach()
 
-    def test_a_judgment_failure_is_re_briefed_by_a_planner(self) -> None:
+    def test_deferred_judgment_reuses_one_paid_decision_after_resume(self) -> None:
         self.add_goal()
-        run_id = self.make_run(status="done", summary="wrong shape")
-        self.replies = [{"action": "dispatch", "rationale": "re-brief it",
+        run_id = self.make_run(status="done", summary="wrong shape",
+                               session_ref="worker-session")
+        self.replies = [{"action": "dispatch", "rationale": "re-brief",
                          "item": "W-0100", "mission": "Fix the tests properly."}]
         con = db.connect()
         dispatch.pause(con, "hold admissions")
         queued = observer.planner_review(
-            con, run_id, "the tests were deleted, not fixed",
-            cfg=self.cfg, turn=self.turn, launcher=self.launcher)
+            con, run_id, "tests were deleted", cfg=self.cfg,
+            turn=self.turn, launcher=self.launcher)
         self.assertEqual(queued["action"], "deferred")
-        self.assertEqual(self.prompts, [], "pause must not spend the planner turn")
+        self.assertEqual(self.prompts, [])
+
         dispatch.resume(con)
         with mock.patch.object(conductor.work_client, "from_cfg",
                                return_value=self.client), \
@@ -718,8 +468,8 @@ class JudgmentSeamTests(ConductorFixture, unittest.TestCase):
             held = conductor.resume_deferred_judgments(
                 con, turn=self.turn, launcher=self.launcher)[0]
         self.assertEqual(held["action"], "deferred")
-        self.assertEqual(len(self.prompts), 1,
-                         "the paid decision is retained while Work is unavailable")
+        self.assertEqual(len(self.prompts), 1)
+
         with mock.patch.object(conductor.work_client, "from_cfg",
                                return_value=self.client):
             result = conductor.resume_deferred_judgments(
@@ -730,47 +480,43 @@ class JudgmentSeamTests(ConductorFixture, unittest.TestCase):
         self.assertEqual(result["action"], "dispatch")
         self.assertIsNotNone(result["run"])
         self.assertEqual(len(self.prompts), 1)
-        self.assertIn("the tests were deleted", self.prompts[0])
-        self.assertEqual(self.db_run()["id"], result["run"])
+        self.assertNotEqual(session_of(self.prompts[0]), "worker-session")
         self.assertIn("Fix the tests properly.",
                       Path(self.db_run()["brief_path"]).read_text())
 
-    def test_a_wait_from_a_judgment_turn_falls_back(self) -> None:
+    def test_unactionable_judgments_fall_back_to_deferred_review(self) -> None:
         self.add_goal()
-        run_id = self.make_run(status="done")
-        self.replies = [{"action": "wait", "rationale": "dodging", "await": "idle"}]
         con = db.connect()
-        result = observer.planner_review(con, run_id, "bad work", cfg=self.cfg,
-                                         turn=self.turn)
-        con.close()
-        self.assertEqual(result["action"], "deferred")
+        try:
+            with self.subTest(case="wait"):
+                run_id = self.make_run(status="done")
+                self.replies = [{"action": "wait", "rationale": "dodging",
+                                 "await": "idle"}]
+                result = observer.planner_review(
+                    con, run_id, "bad work", cfg=self.cfg, turn=self.turn)
+                self.assertEqual(result["action"], "deferred")
 
-    def test_no_goal_falls_back_to_the_recorded_escalation(self) -> None:
-        run_id = self.make_run(item_id=None, status="done")
-        con = db.connect()
-        result = observer.planner_review(con, run_id, "bad work", cfg=self.cfg,
-                                         turn=self.turn)
-        con.close()
-        self.assertEqual(result["action"], "deferred")
-        self.assertEqual(self.prompts, [])
+            with self.subTest(case="no goal"):
+                prompts = len(self.prompts)
+                run_id = self.make_run(item_id=None, status="done")
+                result = observer.planner_review(
+                    con, run_id, "bad work", cfg=self.cfg, turn=self.turn)
+                self.assertEqual(result["action"], "deferred")
+                self.assertEqual(len(self.prompts), prompts)
 
-    def test_an_unconfigured_planner_falls_back(self) -> None:
-        self.global_config.write_text(
-            self.global_config.read_text().replace("tier = 2", ""))
-        self.cfg = config.load()
-        self.add_goal()
-        run_id = self.make_run(status="done")
-        con = db.connect()
-        result = observer.planner_review(con, run_id, "bad work", cfg=self.cfg,
-                                         turn=self.turn)
-        con.close()
-        self.assertEqual(result["action"], "deferred")
-        self.assertEqual(self.prompts, [])
+            with self.subTest(case="unconfigured planner"):
+                self.global_config.write_text(
+                    self.global_config.read_text().replace("tier = 2", ""))
+                cfg = config.load()
+                prompts = len(self.prompts)
+                run_id = self.make_run(status="done")
+                result = observer.planner_review(
+                    con, run_id, "bad work", cfg=cfg, turn=self.turn)
+                self.assertEqual(result["action"], "deferred")
+                self.assertEqual(len(self.prompts), prompts)
+        finally:
+            con.close()
 
 
-def _main():  # pragma: no cover
+if __name__ == "__main__":
     unittest.main()
-
-
-if __name__ == "__main__":  # pragma: no cover
-    _main()

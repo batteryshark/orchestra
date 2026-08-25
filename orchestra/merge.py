@@ -60,7 +60,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from orchestra import db, messaging, nod, paths, project, work_client
+from orchestra import db, nod, paths, project, work_client
 from orchestra.work_client import WorkError
 
 SWAP_ATTEMPTS = 3
@@ -584,10 +584,114 @@ def run_mission(run: dict) -> str:
     return str(run.get("title") or "").strip()
 
 
-def at_completion(con, cfg: dict, run, status: str) -> str | None:
-    """SEAM: land a verified run's branch and report where it went.
+def _recovered_landing(root: Path, cfg: dict, run: dict) -> dict | None:
+    """Rebuild a successful result when landing won but its receipt did not.
 
-    ``supervise.py`` calls this once at finalization, AFTER
+    ``merge_run`` updates the base before it anchors and deletes the run branch.
+    A missing branch is therefore ambiguous until either the uniquely named
+    merge commit is on the base, or the run's checkpoint is already contained
+    by it. In every other case the normal landing path must fail loudly.
+    """
+    try:
+        if _git(["rev-parse", "--git-dir"], root, check=False).returncode != 0:
+            return None
+    except OSError:
+        return None
+    branch = run["branch"]
+    branch_ref = branch if branch.startswith("refs/") else f"refs/heads/{branch}"
+    if _git(["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+            root, check=False).returncode == 0:
+        return None
+
+    settings = merge_cfg(cfg)
+    base = settings["base"] or _out(["symbolic-ref", "--short", "HEAD"], root)
+    subject = f"orchestra: merge {branch}" \
+        + (f" ({run['work_item']})" if run.get("work_item") else "")
+    merge_sha = None
+    matches = _lines(
+        ["log", "--first-parent", "--format=%H%x09%s", "--fixed-strings",
+         f"--grep={subject}", base], root)
+    for line in matches:
+        sha, separator, found_subject = line.partition("\t")
+        if separator and found_subject == subject \
+                and len(_out(["show", "-s", "--format=%P", sha], root).split()) >= 2:
+            merge_sha = sha
+            break
+
+    kept_ref = f"refs/orchestra/{branch.rsplit('/', 1)[-1]}"
+    kept = _git(["rev-parse", "--verify", f"{kept_ref}^{{commit}}"],
+                root, check=False)
+    checkpoint = run.get("checkpoint_commit") or (
+        kept.stdout.strip() if kept.returncode == 0 else None)
+    if merge_sha is None and (not checkpoint or _git(
+            ["merge-base", "--is-ancestor", checkpoint, base],
+            root, check=False).returncode != 0):
+        return None
+
+    result = blank_result(base, branch, checks_skipped=not settings["checks"])
+    result.update({
+        "ok": True,
+        "stage": "merged",
+        "commit": merge_sha,
+        "files_changed": (_lines(
+            ["diff", "--name-only", f"{merge_sha}^1", merge_sha], root)
+            if merge_sha else []),
+        "checks": [
+            {"name": name, "command": command, "ok": True, "exit_code": 0,
+             "output": "landing receipt recovered; original output unavailable"}
+            for name, command in (settings["checks"] or {}).items()
+        ],
+        "branch_deleted": True,
+        "refresh": {"status": "skipped", "command": None,
+                    "why": "landing receipt recovered from the base history"},
+        "kept_ref": kept_ref if kept.returncode == 0 else None,
+    })
+    if merge_sha:
+        result["revert_command"] = f"git -C {root} revert -m 1 {merge_sha}"
+    else:
+        result["note"] = f"already on {base}; nothing to merge"
+    return result
+
+
+def _record_landing(con, run: dict, status: str, note: str | None = None) -> None:
+    """Stamp the landing receipt and keep its human reason on the result row."""
+    row = con.execute("SELECT summary FROM runs WHERE id=?", (run["id"],)).fetchone()
+    if row is None:
+        return
+    summary = row["summary"]
+    if note and note not in (summary or ""):
+        if status == "failed":
+            summary = f"{note}\n\n{summary}" if summary else note
+        else:
+            summary = f"{summary}\n\n{note}" if summary else note
+    con.execute("UPDATE runs SET landing_status=?, summary=? WHERE id=?",
+                (status, (summary or "")[:2000] or None, run["id"]))
+    con.commit()
+
+
+def _consume_landing(con, cfg: dict, result, status: str) -> str | None:
+    """Run landing policy with an explicit effective execution status."""
+    run = dict(result)
+    try:
+        return _land(con, cfg, run, status)
+    except Exception as exc:
+        note = f"Merge failed: {exc}"
+        print(f"orchestra: run {result['id']} {note}", file=sys.stderr)
+        try:
+            _thread(con, int(result["id"]), note)
+        except Exception:  # the database is the last thing left; say nothing
+            pass
+        # This was not a deliberate landing verdict. The base may already
+        # have moved before an after-step failed, so leave the receipt open;
+        # daemon replay can prove success from Git or retry the unsettled step.
+        return note
+
+
+def at_completion(con, cfg: dict, result) -> str | None:
+    """SEAM: consume a terminal result and land a verified run's branch.
+
+    ``result`` is the terminal run row. ``supervise.py`` calls this once at
+    finalization, AFTER
     ``release_worktree`` — git refuses to delete a branch a worktree still
     has checked out (W-0172, DESIGN §9 "Ordering").
 
@@ -595,33 +699,41 @@ def at_completion(con, cfg: dict, run, status: str) -> str | None:
     to land. A merge is never worth losing a finalization, so every failure
     in here becomes a recorded note instead of an exception.
     """
-    try:
-        return _land(con, cfg, dict(run), status)
-    except Exception as exc:
-        note = f"Merge failed: {exc}"
-        print(f"orchestra: run {run['id']} {note}", file=sys.stderr)
-        try:
-            _thread(con, int(run["id"]), note)
-        except Exception:  # the database is the last thing left; say nothing
-            pass
-        return note
+    run = dict(result)
+    persisted = con.execute(
+        "SELECT landing_status FROM runs WHERE id=?", (run["id"],)).fetchone()
+    if persisted is not None and persisted["landing_status"] is not None:
+        return None
+    return _consume_landing(con, cfg, run, run["status"])
+
+
+def retry_landing(con, cfg: dict, result) -> str | None:
+    """Retry landing for the persisted terminal row, whatever its outcome.
+
+    A human explicitly chose to retry the kept branch. That changes landing
+    policy, not the execution result recorded on the row.
+    """
+    return _consume_landing(con, cfg, result, "done")
 
 
 def _land(con, cfg: dict, run: dict, status: str) -> str | None:
     if status != "done" or not run.get("branch"):
+        _record_landing(con, run, "ok")
         return None  # only a verified success lands; a shared-tree run has no branch
     branch = run["branch"]
-    try:
-        result = merge_run(project.root_for(con, run), branch,
-                           item_id=run.get("work_item"), settings=cfg,
-                           mission=run_mission(run))
-    except RuntimeError as exc:
-        # git itself refused — most importantly the compare-and-swap losing to
-        # a base that moved under us, which is meant to fail LOUDLY. Shape it
-        # as an escalation so it blocks the item and reaches the phone, rather
-        # than becoming a note under an item the sweeper moves to review.
-        result = _escalate(blank_result(merge_cfg(cfg)["base"] or "the base",
-                                        branch), "merge", str(exc))
+    root = project.root_for(con, run)
+    result = _recovered_landing(root, cfg, run)
+    if result is None:
+        try:
+            result = merge_run(root, branch, item_id=run.get("work_item"),
+                               settings=cfg, mission=run_mission(run))
+        except RuntimeError as exc:
+            # git itself refused — most importantly the compare-and-swap losing to
+            # a base that moved under us, which is meant to fail LOUDLY. Shape it
+            # as an escalation so it blocks the item and reaches the phone, rather
+            # than becoming a note under an item the sweeper moves to review.
+            result = _escalate(blank_result(merge_cfg(cfg)["base"] or "the base",
+                                            branch), "merge", str(exc))
     if result["ok"] and hasattr(nod, "withdraw_merge_cards"):
         # A landed branch answers its own escalation: the phone card filed
         # for an earlier failure of this run is stale the moment the retry
@@ -662,8 +774,11 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
             request_id = _file_card(con, cfg, run, result)
     report = _report_text(run, result, request_id)
     _thread(con, int(run["id"]), report)
-    _post_to_work(con, cfg, run, result, report)
-    return _note(run, result, request_id)
+    work_settled = _post_to_work(con, cfg, run, result, report)
+    note = _note(run, result, request_id)
+    if work_settled:
+        _record_landing(con, run, "ok" if result["ok"] else "failed", note)
+    return note
 
 
 def _is_resolver(run: dict) -> bool:
@@ -675,6 +790,15 @@ def _is_resolver(run: dict) -> bool:
 def _thread(con, run_id: int, body: str) -> None:
     """The run's own thread. This is the whole report for a hand-dispatched
     run, which has no Work item to post to."""
+    existing = [row["body"] for row in con.execute(
+        "SELECT body FROM messages WHERE run_id=? AND kind='merge'", (run_id,))]
+    success = body.startswith(f"run {run_id} landed `") or (
+        body.startswith(f"run {run_id}: `") and "nothing to merge" in body)
+    if body in existing or (success and any(
+            old.startswith(f"run {run_id} landed `") or (
+                old.startswith(f"run {run_id}: `") and "nothing to merge" in old)
+            for old in existing)):
+        return
     con.execute("INSERT INTO messages(run_id, sender, body, kind, created_at) "
                 "VALUES(?, 'orchestra', ?, 'merge', ?)", (run_id, body, db.now()))
     con.commit()
@@ -781,39 +905,69 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
     return created.get("request_id")
 
 
-def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> None:
+def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> bool:
     """Thread comment, then the run's fact: ``landed`` with the sha that
     reverts it, or ``halted`` with the escalation. This is the only place that
     knows the sha, so it is the only fact that can name one."""
     item = run.get("work_item")
-    if not messaging.mirror_to_work(cfg, item, report):
-        return  # no item, Work off, or Work down — the run thread still has it
-    if not item.startswith("W-"):
-        # ponytail: an issue's outcome is the sweeper's own report fact. The
-        # merge outcome is in its thread either way.
-        return
+    if not item:
+        return True
     client = work_client.from_cfg(cfg)
+    if client is None:
+        return True
     tag = f"[{client.identity}/{run.get('slug') or run['id']}]"
-    if result["ok"]:
+    verb = "landed" if result["ok"] else "halted"
+    marker = f"{tag} merge:{verb}"
+    comment = f"{marker}\n\n{report}"[:19000]
+    try:
+        if not item.startswith("W-"):
+            issue = client.issue(item)
+            if issue is None:
+                return False
+            sent = {entry.get("body") for entry in issue.get("messages") or []}
+            if not any(marker in (body or "") for body in sent):
+                if client.reply_issue(item, comment) is None:
+                    return False
+            # ponytail: an issue's outcome is the sweeper's own report fact.
+            return True
+
+        task = client.task(item)
+        if task is None:
+            return False
+        sent = {entry.get("message") for entry in task.get("log") or []}
+        if not any(marker in (message or "") for message in sent) \
+                and client.log_task(item, comment) is None:
+            return False
         # Work refuses a landing while a criterion is unaccounted (CONTRACT
         # §3 verb 2). The worker was told to answer; what it left open is
         # declined on its behalf, by name, before the fact goes up.
-        declined = client.decline_unaccounted(
-            item, f"not accounted for by run {run['id']} before it landed")
-        if declined:
-            print(f"orchestra: run {run['id']} left {declined} checklist item(s) on "
-                  f"{item} unaccounted; declined on its behalf", file=sys.stderr)
-    fact = (work_client.fact_line(tag, "landed", sha=result["commit"],
-                                  revert=result["revert_command"])
-            if result["ok"] else
-            work_client.fact_line(tag, "halted",
-                                  reason=_note(run, result, None)[:300]))
-    try:
-        posted = client.log_task(item, fact)
+        if result["ok"]:
+            declined = client.decline_unaccounted(
+                item, f"not accounted for by run {run['id']} before it landed")
+            if declined is None:
+                return False
+            if declined:
+                print(f"orchestra: run {run['id']} left {declined} checklist "
+                      f"item(s) on {item} unaccounted; declined on its behalf",
+                      file=sys.stderr)
+        fact = (work_client.fact_line(tag, "landed", sha=result["commit"],
+                                      revert=result["revert_command"])
+                if result["ok"] else
+                work_client.fact_line(tag, "halted",
+                                      reason=_note(run, result, None)[:300]))
+        fact_marker = f"{tag} fact: {verb}"
+        posted = (task if any((message or "").startswith(fact_marker)
+                              for message in sent)
+                  else client.log_task(item, fact))
     except WorkError as exc:
         print(f"orchestra: run {run['id']} fact for {item} refused: {exc}",
               file=sys.stderr)
-        return
+        if work_client.retryable(exc):
+            return False
+        con.execute("UPDATE runs SET work_reported_at=COALESCE(work_reported_at, ?) "
+                    "WHERE id=?", (db.now(), run["id"]))
+        con.commit()
+        return True
     if posted is not None and not result["ok"]:
         # The run itself succeeded, so the sweeper's completion report would
         # append `landed` and bury the escalation. Claim the writeback here:
@@ -821,3 +975,4 @@ def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> None:
         con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
                     (db.now(), run["id"]))
         con.commit()
+    return posted is not None

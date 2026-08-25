@@ -38,62 +38,48 @@ class SyncSkillsTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def test_codex_run_gets_no_other_harness_directory(self) -> None:
-        worktree.sync_skills(self.root, self.wt, "codex")
-        self.assertTrue((self.wt / ".codex").is_dir())
-        self.assertTrue((self.wt / ".agents").is_dir())
-        self.assertTrue((self.wt / "AGENTS.md").is_file())
-        self.assertTrue((self.wt / "ORCHESTRA.md").is_file())
-        for absent in (".claude", ".opencode", "CLAUDE.md"):
-            self.assertFalse((self.wt / absent).exists(), absent)
+    def test_context_is_scoped_to_the_selected_backend(self) -> None:
+        cases = {
+            "codex": ((".codex", ".agents", "AGENTS.md", "ORCHESTRA.md"),
+                      (".claude", ".opencode", "CLAUDE.md")),
+            "claude": ((".claude", "CLAUDE.md"), (".codex", ".opencode")),
+            None: ((".agents",), (".claude", ".codex", ".opencode")),
+        }
+        for backend, (present, absent) in cases.items():
+            with self.subTest(backend=backend):
+                target = Path(self.tmp.name) / f"wt-{backend or 'unknown'}"
+                target.mkdir()
+                worktree.sync_skills(self.root, target, backend)
+                for name in present:
+                    self.assertTrue((target / name).exists(), name)
+                for name in absent:
+                    self.assertFalse((target / name).exists(), name)
 
-    def test_claude_run_gets_claude_dir_and_doc_only(self) -> None:
-        worktree.sync_skills(self.root, self.wt, "claude")
-        self.assertTrue((self.wt / ".claude").is_dir())
-        self.assertTrue((self.wt / "CLAUDE.md").is_file())
-        for absent in (".codex", ".opencode"):
-            self.assertFalse((self.wt / absent).exists(), absent)
-
-    def test_unknown_backend_gets_the_shared_set_only(self) -> None:
-        worktree.sync_skills(self.root, self.wt, None)
-        self.assertTrue((self.wt / ".agents").is_dir())
-        for absent in (".claude", ".codex", ".opencode"):
-            self.assertFalse((self.wt / absent).exists(), absent)
-
-    def test_global_overlay_reaches_a_project_that_lacks_the_skill(self) -> None:
+    def test_global_overlay_reaches_each_harness_discovery_directory(self) -> None:
         write(self.home / "skills" / "orchestration" / "SKILL.md", "global")
-        synced = worktree.sync_skills(self.root, self.wt, "codex")
-        landed = self.wt / ".agents/skills" / "orchestration" / "SKILL.md"
-        self.assertEqual(landed.read_text(), "global")
-        self.assertIn(".agents/skills/orchestration", synced)
+        for backend, directory in (("codex", ".agents"),
+                                   ("claude", ".claude"),
+                                   ("reasonix", ".reasonix")):
+            with self.subTest(backend=backend):
+                target = Path(self.tmp.name) / f"overlay-{backend}"
+                target.mkdir()
+                synced = worktree.sync_skills(self.root, target, backend)
+                landed = target / directory / "skills/orchestration/SKILL.md"
+                self.assertEqual(landed.read_text(), "global")
+                self.assertTrue(any("skills/orchestration" in path
+                                    for path in synced))
 
-    def test_a_claude_run_finds_the_overlay_under_claude_skills(self) -> None:
-        """Claude Code discovers skills at .claude/skills, never .agents."""
-        write(self.home / "skills" / "orchestration" / "SKILL.md", "global")
-        worktree.sync_skills(self.root, self.wt, "claude")
-        landed = self.wt / ".claude" / "skills" / "orchestration" / "SKILL.md"
-        self.assertEqual(landed.read_text(), "global")
-        self.assertFalse((self.wt / ".agents/skills/orchestration").exists())
-
-    def test_a_reasonix_run_finds_the_overlay_under_reasonix_skills(self) -> None:
-        write(self.home / "skills" / "orchestration" / "SKILL.md", "global")
-        worktree.sync_skills(self.root, self.wt, "reasonix")
-        landed = self.wt / ".reasonix" / "skills" / "orchestration" / "SKILL.md"
-        self.assertEqual(landed.read_text(), "global")
-
-    def test_project_skill_of_the_same_name_wins_over_the_overlay(self) -> None:
-        write(self.root / ".agents" / "skills" / "shared" / "SKILL.md", "project")
+    def test_project_skill_wins_over_the_global_overlay(self) -> None:
         write(self.home / "skills" / "shared" / "SKILL.md", "global")
-        worktree.sync_skills(self.root, self.wt, "codex")
-        landed = self.wt / ".agents/skills" / "shared" / "SKILL.md"
-        self.assertEqual(landed.read_text(), "project")
-
-    def test_project_claude_skill_wins_over_the_overlay(self) -> None:
-        write(self.root / ".claude" / "skills" / "shared" / "SKILL.md", "project")
-        write(self.home / "skills" / "shared" / "SKILL.md", "global")
-        worktree.sync_skills(self.root, self.wt, "claude")
-        landed = self.wt / ".claude" / "skills" / "shared" / "SKILL.md"
-        self.assertEqual(landed.read_text(), "project")
+        for backend, directory in (("codex", ".agents"),
+                                   ("claude", ".claude")):
+            with self.subTest(backend=backend):
+                write(self.root / directory / "skills/shared/SKILL.md", "project")
+                target = Path(self.tmp.name) / f"override-{backend}"
+                target.mkdir()
+                worktree.sync_skills(self.root, target, backend)
+                landed = target / directory / "skills/shared/SKILL.md"
+                self.assertEqual(landed.read_text(), "project")
 
     def test_create_scopes_the_worktree_to_the_run_backend(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
@@ -233,6 +219,42 @@ class WorktreeRemovalTests(unittest.TestCase):
         self.assertIn("feature.py", self.git("show", "--name-only", "--format=",
                                              sha, root=wt))
 
+        # Checkout release is an external filesystem step. If it crashes,
+        # recovery must still know which commit owns the worker's changes.
+        log = self.home / "logs" / "run-80.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.touch()
+        self.con.execute(
+            "UPDATE runs SET base_commit=?, log_path=? WHERE id=80",
+            (run["base_commit"], str(log)))
+        self.con.commit()
+        persisted = self.con.execute("SELECT * FROM runs WHERE id=80").fetchone()
+        with mock.patch.object(supervise, "release_worktree",
+                               side_effect=RuntimeError("release crashed")), \
+                self.assertRaisesRegex(RuntimeError, "release crashed"):
+            supervise.finalize_run(self.con, persisted, "done", 0)
+        other = db.connect()
+        try:
+            self.assertEqual(other.execute(
+                "SELECT checkpoint_commit FROM runs WHERE id=80"
+            ).fetchone()["checkpoint_commit"], sha)
+        finally:
+            other.close()
+
+        # Recovery must not checkpoint anything that appeared after that
+        # durable pointer. It may retry checkout release, but the result still
+        # owns exactly the commit recorded before the crash.
+        write(wt / "late-human-edit.py", "leave me alone\n")
+        recovered = self.con.execute(
+            "SELECT * FROM runs WHERE id=80").fetchone()
+        with mock.patch.object(supervise, "_checkpoint_commit") as checkpoint, \
+                mock.patch.object(supervise, "release_worktree", return_value=None):
+            result = supervise.finalize_run(self.con, recovered, "done", 0)
+        checkpoint.assert_not_called()
+        self.assertEqual(result["checkpoint_commit"], sha)
+        self.assertEqual(worktree.head(wt), sha)
+        self.assertTrue((wt / "late-human-edit.py").exists())
+
     def test_checkpoint_records_a_legacy_agent_commit(self):
         """Older runs committed themselves. Checkpoint still points at HEAD."""
         wt = self.make_run(81, "done", commit=True)
@@ -243,6 +265,13 @@ class WorktreeRemovalTests(unittest.TestCase):
 
         self.assertEqual(sha, worktree.head(wt))
         self.assertNotEqual(sha, run["base_commit"])
+
+        clean = self.make_run(82, "done", commit=False)
+        clean_run = dict(self.con.execute("SELECT * FROM runs WHERE id=82").fetchone())
+        clean_run["base_commit"] = worktree.head(clean)
+        self.assertEqual(supervise._checkpoint_commit(clean_run, "done"),
+                         clean_run["base_commit"],
+                         "an unchanged HEAD is the durable checkpoint receipt")
 
     def test_uncommitted_work_is_kept_and_reported_at_finalization(self):
         wt = self.make_run(5, "failed")

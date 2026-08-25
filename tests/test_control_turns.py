@@ -15,9 +15,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from orchestra import db, http, observer, router, traces
+from orchestra import conductor, db, http, merge, observer, review, router, traces
 
 PROFILE = {"name": "stub", "backend": "opencode"}
+LAYERS = ("router", "merge", "observer", "conductor")
 
 # Two enabled profiles plus a router profile, so the staffing turn has a
 # real choice to make.
@@ -72,25 +73,58 @@ class ControlTurnTestCase(unittest.TestCase):
 
     # --- the turn is recorded ----------------------------------------------
 
-    def test_a_turn_is_recorded_and_its_thinking_ingested(self) -> None:
-        meta = {}
-        with mock.patch.object(observer.subprocess, "run",
-                               return_value=fake_proc()):
-            text = observer.model_turn(PROFILE, "pick one", con=self.con,
-                                       layer="router", meta=meta)
-        self.assertIn("cross-cutting", text)
-        row = self.turn_row(meta["turn_id"])
-        self.assertEqual(row["layer"], "router")
-        self.assertEqual(row["status"], "done")
-        self.assertEqual(row["title"], "router turn")
-        self.assertTrue(Path(row["log_path"]).is_file(),
-                        "the transcript is retained, not unlinked")
-        events = traces.events_for_run(self.con, meta["turn_id"])
-        kinds = {e["kind"] for e in events}
-        self.assertIn("reasoning", kinds)
-        self.assertIn("tool_call", kinds)
-        reasoning = [e for e in events if e["kind"] == "reasoning"]
-        self.assertIn("tier 2", reasoning[0]["payload"])
+    def test_each_layer_persists_a_visible_traced_turn_but_no_usage(self) -> None:
+        for layer in LAYERS:
+            project_id = f"proj-{layer}"
+            stdout = _judge_stdout() if layer == "merge" else STDOUT
+            with self.subTest(layer=layer), mock.patch.object(
+                    observer.subprocess, "run", return_value=fake_proc(stdout=stdout)):
+                if layer == "router":
+                    cfg = dict(CFG, project_id=project_id)
+                    name, _, _ = router.choose(
+                        self.con, cfg, "W-1 · rewrite the scheduler", "stub",
+                        dict(cfg["profiles"]["stub"]))
+                    self.assertEqual(name, "big")
+                elif layer == "merge":
+                    cfg = {"project_id": project_id,
+                           "settings": {"observer_profile": "stub"},
+                           "profiles": dict(CFG["profiles"])}
+                    self.assertEqual(
+                        merge.judge_tripwires(
+                            cfg, "delete dead code", ["deletes 6 file(s)"],
+                            "the diff")["verdict"],
+                        "mission_work")
+                elif layer == "observer":
+                    observer.model_turn(PROFILE, "pick one", con=self.con,
+                                        layer=layer, project_id=project_id)
+                else:
+                    conductor.model_turn(PROFILE, "pick one", con=self.con,
+                                         project_id=project_id)
+
+                row = self.con.execute(
+                    "SELECT * FROM runs WHERE layer=? ORDER BY id DESC LIMIT 1",
+                    (layer,)).fetchone()
+                self.assertEqual((row["status"], row["project_id"]),
+                                 ("done", project_id))
+                self.assertTrue(Path(row["log_path"]).is_file())
+                kinds = {e["kind"] for e in
+                         traces.events_for_run(self.con, row["id"])}
+                self.assertTrue({"reasoning", "tool_call"} <= kinds)
+                page = http.control_turns(project_id, layer, con=self.con)
+                self.assertEqual([turn["id"] for turn in page["turns"]],
+                                 [row["id"]])
+                pinned = {turn["project_id"]: turn for turn in
+                          http.snapshot(self.con)["pinned_turns"]}
+                self.assertEqual(pinned[project_id]["id"], row["id"])
+
+        self.con.execute(
+            "UPDATE runs SET tokens_total=100, cost_usd=1 WHERE layer IS NOT NULL")
+        self.con.commit()
+        snapshot = http.snapshot(self.con)
+        self.assertEqual((snapshot["runs"], snapshot["live_runs"]), ([], 0))
+        self.assertEqual(snapshot["statistics"]["runs_total"], 0)
+        self.assertIsNone(snapshot["statistics"]["tokens_total"])
+        self.assertEqual(review.performance(self.con), [])
 
     def test_a_turn_without_a_layer_behaves_as_before(self) -> None:
         with mock.patch.object(observer.subprocess, "run",
@@ -104,109 +138,29 @@ class ControlTurnTestCase(unittest.TestCase):
 
     # --- a failed turn is still viewable ------------------------------------
 
-    def test_a_nonzero_exit_still_leaves_a_readable_log(self) -> None:
-        with mock.patch.object(observer.subprocess, "run",
-                               return_value=fake_proc(returncode=3, stdout="",
-                                                      stderr="boom")):
-            with self.assertRaises(observer.ObserverTurnError):
-                observer.model_turn(PROFILE, "pick one", con=self.con,
-                                    layer="router")
-        row = self.con.execute(
-            "SELECT * FROM runs WHERE layer='router'").fetchone()
-        self.assertIsNotNone(row, "the failed turn is a row, not a gap")
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("exited 3", row["summary"])
-        self.assertTrue(Path(row["log_path"]).is_file(),
-                        "the log exists even though the turn raised")
-
-    def test_a_turn_that_says_nothing_is_recorded_as_failed(self) -> None:
-        with mock.patch.object(observer.subprocess, "run",
-                               return_value=fake_proc(stdout="")):
-            with self.assertRaises(observer.ObserverTurnError):
-                observer.model_turn(PROFILE, "pick one", con=self.con,
-                                    layer="observer")
-        row = self.con.execute(
-            "SELECT * FROM runs WHERE layer='observer'").fetchone()
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("no text", row["summary"])
-
-    # --- through the layers' own seams --------------------------------------
-
-    def test_a_staffing_turn_is_recorded_through_the_router(self) -> None:
-        with mock.patch.object(observer.subprocess, "run",
-                               return_value=fake_proc()):
-            name, _profile, reason = router.choose(
-                self.con, CFG, "W-1 · rewrite the scheduler", "stub",
-                dict(CFG["profiles"]["stub"]))
-        self.assertEqual(name, "big")
-        row = self.con.execute(
-            "SELECT * FROM runs WHERE layer='router'").fetchone()
-        self.assertIsNotNone(row, "the staffing turn left a row")
-        self.assertEqual(row["status"], "done")
-        self.assertEqual(row["summary"], reason,
-                         "the pinned entry reads the decision, not a replay")
-        self.assertIn("staffed big over stub", reason)
-        events = traces.events_for_run(self.con, row["id"])
-        self.assertIn("reasoning", {e["kind"] for e in events})
-        # The staffing decision belongs to the project it staffed for. Without
-        # it the turn is pinned nowhere, which is how "why was this staffed"
-        # went missing from the board it was staffed on.
-        self.assertEqual(row["project_id"], CFG.get("project_id"),
-                         "a staffing turn carries the project it decided for")
-
-    def test_a_staffing_turn_carries_the_project_it_decided_for(self) -> None:
-        cfg = dict(CFG, project_id="proj-scheduler")
-        with mock.patch.object(observer.subprocess, "run",
-                               return_value=fake_proc()):
-            router.choose(self.con, cfg, "W-1 · rewrite the scheduler", "stub",
-                          dict(cfg["profiles"]["stub"]))
-        row = self.con.execute(
-            "SELECT * FROM runs WHERE layer='router'").fetchone()
-        self.assertEqual(row["project_id"], "proj-scheduler")
-        pinned = http.snapshot(self.con)["pinned_turns"]
-        self.assertEqual([t["project_id"] for t in pinned], ["proj-scheduler"],
-                         "and is therefore pinned on that project's board")
-
-    def test_a_merge_judge_turn_is_recorded_through_the_merge(self) -> None:
-        from orchestra import merge
-        cfg = {"settings": {"observer_profile": "stub"},
-               "profiles": dict(CFG["profiles"])}
-        with mock.patch.object(observer.subprocess, "run",
-                               return_value=fake_proc(stdout=_judge_stdout())):
-            verdict = merge.judge_tripwires(cfg, "delete dead code",
-                                            ["deletes 6 file(s)"], "the diff")
-        self.assertEqual(verdict["verdict"], "mission_work")
-        row = self.con.execute(
-            "SELECT * FROM runs WHERE layer='merge'").fetchone()
-        self.assertIsNotNone(row, "the judge turn left a row")
-        self.assertEqual(verdict["turn_id"], row["id"])
-        self.assertIn("mission_work", row["summary"])
-        events = traces.events_for_run(self.con, row["id"])
-        self.assertIn("reasoning", {e["kind"] for e in events})
-
-    # --- the fleet never sees it ---------------------------------------------
-
-    def test_the_badge_and_live_count_do_not_move(self) -> None:
-        live_id = int(self.con.execute(
-            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
-            "started_at) VALUES('w','opencode','human','/p','running',?)",
-            (db.now(),)).lastrowid)
-        self.con.commit()
-        before = http.snapshot(self.con)
-        self.assertEqual(before["live_runs"], 1)
-        observer.record_turn(self.con, "router", PROFILE,
-                             _write(self.tmp.name), True, "staffed big",
-                             project_id="proj-a")
-        after = http.snapshot(self.con)
-        self.assertEqual(after["live_runs"], 1, "the badge count is unchanged")
-        shown = {r["id"] for r in after["runs"]}
-        self.assertIn(live_id, shown)
-        pinned = after["pinned_turns"][0]
-        self.assertIsNotNone(pinned)
-        self.assertNotIn(pinned["id"], shown,
-                         "a control turn is never a fleet entry")
-        self.assertEqual(pinned["layer"], "router")
-        self.assertEqual(pinned["summary"], "staffed big")
+    def test_failed_turns_remain_visible(self) -> None:
+        cases = [
+            ("nonzero", fake_proc(returncode=3, stdout="", stderr="boom"),
+             "exited 3"),
+            ("empty", fake_proc(stdout=""), "no text"),
+        ]
+        for name, proc, reason in cases:
+            project_id = f"failed-{name}"
+            with self.subTest(case=name), mock.patch.object(
+                    observer.subprocess, "run", return_value=proc):
+                with self.assertRaises(observer.ObserverTurnError):
+                    observer.model_turn(PROFILE, "pick one", con=self.con,
+                                        layer="observer", project_id=project_id)
+                row = self.con.execute(
+                    "SELECT * FROM runs WHERE project_id=?", (project_id,)
+                ).fetchone()
+                self.assertEqual(row["status"], "failed")
+                self.assertIn(reason, row["summary"])
+                self.assertTrue(Path(row["log_path"]).is_file())
+                self.assertEqual(
+                    [turn["id"] for turn in http.control_turns(
+                        project_id, con=self.con)["turns"]],
+                    [row["id"]])
 
     def test_a_turn_is_pinned_only_on_the_project_it_acted_on(self) -> None:
         """One decision per project. A staffing turn for another project

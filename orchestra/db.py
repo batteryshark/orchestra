@@ -68,6 +68,18 @@ Data-model invariants (DESIGN D4):
   same detail screen as a run. NULL is a worker run. Fleet queries exclude
   turns with ``layer IS NULL``; queries keyed on work_item, branch or
   parent_run never match one, because a turn carries none of them.
+- ``runs.landing_status``/``handoff_processed_at`` (schema v16, W-0295) are
+  the two durable policy receipts on the terminal result row. NULL means that
+  policy has not settled yet; landing records ``ok`` or ``failed``, while
+  handoff processing records its completion timestamp. ``pid_identity`` is
+  the worker process's kernel creation token; orphan recovery matches it before
+  signaling the stored PID, which may otherwise have been reused.
+  ``supervisor_pid_identity`` applies the same reuse check to the process that
+  owns finalization, though it is never signaled. ``worker_status``/
+  ``worker_exit_code`` preserve a supervised process outcome before slower
+  result enrichment begins. Worker finalization and explicit stop/reaper paths
+  write them; synthetic terminal rows do not become replay candidates merely
+  because their status changed. Historical rows remain NULL.
 - ``nod_requests`` (schema v7, the human loop) maps a Nod request id to the
   run and Work item it escalated, so a decision can be mirrored into the
   Work thread. ``channel`` is stored because a Nod issuer token is scoped to
@@ -82,7 +94,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -121,6 +133,18 @@ RUNS_V13_COLUMNS = (
 # carries none of them.
 RUNS_V15_COLUMNS = (
     ("layer", "TEXT"),
+)
+# Schema v16 (W-0295). Landing, handoff, worker recovery, and Work claim
+# handoff all stamp the plain run row; no result object or replay table is
+# needed.
+RUNS_V16_COLUMNS = (
+    ("landing_status", "TEXT"),
+    ("handoff_processed_at", "TEXT"),
+    ("pid_identity", "TEXT"),
+    ("supervisor_pid_identity", "TEXT"),
+    ("worker_status", "TEXT"),
+    ("worker_exit_code", "INTEGER"),
+    ("work_claim_status", "TEXT"),
 )
 
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
@@ -165,7 +189,9 @@ CREATE TABLE IF NOT EXISTS runs (
   checkpoint_commit TEXT,
   parent_run INTEGER REFERENCES runs(id),
   pid INTEGER,
+  pid_identity TEXT,
   supervisor_pid INTEGER,
+  supervisor_pid_identity TEXT,
   session_ref TEXT,
   status TEXT NOT NULL DEFAULT 'spawning',
   exit_code INTEGER,
@@ -185,14 +211,17 @@ CREATE TABLE IF NOT EXISTS runs (
   usage_source TEXT,
   run_token_hash TEXT,
   routed_reason TEXT,
-  layer TEXT
+  layer TEXT,
+  landing_status TEXT,
+  handoff_processed_at TEXT,
+  worker_status TEXT,
+  worker_exit_code INTEGER,
+  work_claim_status TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
--- Schema v11 (W-0176). A per-run token dies with its run. The revocation is
--- a trigger and not a call in each finalizer, because there are five paths to
--- a terminal status (supervisor, sweeper reaper, HTTP stop, `orchestra kill`,
--- observer) and one of them would eventually forget.
+-- A per-run token dies with its run. This is a trigger and not a call in each
+-- finalizer because every terminal writer must revoke the credential.
 CREATE TRIGGER IF NOT EXISTS revoke_run_token AFTER UPDATE OF status ON runs
 WHEN NEW.status IN ('done','failed','timeout','killed','halted')
      AND NEW.run_token_hash IS NOT NULL
@@ -396,12 +425,28 @@ def connect(db_file=None) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=10000")
     existing = {r["name"] for r in con.execute("PRAGMA table_info(runs)")}
+    upgrading_v16 = bool(existing) and any(
+        name not in existing for name, _ in RUNS_V16_COLUMNS)
     if existing:  # extend a pre-existing table before SCHEMA's indexes run
         for name, sql_type in (RUNS_V2_COLUMNS + RUNS_V4_COLUMNS
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
-                               + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS):
+                               + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
+                               + RUNS_V16_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
+        if upgrading_v16:
+            # A historical completion notice proves the old finalizer reached
+            # its durable result boundary. Settle only those rows: replaying
+            # years of old side effects is unsafe, but an old terminal row with
+            # no completion is ambiguous and must not be labelled complete.
+            con.execute(
+                "UPDATE runs SET landing_status=COALESCE(landing_status, 'ok'), "
+                "handoff_processed_at=COALESCE(handoff_processed_at, "
+                "finished_at, ?), work_reported_at=COALESCE(work_reported_at, "
+                "finished_at, ?) "
+                f"WHERE status IN {TERMINAL_SQL} AND EXISTS ("
+                "SELECT 1 FROM messages m WHERE m.run_id=runs.id "
+                "AND m.kind='completion')", (now(), now()))
     polls = {r["name"] for r in con.execute("PRAGMA table_info(runway_polls)")}
     if polls:
         for name, sql_type in RUNWAY_V12_COLUMNS:
