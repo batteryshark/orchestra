@@ -882,7 +882,11 @@ def finalize_run(con, run, status: str, exit_code: int | None, *,
             if current["summary"]:
                 summary = current["summary"]
         if checkpoint_note and checkpoint_note not in (summary or ""):
-            summary = (f"{summary}\n\n{checkpoint_note}"
+            # LEADS. Appended, it sat past two thousand characters of a
+            # perfectly good handoff, and three PREX3 runs looked like they
+            # had succeeded while the board called them failed with no
+            # visible reason (2026-08-26).
+            summary = (f"{checkpoint_note}\n\n{summary}"
                        if summary else checkpoint_note)[:2000]
 
         con.execute(

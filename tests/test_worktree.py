@@ -121,6 +121,63 @@ class SyncSkillsTests(unittest.TestCase):
         self.assertEqual(branches.strip(), "")
 
 
+class SubmoduleTests(unittest.TestCase):
+    """PREX3 runs 93, 94, and 99: `git worktree add` leaves a declared
+    submodule as an EMPTY directory. Each worker needed godot-cpp to build,
+    reasoned that a symlink to the main checkout was "a local workspace fix,
+    not a git write", and made `git status` refuse the path — which killed
+    the checkpoint of three runs whose work was finished and good.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name).resolve()
+        self.home = base / "home"
+        self.root = base / "project"
+        self.env = mock.patch.dict(os.environ, {"ORCHESTRA_HOME": str(self.home)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.inner = base / "inner"
+        init_repo(self.inner)
+        write(self.inner / "lib.h", "#pragma once\n")
+        git("add", "lib.h", root=self.inner)
+        git("commit", "--quiet", "-m", "lib", root=self.inner)
+        init_repo(self.root)
+
+    def _add_submodule(self) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.root), "-c", "protocol.file.allow=always",
+             "submodule", "add", "--quiet", str(self.inner), "vendor/lib"],
+            check=True, capture_output=True, text=True)
+        git("commit", "--quiet", "-m", "vendor", root=self.root)
+
+    def test_a_worktree_gets_the_submodule_populated(self) -> None:
+        self._add_submodule()
+        wt, _ = worktree.create(self.root, 21, "proj-sub", backend="codex")
+        landed = wt / "vendor/lib"
+        self.assertFalse(landed.is_symlink(),
+                         "the worker has no reason to reach for a symlink")
+        self.assertTrue((landed / "lib.h").is_file(),
+                        "the submodule's content is actually there")
+        # And the checkpoint's first act — reading status — works, which is
+        # exactly what the symlink made impossible.
+        self.assertFalse(worktree.status(wt), "a clean worktree reads clean")
+
+    def test_a_project_without_submodules_is_untouched(self) -> None:
+        self.assertFalse(worktree.submodules(self.root, self.root),
+                         "no .gitmodules, no submodule work")
+
+    def test_a_submodule_that_cannot_be_checked_out_still_starts_the_run(self) -> None:
+        """A worktree with empty submodules is what every run got before
+        this; failing to populate them must not refuse the run."""
+        self._add_submodule()
+        with mock.patch.object(worktree.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(
+                                   [], 1, "", "no network")):
+            self.assertFalse(worktree.submodules(self.root, self.root))
+
+
 class WorktreeRemovalTests(unittest.TestCase):
     """W-0172: a terminal run's checkout goes; a live run's checkout stays."""
 

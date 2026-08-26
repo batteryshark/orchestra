@@ -11,6 +11,7 @@ this file — a worktree belonging to a live run is never touched.
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from orchestra import db, harnesses, paths
@@ -108,6 +109,60 @@ def global_skills_dir() -> Path:
     return paths.home() / "skills"
 
 
+def submodules(root: Path, workdir: Path) -> bool:
+    """Populate a new worktree's submodules, if the project has any.
+
+    ``git worktree add`` leaves every declared submodule as an EMPTY
+    directory. A worker that needs one to build cannot build, and it will
+    not simply stop: PREX3 runs 93, 94, and 99 each reasoned their way to
+    `ln -s` from the main checkout — "a local workspace fix, not a git
+    write" — which made `git status` refuse the path ("expected submodule
+    path ... not to be a symbolic link") and killed the checkpoint of three
+    runs whose work was finished and good. Retrying reran the same
+    reasoning and broke the same way.
+
+    The objects are already in the shared repository, so this is a local
+    checkout and needs no network. Failure is not fatal: a worktree with
+    empty submodules is what every run got before this, and the run should
+    still start.
+    """
+    if not (root / ".gitmodules").is_file():
+        return False
+    # Point each submodule at the copy the SOURCE checkout already holds.
+    # Without this every worktree clones godot-cpp from GitHub again: minutes
+    # and a network per run, for bytes already on the disk. A submodule the
+    # source has not checked out keeps its declared url.
+    for name, rel in _declared_submodules(root).items():
+        if (root / rel / ".git").exists():
+            subprocess.run(
+                ["git", "-C", str(workdir), "config",
+                 f"submodule.{name}.url", str(root / rel)],
+                capture_output=True, text=True, timeout=30)
+    res = subprocess.run(
+        ["git", "-C", str(workdir), "-c", "protocol.file.allow=always",
+         "submodule", "update", "--init", "--recursive"],
+        capture_output=True, text=True, timeout=600)
+    if res.returncode != 0:
+        print(f"orchestra: submodules not populated in {workdir}: "
+              f"{(res.stderr or res.stdout).strip()[:300]}", file=sys.stderr)
+        return False
+    return True
+
+
+def _declared_submodules(root: Path) -> dict:
+    """``{submodule name: path}`` from the project's .gitmodules."""
+    res = subprocess.run(
+        ["git", "config", "-f", str(root / ".gitmodules"), "--get-regexp",
+         r"^submodule\..*\.path$"], capture_output=True, text=True, timeout=30)
+    found = {}
+    for line in res.stdout.splitlines():
+        key, _, rel = line.partition(" ")
+        name = key[len("submodule."):-len(".path")]
+        if name and rel:
+            found[name] = rel.strip()
+    return found
+
+
 def sync_skills(root: Path, workdir: Path, backend: str | None = None) -> list[str]:
     """Mirror the shared context + this backend's own skills into a workdir.
 
@@ -162,6 +217,7 @@ def create(root: Path, run_id: int, project_id: str,
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise SystemExit(f"orchestra: git worktree failed: {res.stderr.strip()}")
+    submodules(root, wt)
     try:
         sync_skills(root, wt, backend)
     except BaseException:

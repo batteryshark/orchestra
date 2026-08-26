@@ -937,6 +937,16 @@ def _automatic_retry_blocker(run) -> str | None:
     if run["backend"] == "claude" and summary.startswith("failed to authenticate:"):
         return "Claude authentication failed; reauthenticate Claude before " \
                "dispatching the work again"
+    # The worker finished; the CHECKOUT would not be read. Repeating a run
+    # that already succeeded cannot change what git objects to — PREX3 runs
+    # 93, 94, and 99 each did fourteen minutes of good work and were thrown
+    # away by the same submodule complaint, twice automatically and again by
+    # hand (2026-08-26).
+    if "checkpoint error:" in summary:
+        detail = summary.split("checkpoint error:", 1)[1].strip()
+        return ("the run finished but its checkout could not be "
+                f"checkpointed: {detail[:200]}. Fix the checkout; another "
+                "identical run cannot")
     return None
 
 
