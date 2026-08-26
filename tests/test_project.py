@@ -404,17 +404,54 @@ class StoreOnlyProjectTests(unittest.TestCase):
         self.assertEqual("p-orch", proj.project_id,
                          "Work's id survives, so settings and writeback line up")
 
+    def test_the_folder_is_found_without_anyone_naming_it(self) -> None:
+        """Grouping is Work's business; the folder keeps its own name. The
+        moment the two tools moved under "Agentic Engineering", the checkout
+        stayed at ~/Projects/orchestra — Orchestra can see that, so no human
+        should have to tell it."""
+        repo = self.root / "orchestra"
+        repo.mkdir()
+        found = project.by_work_path(self.con, "Group/orchestra")
+        self.assertEqual(repo, found.path)
+        self.assertEqual("p-orch", found.project_id)
+
+    def test_a_folder_another_project_claims_is_not_borrowed(self) -> None:
+        """Two projects named the same under different groups must not
+        collapse onto one checkout: an ambiguous hit is declined, and the
+        workspace answers instead."""
+        shared = self.root / "docs"
+        shared.mkdir()
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "p-orch", "id": "Group/docs",
+                           "name": "Ours", "path": "Group/docs"},
+                          {"projectId": "p-other", "id": "docs",
+                           "name": "Theirs", "path": "docs"}])
+        found = project.by_work_path(self.con, "Group/docs")
+        self.assertEqual(paths.workspace_dir("p-orch"), found.path)
+        self.assertEqual(shared, project.by_work_path(self.con, "docs").path,
+                         "the project that owns the folder still gets it")
+
+    def test_an_ungrouped_project_with_no_folder_gets_a_workspace(self) -> None:
+        """Nothing to strip: a flat path that names no directory is a
+        store-only project, not a misplaced checkout."""
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "p-flat", "id": "errands",
+                           "name": "Errands", "path": "errands"}])
+        self.assertEqual(paths.workspace_dir("p-flat"),
+                         project.by_work_path(self.con, "errands").path)
+
     def test_a_linked_checkout_answers_for_the_work_path(self) -> None:
         """The repository Work cannot name: link it once, and every dispatch
         for that project lands in it — with Work's own project id intact, so
         per-project settings and the item's writeback still line up."""
-        repo = self.root / "orchestra"
-        repo.mkdir()
-        linked = project.link(self.con, "Group/orchestra", repo)
+        (self.root / "orchestra").mkdir()   # what discovery would find
+        elsewhere = self.root / "checkouts" / "orch"
+        elsewhere.mkdir(parents=True)
+        linked = project.link(self.con, "Group/orchestra", elsewhere)
         self.assertEqual("p-orch", linked.project_id)
         found = project.by_work_path(self.con, "Group/orchestra")
-        self.assertEqual(repo, found.path)
-        self.assertEqual("p-orch", found.project_id)
+        self.assertEqual(elsewhere, found.path,
+                         "an explicit binding outranks a lucky name match")
 
     def test_a_refresh_keeps_the_link(self) -> None:
         """Work re-serves its list every sweep. The bound checkout is
