@@ -637,6 +637,26 @@ class RetryTests(ObserverCase):
         self.assertEqual(result["action"], "escalate")
         self.assertIn("nothing spends a third", result["reason"])
 
+    def test_a_checkpoint_failure_is_not_retried_at_all(self) -> None:
+        """PREX3 runs 93, 94, and 99 each finished their work, then failed
+        because git would not read the checkout. The retry reran fourteen
+        minutes of identical work into the identical objection, twice
+        automatically and once by hand. Nothing an identical run does can
+        change what git objects to, so it escalates naming the fix."""
+        run_id = self.make_run(
+            status="failed", work_item="W-ckpt",
+            summary="Checkpoint error: cannot read worktree status: error: "
+                    "expected submodule path 'vendor/lib' not to be a "
+                    "symbolic link\n\nAdmitted. The cursor moves.")
+        self._brief(run_id)
+        result = observer.after_terminal(
+            self.con, run_id,
+            launcher=lambda root, rid: self.fail("a checkpoint error was retried"))
+        self.assertEqual(result["action"], "escalate")
+        self.assertIn("could not be checkpointed", result["reason"])
+        self.assertIn("symbolic link", result["reason"])
+        self.assertEqual(self.retries_of(run_id), 0)
+
     def test_non_infrastructure_outcomes_are_never_retried(self) -> None:
         for status in ("done", "killed", "halted"):
             with self.subTest(status=status):
