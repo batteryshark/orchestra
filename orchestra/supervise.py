@@ -832,18 +832,28 @@ def finalize_run(con, run, status: str, exit_code: int | None, *,
         status = latest["status"]
         if latest["exit_code"] is not None or status in ("killed", "halted"):
             exit_code = latest["exit_code"]
+    # A summary this process already established — a stall, an ACP failure, a
+    # worker's own halt — is the answer and outranks anything read back.
+    authoritative = False
     if latest["summary"] and (
             (status == "timeout" and latest["summary"].startswith("Stalled:"))
             or latest["summary"].startswith(acp.FAILURE_PREFIX)):
         last_text = latest["summary"]
+        authoritative = True
 
     summary = (last_text or "").strip()[:2000] or None
     reason = findings.halt_reason(last_text)
     if reason and not already_terminal and status != "killed":
         status = "halted"
         summary = reason
-    if status != "done" and not summary:
-        summary = runners.parse_failure(log_path) if log_path else None
+        authoritative = True
+    if status != "done" and not authoritative and log_path:
+        # WHY a run died beats the last thing the model happened to say
+        # before it did. Run 64 died on "the model is currently at capacity"
+        # and reported a .gitignore fragment, because the structured error
+        # was only consulted when the worker had emitted no text at all —
+        # and a worker that dies mid-task has almost always emitted some.
+        summary = runners.parse_failure(log_path) or summary
     if restart_note and not already_terminal:
         summary = (f"{summary}\n\n{restart_note}" if summary else restart_note)[:2000]
 
