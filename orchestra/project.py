@@ -218,22 +218,25 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
     worktree guard, the other spawned a supervisor with a cwd that did not
     exist and vanished before writing a byte).
 
-    So the path Work names is a hint, and this is the answer:
+    So the path Work names is a hint, and this is the answer, in order:
 
     1. Work's own path, when it IS a directory — the common case, unchanged.
-    2. A checkout bound with ``link`` — how a real repository is named when
-       Work's path does not find it.
-    3. An ephemeral workspace under ~/.orchestra/workspaces — for a project
-       that has no checkout anywhere, which is most of them. It is not a git
-       repository, and ``prepare_launch`` skips isolation there rather than
+    2. The workspace root plus the path's LAST segment. Grouping is Work's
+       business; the folder keeps its own name. "Agentic Engineering/
+       orchestra" finds ~/Projects/orchestra by itself, which is what should
+       have happened the moment the two tools were grouped — no human tells
+       Orchestra something it can see.
+    3. A checkout bound with ``link`` — the escape hatch for a repository
+       that lives somewhere its name does not give away.
+    4. An ephemeral workspace under ~/.orchestra/workspaces, for a project
+       with no folder anywhere, which is most of them. It is not a git
+       repository, and the dispatch skips isolation there rather than
        failing the way run 59 did.
 
-    A LINK WINS EVEN WHEN ITS DIRECTORY IS GONE. Linking is how a checkout
-    is claimed, so a link that no longer resolves — an external volume left
-    unmounted — must fail where the run can see it, never be replaced by an
-    empty workspace an agent would happily fill. The same care cannot be
-    taken for an unlinked path: nothing distinguishes "organizational" from
-    "unmounted", so link the checkouts that live on removable volumes.
+    A LINK WINS EVEN WHEN ITS DIRECTORY IS GONE — it outranks discovery for
+    that reason. Linking is how a checkout is claimed, so a claim that stops
+    resolving (an external volume left unmounted) must fail where a human
+    sees it, never be replaced by an empty workspace an agent would fill.
 
     The workspace directory is created here, like every other directory
     ``paths`` hands out, and owner-only for the same reason.
@@ -245,8 +248,37 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
         (proj.project_id,)).fetchone()
     if linked is not None:
         return _row(linked)
+    found = _discover(con, proj)
+    if found is not None:
+        return Project(proj.project_id, found, proj.work_id, proj.name)
     return Project(proj.project_id, paths.workspace_dir(proj.project_id),
                    proj.work_id, proj.name)
+
+
+def _discover(con, proj: "Project") -> Path | None:
+    """The folder Work's path names WITHOUT its grouping, if it is one.
+
+    Work stores "Group/thing" and Orchestra cached it under the workspace
+    root, so the root is that path with the Work id's segments removed. The
+    same root plus the last segment is where the folder actually sits.
+
+    A directory another project already claims is not this one's: two
+    projects named "docs" under different groups must not collapse onto the
+    same checkout, so an ambiguous hit is declined and the workspace answers
+    instead.
+    """
+    rel = Path(proj.work_id or "")
+    depth = len(rel.parts)
+    if depth < 2 or depth >= len(proj.path.parts):
+        return None  # nothing was grouped, so there is nothing to strip
+    root = proj.path.parents[depth - 1]
+    candidate = root / rel.parts[-1]
+    if not candidate.is_dir():
+        return None
+    taken = con.execute(
+        "SELECT project_id FROM projects WHERE path=? AND project_id<>?",
+        (str(candidate), proj.project_id)).fetchone()
+    return None if taken else candidate
 
 
 def is_workspace(root: Path) -> bool:
