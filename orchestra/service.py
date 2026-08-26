@@ -10,8 +10,10 @@ process that dispatches agents is not.
 """
 import os
 import plistlib
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from orchestra import paths, proc
@@ -72,6 +74,15 @@ def _launchctl(*args: str) -> subprocess.CompletedProcess:
 
 def is_loaded() -> bool:
     return _launchctl("print", _service_target()).returncode == 0
+
+
+def service_pid() -> int | None:
+    """The pid launchd currently has for the job, or None if it holds none."""
+    res = _launchctl("print", _service_target())
+    if res.returncode != 0:
+        return None
+    m = re.search(r"^\s*pid = (\d+)$", res.stdout, re.M)
+    return int(m.group(1)) if m else None
 
 
 def install(start: bool = False) -> int:
@@ -151,13 +162,47 @@ def _darwin_restart() -> int:
         print("orchestra service: nothing is running. "
               "`orchestra daemon` or `orchestra service install --start`")
         return 1
+    before = service_pid()
     res = _launchctl("kickstart", "-k", _service_target())
     if res.returncode != 0:
         print(f"orchestra service: launchctl kickstart failed: "
               f"{(res.stderr or res.stdout).strip()}")
         return 1
-    print(f"orchestra service: restarted {_service_target()}")
+    after = _await_new_pid(before)
+    # kickstart -k reports success and leaves the process untouched (seen on
+    # macOS 25.5: a daemon ran 15 hours across two "restarts", serving stale
+    # code and a wedged runway scraper). A restart that did not restart must
+    # never print that it did, so the pid is checked and SIGTERM finishes the
+    # job — KeepAlive brings the replacement up.
+    if after is not None and after == before:
+        _launchctl("kill", "SIGTERM", _service_target())
+        after = _await_new_pid(before)
+    if after is not None and after == before:
+        print(f"orchestra service: {_service_target()} did not restart; "
+              f"pid {before} is still running")
+        return 1
+    print(f"orchestra service: restarted {_service_target()}"
+          + (f" (pid {after})" if after else ""))
     return 0
+
+
+def _await_new_pid(before: int | None, tries: int = 40) -> int | None:
+    """The pid once launchd has settled, waiting out the gap where the job is
+    down and holds none. Returns ``before`` if it never changed.
+
+    With no pid to compare against there is nothing to wait for, so an
+    unmanaged or already-stopped job returns at once."""
+    if before is None:
+        return None
+    seen = before
+    for _ in range(tries):
+        time.sleep(0.25)
+        pid = service_pid()
+        if pid is not None:
+            seen = pid
+            if pid != before:
+                return pid
+    return seen
 
 
 def status() -> int:

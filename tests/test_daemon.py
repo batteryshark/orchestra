@@ -505,10 +505,47 @@ class ServiceRestartTests(unittest.TestCase):
                                    [], pgrep_rc, pgrep_out, "")):
                 self.assertEqual(expected, service.restart())
             if loaded:
-                self.assertEqual("kickstart", calls[0][0])
-                self.assertIn("-k", calls[0])
+                kick = [c for c in calls if c[0] == "kickstart"]
+                self.assertTrue(kick, "a loaded agent is kickstarted")
+                self.assertIn("-k", kick[0])
             else:
                 self.assertEqual(calls, [])
+
+    def test_a_kickstart_that_changes_nothing_is_not_a_restart(self) -> None:
+        """2026-08-26: `kickstart -k` returned 0 and left the process alone.
+        The daemon ran fifteen hours across two reported restarts, serving
+        stale code. Success is a NEW pid, so the pid is checked, SIGTERM
+        finishes what kickstart would not, and a job that survives both is
+        reported as the failure it is."""
+        # Each sequence is what launchd reports for the job, poll by poll:
+        # the pid before the restart, then one reading per wait.
+        cases = {
+            # kickstart no-ops for the whole wait, SIGTERM lands: restarted.
+            "sigterm finishes the job": ([7] + [7] * 40 + [9] * 40, 0, True),
+            # Nothing moves it: never claim a restart that did not happen.
+            "an immovable job fails loudly": ([7] * 120, 1, True),
+            # The ordinary case still costs exactly one launchctl verb.
+            "a working kickstart needs no sigterm": ([7] + [9] * 40, 0, False),
+        }
+        for label, (pids, expected, sigterm) in cases.items():
+            calls = []
+
+            def fake(*args):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with self.subTest(label), \
+                    mock.patch.object(service, "_windows", return_value=False), \
+                    mock.patch.object(service, "is_loaded", return_value=True), \
+                    mock.patch.object(service, "_launchctl", side_effect=fake), \
+                    mock.patch.object(service, "service_pid",
+                                      side_effect=list(pids) + [pids[-1]] * 200), \
+                    mock.patch.object(service.time, "sleep"):
+                self.assertEqual(expected, service.restart())
+            verbs = [c[0] for c in calls]
+            self.assertEqual("kickstart", verbs[0])
+            self.assertEqual(sigterm, "kill" in verbs,
+                             "SIGTERM only when kickstart changed nothing")
 
 
 if __name__ == "__main__":
