@@ -1809,13 +1809,21 @@ function renderRunwayStrip(list) {
     const chip = el("button",
       "rwchip" + (money || headroom !== null ? "" : " unavailable"));
     chip.type = "button";
+    // A provider that HAS a reading, just not a current one, showed a bare
+    // dash — the same glyph as a provider nobody configured. Claude's sat
+    // like that for eighteen hours and read as "missing" rather than "old".
+    // The age takes the number's place, so the chip says what it knows.
+    const aged = r.age_hours != null && r.age_hours >= 2;
+    const stale = !money && headroom === null && aged;
     chip.title = r.provider
-      + (r.age_hours != null && r.age_hours >= 2
-         ? " · read " + ageText(r.age_hours) + " ago" : "");
+      + (stale ? " · reading is " + ageText(r.age_hours)
+                 + " old, and its windows have reset since — press refresh"
+         : aged ? " · read " + ageText(r.age_hours) + " ago" : "");
     chip.append(
       el("span", null, MONOGRAMS[r.provider] || r.provider.slice(0, 2).toUpperCase()),
-      el("b", money ? null : tone(headroom) || null,
-         money || (headroom !== null ? pct(headroom) : "–")));
+      el("b", money ? null : (stale ? "rwunknown" : tone(headroom) || null),
+         money || (headroom !== null ? pct(headroom)
+                   : stale ? ageText(r.age_hours) : "–")));
     chip.onclick = () => showView("runway");
     return chip;
   }));
