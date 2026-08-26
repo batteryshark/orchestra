@@ -203,13 +203,101 @@ def by_work_path(con, project_path: str | None) -> Project | None:
     if row is None:
         row = con.execute("SELECT * FROM projects WHERE path=?",
                           (str(Path(project_path).expanduser()),)).fetchone()
-    return _row(row)
+    return workdir_for(con, _row(row))
+
+
+def workdir_for(con, proj: "Project | None") -> "Project | None":
+    """The project with a directory a run can actually work in (W-0312).
+
+    Work's project path is ORGANIZATIONAL, not a filesystem path: since the
+    store-only reset a project is a record, and `projects.mjs` hardcodes
+    empty aliasPaths because a store project has no filesystem markers at
+    all. Orchestra still had to derive a checkout from that path, so grouping
+    the two tools under "Agentic Engineering" pointed every dispatch at a
+    directory that was never there (I-0302, runs 59 and 60: one died on the
+    worktree guard, the other spawned a supervisor with a cwd that did not
+    exist and vanished before writing a byte).
+
+    So the path Work names is a hint, and this is the answer:
+
+    1. Work's own path, when it IS a directory — the common case, unchanged.
+    2. A checkout bound with ``link`` — how a real repository is named when
+       Work's path does not find it.
+    3. An ephemeral workspace under ~/.orchestra/workspaces — for a project
+       that has no checkout anywhere, which is most of them. It is not a git
+       repository, and ``prepare_launch`` skips isolation there rather than
+       failing the way run 59 did.
+
+    A LINK WINS EVEN WHEN ITS DIRECTORY IS GONE. Linking is how a checkout
+    is claimed, so a link that no longer resolves — an external volume left
+    unmounted — must fail where the run can see it, never be replaced by an
+    empty workspace an agent would happily fill. The same care cannot be
+    taken for an unlinked path: nothing distinguishes "organizational" from
+    "unmounted", so link the checkouts that live on removable volumes.
+
+    The workspace directory is created here, like every other directory
+    ``paths`` hands out, and owner-only for the same reason.
+    """
+    if proj is None or proj.path.is_dir():
+        return proj
+    linked = con.execute(
+        "SELECT * FROM projects WHERE project_id=? AND work_id IS NULL",
+        (proj.project_id,)).fetchone()
+    if linked is not None:
+        return _row(linked)
+    return Project(proj.project_id, paths.workspace_dir(proj.project_id),
+                   proj.work_id, proj.name)
+
+
+def is_workspace(root: Path) -> bool:
+    """True for an ephemeral workspace Orchestra invented (W-0312).
+
+    The one place isolation is skipped rather than demanded: a workspace has
+    no repository to branch from and never had one. A REAL checkout that is
+    not a git repository still fails closed when [work] worktree is on — a
+    run that quietly shares a checkout it was told to isolate from is the
+    thing that guard exists to prevent.
+    """
+    try:
+        return Path(root).resolve().is_relative_to(
+            (paths.home() / "workspaces").expanduser().resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def link(con, project_path: str, root: Path) -> "Project":
+    """Bind a Work project to the checkout it actually lives in.
+
+    The row carries Work's project id with ``work_id`` NULL, so a refresh
+    neither replaces it (it inserts by path) nor prunes it (the prune skips
+    locally owned rows). Work keeps organizing; Orchestra keeps the address.
+    """
+    from orchestra import db  # local: db imports paths, not project
+
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"orchestra: {root} is not a directory")
+    row = con.execute(
+        "SELECT * FROM projects WHERE work_id=? OR project_id=? "
+        "ORDER BY work_id IS NULL LIMIT 1",
+        (project_path, project_path)).fetchone()
+    if row is None:
+        raise SystemExit(
+            f"orchestra: no project matches {project_path!r} — "
+            "`orchestra project list` names them")
+    con.execute(
+        "INSERT OR REPLACE INTO projects(path, project_id, work_id, name, "
+        "refreshed_at) VALUES(?,?,NULL,?,?)",
+        (str(root), row["project_id"], row["name"], db.now()))
+    con.commit()
+    return _row(con.execute("SELECT * FROM projects WHERE path=?",
+                            (str(root),)).fetchone())
 
 
 def root_for(con, run) -> Path:
     """A run's project checkout. Falls back to its recorded workdir so a run
     whose project left Work is still supervisable."""
-    hit = by_id(con, run["project_id"])
+    hit = workdir_for(con, by_id(con, run["project_id"]))
     return hit.path if hit else Path(run["workdir"])
 
 

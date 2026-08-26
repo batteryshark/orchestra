@@ -1061,6 +1061,12 @@ def cmd_project(args):
                 print(f"{str(r.path):<{width}}  {source:<5}  "
                       f"{r.project_id}  {r.name or ''}")
             return
+        if args.action == "link":
+            linked = project.link(con, args.project, Path(args.path or "."))
+            print(f"{linked.path}\n  project id: {linked.project_id}"
+                  f"\n  name:       {linked.name}")
+            print("\nWork keeps organizing this project; runs go here.")
+            return
         if args.action == "forget":
             target = Path(args.path or ".").expanduser().resolve()
             print(f"forgot {target}" if project.forget(con, target)
@@ -1408,13 +1414,19 @@ def main():
 
     s = sub.add_parser("project", help="register a local directory Orchestra "
                                        "may dispatch into")
-    s.set_defaults(fn=cmd_project, action="add", path=None, name=None)
+    s.set_defaults(fn=cmd_project, action="add", path=None, name=None,
+               project=None)
     psub = s.add_subparsers(dest="action")
     pa = psub.add_parser("add", help="adopt a directory as a project")
     pa.add_argument("path", nargs="?", help="default: the current directory")
     pa.add_argument("--name", help="default: the directory's own name")
     pl = psub.add_parser("list", help="every registered project, local or Work-backed")
     pl.set_defaults(path=None, name=None)
+    pk = psub.add_parser("link", help="bind a Work project to the checkout it "
+                                      "lives in, when Work's path is not one")
+    pk.add_argument("project", help="the Work project path or project id")
+    pk.add_argument("path", nargs="?", help="default: the current directory")
+    pk.set_defaults(name=None)
     pf = psub.add_parser("forget", help="drop a locally adopted project")
     pf.add_argument("path", nargs="?", help="default: the current directory")
     pf.set_defaults(name=None)

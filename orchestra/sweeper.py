@@ -484,7 +484,12 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
             else:
                 supervise.prepare_launch(
                     con, root, pcfg, run, mission=_mission(item, kind),
-                    use_worktree=bool(work_cfg(pcfg).get("worktree", True)),
+                    # An ephemeral workspace has no repository to branch
+                    # from and never had one, so the run works in it directly
+                    # (W-0312). A real checkout that is not a repository still
+                    # fails closed — that guard stays exactly as it was.
+                    use_worktree=bool(work_cfg(pcfg).get("worktree", True))
+                    and not project.is_workspace(root),
                     work_snapshot=render_snapshot(item, kind))
         con.execute(
             "UPDATE runs SET work_seen_ts=? WHERE id=?",
@@ -599,6 +604,8 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             print(f"orchestra sweep: {item_id} has no known project "
                   f"({item.get('projectPath')!r}) — skipped")
             continue
+        # A store-only project has no checkout of its own; by_work_path
+        # hands it an ephemeral workspace instead (W-0312).
         root = proj.path
         # Per-project settings key on projectId (DESIGN §2), and so does the
         # project's ENABLED SET (W-0187) — this is a staffing moment, so the

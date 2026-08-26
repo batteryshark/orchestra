@@ -362,3 +362,98 @@ class AdoptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoreOnlyProjectTests(unittest.TestCase):
+    """W-0312: Work's project path is ORGANIZATIONAL, not a directory.
+
+    Since the store-only reset a Work project is a record — `projects.mjs`
+    hardcodes empty aliasPaths because a store project has no filesystem
+    markers. Orchestra still derived a checkout from that path, so grouping
+    the two tools under "Agentic Engineering" pointed every dispatch at a
+    directory that never existed: I-0302's run 59 died on the worktree
+    guard, and its retry spawned a supervisor with a missing cwd that
+    vanished before writing a byte.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.env = mock.patch.dict(os.environ,
+                                   {"ORCHESTRA_HOME": str(self.root / "home")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.con = db.connect()
+        self.addCleanup(self.con.close)
+        # Exactly what Work serves: a grouped path, no aliases, no directory.
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "p-orch", "id": "Group/orchestra",
+                           "name": "Orchestra", "path": "Group/orchestra"}])
+
+    def test_a_project_with_no_directory_gets_an_ephemeral_workspace(self) -> None:
+        """No checkout anywhere: the run still gets somewhere to work, keyed
+        by the project id so a second pass sees the first one's files."""
+        proj = project.by_work_path(self.con, "Group/orchestra")
+        self.assertTrue(proj.path.is_dir(), "the run has somewhere to work")
+        self.assertEqual(0o700, proj.path.stat().st_mode & 0o777,
+                         "owner-only, like every directory paths hands out")
+        self.assertEqual(proj.path,
+                         project.by_work_path(self.con, "Group/orchestra").path,
+                         "the same project comes back to the same workspace")
+        self.assertEqual("p-orch", proj.project_id,
+                         "Work's id survives, so settings and writeback line up")
+
+    def test_a_linked_checkout_answers_for_the_work_path(self) -> None:
+        """The repository Work cannot name: link it once, and every dispatch
+        for that project lands in it — with Work's own project id intact, so
+        per-project settings and the item's writeback still line up."""
+        repo = self.root / "orchestra"
+        repo.mkdir()
+        linked = project.link(self.con, "Group/orchestra", repo)
+        self.assertEqual("p-orch", linked.project_id)
+        found = project.by_work_path(self.con, "Group/orchestra")
+        self.assertEqual(repo, found.path)
+        self.assertEqual("p-orch", found.project_id)
+
+    def test_a_refresh_keeps_the_link(self) -> None:
+        """Work re-serves its list every sweep. The bound checkout is
+        Orchestra's own row, so neither the replace nor the stale-row prune
+        may touch it — otherwise the fix would last one pass."""
+        repo = self.root / "orchestra"
+        repo.mkdir()
+        project.link(self.con, "Group/orchestra", repo)
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "p-orch", "id": "Group/orchestra",
+                           "name": "Orchestra", "path": "Group/orchestra"}])
+        self.assertEqual(repo, project.by_work_path(self.con,
+                                                    "Group/orchestra").path)
+
+    def test_a_real_directory_still_wins_untouched(self) -> None:
+        """The common case must not move: a Work path that IS a directory is
+        used exactly as before, with no workspace and no link involved."""
+        real = self.root / "plain"
+        real.mkdir()
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "p-plain", "id": "plain",
+                           "name": "Plain", "path": "plain"}])
+        self.assertEqual(real, project.by_work_path(self.con, "plain").path)
+
+    def test_a_link_whose_directory_is_gone_fails_loudly(self) -> None:
+        """An unmounted volume must not become an empty workspace: linking is
+        how a checkout is claimed, and a claim that stops resolving is an
+        error a human fixes, not a blank directory an agent fills."""
+        repo = self.root / "on-a-volume"
+        repo.mkdir()
+        project.link(self.con, "Group/orchestra", repo)
+        repo.rmdir()  # the volume goes away
+        found = project.by_work_path(self.con, "Group/orchestra")
+        self.assertEqual(repo, found.path)
+        self.assertFalse(found.path.exists(),
+                         "no workspace is substituted for a claimed checkout")
+
+    def test_link_refuses_a_project_it_cannot_find(self) -> None:
+        repo = self.root / "orchestra"
+        repo.mkdir()
+        with self.assertRaises(SystemExit):
+            project.link(self.con, "no/such/project", repo)
