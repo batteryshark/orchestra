@@ -562,15 +562,46 @@ class RetryTests(ObserverCase):
         self.assertGreaterEqual(observer.infra_streak(self.con, self.one(
             "SELECT * FROM runs WHERE id=?", second)), 2,
             "the streak alone would have escalated")
-        launched = []
         result = observer.after_terminal(
-            self.con, second, launcher=lambda root, rid: launched.append(rid))
-        self.assertEqual(result["action"], "retry")
-        self.assertEqual(launched, [result["run"]])
+            self.con, second,
+            launcher=lambda root, rid: self.fail("a full provider was spun"))
+        self.assertEqual(result["action"], "waiting")
         waiting = self.one(
             "SELECT * FROM observations WHERE run_id=? AND layer='retry' "
             "AND action='waiting' ORDER BY id DESC", second)
         self.assertIn("capacity window", waiting["reason"])
+        # Scheduled, not spun: the row says when, and the wait grows.
+        self.assertGreater(json.loads(waiting["detail"])["not_before"], db.now())
+        self.assertEqual(60, observer.capacity_delay(1))
+        self.assertEqual(120, observer.capacity_delay(2))
+        self.assertEqual(observer.CAPACITY_BACKOFF_MAX_S,
+                         observer.capacity_delay(9), "the wait is capped")
+
+    def test_a_scheduled_capacity_retry_fires_when_it_is_due(self) -> None:
+        """The daemon's own resume sweep is the clock: it passes over a
+        waiting row until its time comes, then makes the attempt."""
+        run_id = self.make_run(status="failed", work_item="W-cap3",
+                               summary=self.CAPACITY_SUMMARY)
+        self._brief(run_id)
+        self.assertEqual("waiting", observer.after_terminal(
+            self.con, run_id,
+            launcher=lambda root, rid: self.fail("spun"))["action"])
+
+        early = observer.resume_deferred_retries(
+            self.con, launcher=lambda root, rid: self.fail("fired too early"))
+        self.assertEqual([], early, "not due yet, so nothing happens")
+
+        # Time passes.
+        self.con.execute(
+            "UPDATE observations SET detail=? WHERE run_id=? AND action='waiting'",
+            (json.dumps({"not_before": "2026-01-01T00:00:00Z", "streak": 1}),
+             run_id))
+        self.con.commit()
+        launched = []
+        due = observer.resume_deferred_retries(
+            self.con, launcher=lambda root, rid: launched.append(rid))
+        self.assertEqual(["retry"], [d["action"] for d in due])
+        self.assertEqual(launched, [due[0]["run"]])
 
     def test_a_provider_full_for_the_whole_window_hands_over_to_a_human(self) -> None:
         """The window is measured from the FIRST refusal, so a provider that
