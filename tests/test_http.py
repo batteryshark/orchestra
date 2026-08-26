@@ -950,22 +950,27 @@ class RunListNumberingTests(ServerCase):
         second = self.make_run(status="done", finished_at=db.now())
         _, snap = self.json_request()
         self.assertEqual([r["id"] for r in snap["runs"]], [second, first])
-        self.assertEqual([r["board_n"] for r in snap["runs"]], [2, 1])
         self.assertEqual(second, first + 2)
+        # The gap is counted, not renumbered: one turn ran between them.
+        self.assertEqual([r["turns_before"] for r in snap["runs"]], [1, 0])
         _, page = self.json_request(path="/api/turns")
         self.assertEqual([t["id"] for t in page["turns"]], [turn])
-        self.assertIsNone(page["turns"][0]["board_n"])
+        self.assertIsNone(page["turns"][0]["turns_before"])
         self.assertEqual(len(snap["pinned_turns"]), 1)
         self.assertEqual(snap["pinned_turns"][0]["id"], turn)
-        self.assertIsNone(snap["pinned_turns"][0]["board_n"])
+        self.assertIsNone(snap["pinned_turns"][0]["turns_before"])
         self.assertEqual(snap["pinned_turns"][0]["layer"], "observer")
 
-    def test_the_runs_list_numbers_workers_densely(self) -> None:
+    def test_the_runs_list_shows_the_run_s_own_id(self) -> None:
+        """One run, one number. Dense numbering made the board say #37 where
+        the log file, the branch, and the detail header said 64 — the owner
+        read them as two different things (2026-08-26)."""
         src = mhttp.DASHBOARD.read_text(encoding="utf-8")
         start = src.index("function renderRunList(s) {")
         body = src[start:src.index("\nfunction ", start + 1)]
-        self.assertIn('"#" + r.board_n', body)
-        self.assertNotIn('"#" + r.id', body)
+        self.assertIn('"#" + r.id', body)
+        self.assertNotIn("board_n", body)
+        self.assertIn("machine turn", body, "the gap explains itself")
         self.assertIn("turnItem(pinned)", body)
         start = src.index("function renderDetail(s) {")
         detail = src[start:src.index("\nfunction ", start + 1)]

@@ -4,6 +4,7 @@ The stub impersonates `opencode`: it emits the same JSONL shapes the real
 backend does (session id, step_finish boundaries, text output), so the
 whole dispatch -> supervise -> finalize path runs unmodified.
 """
+import json
 import os
 import signal as signal_module
 import tempfile
@@ -347,6 +348,51 @@ class E2ETestCase(unittest.TestCase):
         self.assertEqual(con.execute(
             "SELECT action FROM observations WHERE run_id=? AND layer='retry'",
             (orphan_id,)).fetchone()["action"], "deferred")
+        con.close()
+
+    def test_a_failed_run_says_why_it_died_not_its_last_words(self) -> None:
+        """PREX3 run 64 died on "the model is currently at capacity" and the
+        board showed a .gitignore fragment. The structured error was read
+        only when the worker had emitted NO text at all — and a worker that
+        dies mid-task has almost always emitted some. The reason outranks
+        the last thing the model happened to say before it stopped.
+        """
+        log = self.root / "run-64.jsonl"
+        log.write_text(
+            json.dumps({"type": "message",
+                        "text": "# Godot generated files\n.godot/"}) + "\n"
+            + json.dumps({"type": "error", "error": {
+                "message": "The model is currently at capacity due to high "
+                           "demand. Please try again in a few minutes."}}) + "\n")
+        con = db.connect()
+        run_id = int(con.execute(
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "log_path, started_at) VALUES('stub','opencode','human',?,'running',?,?)",
+            (str(self.root), str(log), db.now())).lastrowid)
+        con.commit()
+        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        result = supervise.finalize_run(con, run, "failed", 1)
+        self.assertIn("at capacity", result["summary"])
+        self.assertNotIn("Godot generated files", result["summary"])
+        con.close()
+
+    def test_a_run_that_finished_keeps_its_closing_words(self) -> None:
+        """The precedence is for the DEAD only: a run that ended on its own
+        terms still reports what it said, even when the log holds an error it
+        recovered from."""
+        log = self.root / "run-ok.jsonl"
+        log.write_text(
+            json.dumps({"type": "error", "error": {"message": "transient"}}) + "\n"
+            + json.dumps({"type": "message", "text": "Pack builds."}) + "\n")
+        con = db.connect()
+        run_id = int(con.execute(
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "log_path, started_at) VALUES('stub','opencode','human',?,'running',?,?)",
+            (str(self.root), str(log), db.now())).lastrowid)
+        con.commit()
+        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        result = supervise.finalize_run(con, run, "done", 0)
+        self.assertEqual("Pack builds.", result["summary"])
         con.close()
 
     def test_stalled_worker_is_timed_out(self) -> None:

@@ -171,6 +171,10 @@
   .runitem { padding: .5rem .8rem; border-bottom: 1px solid var(--line);
              cursor: pointer; border-left: 3px solid transparent; }
   .runitem:hover { background: var(--sel); }
+  /* Says where the missing ids went, without pretending they are runs. */
+  .rungap { padding: .15rem .8rem; border-bottom: 1px solid var(--line);
+            font: 11px var(--mono); color: var(--dim); text-align: right;
+            opacity: .7; }
   .runitem.sel { background: var(--sel); border-left-color: var(--live); }
   /* lineage, exactly as the run row records it: a spawned child, or the one
      automatic retry of an earlier attempt. */
@@ -801,14 +805,17 @@ function renderRunList(s) {
     return;
   }
   const ids = new Set(runs.map((r) => r.id));
-  // W-0304: workers number densely via board_n; turns stay unnumbered.
-  // The real id stays on the detail header.
-  box.replaceChildren(...pin, ...runs.map((r) => {
+  // W-0304: the run's own id, the same one the detail header, the branch,
+  // the log file, and every writeback use. A gap in the sequence is a
+  // machine turn, and the divider below says how many — the numbers no
+  // longer disagree about which run this is.
+  const rows = [];
+  runs.forEach((r) => {
     const lineage = (r.retry_of && ids.has(r.retry_of)) ? " continuation"
                   : (r.parent_run && ids.has(r.parent_run)) ? " related" : "";
     const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
     const top = el("div", "top");
-    top.append(el("span", "mono", "#" + r.board_n));
+    top.append(el("span", "mono", "#" + r.id));
     if (r.slug) top.append(el("span", "mono dim", r.slug));
     top.append(statusChip(r));
     const when = el("span", "mono dim", dur(r.elapsed_seconds));
@@ -822,8 +829,15 @@ function renderRunList(s) {
       r.parent_run ? "parent #" + r.parent_run : "",
     ].filter(Boolean).join(" · ")));
     item.onclick = () => selectRun(r.id);
-    return item;
-  }));
+    rows.push(item);
+    // The list runs newest first, so the turns that ran before this one sit
+    // between it and the row below.
+    if (r.turns_before > 0) {
+      rows.push(el("div", "rungap", r.turns_before === 1
+        ? "1 machine turn" : r.turns_before + " machine turns"));
+    }
+  });
+  box.replaceChildren(...pin, ...rows);
 }
 
 // --- runs: the detail pane --------------------------------------------------

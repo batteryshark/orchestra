@@ -104,7 +104,12 @@ from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
 # v13 (W-0301): statistics include the latest run instrumentation report.
 # v14 (W-0304): each worker run carries board_n, a dense rank among
 # layer-IS-NULL rows. Turns keep id and carry board_n null.
-SNAPSHOT_VERSION = 14
+# v15 (W-0304, second pick): board_n is gone. Dense numbering gave one run
+# two numbers, and the board's disagreed with the log, the branch, and the
+# detail header. A worker run now carries turns_before: the machine turns
+# between it and the previous worker run, which explains the gap in the ids
+# instead of renumbering around it.
+SNAPSHOT_VERSION = 15
 
 DEFAULT_PORT = 3011
 KEY_ENV = "ORCHESTRA_KEY"
@@ -496,17 +501,23 @@ _RUN_SELECT = (
     "AS project_work_id, "
     "(SELECT name FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
     "AS project_name, "
-    # W-0304: dense worker rank, window-independent. Turns share the id
-    # space; the board numbers workers only.
-    "(SELECT COUNT(*) FROM runs w WHERE w.layer IS NULL AND w.id<=r.id) "
-    "AS board_n FROM runs r ")
+    # W-0304, second pick: how many machine turns sit between this worker
+    # run and the previous one. Dense numbering was the first attempt and
+    # gave one run two numbers — the board said #37 where the log, the
+    # branch, and the detail header all said 64. The item allowed for this:
+    # "fall back to the divider if dual numbering proves confusing." The id
+    # is the id everywhere; this count explains the gap instead of hiding it.
+    "(SELECT COUNT(*) FROM runs t WHERE t.layer IS NOT NULL AND t.id<r.id "
+    " AND t.id>COALESCE((SELECT MAX(w.id) FROM runs w "
+    "                    WHERE w.layer IS NULL AND w.id<r.id), 0)) "
+    "AS turns_before FROM runs r ")
 
 
 def _run_payload(con, r, blocked: dict) -> dict:
     summary = r["summary"] or ""
     return {
         "id": r["id"],
-        "board_n": None if r["layer"] else r["board_n"],
+        "turns_before": None if r["layer"] else r["turns_before"],
         "slug": r["slug"],
         "status": r["status"],
         "profile": r["profile"],

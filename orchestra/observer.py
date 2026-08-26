@@ -28,7 +28,10 @@ same judgement immediately, through ``check()``.
 automatically, reusing the same brief. A recognized persistent authentication
 failure is escalated until the credential changes instead of repeating the
 same doomed attempt. Two consecutive infrastructure failures on the same item
-stop and escalate; nothing spends a third. A run that FINISHED but produced bad
+stop and escalate; nothing spends a third. A provider AT CAPACITY is the
+exception: nothing about the work is wrong and only another attempt can clear
+it, so it retries for a two-hour window measured from the first refusal, then
+escalates for a human to decide (2026-08-26). A run that FINISHED but produced bad
 work is a judgment failure, not an infrastructure one: it goes to a planner
 turn, whose seam is ``planner_review`` at the bottom of this file.
 """
@@ -937,6 +940,68 @@ def _automatic_retry_blocker(run) -> str | None:
     return None
 
 
+# A provider at capacity is not a failure of the work, and the next attempt
+# is the only thing that can clear it. Retrying twice and giving up spends a
+# whole mission on someone else's busy hour, so capacity retries are bounded
+# by the CLOCK instead of a count: keep going for this long, then hand the
+# decision to a human (2026-08-26, PREX3 run 64).
+CAPACITY_WINDOW_S = 2 * 3600
+
+# Deliberately narrow, like _automatic_retry_blocker: these are the phrases
+# providers use for "full right now, come back", never for a broken request.
+CAPACITY_PHRASES = ("at capacity", "overloaded", "capacity constraints",
+                    "try again in a few minutes", "server is busy",
+                    "temporarily unable to process")
+
+
+def capacity_wait(run) -> str | None:
+    """The provider is momentarily full; another identical attempt may work."""
+    summary = str(run["summary"] or "").casefold()
+    return next((p for p in CAPACITY_PHRASES if p in summary), None)
+
+
+def _streak_started_at(con, run) -> str | None:
+    """When the OLDEST failure of the current infrastructure streak began.
+
+    The window is measured from the first refusal, not the latest, so a
+    provider that stays full cannot extend its own deadline forever.
+    """
+    oldest = run["started_at"]
+    if run["work_item"]:
+        rows = con.execute(
+            f"SELECT status, backend, summary, started_at FROM runs "
+            f"WHERE work_item=? AND id<=? AND status IN {db.TERMINAL_SQL} "
+            "ORDER BY id DESC", (run["work_item"], run["id"]))
+        for row in rows:
+            if row["status"] not in INFRA_TERMINAL or _automatic_retry_blocker(row):
+                break
+            oldest = row["started_at"] or oldest
+        return oldest
+    current = run
+    while current is not None and current["status"] in INFRA_TERMINAL \
+            and not _automatic_retry_blocker(current):
+        oldest = current["started_at"] or oldest
+        previous = current["retry_of"]
+        current = con.execute("SELECT * FROM runs WHERE id=?",
+                              (previous,)).fetchone() if previous else None
+    return oldest
+
+
+def _capacity_window_left(con, run) -> float | None:
+    """Seconds left in the capacity window, or None when it cannot be read."""
+    started = _streak_started_at(con, run)
+    if not started:
+        return None
+    try:
+        began = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if began.tzinfo is None:
+        began = began.replace(tzinfo=timezone.utc)
+    spent = (datetime.now(timezone.utc) - began).total_seconds()
+    return CAPACITY_WINDOW_S - spent
+
+
 def infra_streak(con, run) -> int:
     """Consecutive infrastructure-shaped failures on the same item, this one
     included. The item is the Work item when there is one, else the retry
@@ -1158,7 +1223,35 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
             cfg=cfg, alert_only=True)
         return result
     streak = infra_streak(con, run)
-    if streak >= 2:
+    # A provider's busy hour is not two failures' worth of evidence about the
+    # work. While the window holds, capacity keeps its turn (2026-08-26).
+    waiting = capacity_wait(run)
+    left = _capacity_window_left(con, run) if waiting else None
+    if waiting and left is not None and left > 0:
+        record(con, run_id, "retry", "waiting",
+               f"provider {waiting}; retrying — "
+               f"{int(left // 60)} min left of the {CAPACITY_WINDOW_S // 3600}h "
+               "capacity window", {"streak": streak, "phrase": waiting})
+        con.commit()
+    elif waiting:
+        reason = (f"provider {waiting} for the whole "
+                  f"{CAPACITY_WINDOW_S // 3600}h capacity window "
+                  f"({streak} attempts) — a human decides now")
+        record(con, run_id, "retry", "escalate", reason,
+               {"streak": streak, "phrase": waiting})
+        con.commit()
+        result = {"action": "escalate", "reason": reason, "streak": streak}
+        result["escalation"] = escalate(
+            con, run, title=f"{run['backend']} stayed at capacity for "
+                            f"{run['work_item'] or f'run {run_id}'}",
+            detail=f"Run {run_id} and {streak - 1} attempt(s) before it were "
+                   f"all refused by the provider, across "
+                   f"{CAPACITY_WINDOW_S // 3600} hours.\n\n"
+                   f"{(run['summary'] or '(no summary)')[:1000]}\n\n"
+                   "Nothing is wrong with the brief. Retry when the provider "
+                   "has room, or staff the item on another backend.", cfg=cfg)
+        return result
+    elif streak >= 2:
         reason = (f"{streak} consecutive infrastructure failures on "
                   f"{run['work_item'] or f'run {run_id}'} — nothing spends a third")
         record(con, run_id, "retry", "escalate", reason, {"streak": streak})

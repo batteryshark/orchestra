@@ -545,6 +545,67 @@ class RetryTests(ObserverCase):
         self.assertIn("Two infrastructure failures", body)
         self.assertIn("W-0002", body)
 
+    CAPACITY_SUMMARY = ("The model is currently at capacity due to high "
+                        "demand. Please try again in a few minutes.")
+
+    def test_a_provider_at_capacity_keeps_its_turn_past_the_two_failure_rule(self) -> None:
+        """PREX3 run 64: xAI was full, the retry was full too, and the item
+        was escalated after two attempts. Nothing about the brief was wrong —
+        only another attempt can clear a busy provider, so the count rule
+        gives way to a clock."""
+        first = self.make_run(status="failed", work_item="W-cap",
+                              summary=self.CAPACITY_SUMMARY)
+        self._brief(first)
+        second = self.make_run(status="failed", work_item="W-cap",
+                               retry_of=first, summary=self.CAPACITY_SUMMARY)
+        self._brief(second)
+        self.assertGreaterEqual(observer.infra_streak(self.con, self.one(
+            "SELECT * FROM runs WHERE id=?", second)), 2,
+            "the streak alone would have escalated")
+        launched = []
+        result = observer.after_terminal(
+            self.con, second, launcher=lambda root, rid: launched.append(rid))
+        self.assertEqual(result["action"], "retry")
+        self.assertEqual(launched, [result["run"]])
+        waiting = self.one(
+            "SELECT * FROM observations WHERE run_id=? AND layer='retry' "
+            "AND action='waiting' ORDER BY id DESC", second)
+        self.assertIn("capacity window", waiting["reason"])
+
+    def test_a_provider_full_for_the_whole_window_hands_over_to_a_human(self) -> None:
+        """The window is measured from the FIRST refusal, so a provider that
+        stays full cannot extend its own deadline. When it runs out, a human
+        decides — retry later, or staff the item somewhere else."""
+        old_start = "2026-08-25T00:00:00Z"
+        first = self.make_run(status="failed", work_item="W-cap2",
+                              started_at=old_start, summary=self.CAPACITY_SUMMARY)
+        self._brief(first)
+        second = self.make_run(status="failed", work_item="W-cap2",
+                               retry_of=first, started_at=old_start,
+                               summary=self.CAPACITY_SUMMARY)
+        self._brief(second)
+        result = observer.after_terminal(
+            self.con, second,
+            launcher=lambda root, rid: self.fail("a spent window must not retry"))
+        self.assertEqual(result["action"], "escalate")
+        self.assertIn("capacity window", result["reason"])
+        self.assertEqual(self.retries_of(second), 0)
+
+    def test_ordinary_failures_still_stop_at_two(self) -> None:
+        """The exception is capacity alone: a run that failed for its own
+        reasons keeps the count rule exactly as it was."""
+        first = self.make_run(status="failed", work_item="W-plain",
+                              summary="Traceback: something broke")
+        self._brief(first)
+        second = self.make_run(status="failed", work_item="W-plain",
+                               retry_of=first, summary="Traceback: again")
+        self._brief(second)
+        result = observer.after_terminal(
+            self.con, second,
+            launcher=lambda root, rid: self.fail("a third attempt was spent"))
+        self.assertEqual(result["action"], "escalate")
+        self.assertIn("nothing spends a third", result["reason"])
+
     def test_non_infrastructure_outcomes_are_never_retried(self) -> None:
         for status in ("done", "killed", "halted"):
             with self.subTest(status=status):
