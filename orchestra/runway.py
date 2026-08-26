@@ -1195,10 +1195,37 @@ def parse_codex(lines) -> Runway:
     }))
 
 
+def _codex_reset_credits(result: dict) -> str | None:
+    """Banked rate-limit resets, from the app server's OWN list of them.
+
+    ``rateLimits.credits.balance`` is a different thing and reads "0" while
+    a granted reset sits unspent: the resets live at the top level, in
+    ``rateLimitResetCredits.credits``, each with a status and an expiry
+    (2026-08-26 — the owner had one full reset banked and the card said
+    "0 banked resets", on an account already at 100% of its week).
+
+    Only ``available`` ones count. A spent or expired grant is history, and
+    a reset the owner never spends is one they lose — so the soonest expiry
+    rides along, as it does for Grok.
+    """
+    block = (result or {}).get("rateLimitResetCredits")
+    entries = (block or {}).get("credits") if isinstance(block, dict) else None
+    if not isinstance(entries, list):
+        return None
+    live = [c for c in entries if isinstance(c, dict)
+            and str(c.get("status", "")).lower() == "available"]
+    text = f"{len(live)} banked reset" + ("" if len(live) == 1 else "s")
+    expiries = sorted(c["expiresAt"] for c in live
+                      if isinstance(c.get("expiresAt"), (int, float)))
+    if not expiries:
+        return text
+    soonest = datetime.fromtimestamp(expiries[0], timezone.utc)
+    return f"{text} · soonest expires {soonest.strftime('%Y-%m-%d')}"
+
+
 def _codex_credits_text(credits) -> str | None:
-    """``credits`` on a Codex plan is banked RESETS, not money — which is why
-    a plan provider may show it (W-0184). ZERO is the reading the owner asked
-    for: "no resets banked" is a fact, and an absent line is not."""
+    """The plan's own ``credits`` block, used only when the app server gave
+    no reset list — a session-file recording carries this and nothing else."""
     if not isinstance(credits, dict):
         return None
     if credits.get("unlimited"):
@@ -1233,7 +1260,8 @@ def parse_codex_live(result: dict) -> Runway:
     return from_windows("codex", windows, as_of=db.now(), raw=_scrub({
         "plan_type": limits.get("planType"),
         "rate_limit_reached_type": limits.get("rateLimitReachedType"),
-        "credits": _codex_credits_text(limits.get("credits")),
+        "credits": _codex_reset_credits(result)
+                   or _codex_credits_text(limits.get("credits")),
     }))
 
 

@@ -876,6 +876,38 @@ class CodexLiveTests(unittest.TestCase):
         self.assertEqual(["weekly"], [w["label"] for w in r.windows])
         self.assertEqual("0 banked resets", runway.credits_text(r.raw))
 
+    # The shape the app server actually returns, trimmed: the granted
+    # resets live at the TOP level, beside rateLimits, not inside it.
+    WITH_RESET = {
+        **LIVE,
+        "rateLimitResetCredits": {"credits": [
+            {"id": "RateLimitResetCredit_83e", "resetType": "codexRateLimits",
+             "status": "available", "grantedAt": 1787357037,
+             "expiresAt": 1789949037, "title": "Full reset"},
+            {"id": "RateLimitResetCredit_old", "resetType": "codexRateLimits",
+             "status": "redeemed", "grantedAt": 1780000000,
+             "expiresAt": 1780009037, "title": "Full reset"}]}}
+
+    def test_a_banked_reset_is_read_from_the_reset_list(self) -> None:
+        """2026-08-26: the owner had a full reset banked, on an account
+        already at 100% of its week, and the card said "0 banked resets" —
+        rateLimits.credits.balance is a different thing and reads zero while
+        a granted reset sits unspent. A spent one is history; a reset the
+        owner never spends is one they lose, so the expiry rides along."""
+        r = runway.parse_codex_live(self.WITH_RESET)
+        self.assertEqual("1 banked reset · soonest expires 2026-09-21",
+                         runway.credits_text(r.raw))
+
+    def test_no_reset_list_still_reads_the_plan_block(self) -> None:
+        """A session-file recording carries the old block and nothing else."""
+        self.assertEqual("0 banked resets",
+                         runway.credits_text(runway.parse_codex_live(self.LIVE).raw))
+
+    def test_an_empty_reset_list_says_none_banked(self) -> None:
+        payload = {**self.LIVE, "rateLimitResetCredits": {"credits": []}}
+        self.assertEqual("0 banked resets",
+                         runway.credits_text(runway.parse_codex_live(payload).raw))
+
     def test_a_dead_app_server_falls_back_to_the_session_record(self) -> None:
         def boom():
             raise RuntimeError("codex is not installed")
