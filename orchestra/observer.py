@@ -41,7 +41,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from orchestra import config, db, dispatch, nod, paths, runners, traces
@@ -954,6 +954,20 @@ CAPACITY_PHRASES = ("at capacity", "overloaded", "capacity constraints",
                     "temporarily unable to process")
 
 
+# Backoff between capacity attempts. The provider asked for "a few minutes";
+# hammering it every few seconds for two hours is how you turn a busy hour
+# into a rate-limit ban. Doubling from a minute, capped, spends roughly
+# fifteen attempts on a two-hour window instead of hundreds.
+CAPACITY_BACKOFF_MIN_S = 60
+CAPACITY_BACKOFF_MAX_S = 900
+
+
+def capacity_delay(streak: int) -> int:
+    """Seconds to wait before the next attempt at a full provider."""
+    return min(CAPACITY_BACKOFF_MAX_S,
+               CAPACITY_BACKOFF_MIN_S * 2 ** max(0, streak - 1))
+
+
 def capacity_wait(run) -> str | None:
     """The provider is momentarily full; another identical attempt may work."""
     summary = str(run["summary"] or "").casefold()
@@ -985,6 +999,12 @@ def _streak_started_at(con, run) -> str | None:
         current = con.execute("SELECT * FROM runs WHERE id=?",
                               (previous,)).fetchone() if previous else None
     return oldest
+
+
+def _iso_in(seconds: int) -> str:
+    """A UTC stamp `seconds` from now, in the shape db.now() writes."""
+    when = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _capacity_window_left(con, run) -> float | None:
@@ -1181,9 +1201,14 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     if run is None:
         return {"action": "none", "reason": f"no run {run_id}"}
     retry = _last(con, run_id, "retry")
-    if retry is not None and retry["action"] != "deferred":
+    if retry is not None and retry["action"] not in ("deferred", "waiting"):
         return {"action": "none", "reason":
                 f"retry policy already settled as {retry['action']}"}
+    # Arriving on a wait that has come due means the waiting is OVER: this
+    # pass makes the attempt instead of scheduling another one, or a
+    # capacity retry would reschedule itself forever and never run.
+    resuming = retry is not None and retry["action"] == "waiting" \
+        and _retry_due(retry)
     stop = _last(con, run_id, "observer", "stop") or _last(con, run_id, "mechanical", "stop")
     if stop is not None:
         # The finalizer overwrote `summary` with the transcript's last words;
@@ -1227,13 +1252,22 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     # work. While the window holds, capacity keeps its turn (2026-08-26).
     waiting = capacity_wait(run)
     left = _capacity_window_left(con, run) if waiting else None
-    if waiting and left is not None and left > 0:
+    window_open = waiting and left is not None and left > 0
+    if window_open and not resuming:
+        # Scheduled, not spun: the row says when it is due, and the daemon's
+        # own resume sweep fires it. Sleeping here would hold the dependency
+        # release that runs immediately after this call.
+        delay = min(capacity_delay(streak), int(left))
+        due = _iso_in(delay)
         record(con, run_id, "retry", "waiting",
-               f"provider {waiting}; retrying — "
+               f"provider {waiting}; next attempt in {delay // 60 or 1} min — "
                f"{int(left // 60)} min left of the {CAPACITY_WINDOW_S // 3600}h "
-               "capacity window", {"streak": streak, "phrase": waiting})
+               "capacity window",
+               {"streak": streak, "phrase": waiting, "not_before": due})
         con.commit()
-    elif waiting:
+        return {"action": "waiting", "reason": f"provider {waiting}",
+                "not_before": due, "streak": streak}
+    if waiting and not window_open:
         reason = (f"provider {waiting} for the whole "
                   f"{CAPACITY_WINDOW_S // 3600}h capacity window "
                   f"({streak} attempts) — a human decides now")
@@ -1251,7 +1285,7 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
                    "Nothing is wrong with the brief. Retry when the provider "
                    "has room, or staff the item on another backend.", cfg=cfg)
         return result
-    elif streak >= 2:
+    if streak >= 2 and not window_open:
         reason = (f"{streak} consecutive infrastructure failures on "
                   f"{run['work_item'] or f'run {run_id}'} — nothing spends a third")
         record(con, run_id, "retry", "escalate", reason, {"streak": streak})
@@ -1305,19 +1339,50 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
 
 def resume_deferred_retries(con, cfg: dict | None = None,
                             launcher=None) -> list[dict]:
-    """Replay one-shot infrastructure retries held by the pause switch."""
+    """Replay retries the policy held: by the pause switch, or by a clock.
+
+    A capacity retry is scheduled rather than spun (``not_before`` on its
+    ``waiting`` row), so this pass is also the thing that fires it when the
+    provider has had its few minutes.
+    """
     if dispatch.paused(con):
         return []
     rows = list(con.execute(
-        "SELECT o.run_id FROM observations o JOIN runs r ON r.id=o.run_id "
-        "WHERE o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
+        "SELECT o.run_id, o.action, o.detail FROM observations o "
+        "JOIN runs r ON r.id=o.run_id "
+        "WHERE o.layer='retry' AND o.action IN ('deferred','waiting') "
+        "AND NOT EXISTS ("
         " SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
         " AND newer.layer='retry' AND newer.id>o.id) "
         "AND r.landing_status IS NOT NULL AND r.handoff_processed_at IS NOT NULL "
         "AND EXISTS (SELECT 1 FROM messages m WHERE m.run_id=r.id "
         "AND m.kind='completion') ORDER BY o.id"))
     return [after_terminal(con, int(row["run_id"]), cfg=cfg, launcher=launcher)
-            for row in rows]
+            for row in rows if _retry_due(row)]
+
+
+def _retry_due(row) -> bool:
+    """True unless the row carries a ``not_before`` still in the future.
+
+    An unreadable stamp is treated as due: a retry that cannot be scheduled
+    must still happen, and the window above bounds how long it can go on.
+    """
+    if row["action"] != "waiting":
+        return True
+    try:
+        detail = json.loads(row["detail"] or "{}")
+        due = str(detail.get("not_before") or "")
+    except (ValueError, TypeError):
+        return True
+    if not due:
+        return True
+    try:
+        when = datetime.fromisoformat(due.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) >= when
 
 
 # --- the planner seam --------------------------------------------------------

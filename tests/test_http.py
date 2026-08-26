@@ -6,6 +6,7 @@ throwaway directory. No daemon is started.
 """
 import gzip
 import json
+import re
 import os
 import signal as signal_module
 import subprocess
@@ -972,6 +973,29 @@ class RunListNumberingTests(ServerCase):
         self.assertNotIn("board_n", body)
         self.assertIn("machine turn", body, "the gap explains itself")
         self.assertIn("turnItem(pinned)", body)
+
+    def test_every_surface_means_the_same_run_by_the_same_number(self) -> None:
+        """"Run 64" has to mean run 64 everywhere: the list, the detail
+        header, the stop prompt, the instruction box, the turns card, and
+        every id the payload carries. The board once numbered workers
+        densely and said #37 for the run whose log, branch, and header all
+        said 64 (2026-08-26) — nothing may introduce a second numbering.
+        """
+        src = mhttp.DASHBOARD.read_text(encoding="utf-8")
+        shown = set(re.findall(r'"#"\s*\+\s*([A-Za-z_][\w.]*)', src))
+        self.assertTrue(shown, "the dashboard shows run numbers somewhere")
+        allowed = {"r.id", "run.id", "r.run_id", "SELECTED", "r.parent_run",
+                   "r.retry_of", "k.id"}
+        self.assertEqual(set(), shown - allowed,
+                         f"a run number came from something other than its id: "
+                         f"{sorted(shown - allowed)}")
+        # And the wire carries no rival numbering to render.
+        _, snap = self.json_request()
+        for run in snap["runs"]:
+            self.assertNotIn("board_n", run)
+            for key, value in run.items():
+                if key.endswith(("_n", "_no", "_number", "ordinal")):
+                    self.fail(f"payload carries a second run number: {key}={value}")
         start = src.index("function renderDetail(s) {")
         detail = src[start:src.index("\nfunction ", start + 1)]
         self.assertIn('"#" + r.id', detail)
