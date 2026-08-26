@@ -751,8 +751,11 @@ def _runway(con) -> list[dict]:
     for r in con.execute("SELECT * FROM runway_polls ORDER BY id DESC LIMIT ?",
                          (RUNWAY_POLLS,)):
         history.setdefault(r["provider"], []).append(r)
+    # A provider that used to be staffed leaves rows behind. The board shows
+    # what is being spent now, so yesterday's plan drops off with it.
+    on_the_board = runway.shown(config.load())
     out = []
-    for provider in sorted(history):
+    for provider in sorted(p for p in history if p in on_the_board):
         rows = history[provider]
         latest = rows[0]
         windows = [runway.as_of_now(w) for w in _json_list(latest["windows"])]
