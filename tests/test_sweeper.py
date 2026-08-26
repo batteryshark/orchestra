@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import brief, config, db, project, supervise, sweeper
+from orchestra import brief, config, db, paths, project, supervise, sweeper
 from orchestra.work_client import WorkClient, WorkError
 from tests.fake_work import FakeWork
 
@@ -1156,3 +1156,35 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoreOnlyDispatchTests(SweeperFixture, unittest.TestCase):
+    """W-0312, end to end: an item whose project has no checkout still runs.
+
+    I-0302 sat in a project Work groups under a folder name. Orchestra read
+    that organizational path as a directory, found none, and failed twice —
+    once on the worktree guard, once as a supervisor spawned with a cwd that
+    did not exist. The lane now works in an ephemeral workspace, without
+    isolation there is nothing to isolate from.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Work's shape for a store-only project: a grouped path, no directory.
+        self.work.add_project("Group/paperwork", "p-store",
+                              path="Group/paperwork", name="Paperwork")
+
+    def test_a_project_with_no_checkout_still_dispatches(self) -> None:
+        self.work.add_task("W-0001", "book the trip", delegated=True,
+                           project_path="Group/paperwork")
+        self.sweep()
+        con = db.connect()
+        run = con.execute("SELECT * FROM runs WHERE work_item='W-0001'").fetchone()
+        con.close()
+        self.assertIsNotNone(run, "the item was dispatched, not skipped")
+        self.assertEqual("p-store", run["project_id"])
+        workdir = Path(run["workdir"])
+        self.assertTrue(workdir.is_dir(), "the run has a real directory")
+        self.assertEqual(paths.workspace_dir("p-store"), workdir)
+        self.assertFalse(run["branch"], "no worktree without a repository")
+        self.assertEqual([workdir], [r for r, _ in self.launched])

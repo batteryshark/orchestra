@@ -71,6 +71,17 @@ def worktrees_dir(project_id: str) -> Path:
     return _owner_dir(_sub("worktrees") / slugify(project_id))
 
 
+def workspace_dir(project_id: str) -> Path:
+    """Where a project with no checkout of its own runs (W-0312).
+
+    A store-only Work project — a trip to book, a will to finalize — has an
+    organizational path and no directory anywhere. It still needs somewhere
+    to put a file, so it gets one here, keyed by the immutable project id and
+    kept across runs so a second pass sees what the first one wrote.
+    """
+    return _owner_dir(_sub("workspaces") / slugify(project_id))
+
+
 def hooks_dir() -> Path:
     """Where Orchestra keeps the artifacts it installs into harnesses (§6)."""
     return _sub("hooks")
