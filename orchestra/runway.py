@@ -1350,22 +1350,50 @@ def skipped(cfg: dict | None) -> set:
     return {str(n).strip().lower() for n in names if str(n).strip()}
 
 
-def poll_all(cfg: dict | None = None) -> list[Runway]:
+def in_use(cfg: dict | None) -> set:
+    """Providers an ENABLED profile actually spends against.
+
+    A plan nobody is staffed on is not this workspace's business: kimi and
+    minimax sat on the board forever showing "–", indistinguishable from a
+    provider that was failing to answer. The board is for what is being
+    spent, so a provider no profile routes to is not shown at all (the CLI's
+    `orchestra runway` still polls every adapter, so nothing is unfindable).
+    """
+    from orchestra import config  # local: config imports paths, not runway
+
+    return {provider_of(p.get("backend") or "", p.get("model"))
+            for p in config.enabled_profiles(cfg or {}).values()
+            if p.get("backend")}
+
+
+def shown(cfg: dict | None) -> set:
+    """The adapters the board polls: in use, and not explicitly skipped.
+
+    A config that names NO profiles cannot say what is in use, so it hides
+    nothing — an unreadable or half-written config must not silently blank
+    the board, which would look exactly like every provider going quiet.
+    """
+    names = {a.__name__ for a in ADAPTERS}
+    used = in_use(cfg) & names
+    return (used or names) - skipped(cfg)
+
+
+def poll_all(cfg: dict | None = None, all_providers: bool = False) -> list[Runway]:
     """Four of the six adapters are network-bound and independent, so they run
     together: polled in series a refresh costs the SUM of the timeouts, which
     is what a human waits behind on the dashboard's refresh button. Every
     adapter is already @soft, so a worker thread cannot raise out of the pool.
 
-    A skipped provider is still REPORTED, as unknown with a reason. Dropping
-    the row entirely would make a lapsed plan look like a provider that never
-    existed, and the owner would have no way to see what they turned off.
+    ``all_providers`` polls every adapter, which is what the CLI does — the
+    board polls only what it will show (``shown``), so a plan nobody is
+    staffed on costs neither a request nor a row that reads as a fault.
     """
-    off = skipped(cfg)
-    live = [a for a in ADAPTERS if a.__name__ not in off]
+    live = ADAPTERS if all_providers else [
+        a for a in ADAPTERS if a.__name__ in shown(cfg)]
+    if not live:
+        return []
     with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
         results = list(pool.map(lambda adapter: adapter(), live))
-    results += [unknown(name, "no plan configured (skipped in [runway] skip)")
-                for name in sorted(off) if name in {a.__name__ for a in ADAPTERS}]
     return sorted(results, key=lambda r: r.provider)
 
 

@@ -317,7 +317,14 @@ class SnapshotTests(ServerCase):
         self.assertEqual(
             [p["profile"] for p in payload["statistics"]["by_profile"]], ["codex"])
 
+    def _staff(self, *profiles: str) -> None:
+        """The board shows the providers this workspace is STAFFED on, so a
+        runway test has to say who it staffs (2026-08-26)."""
+        self.config_path.write_text("\n\n".join(profiles))
+
     def test_the_runway_route_replays_stored_polls_without_refresh(self) -> None:
+        self._staff('[profiles.ds]\nbackend = "reasonix"\n'
+                    'model = "deepseek/deepseek-v4-flash"\n')
         self.con.execute(
             "INSERT INTO runway_polls(provider, remaining, unit, polled_at) "
             "VALUES('deepseek', 10.5, 'USD', ?)", (db.now(),))
@@ -333,7 +340,11 @@ class SnapshotTests(ServerCase):
         ``?refresh=1`` the route only replays what is stored."""
         polled = []
 
-        def fake_poll(cfg=None):  # poll_all takes the config now
+        self._staff('[profiles.probe]\nbackend = "codex"\nmodel = "gpt-5"\n',
+                    '[profiles.grok]\nbackend = "opencode"\n'
+                    'model = "xai/grok-4.6"\n')
+
+        def fake_poll(cfg=None, all_providers=False):
             polled.append(True)
             return [runway.unknown("xai", "no endpoint"),
                     runway.Runway("codex", remaining=75.0, unit="percent")]

@@ -803,14 +803,38 @@ class SkipTests(unittest.TestCase):
             return adapter
         return tuple(make(n) for n in ("claude", "codex", "minimax"))
 
-    def test_a_skipped_provider_is_reported_not_hidden(self) -> None:
+    STAFFED = {"profiles": {
+        "a": {"backend": "claude", "model": "claude-opus-5"},
+        "b": {"backend": "codex", "model": "gpt-5.6-sol"},
+        "c": {"backend": "opencode", "model": "minimax/m2"}}}
+
+    def test_a_skipped_provider_is_off_the_board_entirely(self) -> None:
+        """2026-08-26, the owner: hide what we are not leveraging. A skipped
+        plan used to keep a row reading "–", which on the board is the same
+        glyph a provider that failed to answer gets."""
+        cfg = {**self.STAFFED, "runway": {"skip": ["minimax"]}}
         with mock.patch.object(runway, "ADAPTERS", self._fake_adapters()):
-            results = runway.poll_all({"runway": {"skip": ["minimax"]}})
+            results = runway.poll_all(cfg)
         by_name = {r.provider: r for r in results}
-        self.assertIn("minimax", by_name, "a skipped provider still gets a row")
-        self.assertFalse(by_name["minimax"].known)
-        self.assertIn("no plan configured", by_name["minimax"].reason)
+        self.assertNotIn("minimax", by_name)
         self.assertTrue(by_name["claude"].known, "the rest still poll")
+
+    def test_a_provider_no_profile_uses_is_off_the_board_too(self) -> None:
+        """Nothing is staffed on minimax, so it is not this workspace's
+        business — no request, no row, no glyph."""
+        staffed_elsewhere = {"profiles": {
+            "a": {"backend": "claude", "model": "claude-opus-5"}}}
+        with mock.patch.object(runway, "ADAPTERS", self._fake_adapters()):
+            results = runway.poll_all(staffed_elsewhere)
+        self.assertEqual(["claude"], [r.provider for r in results])
+
+    def test_the_cli_still_polls_every_adapter(self) -> None:
+        """Hidden is not unfindable: `orchestra runway` asks all of them."""
+        with mock.patch.object(runway, "ADAPTERS", self._fake_adapters()):
+            results = runway.poll_all({"runway": {"skip": ["minimax"]}},
+                                      all_providers=True)
+        self.assertEqual(["claude", "codex", "minimax"],
+                         [r.provider for r in results])
 
     def test_a_skipped_provider_is_not_polled(self) -> None:
         called = []
@@ -821,9 +845,9 @@ class SkipTests(unittest.TestCase):
 
         spy.__name__ = "minimax"
         with mock.patch.object(runway, "ADAPTERS", (spy,)):
-            runway.poll_all({"runway": {"skip": ["minimax"]}})
+            runway.poll_all({**self.STAFFED, "runway": {"skip": ["minimax"]}})
             self.assertEqual([], called)
-            runway.poll_all({})
+            runway.poll_all(self.STAFFED)
             self.assertEqual(["minimax"], called)
 
     def test_the_skip_list_is_case_and_space_tolerant(self) -> None:
