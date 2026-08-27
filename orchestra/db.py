@@ -94,7 +94,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "16"
+SCHEMA_VERSION = "17"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -145,6 +145,17 @@ RUNS_V16_COLUMNS = (
     ("worker_status", "TEXT"),
     ("worker_exit_code", "INTEGER"),
     ("work_claim_status", "TEXT"),
+)
+# Schema v17. A run may ask for HELP: a weaker profile to take a bounded
+# piece while it keeps the mission. ``parent_run`` already says who spawned
+# it; these say how deep the tree goes, which request produced this child,
+# and how its lead was told the batch had settled — once, whether the lead
+# was still running (a message) or already finished (a continuation run).
+RUNS_V17_COLUMNS = (
+    ("child_depth", "INTEGER"),
+    ("spawn_request_id", "INTEGER"),
+    ("child_wakeup_run", "INTEGER"),
+    ("child_wakeup_message", "INTEGER"),
 )
 
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
@@ -216,7 +227,11 @@ CREATE TABLE IF NOT EXISTS runs (
   handoff_processed_at TEXT,
   worker_status TEXT,
   worker_exit_code INTEGER,
-  work_claim_status TEXT
+  work_claim_status TEXT,
+  child_depth INTEGER,
+  spawn_request_id INTEGER,
+  child_wakeup_run INTEGER,
+  child_wakeup_message INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
@@ -278,6 +293,30 @@ CREATE TABLE IF NOT EXISTS deferred_dispatches (
 -- yet waits HERE, with the reason it waits, instead of being moved to
 -- in_progress on entering a queue. One row per item; ``id`` is the FIFO
 -- tiebreak and ``lane_index`` the ready-lane board position it last had.
+-- Schema v17. A worker asks for help by WRITING here; it never launches a
+-- process from inside its own sandbox. The parent's supervisor claims each
+-- request, enforces the bounds, creates the batch, and starts it. The
+-- broker is the enforcement point, never the model's judgment.
+CREATE TABLE IF NOT EXISTS spawn_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lead_run INTEGER NOT NULL REFERENCES runs(id),
+  requested_by TEXT NOT NULL,
+  targets_json TEXT NOT NULL,
+  mission TEXT NOT NULL,
+  title TEXT,
+  context TEXT,
+  shared_workdir INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT,
+  child_run_ids_json TEXT,
+  wakeup_run INTEGER,
+  wakeup_message INTEGER,
+  notified_at TEXT,
+  created_at TEXT NOT NULL,
+  processed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS spawn_requests_lead
+  ON spawn_requests(lead_run, status);
 CREATE TABLE IF NOT EXISTS dispatch_queue (
   id INTEGER PRIMARY KEY,
   item_id TEXT NOT NULL UNIQUE,
@@ -431,7 +470,7 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in (RUNS_V2_COLUMNS + RUNS_V4_COLUMNS
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
-                               + RUNS_V16_COLUMNS):
+                               + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
         if upgrading_v16:

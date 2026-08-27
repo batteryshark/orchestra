@@ -27,9 +27,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import (acp, auth, brief, config, db, dispatch, findings,
-                         merge, messaging, names, observer, paths, project,
-                         runners, traces, worktree)
+from orchestra import (acp, auth, brief, child_runs, config, db, dispatch,
+                       findings, merge, messaging, names, observer, paths,
+                       project, runners, traces, worktree)
 from orchestra.proc import (enrich_path, process_identity, resolve_cmd,
                             session_kwargs, terminate_group)
 
@@ -257,7 +257,8 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
             mission=mission, requester=run["requested_by"], root=root,
             workdir=workdir, extra_context=context, work_snapshot=work_snapshot,
             work_item=item if (item or "").startswith("W-") else None,
-            recent_commits=worktree.recent_commits(Path(workdir)))
+            recent_commits=worktree.recent_commits(Path(workdir)),
+            cfg=cfg)
         bp.write_text(text, encoding="utf-8")
         lp.touch()
         prepared = con.execute(
@@ -534,7 +535,8 @@ def _wait_after_term(child: subprocess.Popen, timeout: float = 15) -> None:
 
 
 def _run_proc(con, run, cmd, env, log_path, run_id, deadline,
-              stall_timeout: int | None) -> tuple[str, int | None]:
+              stall_timeout: int | None, root: Path | None = None,
+              cfg: dict | None = None) -> tuple[str, int | None]:
     """Start one worker process; wait with stall detection + hard timeout +
     early session-ref capture + safe-boundary interrupt watching.
     Returns (outcome, exit_code) where outcome is 'exit' | 'timeout'."""
@@ -588,6 +590,16 @@ def _run_proc(con, run, cmd, env, log_path, run_id, deadline,
                 con.execute("UPDATE runs SET session_ref=? WHERE id=?", (ref, run_id))
                 con.commit()
                 have_ref = True
+        # A worker asking for help WRITES a request; this is the only place
+        # that turns one into running children, and it is outside the
+        # worker's sandbox on purpose (child_runs).
+        if root is not None and cfg is not None:
+            try:
+                child_runs.process_pending(con, root, cfg, run_id,
+                                           spawn_supervisor)
+            except Exception as exc:  # help must never kill the lead
+                print(f"orchestra: run {run_id} spawn request failed: {exc}",
+                      file=sys.stderr)
         pending = _pending_delivery_offset(con, run_id)
         if pending is not None:
             if pending_after != pending:
@@ -1097,7 +1109,8 @@ def supervise(root: Path, run_id: int) -> int:
         if lane := runners.lane_of(profile):
             runners.write_lane(run["log_path"], lane)
         outcome, exit_code = _run_proc(con, run, cmd, env, run["log_path"],
-                                       run_id, deadline, stall_timeout)
+                                       run_id, deadline, stall_timeout,
+                                       root=root, cfg=cfg)
         run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if outcome == "timeout":
             status = "timeout"
@@ -1211,6 +1224,18 @@ def supervise(root: Path, run_id: int) -> int:
     # the dependency release, so a retry re-points the waiting dependents
     # instead of letting them be declined.
     observer.after_terminal(con, run_id)
+    # A lead that ended owes its unclaimed requests an answer, and a batch
+    # that just settled owes its lead the results — once (child_runs).
+    child_runs.fail_unprocessed(con, run_id, f"run {run_id} ended {status} "
+                                             "before this request was claimed")
+    try:
+        wake_id = child_runs.maybe_wake_lead(con, root, run_id)
+    except Exception as exc:
+        wake_id = None
+        print(f"orchestra: run {run_id} child wakeup failed: {exc}",
+              file=sys.stderr)
     process_ready(con, spawn_supervisor)  # dependency release (D3)
     con.close()
+    if wake_id:
+        spawn_supervisor(root, wake_id)
     return 0 if status == "done" else 1

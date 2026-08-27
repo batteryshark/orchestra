@@ -8,7 +8,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import (acp, auth, conductor, config, daemon, db, dispatch,
+from orchestra import (acp, auth, child_runs, conductor, config, daemon, db,
+                         dispatch,
                          harnesses, hooks, http, merge, messaging, nod,
                          observer, paths, proc, profile_edit, profiles, project,
                          review, runway, service, supervise, sweeper, traces,
@@ -388,6 +389,42 @@ def cmd_reply(args):
             finally:
                 con.close()
             raise
+
+
+def cmd_spawn(args):
+    """`orchestra spawn --to <profile> "<mission>"` — a run asks for help.
+
+    This WRITES a request and returns. The lead's own supervisor claims it,
+    checks the bounds, and starts the children — a worker never launches a
+    process from inside its own sandbox (child_runs).
+    """
+    con = db.connect()
+    try:
+        token = os.environ.get(auth.TOKEN_ENV, "")
+        identity = auth.identify(con, token, None) if token else None
+        identity_run = identity.run_id if identity else None
+        run_id = args.run_id or identity_run
+        if not run_id:
+            raise SystemExit(
+                "orchestra: spawn is for a running run to ask for help; it "
+                f"needs {auth.TOKEN_ENV} in the environment, or --run")
+        cfg = config.load(_project_id(con, run_id))
+        parent = child_runs.validate_parent(con, cfg, int(run_id), identity_run)
+        child_runs.validate_targets(cfg, parent, args.to)
+        request_id = child_runs.enqueue(
+            con, parent, args.to, " ".join(args.mission),
+            title=args.title, context=args.context,
+            shared_workdir=args.shared_workdir)
+    finally:
+        con.close()
+    print(f"spawn request {request_id}: {', '.join(args.to)} for run {run_id}. "
+          "Your supervisor starts them; keep working until they settle.")
+
+
+def _project_id(con, run_id: int) -> str | None:
+    row = con.execute("SELECT project_id FROM runs WHERE id=?",
+                      (run_id,)).fetchone()
+    return row["project_id"] if row else None
 
 
 def cmd_interrupt(args):
@@ -1413,6 +1450,20 @@ def main():
     s.add_argument("--start", action="store_true",
                    help="also load and start it now (install only)")
     s.set_defaults(fn=cmd_service)
+
+    s = sub.add_parser("spawn", help="ask for help: bounded child runs on "
+                                     "weaker profiles")
+    s.set_defaults(fn=cmd_spawn, run_id=None, title=None, context=None,
+                   shared_workdir=False)
+    s.add_argument("mission", nargs="+", help="what the children are to do")
+    s.add_argument("--to", action="append", required=True, metavar="PROFILE",
+                   help="a profile to hand a piece to; repeat for a batch")
+    s.add_argument("--run", dest="run_id", type=int,
+                   help="the lead run (default: the caller's own)")
+    s.add_argument("--title", help="short title for the child runs")
+    s.add_argument("--context", help="extra context for the brief")
+    s.add_argument("--shared-workdir", action="store_true",
+                   help="work in the lead's checkout instead of a worktree")
 
     s = sub.add_parser("project", help="register a local directory Orchestra "
                                        "may dispatch into")
