@@ -7,6 +7,8 @@ under 300 tokens (tested as <= 1,200 chars); the protocol card renders in
 import re
 from pathlib import Path
 
+from orchestra import config
+
 # Must stay <= 10 lines and inside the D6 budget (tests enforce both).
 PROTOCOL_CARD = """\
 ## Protocol
@@ -120,6 +122,35 @@ def writeback_section() -> str:
     return WRITEBACK_STYLE.read_text(encoding="utf-8").rstrip() + "\n"
 
 
+# A brief never teaches a verb it cannot use, so this is added only for a
+# run that may actually spawn: one with depth left, and a weaker profile to
+# hand a piece to. Delegation was invisible for exactly this reason — the
+# card said nothing, so no worker ever asked.
+HELP_PROTOCOL = """\
+- You may hand ONE bounded piece to a cheaper model: `orchestra spawn --to \
+{targets} "<what to do>"`. It records a request; your supervisor starts it.
+- Ask only for work you can check. You keep the mission, they keep a branch,
+  and you decide what of it survives. Keep working; you are told when they settle.
+"""
+
+
+def help_protocol(cfg: dict, profile_name: str) -> str:
+    """The spawn line, when this run has somewhere weaker to hand work."""
+    from orchestra import child_runs  # cycle: child_runs imports brief
+
+    tier = config.tier_of((cfg.get("profiles") or {})
+                          .get(profile_name, {}).get("tier"))
+    if tier is None:
+        return ""
+    max_depth, _, _ = child_runs.limits(cfg)
+    if max_depth < 1:
+        return ""
+    weaker = sorted(
+        name for name, p in config.enabled_profiles(cfg).items()
+        if name != profile_name and (config.tier_of(p.get("tier")) or 99) < tier)
+    return HELP_PROTOCOL.format(targets="|".join(weaker)) if weaker else ""
+
+
 def _protocol_card() -> str:
     """Return the fixed protocol."""
     return PROTOCOL_CARD
@@ -158,7 +189,8 @@ def compose(*, run_id: int, slug: str | None, profile: dict, mission: str,
             extra_context: str | None = None,
             work_snapshot: str | None = None,
             work_item: str | None = None,
-            recent_commits: list[str] | None = None) -> str:
+            recent_commits: list[str] | None = None,
+            cfg: dict | None = None) -> str:
     run_label = f"{run_id} · {slug}" if slug else str(run_id)
     parts = [f"""# Run {run_label}
 
@@ -191,7 +223,40 @@ Project: `{root}` · Working directory: `{workdir}`.
         parts.append(f"## Additional context\n\n{extra_context}\n")
     parts.append(writeback_section())
     parts.append(_protocol_card())
+    if cfg is not None:
+        parts.append(help_protocol(cfg, profile.get("name", "")))
     return "\n".join(parts)
+
+
+def compose_child(root: Path, run, profile: dict, mission: str, *,
+                  parent, context: str | None = None, workdir: str,
+                  cfg: dict | None = None) -> str:
+    """A child run's brief: the piece, and nothing about the whole.
+
+    A child is help, not a second lead. It is told what its lead wants done
+    and where, and explicitly NOT to take over the mission or land anything —
+    the lead reads the branch and decides what survives.
+    """
+    text = compose(run_id=int(run["id"]), slug=run["slug"], profile=profile,
+                   mission=mission, requester=f"run {parent['id']} "
+                                              f"({parent['profile']})",
+                   root=root, workdir=workdir, extra_context=context,
+                   work_item=parent["work_item"],
+                   # A child is at the depth limit already; a brief never
+                   # teaches a verb it cannot use.
+                   cfg=None)
+    return text + f"""
+## You are a child run
+
+Run {parent['id']} is leading this work and asked you for one bounded piece:
+the mission above, and nothing beyond it.
+
+- Do the piece. Do not widen it, and do not take over the lead's mission.
+- Do not merge, land, or report to Work. Your branch is your answer, and
+  run {parent['id']} decides what of it survives.
+- Finish with a summary that says what you did and what you did not, plainly.
+  It is read by the lead, not by a human.
+"""
 
 
 def compose_continuation(*, run_id: int, parent_run: int, instructions: str,
