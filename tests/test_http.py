@@ -1014,7 +1014,8 @@ class RunListNumberingTests(ServerCase):
         self.assertIn("lineages(runs)", listing)
         self.assertNotIn("turnItem(pinned)", listing,
                          "a turn is no longer pinned above the runs")
-        self.assertIn("machine_note", listing)
+        self.assertNotIn("machine_note", listing,
+                         "control-turn content lives on health, not per row")
 
     def test_every_surface_means_the_same_run_by_the_same_number(self) -> None:
         """"Run 64" has to mean run 64 everywhere: the list, the detail
