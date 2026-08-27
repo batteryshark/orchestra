@@ -113,9 +113,8 @@ class ControlTurnTestCase(unittest.TestCase):
                 page = http.control_turns(project_id, layer, con=self.con)
                 self.assertEqual([turn["id"] for turn in page["turns"]],
                                  [row["id"]])
-                pinned = {turn["project_id"]: turn for turn in
-                          http.snapshot(self.con)["pinned_turns"]}
-                self.assertEqual(pinned[project_id]["id"], row["id"])
+                self.assertNotIn("pinned_turns", http.snapshot(self.con),
+                                 "a turn is not a headline over the runs")
 
         self.con.execute(
             "UPDATE runs SET tokens_total=100, cost_usd=1 WHERE layer IS NOT NULL")
@@ -162,32 +161,33 @@ class ControlTurnTestCase(unittest.TestCase):
                         project_id, con=self.con)["turns"]],
                     [row["id"]])
 
-    def test_a_turn_is_pinned_only_on_the_project_it_acted_on(self) -> None:
-        """One decision per project. A staffing turn for another project
-        pinned above this board reads as if it happened here."""
+    def test_a_turn_is_read_per_project_from_its_own_feed(self) -> None:
+        """A turn was pinned above the runs list, one per project. That put
+        the machine's opinion of ONE run where it read as a headline over
+        all of them (2026-08-27), so the turns keep their own feed and each
+        run carries its own note. The per-project scoping still matters:
+        a staffing turn for another project must not appear on this one."""
         observer.record_turn(self.con, "router", PROFILE,
                              _write(self.tmp.name), True, "staffed for A",
                              project_id="proj-a")
         observer.record_turn(self.con, "merge", PROFILE,
                              _write(self.tmp.name), True, "escalated for B",
                              project_id="proj-b")
-        # An older turn for A must lose to A's newest, not to B's.
         observer.record_turn(self.con, "observer", PROFILE,
                              _write(self.tmp.name), True, "watched A again",
                              project_id="proj-a")
-        pinned = http.snapshot(self.con)["pinned_turns"]
-        by_project = {t["project_id"]: t for t in pinned}
-        self.assertEqual(set(by_project), {"proj-a", "proj-b"})
-        self.assertEqual(by_project["proj-a"]["summary"], "watched A again")
-        self.assertEqual(by_project["proj-b"]["summary"], "escalated for B")
+        a = [t["summary"] for t in
+             http.control_turns("proj-a", con=self.con)["turns"]]
+        self.assertEqual(["watched A again", "staffed for A"], a,
+                         "newest first, and only this project's")
+        self.assertEqual(["escalated for B"],
+                         [t["summary"] for t in
+                          http.control_turns("proj-b", con=self.con)["turns"]])
 
-    def test_a_turn_with_no_project_is_pinned_nowhere(self) -> None:
-        """It names no project, so there is no board it belongs above."""
+    def test_a_projectless_turn_stays_out_of_the_fleets_numbers(self) -> None:
         observer.record_turn(self.con, "router", PROFILE,
                              _write(self.tmp.name), True, "no project")
         snapshot = http.snapshot(self.con)
-        self.assertEqual(snapshot["pinned_turns"], [])
-        # ...and even a projectless turn stays out of the fleet's numbers.
         self.assertEqual(snapshot["statistics"]["runs_total"], 0)
         self.assertEqual(review.performance(self.con), [])
 

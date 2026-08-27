@@ -172,6 +172,10 @@
              cursor: pointer; border-left: 3px solid transparent; }
   .runitem:hover { background: var(--sel); }
   /* Says where the missing ids went, without pretending they are runs. */
+  /* The machine's own word about THIS run, under it where it belongs. */
+  .runnote { margin-top: .3rem; font-size: 11px; color: var(--dim);
+             border-left: 2px solid var(--think); padding-left: .45rem;
+             opacity: .85; }
   .rungap { padding: .15rem .8rem; border-bottom: 1px solid var(--line);
             font: 11px var(--mono); color: var(--dim); text-align: right;
             opacity: .7; }
@@ -787,19 +791,55 @@ function selectRun(id) {
   if (SNAP) { renderRunList(SNAP); renderDetail(SNAP); }
 }
 
+// Parent first, then the runs it spawned, in the order they were spawned
+// (2026-08-27). A flat id-descending list put a retry ABOVE the run it
+// retried and scattered a mission's attempts among unrelated ones, so the
+// order of operations had to be reconstructed by reading ids.
+//
+// Families are ordered by their NEWEST member, so active work stays at the
+// top; inside a family the order is ascending, which is the order things
+// actually happened. A parent outside the window leaves its children as
+// roots — they are still shown, never dropped.
+function lineages(runs) {
+  const byId = new Map(runs.map((r) => [r.id, r]));
+  const parentOf = (r) => {
+    const up = r.retry_of && byId.has(r.retry_of) ? r.retry_of
+             : r.parent_run && byId.has(r.parent_run) ? r.parent_run : null;
+    return up === r.id ? null : up;   // a row can never be its own parent
+  };
+  const kids = new Map();
+  const roots = [];
+  runs.forEach((r) => {
+    const up = parentOf(r);
+    if (up === null) { roots.push(r); return; }
+    if (!kids.has(up)) kids.set(up, []);
+    kids.get(up).push(r);
+  });
+  const newest = (r) =>
+    Math.max(r.id, ...(kids.get(r.id) || []).map(newest));
+  const out = [];
+  const walk = (r, depth, seen) => {
+    if (seen.has(r.id)) return;       // a cycle must not hang the board
+    seen.add(r.id);
+    out.push({...r, depth});
+    (kids.get(r.id) || []).sort((a, b) => a.id - b.id)
+      .forEach((k) => walk(k, depth + 1, seen));
+  };
+  const seen = new Set();
+  roots.sort((a, b) => newest(b) - newest(a)).forEach((r) => walk(r, 0, seen));
+  runs.forEach((r) => walk(r, 0, seen));   // anything a cycle stranded
+  return out;
+}
+
 function renderRunList(s) {
   const box = $("runlist");
   const runs = visibleRuns(s);
   $("runcount").textContent = runs.length ? "(" + runs.length + ")" : "";
-  // The scoped project's newest control turn, pinned above its runs
-  // (W-0214). Only when a project is picked: a staffing decision about
-  // another project pinned here would read as if it happened here. The
-  // full feed lives on the health view.
-  const pinned = PROJECT === null ? null
-    : (s.pinned_turns || []).find((t) => t.project_id === PROJECT);
-  const pin = pinned ? [turnItem(pinned)] : [];
+  // A control turn used to be pinned above this list, where the machine's
+  // opinion of ONE run read as a headline over all of them. Each run now
+  // carries its own note (machine_note); the full feed is on health.
   if (!runs.length) {
-    box.replaceChildren(...pin, el("div", "runitem dim", PROJECT === null
+    box.replaceChildren(el("div", "runitem dim", PROJECT === null
       ? "no runs yet — `orchestra run`"
       : "no runs for " + projectName(PROJECT) + " in the snapshot window"));
     return;
@@ -810,10 +850,11 @@ function renderRunList(s) {
   // machine turn, and the divider below says how many — the numbers no
   // longer disagree about which run this is.
   const rows = [];
-  runs.forEach((r) => {
+  lineages(runs).forEach((r) => {
     const lineage = (r.retry_of && ids.has(r.retry_of)) ? " continuation"
                   : (r.parent_run && ids.has(r.parent_run)) ? " related" : "";
     const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
+    if (r.depth) item.style.paddingLeft = (0.8 + r.depth * 0.9) + "rem";
     const top = el("div", "top");
     top.append(el("span", "mono", "#" + r.id));
     if (r.slug) top.append(el("span", "mono dim", r.slug));
@@ -828,6 +869,9 @@ function renderRunList(s) {
       r.retry_of ? "retry of #" + r.retry_of : "",
       r.parent_run ? "parent #" + r.parent_run : "",
     ].filter(Boolean).join(" · ")));
+    if (r.machine_note) {
+      item.append(el("div", "runnote", r.machine_note.slice(0, 200)));
+    }
     item.onclick = () => selectRun(r.id);
     rows.push(item);
     // The list runs newest first, so the turns that ran before this one sit
@@ -837,7 +881,7 @@ function renderRunList(s) {
         ? "1 machine turn" : r.turns_before + " machine turns"));
     }
   });
-  box.replaceChildren(...pin, ...rows);
+  box.replaceChildren(...rows);
 }
 
 // --- runs: the detail pane --------------------------------------------------
