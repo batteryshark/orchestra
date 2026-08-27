@@ -438,7 +438,7 @@ def prompt_for(con, run, *, limit: int = DIGEST_EVENTS) -> str:
         mission = ""
     started = _epoch(run["started_at"])
     elapsed = int(time.time() - started) // 60 if started else 0
-    return (f"{INSTRUCTIONS}\n--- mission (run {run['id']}, running for "
+    return (f"{INSTRUCTIONS}\n--- mission ({db.run_no(run)}, running for "
             f"{elapsed} minutes) ---\n{mission or run['title'] or '(no brief)'}\n"
             f"\n--- activity ---\n{activity(con, run['id'])}\n"
             f"\n--- last {limit} trace events ---\n{digest(con, run['id'], limit)}\n")

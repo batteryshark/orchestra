@@ -154,13 +154,14 @@ def create(con, root: Path, cfg: dict, parent, targets: list[str],
             cur = con.execute(
                 "INSERT INTO runs(profile, backend, model, title, work_item, "
                 "requested_by, workdir, project_id, parent_run, "
-                "spawn_request_id, child_depth, status, started_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,'spawning',?)",
+                "spawn_request_id, child_depth, status, started_at, "
+                f"project_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,'spawning',?,"
+                f"{db.NEXT_PROJECT_SEQ})",
                 (name, profile["backend"], profile.get("model"),
                  (title or mission)[:80], parent["work_item"], REQUESTED_BY,
                  str(root), parent["project_id"], parent["id"],
                  spawn_request_id, int(parent["child_depth"] or 0) + 1,
-                 db.now()))
+                 db.now(), parent["project_id"]))
             run_ids.append(int(cur.lastrowid))
         con.execute("COMMIT")
     except BaseException:

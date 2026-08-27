@@ -94,7 +94,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "17"
+SCHEMA_VERSION = "18"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -151,6 +151,16 @@ RUNS_V16_COLUMNS = (
 # it; these say how deep the tree goes, which request produced this child,
 # and how its lead was told the batch had settled — once, whether the lead
 # was still running (a message) or already finished (a continuation run).
+# Schema v18. THE number a human reads: this project's own count, dense and
+# starting at 1. ``id`` stays the internal key every foreign key points at,
+# and stops being shown. A single global sequence was read as a per-project
+# run count and could not be: control turns took 146 of the first 300
+# numbers, and five projects shared the rest, so PREX3's 105 runs were
+# spread across ids 1 to 299 (2026-08-27). A control turn is not a run and
+# gets no number.
+RUNS_V18_COLUMNS = (
+    ("project_seq", "INTEGER"),
+)
 RUNS_V17_COLUMNS = (
     ("child_depth", "INTEGER"),
     ("spawn_request_id", "INTEGER"),
@@ -231,7 +241,8 @@ CREATE TABLE IF NOT EXISTS runs (
   child_depth INTEGER,
   spawn_request_id INTEGER,
   child_wakeup_run INTEGER,
-  child_wakeup_message INTEGER
+  child_wakeup_message INTEGER,
+  project_seq INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
@@ -452,6 +463,27 @@ RUN_TERMINAL = ("done", "failed", "timeout", "killed", "halted")
 TERMINAL_SQL = "(" + ",".join(f"'{s}'" for s in RUN_TERMINAL) + ")"
 
 
+# The next number for a project, as a scalar subquery: the caller passes the
+# project_id one more time where this lands. Written inline so the number is
+# taken inside the same write lock that reserves the row — two dispatches
+# racing must not both read the same maximum.
+NEXT_PROJECT_SEQ = ("(SELECT COALESCE(MAX(project_seq), 0) + 1 FROM runs "
+                    " WHERE layer IS NULL AND project_id IS ?)")
+
+
+def run_no(run) -> str:
+    """How a run is named to a human: its project's own count (schema v18).
+
+    Falls back to the row id for a row that has no number — a control turn,
+    or a run recorded before the column existed. Never invents one.
+    """
+    try:
+        number = run["project_seq"]
+    except (IndexError, KeyError, TypeError):
+        number = None
+    return f"run {number}" if number else f"run {run['id']}"
+
+
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -470,7 +502,8 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in (RUNS_V2_COLUMNS + RUNS_V4_COLUMNS
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
-                               + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS):
+                               + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS
+                               + RUNS_V18_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
         if upgrading_v16:
@@ -486,6 +519,14 @@ def connect(db_file=None) -> sqlite3.Connection:
                 f"WHERE status IN {TERMINAL_SQL} AND EXISTS ("
                 "SELECT 1 FROM messages m WHERE m.run_id=runs.id "
                 "AND m.kind='completion')", (now(), now()))
+        if "project_seq" not in existing:
+            # Every run already recorded gets the number it would have had:
+            # its project's order, by id. Done once, on the upgrade.
+            con.execute(
+                "UPDATE runs SET project_seq = (SELECT COUNT(*) FROM runs earlier "
+                " WHERE earlier.layer IS NULL AND earlier.id <= runs.id "
+                " AND earlier.project_id IS runs.project_id) "
+                "WHERE layer IS NULL")
     polls = {r["name"] for r in con.execute("PRAGMA table_info(runway_polls)")}
     if polls:
         for name, sql_type in RUNWAY_V12_COLUMNS:
