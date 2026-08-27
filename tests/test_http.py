@@ -139,6 +139,12 @@ class ServerCase(unittest.TestCase):
         run_id = int(self.con.execute(
             f"INSERT INTO runs({names}) VALUES({marks})",
             tuple(fields.values())).lastrowid)
+        # create_run stamps this inside its reservation; a row inserted
+        # straight into the table has to number itself the same way.
+        if fields.get("layer") is None:
+            self.con.execute(
+                f"UPDATE runs SET project_seq = {db.NEXT_PROJECT_SEQ} "
+                "WHERE id=?", (fields["project_id"], run_id))
         self.con.commit()
         return run_id
 
@@ -978,16 +984,29 @@ class RunListNumberingTests(ServerCase):
         self.assertNotIn("pinned_turns", snap,
                          "a turn is no longer a headline over the runs list")
 
-    def test_the_runs_list_shows_the_run_s_own_id(self) -> None:
-        """One run, one number. Dense numbering made the board say #37 where
-        the log file, the branch, and the detail header said 64 — the owner
-        read them as two different things (2026-08-26)."""
+    def test_the_runs_list_shows_the_project_s_own_run_number(self) -> None:
+        """The number a human reads counts THIS PROJECT's runs. A single
+        global sequence could not: control turns took 146 of the first 300
+        numbers and five projects shared the rest, so PREX3's 105 runs were
+        spread across ids 1 to 299 (2026-08-27)."""
         src = mhttp.DASHBOARD.read_text(encoding="utf-8")
         start = src.index("function renderRunList(s) {")
         body = src[start:src.index("\nfunction ", start + 1)]
-        self.assertIn('"#" + r.id', body)
-        self.assertNotIn("board_n", body)
-        self.assertIn("machine turn", body, "the gap explains itself")
+        self.assertIn("runNo(r)", body)
+        self.assertNotIn("machine_note", body,
+                         "control-turn content lives on health, not per row")
+
+    def test_the_number_is_dense_per_project_and_starts_at_one(self) -> None:
+        mine = self.make_run(status="done", finished_at=db.now())
+        self.con.execute("UPDATE runs SET project_id='other' WHERE id=?",
+                         (self.make_run(status="done", finished_at=db.now()),))
+        self.con.commit()
+        second = self.make_run(status="done", finished_at=db.now())
+        _, snap = self.json_request()
+        numbered = {r["id"]: r["no"] for r in snap["runs"]}
+        self.assertEqual(1, numbered[mine], "a project counts from one")
+        self.assertEqual(2, numbered[second],
+                         "another project's run does not take a number here")
 
     def test_a_run_carries_the_machines_latest_word_about_it(self) -> None:
         """The observer's note belongs ON the run it judged. A control turn's
@@ -1024,37 +1043,23 @@ class RunListNumberingTests(ServerCase):
         self.assertNotIn("machine_note", listing,
                          "control-turn content lives on health, not per row")
 
-    def test_every_surface_means_the_same_run_by_the_same_number(self) -> None:
-        """"Run 64" has to mean run 64 everywhere: the list, the detail
-        header, the stop prompt, the instruction box, the turns card, and
-        every id the payload carries. The board once numbered workers
-        densely and said #37 for the run whose log, branch, and header all
-        said 64 (2026-08-26) — nothing may introduce a second numbering.
-        """
+    def test_no_surface_shows_the_row_id_to_a_human(self) -> None:
+        """The row id is the internal key every foreign key points at, and
+        nothing renders it. Mixing the two is what made "run 37" and "run
+        64" the same run (2026-08-26); the cure is one number in front of a
+        human, and this one now counts the project's runs."""
         src = mhttp.DASHBOARD.read_text(encoding="utf-8")
         shown = set(re.findall(r'"#"\s*\+\s*([A-Za-z_][\w.]*)', src))
-        self.assertTrue(shown, "the dashboard shows run numbers somewhere")
-        allowed = {"r.id", "run.id", "r.run_id", "SELECTED", "r.parent_run",
-                   "r.retry_of", "k.id"}
-        self.assertEqual(set(), shown - allowed,
-                         f"a run number came from something other than its id: "
-                         f"{sorted(shown - allowed)}")
-        # And the wire carries no rival numbering to render.
+        self.assertEqual({"hit.no"}, shown,
+                         f"a run number came from something else: {sorted(shown)}")
+        self.assertNotIn('"#" + r.id', src)
+        self.assertNotIn('"#" + run.id', src)
+        # The wire still carries the id — routes are addressed by it — but
+        # every run also carries the number that is shown instead.
         _, snap = self.json_request()
         for run in snap["runs"]:
-            self.assertNotIn("board_n", run)
-            for key, value in run.items():
-                if key.endswith(("_n", "_no", "_number", "ordinal")):
-                    self.fail(f"payload carries a second run number: {key}={value}")
-        start = src.index("function renderDetail(s) {")
-        detail = src[start:src.index("\nfunction ", start + 1)]
-        self.assertIn('"#" + r.id', detail)
-        start = src.index("async function loadTurns() {")
-        nxt = src.find("\nfunction ", start + 1)
-        nxt_async = src.find("\nasync function ", start + 1)
-        end = min(x for x in (nxt, nxt_async) if x != -1)
-        self.assertIn("data.turns.map(turnItem)", src[start:end])
-
+            self.assertIn("no", run)
+            self.assertIsNotNone(run["no"])
 
 class SeatsAndOutageTests(ServerCase):
     """The seats picker and the auth-outage feed (2026-08-25): an expired

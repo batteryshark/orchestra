@@ -104,6 +104,11 @@ from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
 # v13 (W-0301): statistics include the latest run instrumentation report.
 # v14 (W-0304): each worker run carries board_n, a dense rank among
 # layer-IS-NULL rows. Turns keep id and carry board_n null.
+# v18: every worker run carries `no`, its project's own count. A single
+# global sequence was read as a per-project run count and could not be —
+# control turns took 146 of the first 300 numbers and five projects shared
+# the rest. `id` stays on the wire as the internal key routes are addressed
+# by; nothing shows it to a human.
 # v16: pinned_turns is gone. A control turn pinned above the runs list put
 # the machine's opinion of ONE run where it read as a headline over all of
 # them; each run now carries its own `machine_note`, and the full feed of
@@ -113,7 +118,7 @@ from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
 # detail header. A worker run now carries turns_before: the machine turns
 # between it and the previous worker run, which explains the gap in the ids
 # instead of renumbering around it.
-SNAPSHOT_VERSION = 16
+SNAPSHOT_VERSION = 18
 
 DEFAULT_PORT = 3011
 KEY_ENV = "ORCHESTRA_KEY"
@@ -528,6 +533,9 @@ def _run_payload(con, r, blocked: dict) -> dict:
     summary = r["summary"] or ""
     return {
         "id": r["id"],
+        # THE number a human reads: this project's own count. `id` is the
+        # internal key and is no longer shown (schema v18).
+        "no": None if r["layer"] else r["project_seq"],
         "turns_before": None if r["layer"] else r["turns_before"],
         "machine_note": r["machine_note"],
         "slug": r["slug"],

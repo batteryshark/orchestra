@@ -185,6 +185,19 @@ def try_resolve(con, cfg: dict, explicit: str | None = None) -> Project | None:
         return None
 
 
+def current(con) -> Project | None:
+    """The project the working directory belongs to, or None outside them.
+
+    Unlike ``resolve`` this asks no config and refuses nothing: it is for
+    reading a number the way a human meant it, where being outside a project
+    is an ordinary answer.
+    """
+    try:
+        return _deepest(con, start_dir())
+    except (OSError, ValueError):
+        return None
+
+
 def by_id(con, project_id: str | None) -> Project | None:
     if not project_id:
         return None

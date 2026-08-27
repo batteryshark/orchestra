@@ -116,11 +116,13 @@ def create_run(con, *, profile: str, backend: str, requested_by: str,
                     "INSERT INTO runs(slug, profile, backend, model, title, "
                     "requested_by, workdir, project_id, status, started_at, "
                     "work_item, work_seen_ts, parent_run, session_ref, retry_of, "
-                    "routed_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "routed_reason, project_seq) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    f"{db.NEXT_PROJECT_SEQ})",
                     (slug, profile, backend, model, title, requested_by,
                      str(workdir), project_id, status, db.now(), work_item,
                      work_seen_ts, parent_run, session_ref, retry_of,
-                     routed_reason))
+                     routed_reason, project_id))
                 run_id = int(cur.lastrowid)
                 break
             except sqlite3.IntegrityError as exc:

@@ -52,10 +52,42 @@ def _gate_dispatch(con, cfg: dict, requester: str) -> None:
             + ").\nRun `orchestra resume` to start new runs again.")
 
 
-def _fetch_run(con, run_id: int):
+def _fetch_run(con, run_id: int, *, row_id_only: bool = False):
+    """The run a human means by that number (schema v18).
+
+    A typed number is THIS PROJECT's run number — the one the board shows —
+    resolved against the project the current directory belongs to. The row
+    id still works for anything that carries it (a branch name, a log file),
+    and is tried second, because the two spaces overlap: prex3's run 105 is
+    row 299, and row 105 is a different run of the same project.
+    """
+    hit = None if row_id_only else project.current(con)
+    project_id = hit.project_id if hit else None
+    if project_id is not None:
+        run = con.execute(
+            "SELECT * FROM runs WHERE project_id IS ? AND project_seq=? "
+            "AND layer IS NULL", (project_id, run_id)).fetchone()
+        if run:
+            return run
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not run:
-        raise SystemExit(f"orchestra: no run {run_id}")
+        raise SystemExit(
+            f"orchestra: no run {run_id} here"
+            + (" — `orchestra runs` lists this project's" if project_id
+               else "; this directory is not inside a registered project"))
+    return run
+
+
+def _target(con, args):
+    """Resolve ``args.run_id`` ONCE and rewrite it to the row id.
+
+    A typed number is this project's run number, which is NOT the row id, and
+    a dozen call sites go on to use ``args.run_id`` in SQL of their own —
+    including the one that kills a process. Translating in place means none
+    of them can act on a different run than the one that was found.
+    """
+    run = _fetch_run(con, args.run_id)
+    args.run_id = int(run["id"])
     return run
 
 
@@ -131,9 +163,10 @@ def cmd_dispatch(args):
 
     after_ids = []
     for rid in args.after or []:
-        _fetch_run(con, rid)
-        if rid not in after_ids:
-            after_ids.append(rid)
+        # The dependency edge stores the ROW id, whatever number was typed.
+        settled = int(_fetch_run(con, rid)["id"])
+        if settled not in after_ids:
+            after_ids.append(settled)
     initial_status = "pending" if after_ids else "spawning"
     _gate_dispatch(con, cfg, requester)
     run, blocked = supervise.create_run(
@@ -304,7 +337,7 @@ def cmd_runs(args):
 
 def cmd_show(args):
     con = db.connect()
-    r = _fetch_run(con, args.run_id)
+    r = _target(con, args)
     print(f"isolation: {http.run_isolation(r)}")
     for k in r.keys():
         v = r[k]
@@ -338,7 +371,7 @@ def _continuation_line(con, run_id: int):
 
 def cmd_reply(args):
     con = db.connect()
-    parent_run = _fetch_run(con, args.run_id)
+    parent_run = _target(con, args)
     cfg = config.load(parent_run["project_id"])
     _gate_dispatch(con, cfg, _requester(cfg))
     root = project.root_for(con, parent_run)
@@ -403,7 +436,9 @@ def cmd_spawn(args):
         token = os.environ.get(auth.TOKEN_ENV, "")
         identity = auth.identify(con, token, None) if token else None
         identity_run = identity.run_id if identity else None
-        run_id = args.run_id or identity_run
+        # The token's run is a ROW id; a typed --run is a human's number.
+        run_id = (int(_fetch_run(con, args.run_id)["id"]) if args.run_id
+                  else identity_run)
         if not run_id:
             raise SystemExit(
                 "orchestra: spawn is for a running run to ask for help; it "
@@ -442,7 +477,7 @@ def cmd_interrupt(args):
     if not body.strip():
         raise SystemExit("orchestra: the message must not be empty")
     con = db.connect()
-    r = _fetch_run(con, args.run_id)
+    r = _target(con, args)
     cfg = config.load(r["project_id"])
     if r["status"] in db.RUN_TERMINAL:
         con.close()
@@ -462,7 +497,7 @@ def cmd_interrupt(args):
         messaging.queue_tell(con, args.run_id, _requester(cfg), body, r["log_path"],
                              boundary=not live)
     except messaging.RunClosed:
-        latest = _fetch_run(con, args.run_id)
+        latest = _target(con, args)
         con.close()
         raise SystemExit(f"orchestra: run {args.run_id} already {latest['status']} — "
                          f"use `orchestra reply {args.run_id} \"...\"` instead")
@@ -513,7 +548,8 @@ def cmd_ask(args):
     if not run_id:
         raise SystemExit("orchestra: ask runs inside a run — pass --run RUN outside one")
     con = db.connect()
-    run = _fetch_run(con, int(run_id))
+    # ORCHESTRA_RUN_ID and --run carry a ROW id, set by machines.
+    run = _fetch_run(con, int(run_id), row_id_only=True)
     if run["status"] in db.RUN_TERMINAL:
         con.close()
         raise SystemExit(f"orchestra: run {run_id} is already {run['status']}")
@@ -560,7 +596,7 @@ def cmd_hook(args):
 
 def cmd_kill(args):
     con = db.connect()
-    r = _fetch_run(con, args.run_id)
+    r = _target(con, args)
     if r["status"] in db.RUN_TERMINAL:
         print(f"run {args.run_id} already {r['status']}")
         con.close()
@@ -574,7 +610,7 @@ def cmd_kill(args):
         f"AND status NOT IN {db.TERMINAL_SQL}", (db.now(), args.run_id))
     con.commit()
     if changed.rowcount != 1:
-        latest = _fetch_run(con, args.run_id)
+        latest = _target(con, args)
         print(f"run {args.run_id} already {latest['status']}")
         con.close()
         return
@@ -613,7 +649,7 @@ def cmd_check(args):
     reasoning, and everything else just prints.
     """
     con = db.connect()
-    _fetch_run(con, args.run_id)  # exits with a clear message for a bad id
+    _target(con, args)  # exits with a clear message for a bad id
     try:
         result = http.check_run(con, args.run_id, observe=not args.mechanical)
     finally:

@@ -208,16 +208,16 @@ def _completion_outcome(run) -> tuple[bool, str]:
                       None)
         summary = reason or summary
     return run["status"] == "done" and not landing_failed, \
-        summary or f"run {run['id']} {run['status']}"
+        summary or f"{db.run_no(run)} {run['status']}"
 
 
 def _headline(run, summary: str) -> str:
     """One board-readable line: what happened and why."""
     first = (summary or "").strip().splitlines()[0] if summary else ""
-    reason = f": {first}" if first and not first.startswith(f"run {run['id']}") else ""
+    reason = f": {first}" if first and not first.startswith(db.run_no(run)) else ""
     outcome = ("landing failed" if run["status"] == "done"
                and run["landing_status"] == "failed" else run["status"])
-    return f"run {run['id']} {outcome}{reason}"[:300]
+    return f"{db.run_no(run)} {outcome}{reason}"[:300]
 
 
 def _decline_unaccounted(client: WorkClient, item_id: str, run,
@@ -226,7 +226,7 @@ def _decline_unaccounted(client: WorkClient, item_id: str, run,
     Runs before the terminal fact: Work refuses a landing with anything
     unaccounted."""
     declined = client.decline_unaccounted(
-        item_id, f"not accounted for by run {run['id']} ({run['status']})")
+        item_id, f"not accounted for by {db.run_no(run)} ({run['status']})")
     if declined:
         print(f"orchestra sweep: {tag} declined {declined} unaccounted "
               f"checklist item(s) on {item_id}")
@@ -509,7 +509,7 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
         return "failed"
 
     tag = f"[{client.identity}/{run['slug'] or run_id}]"
-    note = f"{tag} dispatched run {run_id}" + \
+    note = f"{tag} dispatched {db.run_no(run)}" + \
         (" (session resumed)" if prior is not None else "")
     if run["routed_reason"]:
         note += f"\nstaffing: {run['routed_reason']}"

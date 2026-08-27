@@ -827,6 +827,21 @@ function lineages(runs) {
   return out;
 }
 
+// THE number a human reads: this project's own count, not the row id. Two
+// projects both have a run 105, so an unscoped board says which project —
+// scoped, the project is already the frame and the number stands alone.
+function runNo(r) {
+  if (r.no == null) return r.slug || "turn";
+  return (PROJECT === null && r.project ? r.project + " #" : "#") + r.no;
+}
+
+// A lineage pointer is stored as the internal id, because that is what the
+// row actually references. Show the number of whatever run it names.
+function refNo(id) {
+  const hit = (SNAP && SNAP.runs || []).find((r) => r.id === id);
+  return hit && hit.no != null ? "#" + hit.no : "run " + id;
+}
+
 function renderRunList(s) {
   const box = $("runlist");
   const runs = visibleRuns(s);
@@ -853,7 +868,7 @@ function renderRunList(s) {
     const item = el("div", "runitem" + lineage + (r.id === SELECTED ? " sel" : ""));
     if (r.depth) item.style.paddingLeft = (0.8 + r.depth * 0.9) + "rem";
     const top = el("div", "top");
-    top.append(el("span", "mono", "#" + r.id));
+    top.append(el("span", "mono", runNo(r)));
     if (r.slug) top.append(el("span", "mono dim", r.slug));
     top.append(statusChip(r));
     const when = el("span", "mono dim", dur(r.elapsed_seconds));
@@ -863,8 +878,8 @@ function renderRunList(s) {
     item.append(el("div", "title", r.title || "(no title recorded)"));
     item.append(el("div", "meta", [
       r.profile, r.backend, r.work_item, r.project,
-      r.retry_of ? "retry of #" + r.retry_of : "",
-      r.parent_run ? "parent #" + r.parent_run : "",
+      r.retry_of ? "retry of " + refNo(r.retry_of) : "",
+      r.parent_run ? "parent " + refNo(r.parent_run) : "",
     ].filter(Boolean).join(" · ")));
     item.onclick = () => selectRun(r.id);
     rows.push(item);
@@ -883,8 +898,8 @@ function instructionPane(r) {
   const box = el("form", "run-actions");
   const area = el("textarea");
   area.rows = 3;
-  area.placeholder = "Correction or instruction for run #" + r.id;
-  area.setAttribute("aria-label", "instruction for run #" + r.id);
+  area.placeholder = "Correction or instruction for " + runNo(r);
+  area.setAttribute("aria-label", "instruction for " + runNo(r));
   area.value = INSTRUCTION_DRAFTS.get(r.id) || "";
   const send = el("button", null, "send instruction");
   send.type = "submit";
@@ -1022,7 +1037,7 @@ function renderTabs(run) {
   if (run.live) {
     const stop = el("button", "danger stop-run", "stop run");
     stop.onclick = () => {
-      if (confirm("stop run #" + run.id + "?"))
+      if (confirm("stop " + runNo(run) + "?"))
         act("/api/runs/" + run.id + "/stop", {method: "POST"});
     };
     strip.append(stop);
@@ -1160,15 +1175,15 @@ function renderDetail(s) {
   const head = $("phead"), body = $("pbody");
   if (!r) {
     head.replaceChildren(el("span", "dim",
-      SELECTED === null ? "select a run" : "run #" + SELECTED +
-      " is no longer in the snapshot window"));
+      SELECTED === null ? "select a run"
+        : "that run is no longer in the snapshot window"));
     renderTabs(null);
     body.replaceChildren();
     closeTrace();
     return;
   }
   head.replaceChildren();
-  head.append(el("span", "mono", "#" + r.id));
+  head.append(el("span", "mono", runNo(r)));
   if (r.slug) head.append(el("span", "mono dim", r.slug));
   head.append(statusChip(r));
   if (r.work_item) head.append(el("span", "mono", r.work_item));
@@ -2031,7 +2046,7 @@ function renderStats(s) {
     ["classified", pct(report.classification_rate)],
   ]);
   const runRows = report.runs.map((r) => {
-    const open = el("button", null, r.slug || "#" + r.run_id);
+    const open = el("button", null, r.slug || (r.layer || "turn"));
     open.onclick = () => { $("statsdlg").close(); selectRun(r.run_id); };
     return [open, r.profile, r.model || "–", r.status, dur(r.seconds),
             num(r.tokens), r.turns, r.compactions, pct(r.classification_rate)];
