@@ -30,7 +30,8 @@ from pathlib import Path
 from orchestra import (acp, auth, brief, child_runs, config, db, dispatch,
                        findings, merge, messaging, names, observer, paths,
                        project, runners, traces, worktree)
-from orchestra.proc import (enrich_path, process_identity, resolve_cmd,
+from orchestra.proc import (enrich_path, process_identity, raise_file_limit,
+                            resolve_cmd,
                             session_kwargs, terminate_group)
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
@@ -1051,6 +1052,10 @@ def process_ready(con, launcher) -> list[dict]:
 # --- the run loop -----------------------------------------------------------
 
 def supervise(root: Path, run_id: int) -> int:
+    # The worker inherits this process's descriptor limit, and launchd's 256
+    # is below what a harness needs — piu-arcade-lift run 40 died in one
+    # second saying so (proc.raise_file_limit).
+    raise_file_limit()
     con = db.connect()
     run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if not run:

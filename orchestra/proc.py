@@ -366,3 +366,38 @@ def fchmod(fd: int, mode: int) -> None:
         fn(fd, mode)
     except (OSError, NotImplementedError):
         pass
+
+
+# launchd hands its jobs 256 file descriptors, and every run Orchestra
+# starts inherits that number: the daemon, each supervisor, and each worker
+# harness. 256 is not enough for a harness — opencode refuses to start with
+# "possibly due to low max file descriptors (Current limit: 256)", which is
+# how piu-arcade-lift run 40 died in one second, and how run 38 was left
+# with no supervisor at all while nine runs were live at once.
+FILE_LIMIT = 65536
+
+
+def raise_file_limit(target: int = FILE_LIMIT) -> int:
+    """Give this process and everything it spawns room to work.
+
+    Only the SOFT limit moves, and only upward: a process may always raise
+    its soft limit to the hard one, so this needs no privilege and changes
+    nothing outside this process tree. Returns the soft limit in force.
+    """
+    try:
+        import resource
+    except ImportError:  # Windows has no rlimits
+        return 0
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft >= target:
+        return soft
+    ceiling = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    for want in (ceiling, 10240, 4096):
+        if want <= soft:
+            break
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            return want
+        except (ValueError, OSError):
+            continue  # the kernel's own per-process cap; try a smaller one
+    return soft
