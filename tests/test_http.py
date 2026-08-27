@@ -235,7 +235,7 @@ class SnapshotTests(ServerCase):
             set(payload),
             {"version", "generated_at", "home", "runs", "live_runs", "dispatch",
              "projects", "profiles", "runway", "statistics", "daemon",
-             "pinned_turns"})
+             })
         self.assertEqual(payload["dispatch"], {"paused": False, "since": None})
         # There are no default profiles (DESIGN §5), so the snapshot lists
         # exactly what is configured — here, the one this case declares.
@@ -968,10 +968,8 @@ class RunListNumberingTests(ServerCase):
         _, page = self.json_request(path="/api/turns")
         self.assertEqual([t["id"] for t in page["turns"]], [turn])
         self.assertIsNone(page["turns"][0]["turns_before"])
-        self.assertEqual(len(snap["pinned_turns"]), 1)
-        self.assertEqual(snap["pinned_turns"][0]["id"], turn)
-        self.assertIsNone(snap["pinned_turns"][0]["turns_before"])
-        self.assertEqual(snap["pinned_turns"][0]["layer"], "observer")
+        self.assertNotIn("pinned_turns", snap,
+                         "a turn is no longer a headline over the runs list")
 
     def test_the_runs_list_shows_the_run_s_own_id(self) -> None:
         """One run, one number. Dense numbering made the board say #37 where
@@ -983,7 +981,40 @@ class RunListNumberingTests(ServerCase):
         self.assertIn('"#" + r.id', body)
         self.assertNotIn("board_n", body)
         self.assertIn("machine turn", body, "the gap explains itself")
-        self.assertIn("turnItem(pinned)", body)
+
+    def test_a_run_carries_the_machines_latest_word_about_it(self) -> None:
+        """The observer's note belongs ON the run it judged. A control turn's
+        own row carries no link back to what it looked at; the observation
+        does (2026-08-27)."""
+        run_id = self.make_run(status="running")
+        for reason in ("reading the files its mission names", "still on task"):
+            self.con.execute(
+                "INSERT INTO observations(run_id, layer, action, reason, "
+                "created_at) VALUES(?,'observer','ok',?,?)",
+                (run_id, reason, db.now()))
+        self.con.commit()
+        _, snap = self.json_request()
+        note = [r for r in snap["runs"] if r["id"] == run_id][0]["machine_note"]
+        self.assertEqual("ok: still on task", note, "the LATEST word, not the first")
+
+    def test_the_runs_list_puts_children_under_their_parent_in_spawn_order(self) -> None:
+        """2026-08-27: a retry sorted ABOVE the run it retried, and a
+        mission's attempts scattered among unrelated ones, so the order of
+        operations had to be reconstructed from ids. Families group; inside
+        one the order is the order things happened."""
+        src = mhttp.DASHBOARD.read_text(encoding="utf-8")
+        start = src.index("function lineages(runs) {")
+        body = src[start:src.index("\nfunction ", start + 1)]
+        self.assertIn("a.id - b.id", body, "children ascend: spawn order")
+        self.assertIn("newest(b) - newest(a)", body,
+                      "families ordered by their newest member")
+        self.assertIn("seen.has(r.id)", body, "a cycle must not hang the board")
+        listing = src[src.index("function renderRunList(s) {"):]
+        listing = listing[:listing.index("\nfunction ")]
+        self.assertIn("lineages(runs)", listing)
+        self.assertNotIn("turnItem(pinned)", listing,
+                         "a turn is no longer pinned above the runs")
+        self.assertIn("machine_note", listing)
 
     def test_every_surface_means_the_same_run_by_the_same_number(self) -> None:
         """"Run 64" has to mean run 64 everywhere: the list, the detail

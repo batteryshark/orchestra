@@ -104,12 +104,16 @@ from orchestra import (auth, config, db, dispatch, messaging, paths, proc,
 # v13 (W-0301): statistics include the latest run instrumentation report.
 # v14 (W-0304): each worker run carries board_n, a dense rank among
 # layer-IS-NULL rows. Turns keep id and carry board_n null.
+# v16: pinned_turns is gone. A control turn pinned above the runs list put
+# the machine's opinion of ONE run where it read as a headline over all of
+# them; each run now carries its own `machine_note`, and the full feed of
+# turns already had a card on health.
 # v15 (W-0304, second pick): board_n is gone. Dense numbering gave one run
 # two numbers, and the board's disagreed with the log, the branch, and the
 # detail header. A worker run now carries turns_before: the machine turns
 # between it and the previous worker run, which explains the gap in the ids
 # instead of renumbering around it.
-SNAPSHOT_VERSION = 15
+SNAPSHOT_VERSION = 16
 
 DEFAULT_PORT = 3011
 KEY_ENV = "ORCHESTRA_KEY"
@@ -510,7 +514,14 @@ _RUN_SELECT = (
     "(SELECT COUNT(*) FROM runs t WHERE t.layer IS NOT NULL AND t.id<r.id "
     " AND t.id>COALESCE((SELECT MAX(w.id) FROM runs w "
     "                    WHERE w.layer IS NULL AND w.id<r.id), 0)) "
-    "AS turns_before FROM runs r ")
+    "AS turns_before, "
+    # The machine's latest word ABOUT THIS RUN. A control turn's own row
+    # carries no link back to what it judged; the observation does, so the
+    # note belongs on the run it is about rather than pinned above a list
+    # where it read as a headline (2026-08-27).
+    "(SELECT o.action || ': ' || o.reason FROM observations o "
+    " WHERE o.run_id=r.id AND o.layer IN ('observer','mechanical') "
+    " ORDER BY o.id DESC LIMIT 1) AS machine_note FROM runs r ")
 
 
 def _run_payload(con, r, blocked: dict) -> dict:
@@ -518,6 +529,7 @@ def _run_payload(con, r, blocked: dict) -> dict:
     return {
         "id": r["id"],
         "turns_before": None if r["layer"] else r["turns_before"],
+        "machine_note": r["machine_note"],
         "slug": r["slug"],
         "status": r["status"],
         "profile": r["profile"],
@@ -575,7 +587,8 @@ def _runs(con) -> list[dict]:
 
     Control turns (W-0214, ``layer`` set) are never in this list: they are
     not the fleet, so the live count and the tab badge do not move for them.
-    The most recent one is pinned separately — see ``_pinned_turn``.
+    Each run carries the machine's latest word about it as
+    ``machine_note``; the turns themselves are served by /api/turns.
     """
     rows = list(con.execute(
         _RUN_SELECT + f"WHERE r.status NOT IN {db.TERMINAL_SQL} "
@@ -589,23 +602,6 @@ def _runs(con) -> list[dict]:
             "ORDER BY depends_on_run"):
         blocked.setdefault(row["run_id"], []).append(row["depends_on_run"])
     return [_run_payload(con, r, blocked) for r in rows]
-
-
-def _pinned_turns(con) -> list[dict]:
-    """The most recent control turn PER PROJECT (W-0214), pinned at the top of
-    the Runs tab. Its summary is the decision one-liner and names the
-    escalation it produced; the row opens in the same detail screen as any run.
-
-    Per project, not one globally: the reader filters the board to a project,
-    and a staffing decision about another one pinned above it reads as if it
-    happened here. A turn with no project names nothing and is not pinned.
-    """
-    rows = con.execute(
-        _RUN_SELECT + "WHERE r.layer IS NOT NULL AND r.project_id IS NOT NULL "
-        "AND r.id IN (SELECT MAX(id) FROM runs WHERE layer IS NOT NULL "
-        "AND project_id IS NOT NULL GROUP BY project_id) ORDER BY r.id DESC"
-    ).fetchall()
-    return [_run_payload(con, r, {}) for r in rows]
 
 
 def _messages(con, run_id: int) -> list[dict]:
@@ -968,7 +964,6 @@ def snapshot(con=None) -> dict:
             # project, pinned at the top of the Runs tab. Never in ``runs``,
             # never in ``live_runs``. The client shows the one for the project
             # it is scoped to.
-            "pinned_turns": _pinned_turns(con),
             # v5 (W-0186): what the project picker offers, derived from the
             # runs above — never a roster of every project on the machine.
             "projects": _projects(runs),
