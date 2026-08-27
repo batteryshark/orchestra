@@ -440,6 +440,9 @@ def run(interval: int | None = None, once: bool = False) -> int:
     if interval is None:
         interval = int(cfg.get("work", {}).get("poll_interval", DEFAULT_INTERVAL) or
                        DEFAULT_INTERVAL)
+    # Everything this daemon spawns inherits its descriptor limit, and
+    # launchd's 256 is below what a harness needs (proc.raise_file_limit).
+    proc.raise_file_limit()
     stop = threading.Event()
     wake = threading.Event()  # "sweep now" from the dashboard, and shutdown
     restart = threading.Event()  # "restart" from the dashboard

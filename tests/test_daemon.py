@@ -550,3 +550,55 @@ class ServiceRestartTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileLimitTests(unittest.TestCase):
+    """piu-arcade-lift run 40 died in one second: "possibly due to low max
+    file descriptors (Current limit: 256)". launchd hands its jobs 256, and
+    every run Orchestra starts inherits it — the daemon, each supervisor,
+    each worker. Run 38 went the other way and was left with no supervisor
+    at all, while nine runs were live at once.
+    """
+
+    def test_a_launchd_limit_is_raised_for_everything_spawned(self) -> None:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+
+        raised = proc.raise_file_limit()
+        self.assertGreater(raised, 256)
+        self.assertEqual(raised, resource.getrlimit(resource.RLIMIT_NOFILE)[0])
+        # A child inherits it, which is the whole point: the harness is the
+        # process that runs out, not us.
+        seen = subprocess.run(
+            [sys.executable, "-c", "import resource;"
+             "print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])"],
+            capture_output=True, text=True, check=True)
+        self.assertEqual(raised, int(seen.stdout.strip()))
+
+    def test_a_limit_already_high_enough_is_left_alone(self) -> None:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (proc.FILE_LIMIT, hard))
+        self.assertEqual(proc.FILE_LIMIT, proc.raise_file_limit())
+
+    def test_a_kernel_that_refuses_the_ask_gets_a_smaller_one(self) -> None:
+        """macOS caps a process below its own hard limit
+        (kern.maxfilesperproc). A refusal is not a reason to leave the run
+        with 256 descriptors, so the next size down is tried."""
+        import resource
+        asked = []
+
+        def picky(which, limits):
+            asked.append(limits[0])
+            if limits[0] > 10240:
+                raise ValueError("current limit exceeds maximum limit")
+
+        with mock.patch.object(resource, "getrlimit",
+                               return_value=(256, resource.RLIM_INFINITY)), \
+                mock.patch.object(resource, "setrlimit", side_effect=picky):
+            self.assertEqual(10240, proc.raise_file_limit())
+        self.assertEqual([proc.FILE_LIMIT, 10240], asked,
+                         "the big ask first, then the one that fits")
