@@ -213,7 +213,9 @@ class AcpDeliveryStateTest(unittest.TestCase):
     """DESIGN §7 badge: an ACP message is not waiting on a boundary."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        # A peer subprocess may still be writing its log while cleanup
+        # walks this tree; an rmdir race is not a test result.
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.env = mock.patch.dict(
             os.environ, {"ORCHESTRA_HOME": str(Path(self.tmp.name) / "home")})
         self.env.start()
@@ -250,7 +252,9 @@ class AcpEndToEndTest(unittest.TestCase):
     permission, normalized events, dead peer."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        # A peer subprocess may still be writing its log while cleanup
+        # walks this tree; an rmdir race is not a test result.
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.tmp_path = Path(self.tmp.name).resolve()
         self.root = self.tmp_path / "workspace" / "demo"
         self.root.mkdir(parents=True)
