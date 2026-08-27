@@ -172,10 +172,6 @@
              cursor: pointer; border-left: 3px solid transparent; }
   .runitem:hover { background: var(--sel); }
   /* Says where the missing ids went, without pretending they are runs. */
-  /* The machine's own word about THIS run, under it where it belongs. */
-  .runnote { margin-top: .3rem; font-size: 11px; color: var(--dim);
-             border-left: 2px solid var(--think); padding-left: .45rem;
-             opacity: .85; }
   .rungap { padding: .15rem .8rem; border-bottom: 1px solid var(--line);
             font: 11px var(--mono); color: var(--dim); text-align: right;
             opacity: .7; }
@@ -835,9 +831,10 @@ function renderRunList(s) {
   const box = $("runlist");
   const runs = visibleRuns(s);
   $("runcount").textContent = runs.length ? "(" + runs.length + ")" : "";
-  // A control turn used to be pinned above this list, where the machine's
-  // opinion of ONE run read as a headline over all of them. Each run now
-  // carries its own note (machine_note); the full feed is on health.
+  // No control-turn content lives here. Pinning one above the list made it
+  // a headline; repeating each run's note under its row cost more space than
+  // the runs themselves (2026-08-27). The turns have their own card on
+  // health, which is the whole feed rather than a sample of it.
   if (!runs.length) {
     box.replaceChildren(el("div", "runitem dim", PROJECT === null
       ? "no runs yet — `orchestra run`"
@@ -869,9 +866,6 @@ function renderRunList(s) {
       r.retry_of ? "retry of #" + r.retry_of : "",
       r.parent_run ? "parent #" + r.parent_run : "",
     ].filter(Boolean).join(" · ")));
-    if (r.machine_note) {
-      item.append(el("div", "runnote", r.machine_note.slice(0, 200)));
-    }
     item.onclick = () => selectRun(r.id);
     rows.push(item);
     // The list runs newest first, so the turns that ran before this one sit
