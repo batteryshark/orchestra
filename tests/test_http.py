@@ -286,8 +286,15 @@ class SnapshotTests(ServerCase):
         self.assertIsNone(penc)
         self.assertEqual(zenc, "gzip")
         self.assertLess(len(zipped), len(plain) / 2)
-        # and it is the same payload, byte for byte, once unwrapped
-        self.assertEqual(gzip.decompress(zipped), plain)
+        # ...and it is the same payload once unwrapped. The two requests are
+        # two snapshots, so `generated_at` is allowed to differ by the second
+        # that passed between them — comparing them raw failed whenever the
+        # clock ticked mid-test, roughly one run in twenty.
+        def settled(raw):
+            payload = json.loads(raw)
+            payload.pop("generated_at")
+            return payload
+        self.assertEqual(settled(gzip.decompress(zipped)), settled(plain))
 
     def test_a_small_response_is_not_worth_compressing(self) -> None:
         """Below GZIP_MIN_BYTES the gzip header costs more than it saves."""

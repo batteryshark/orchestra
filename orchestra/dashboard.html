@@ -1296,7 +1296,9 @@ const NOISE = new Set(["tool_progress", "stream_attempt", "usage",
   "hook_started", "hook_response", "step_start", "step-start",
   "step_finish", "step-finish", "session.idle", "session.updated",
   "message.updated", "thread.started", "turn.started", "turn.completed",
-  "turn_started", "session.created"]);
+  // Every one of these carries an empty payload: the harness announcing
+  // that it asked itself for permission, with no subject and no answer.
+  "turn_started", "session.created", "permission.asked"]);
 // About 6–8 wrapped lines in the trace pane: useful at a glance without
 // letting longer reasoning blocks take over the feed.
 const SHORT_REASONING_CHARS = 512;
