@@ -96,7 +96,7 @@ def sign_off(con, cfg: dict, client: WorkClient, item_id: str, worker_id: int,
     if worker is None or worker["requested_by"] == REQUESTED_BY:
         return
     already = con.execute(
-        "SELECT id FROM runs WHERE work_item=? AND requested_by=?",
+        "SELECT id FROM runs WHERE ref=? AND requested_by=?",
         (item_id, REQUESTED_BY)).fetchone()
     if already:
         return
@@ -459,11 +459,13 @@ def _insert(con, worker, root: Path, profile_name: str, profile: dict,
         con, profile=profile_name, backend=profile["backend"],
         model=profile.get("model"), title=title, requested_by=REQUESTED_BY,
         workdir=str(root), project_id=worker["project_id"], status="running",
-        work_item=item_id, parent_run=int(worker["id"]), pause_gate=False)
+        ref=item_id, parent_run=int(worker["id"]), pause_gate=False)
 
 
 def _finalize(con, run_id: int, status: str, summary: str) -> None:
     con.execute(
-        "UPDATE runs SET status=?, summary=?, finished_at=?, work_reported_at=? "
-        "WHERE id=?", (status, summary, db.now(), db.now(), run_id))
-    con.commit()
+        "UPDATE runs SET status=?, summary=?, finished_at=? WHERE id=?",
+        (status, summary, db.now(), run_id))
+    from orchestra import sweeper  # sweeper imports this module
+    # The verify run reports itself; the receipt is the adapter's (schema v21).
+    sweeper.mark(con, run_id, "reported_at", db.now(), once=True)

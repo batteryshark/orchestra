@@ -48,7 +48,7 @@ class RunClosed(RuntimeError):
 
 def queue_tell(con: sqlite3.Connection, run_id: int, sender: str, body: str,
                log_path: str | None, *, boundary: bool = True,
-               work_seen_ts: str | None = None) -> int:
+               commit: bool = True) -> int:
     """Record a message for delivery at the run's next safe boundary.
 
     ``boundary=False`` is the ACP transport (W-0104, DESIGN §6): the run has
@@ -58,6 +58,12 @@ def queue_tell(con: sqlite3.Connection, run_id: int, sender: str, body: str,
     exec boundary machinery ignores it (``supervise._pending_delivery_offset``
     filters on that column) and ``traces.run_messages`` stops badging it
     ``pending_boundary``, because no boundary is pending.
+
+    ``commit=False`` leaves this function's transaction open so a caller can
+    attach its own row to the same admission — the pattern ``create_run``
+    already uses. The Work adapter's ferry needs it: its thread watermark and
+    the message that explains it must land together or not at all, and after
+    schema v21 that watermark is the adapter's row to write, not this one's.
     """
     if con.in_transaction:
         raise RuntimeError("message admission requires a clean transaction")
@@ -78,12 +84,8 @@ def queue_tell(con: sqlite3.Connection, run_id: int, sender: str, body: str,
             "INSERT INTO messages(run_id, sender, body, kind, created_at, "
             "delivery_offset) VALUES(?,?,?,?,?,?)",
             (run_id, sender, body, DELIVERY_KIND, db.now(), offset))
-        if work_seen_ts is not None:
-            # The ferry cursor and its message are one admission. A crash can
-            # therefore cause neither a duplicate nor a lost Work comment.
-            con.execute("UPDATE runs SET work_seen_ts=? WHERE id=?",
-                        (work_seen_ts, run_id))
-        con.commit()
+        if commit:
+            con.commit()
     except BaseException:
         if con.in_transaction:
             con.rollback()
@@ -182,7 +184,7 @@ def file_question(con: sqlite3.Connection, cfg: dict, run, question: str,
     seconds = ask_seconds(cfg)
     title = f"run {run['slug'] or run_id} is asking"
     created = nod.blocked_run(
-        channels, question, con=con, run_id=run_id, work_item=run["work_item"],
+        channels, question, con=con, run_id=run_id, work_item=run["ref"],
         title=title,
         summary=(run["title"] or "")[:200],
         expires_at=nod.expires_in(seconds),
@@ -196,7 +198,7 @@ def file_question(con: sqlite3.Connection, cfg: dict, run, question: str,
         "VALUES(?,?,?,?,?,?)",
         (run_id, f"run {run_id}", question, ASK_KIND, db.now(), db.now()))
     con.commit()
-    mirror_to_work(cfg, run["work_item"], f"Question for the human:\n\n{question}")
+    mirror_to_work(cfg, run["ref"], f"Question for the human:\n\n{question}")
     return created["request_id"], seconds
 
 

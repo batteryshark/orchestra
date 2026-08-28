@@ -458,10 +458,10 @@ class ActingTestCase(NodTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _merge_card(self, run_id=7, work_item="W-0201", dedupe_key=None) -> str:
+    def _merge_card(self, run_id=7, item="W-0201", dedupe_key=None) -> str:
         got = nod.merge_conflict(
             self.channels, "conflict detail", con=self.con, run_id=run_id,
-            work_item=work_item, title=f"run {run_id} did not land",
+            work_item=item, title=f"run {run_id} did not land",
             dedupe_key=dedupe_key or f"test:{run_id}")
         return got["request_id"]
 

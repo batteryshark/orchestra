@@ -43,8 +43,8 @@ LAUNCH_FAILURE_PREFIXES = (
 def create_run(con, *, profile: str, backend: str, requested_by: str,
                workdir: str, model: str | None = None,
                title: str | None = None, project_id: str | None = None,
-               status: str = "spawning", work_item: str | None = None,
-               work_seen_ts: str | None = None, parent_run: int | None = None,
+               status: str = "spawning", ref: str | None = None,
+               parent_run: int | None = None,
                session_ref: str | None = None, retry_of: int | None = None,
                routed_reason: str | None = None, pause_gate: bool = True,
                commit: bool = True) -> tuple[sqlite3.Row | None, str | None]:
@@ -69,22 +69,22 @@ def create_run(con, *, profile: str, backend: str, requested_by: str,
         blocked = None
         if pause_gate and dispatch.paused(con):
             blocked = "paused"
-        elif work_item:
+        elif ref:
             if retry_of is not None:
                 # A delayed retry may wake after a newer attempt already
                 # settled. That newer result owns the item; repeating stale
                 # work would be a regression, not resilience.
                 active = con.execute(
-                    "SELECT id FROM runs WHERE work_item=? AND layer IS NULL "
+                    "SELECT id FROM runs WHERE ref=? AND layer IS NULL "
                     "AND id>? ORDER BY id DESC LIMIT 1",
-                    (work_item, int(retry_of))).fetchone()
+                    (ref, int(retry_of))).fetchone()
             else:
                 active = con.execute(
-                    f"SELECT id FROM runs WHERE work_item=? AND layer IS NULL "
+                    f"SELECT id FROM runs WHERE ref=? AND layer IS NULL "
                     f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
-                    (work_item,)).fetchone()
+                    (ref,)).fetchone()
             if active is not None:
-                blocked = f"work_item:{active['id']}"
+                blocked = f"ref:{active['id']}"
         if blocked is None and session_ref:
             active = con.execute(
                 f"SELECT id FROM runs WHERE session_ref=? AND layer IS NULL "
@@ -116,13 +116,13 @@ def create_run(con, *, profile: str, backend: str, requested_by: str,
                 cur = con.execute(
                     "INSERT INTO runs(slug, profile, backend, model, title, "
                     "requested_by, workdir, project_id, status, started_at, "
-                    "work_item, work_seen_ts, parent_run, session_ref, retry_of, "
+                    "ref, parent_run, session_ref, retry_of, "
                     "routed_reason, project_seq) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
                     f"{db.NEXT_PROJECT_SEQ})",
                     (slug, profile, backend, model, title, requested_by,
-                     str(workdir), project_id, status, db.now(), work_item,
-                     work_seen_ts, parent_run, session_ref, retry_of,
+                     str(workdir), project_id, status, db.now(), ref,
+                     parent_run, session_ref, retry_of,
                      routed_reason, project_id))
                 run_id = int(cur.lastrowid)
                 break
@@ -268,7 +268,7 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
         # hard way).
         # Only a Work TASK carries a checklist; issues do not, so only a task id
         # earns the checklist protocol in the brief.
-        item = run["work_item"] if "work_item" in run.keys() else None
+        item = run["ref"] if "ref" in run.keys() else None
         text = brief.compose(
             run_id=run_id, slug=run["slug"], profile=profile,
             mission=mission, requester=run["requested_by"], root=root,
@@ -395,8 +395,7 @@ def reserve_followup(con, root: Path, parent, requester: str,
         title=title or f"continuation of run {parent['id']}",
         requested_by=requester, workdir=str(root),
         project_id=parent["project_id"], parent_run=int(parent["id"]),
-        session_ref=parent["session_ref"], work_item=parent["work_item"],
-        work_seen_ts=parent["work_seen_ts"], commit=commit)
+        session_ref=parent["session_ref"], ref=parent["ref"], commit=commit)
 
 
 def prepare_followup(con, root: Path, parent, run, text: str) -> int:

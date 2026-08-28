@@ -889,7 +889,7 @@ function renderRunList(s) {
     item.append(top);
     item.append(el("div", "title", r.title || "(no title recorded)"));
     item.append(el("div", "meta", [
-      r.profile, r.backend, r.work_item, r.project,
+      r.profile, r.backend, r.ref, r.project,
       r.retry_of ? "retry of " + refNo(r.retry_of) : "",
       r.parent_run ? "parent " + refNo(r.parent_run) : "",
     ].filter(Boolean).join(" · ")));
@@ -1103,7 +1103,7 @@ const PANES = {
     ["harness", r.backend + (r.model ? " · " + r.model : "")],
     ["isolation", r.isolation],
     ["project", r.project || r.project_id],
-    ["work item", r.work_item],
+    ["ref", r.ref],
     ["branch", r.branch],
     ["base commit", r.base_commit],
     ["checkpoint", r.checkpoint_commit],
@@ -1203,7 +1203,7 @@ function renderDetail(s) {
   head.append(el("span", "mono", runNo(r)));
   if (r.slug) head.append(el("span", "mono dim", r.slug));
   head.append(statusChip(r));
-  if (r.work_item) head.append(el("span", "mono", r.work_item));
+  if (r.ref) head.append(el("span", "mono", r.ref));
   // Facts left the tab strip: eighteen rows of metadata are reference, not a
   // place you work, so they live behind a glyph beside the run's name.
   const facts = el("button",

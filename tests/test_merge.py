@@ -524,7 +524,7 @@ class MergeTestCase(unittest.TestCase):
         dispatch.pause(con, "hold admissions")
         try:
             run = {"id": 7, "branch": BRANCH, "requested_by": "human",
-                   "title": "done", "work_item": None, "brief_path": None}
+                   "title": "done", "ref": None, "brief_path": None}
             with mock.patch.object(merge, "merge_run", return_value=result) as land, \
                     mock.patch.object(merge.project, "root_for", return_value=self.root), \
                     mock.patch.object(merge.nod, "withdraw_merge_cards"), \

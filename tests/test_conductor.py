@@ -63,7 +63,7 @@ class ConductorFixture(SweeperFixture):
             "profile": "stub", "backend": "opencode", "title": "work",
             "requested_by": "work", "workdir": str(self.root),
             "project_id": PROJECT_ID, "status": status, "started_at": db.now(),
-            "work_item": item_id,
+            "ref": item_id,
         }
         if status in db.RUN_TERMINAL:
             fields["finished_at"] = db.now()
@@ -268,7 +268,7 @@ class ActionTests(ConductorFixture, unittest.TestCase):
                              "item": "W-0100", "mission": "Build the API."})
         run = self.db_run()
         self.assertEqual(took[0]["run"], run["id"])
-        self.assertEqual(run["work_item"], "W-0100")
+        self.assertEqual(run["ref"], "W-0100")
         self.assertEqual(self.launched, [(self.root, run["id"])])
         self.assertIn("Build the API.", Path(run["brief_path"]).read_text())
         self.assertRegex(self.goal_log(), r"\[orchestra/\w+_\w+\] dispatched run \d+")
@@ -297,12 +297,12 @@ class ActionTests(ConductorFixture, unittest.TestCase):
 
         self.conduct({"action": "dispatch", "rationale": "outside",
                       "item": "W-0200", "mission": "nope"})
-        self.assertEqual(self.db_run()["work_item"], "W-0100")
+        self.assertEqual(self.db_run()["ref"], "W-0100")
 
         self.work.human_log("W-0100", "start the child")
         self.conduct({"action": "dispatch", "rationale": "child",
                       "item": "W-0101", "mission": "Do the child."})
-        self.assertEqual(self.db_run()["work_item"], "W-0101")
+        self.assertEqual(self.db_run()["ref"], "W-0101")
 
         self.work.human_log("W-0100", "start the child again")
         took = self.conduct({"action": "dispatch", "rationale": "again",

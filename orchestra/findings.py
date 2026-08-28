@@ -386,7 +386,7 @@ def file_proposals(con, client, run, entries: list[dict], project_path: str | No
                    ceiling: int = DEFAULT_CHILD_CEILING) -> list[dict]:
     """Contract verb 5, with alignment judged elsewhere and tripwires here."""
     results = []
-    goal_id = run["work_item"] if (run["work_item"] or "").startswith("W-") else None
+    goal_id = run["ref"] if (run["ref"] or "").startswith("W-") else None
     tag = _tag(client, run)
     children = None
     tasks = decisions = None

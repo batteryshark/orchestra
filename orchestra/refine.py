@@ -49,7 +49,7 @@ def _live(con, item_id: str):
     """A refine run still in flight for this item — the ONE thing that stops
     a dispatch. A worker run's own liveness is not this lane's business."""
     return con.execute(
-        f"SELECT id FROM runs WHERE work_item=? AND requested_by=? "
+        f"SELECT id FROM runs WHERE ref=? AND requested_by=? "
         f"AND status NOT IN {db.TERMINAL_SQL} LIMIT 1",
         (item_id, REQUESTED_BY)).fetchone()
 
@@ -107,7 +107,7 @@ def dispatch_one(con, cfg: dict, client: WorkClient, item: dict,
         con, profile=profile_name, backend=profile["backend"],
         model=profile.get("model"), title=f"Refine {item_id}"[:80],
         requested_by=REQUESTED_BY, workdir=str(proj.path),
-        project_id=proj.project_id, work_item=item_id)
+        project_id=proj.project_id, ref=item_id)
     if run is None:
         # Paused, or another run holds the item. The tag stays put and the
         # held cursor brings the item back next pass.

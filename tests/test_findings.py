@@ -124,7 +124,7 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         con = db.connect()
         con.execute(
             "INSERT INTO runs(id, slug, profile, backend, requested_by, workdir, "
-            "project_id, work_item, status, started_at) "
+            "project_id, ref, status, started_at) "
             "VALUES(7, 'calm_otter', 'stub', 'opencode', 'work', ?, ?, 'W-0001', "
             "'done', ?)", (str(self.root), PROJECT_ID, db.now()))
         con.commit()
@@ -149,7 +149,7 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
         con = db.connect()
         con.execute(
             "INSERT INTO runs(id, slug, profile, backend, requested_by, workdir, "
-            "project_id, work_item, status, started_at) "
+            "project_id, ref, status, started_at) "
             "VALUES(?, ?, 'stub', 'opencode', 'work', ?, ?, 'W-0001', 'done', ?)",
             (run_id, f"run_{run_id}", str(self.root), PROJECT_ID, db.now()))
         con.commit()
@@ -389,7 +389,7 @@ class FilingTestCase(SweeperFixture, unittest.TestCase):
 
     def test_run_without_a_goal_task_cannot_propose(self) -> None:
         con = db.connect()
-        con.execute("UPDATE runs SET work_item='issue_9' WHERE id=7")
+        con.execute("UPDATE runs SET ref='issue_9' WHERE id=7")
         con.commit()
         con.close()
         result = self.run_at_completion(HANDOFF % ("", PROPOSAL))

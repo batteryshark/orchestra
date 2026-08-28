@@ -309,19 +309,19 @@ class SnapshotTests(ServerCase):
         self.assertLess(len(body), mhttp.GZIP_MIN_BYTES)
         self.assertIsNone(encoding)
 
-    def test_runs_carry_status_profile_work_item_and_project(self) -> None:
+    def test_runs_carry_status_profile_ref_and_project(self) -> None:
         self.con.execute(
             "INSERT INTO projects(path, project_id, work_id, name, refreshed_at) "
             "VALUES(?,?,?,?,?)",
             (str(self.tmp_path), PROJECT_ID, "P-1", "demo", db.now()))
-        live = self.make_run(work_item="W-0100", title="build the HTTP surface")
+        live = self.make_run(ref="W-0100", title="build the HTTP surface")
         done = self.make_run(status="done", finished_at=db.now())
         _, payload = self.json_request()
         by_id = {r["id"]: r for r in payload["runs"]}
         self.assertEqual(payload["live_runs"], 1)
         self.assertEqual(by_id[live]["status"], "running")
         self.assertEqual(by_id[live]["profile"], "codex")
-        self.assertEqual(by_id[live]["work_item"], "W-0100")
+        self.assertEqual(by_id[live]["ref"], "W-0100")
         self.assertEqual(by_id[live]["project"], "P-1")
         self.assertTrue(by_id[live]["live"])
         self.assertFalse(by_id[done]["live"])

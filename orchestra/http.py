@@ -565,7 +565,7 @@ def _run_payload(con, r, blocked: dict) -> dict:
         "backend": r["backend"],
         "model": r["model"],
         "title": r["title"],
-        "work_item": r["work_item"],
+        "ref": r["ref"],
         "project_id": r["project_id"],
         "project": r["project_work_id"] or r["project_name"],
         "workdir": r["workdir"],

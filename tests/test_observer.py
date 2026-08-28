@@ -424,7 +424,7 @@ class RetryTests(ObserverCase):
             self.con, self.cfg(), launcher=lambda root, rid: None), [])
 
     def test_an_infrastructure_failure_is_retried_once_with_the_same_brief(self) -> None:
-        run_id = self.make_run(status="failed", work_item="W-0001")
+        run_id = self.make_run(status="failed", ref="W-0001")
         self._brief(run_id)
         launched = []
         result = observer.after_terminal(self.con, run_id,
@@ -432,7 +432,7 @@ class RetryTests(ObserverCase):
         self.assertEqual(result["action"], "retry")
         retry = self.one("SELECT * FROM runs WHERE id=?", result["run"])
         self.assertEqual(
-            (retry["retry_of"], retry["work_item"], retry["session_ref"],
+            (retry["retry_of"], retry["ref"], retry["session_ref"],
              Path(retry["brief_path"]).read_text()),
             (run_id, "W-0001", None, "the original mission"),
             "a retry is a fresh run with the same brief, not a resume")
@@ -446,7 +446,7 @@ class RetryTests(ObserverCase):
 
     def test_expired_authentication_requires_a_changed_precondition(self) -> None:
         run_id = self.make_run(status="failed", backend="claude",
-                               work_item="W-auth", summary=self.AUTH_SUMMARY)
+                               ref="W-auth", summary=self.AUTH_SUMMARY)
         self._brief(run_id)
         dependent = self._add_waiter(run_id, "continue after auth")
         launched = []
@@ -478,12 +478,12 @@ class RetryTests(ObserverCase):
         summary, must not spend the one transient retry."""
         def auth_history():
             auth = self.make_run(status="failed", backend="claude",
-                                 work_item="W-auth-history",
+                                 ref="W-auth-history",
                                  summary=self.AUTH_SUMMARY)
             self._brief(auth)
             observer.after_terminal(self.con, auth, launcher=lambda root, rid: None)
             later = self.make_run(status="failed", backend="claude",
-                                  work_item="W-auth-history",
+                                  ref="W-auth-history",
                                   summary="connection reset")
             self._brief(later)
             return later
@@ -527,7 +527,7 @@ class RetryTests(ObserverCase):
 
     def test_a_second_consecutive_failure_escalates_instead(self) -> None:
         from orchestra import dispatch
-        first = self.make_run(status="failed", work_item="W-0002")
+        first = self.make_run(status="failed", ref="W-0002")
         self._brief(first)
         retry_id = observer.after_terminal(
             self.con, first, launcher=lambda root, rid: None)["run"]
@@ -553,10 +553,10 @@ class RetryTests(ObserverCase):
         was escalated after two attempts. Nothing about the brief was wrong —
         only another attempt can clear a busy provider, so the count rule
         gives way to a clock."""
-        first = self.make_run(status="failed", work_item="W-cap",
+        first = self.make_run(status="failed", ref="W-cap",
                               summary=self.CAPACITY_SUMMARY)
         self._brief(first)
-        second = self.make_run(status="failed", work_item="W-cap",
+        second = self.make_run(status="failed", ref="W-cap",
                                retry_of=first, summary=self.CAPACITY_SUMMARY)
         self._brief(second)
         self.assertGreaterEqual(observer.infra_streak(self.con, self.one(
@@ -580,7 +580,7 @@ class RetryTests(ObserverCase):
     def test_a_scheduled_capacity_retry_fires_when_it_is_due(self) -> None:
         """The daemon's own resume sweep is the clock: it passes over a
         waiting row until its time comes, then makes the attempt."""
-        run_id = self.make_run(status="failed", work_item="W-cap3",
+        run_id = self.make_run(status="failed", ref="W-cap3",
                                summary=self.CAPACITY_SUMMARY)
         self._brief(run_id)
         self.assertEqual("waiting", observer.after_terminal(
@@ -608,10 +608,10 @@ class RetryTests(ObserverCase):
         stays full cannot extend its own deadline. When it runs out, a human
         decides — retry later, or staff the item somewhere else."""
         old_start = "2026-08-25T00:00:00Z"
-        first = self.make_run(status="failed", work_item="W-cap2",
+        first = self.make_run(status="failed", ref="W-cap2",
                               started_at=old_start, summary=self.CAPACITY_SUMMARY)
         self._brief(first)
-        second = self.make_run(status="failed", work_item="W-cap2",
+        second = self.make_run(status="failed", ref="W-cap2",
                                retry_of=first, started_at=old_start,
                                summary=self.CAPACITY_SUMMARY)
         self._brief(second)
@@ -625,10 +625,10 @@ class RetryTests(ObserverCase):
     def test_ordinary_failures_still_stop_at_two(self) -> None:
         """The exception is capacity alone: a run that failed for its own
         reasons keeps the count rule exactly as it was."""
-        first = self.make_run(status="failed", work_item="W-plain",
+        first = self.make_run(status="failed", ref="W-plain",
                               summary="Traceback: something broke")
         self._brief(first)
-        second = self.make_run(status="failed", work_item="W-plain",
+        second = self.make_run(status="failed", ref="W-plain",
                                retry_of=first, summary="Traceback: again")
         self._brief(second)
         result = observer.after_terminal(
@@ -644,7 +644,7 @@ class RetryTests(ObserverCase):
         automatically and once by hand. Nothing an identical run does can
         change what git objects to, so it escalates naming the fix."""
         run_id = self.make_run(
-            status="failed", work_item="W-ckpt",
+            status="failed", ref="W-ckpt",
             summary="Checkpoint error: cannot read worktree status: error: "
                     "expected submodule path 'vendor/lib' not to be a "
                     "symbolic link\n\nAdmitted. The cursor moves.")
@@ -714,7 +714,7 @@ class RetryTests(ObserverCase):
         # before the daemon replays its deferred retry. The waiter must follow
         # that winning run; the old retry decision must not replay forever.
         launched.clear()
-        failed = self.make_run(status="failed", work_item="W-COMPETING")
+        failed = self.make_run(status="failed", ref="W-COMPETING")
         self._brief(failed)
         dependent = self._add_waiter(failed, "follow the winner")
         dispatch.pause(self.con, "maintenance")
@@ -724,7 +724,7 @@ class RetryTests(ObserverCase):
         winner, blocked = supervise.create_run(
             self.con, profile="worker", backend="opencode",
             requested_by="human", workdir=str(self.tmp_path),
-            project_id=PROJECT_ID, status="running", work_item="W-COMPETING")
+            project_id=PROJECT_ID, status="running", ref="W-COMPETING")
         self.assertIsNone(blocked)
         self.con.execute("UPDATE runs SET status='done', finished_at=? WHERE id=?",
                          (db.now(), winner["id"]))
@@ -734,7 +734,7 @@ class RetryTests(ObserverCase):
             self.con, self.cfg(), launcher=lambda root, rid: launched.append(rid))
         self.assertEqual(len(resumed), 1)
         self.assertEqual(resumed[0]["action"], "none")
-        self.assertIn(f"work_item:{winner['id']}", resumed[0]["reason"])
+        self.assertIn(f"ref:{winner['id']}", resumed[0]["reason"])
         self.assertEqual(launched, [])
         self.assertEqual(self.one(
             "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
@@ -772,21 +772,21 @@ class RetryTests(ObserverCase):
             self.con, first, layer="retry")], ["deferred", "retry"])
 
     def test_blocked_retry_chases_the_winners_current_owner(self) -> None:
-        failed = self.make_run(status="failed", work_item="W-RACE")
+        failed = self.make_run(status="failed", ref="W-RACE")
         self._brief(failed)
         dependent = self._add_waiter(failed, "follow the final owner")
         self.assertTrue(observer.defer_retry(self.con, failed))
         self.con.commit()
-        winner = self.make_run(status="failed", work_item="W-RACE")
+        winner = self.make_run(status="failed", ref="W-RACE")
         real_create = supervise.create_run
         replacements = []
 
         def settle_winner_before_repoint(con, **kwargs):
             blocked = real_create(con, **kwargs)
-            self.assertEqual(blocked[1], f"work_item:{winner}")
+            self.assertEqual(blocked[1], f"ref:{winner}")
             retry = self.make_run(
-                status="failed", work_item="W-RACE", retry_of=winner)
-            current = self.make_run(status="running", work_item="W-RACE")
+                status="failed", ref="W-RACE", retry_of=winner)
+            current = self.make_run(status="running", ref="W-RACE")
             # Both ownership passes finish before the old failed run adds its
             # waiter to the winner: the ordering that exposed the race.
             observer._repoint_dependents(con, winner, retry)
@@ -807,7 +807,7 @@ class RetryTests(ObserverCase):
 
         current = replacements[-1]
         self.assertEqual(result["action"], "none")
-        self.assertIn(f"work_item:{current}", result["reason"])
+        self.assertIn(f"ref:{current}", result["reason"])
         edges = list(self.con.execute(
             "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=?",
             (dependent,)))
@@ -842,7 +842,7 @@ class RetryTests(ObserverCase):
                            "path": "demo"}])
 
         released = checkout / "worktrees" / "run-1"  # given back at finalization
-        run_id = self.make_run(status="failed", work_item="W-0028",
+        run_id = self.make_run(status="failed", ref="W-0028",
                                workdir=str(released), branch="orchestra/run-1")
         self._brief(run_id)
         self.assertFalse(released.exists())

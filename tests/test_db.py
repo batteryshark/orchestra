@@ -96,11 +96,12 @@ class DbTests(unittest.TestCase):
 
         con = db.connect(legacy)
         rows = list(con.execute(
-            "SELECT status, landing_status, handoff_processed_at, work_reported_at, "
-            "worker_status, worker_exit_code FROM runs ORDER BY id"))
+            "SELECT r.status, r.landing_status, r.handoff_processed_at, "
+            "m.reported_at, r.worker_status, r.worker_exit_code FROM runs r "
+            "LEFT JOIN work_marks m ON m.run_id = r.id ORDER BY r.id"))
         self.assertEqual(
             [(row["status"], row["landing_status"], row["handoff_processed_at"],
-              row["work_reported_at"])
+              row["reported_at"])
             for row in rows],
             [("done", "ok", "done-at", "done-at"),
              ("failed", None, None, None),

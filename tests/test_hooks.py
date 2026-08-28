@@ -70,7 +70,7 @@ class HookFixture(unittest.TestCase):
         self.log.touch()
         self.con.execute(
             "INSERT INTO runs(id, slug, profile, backend, requested_by, workdir, "
-            "project_id, work_item, log_path, status, started_at) "
+            "project_id, ref, log_path, status, started_at) "
             "VALUES(1,'brave_otter','stub','claude','human',?,?, 'W-0001', ?, "
             "'running', ?)",
             (str(self.tmp_path), PROJECT_ID, str(self.log), db.now()))
