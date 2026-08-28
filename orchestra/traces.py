@@ -14,8 +14,11 @@ Retention: normalized events are kept indefinitely; raw logs age out after
 ``raw_log_retention_days`` for TERMINAL runs only.
 
 HTTP seam (DESIGN §3, item W-0100): ``http.py`` calls
-``stream_run_trace()``, ``stream_daemon_log()``, ``events_for_run()`` and
-``run_messages()`` from here. Nothing in this module imports http.
+``stream_run_trace()``, ``stream_daemon_log()``, ``stream_board()``,
+``events_for_run()`` and ``run_messages()`` from here. Nothing in this module
+imports http. The three streams share ``sse()``, ``SSE_RETRY_MS`` and the
+stop-aware ``_pause()``; ``stream_board()`` is the odd one — an invalidation,
+not a trace — but it belongs beside the machinery it reuses.
 """
 import json
 import re
@@ -876,6 +879,47 @@ def stream_run_trace(run_id: int, after_id: int = 0, *, stop=None,
                     return
                 continue
             yield ": keepalive\n\n"
+            _pause(stop, poll)
+    finally:
+        if owned:
+            con.close()
+
+
+def stream_board(after: int = 0, *, stop=None, poll: float = 1.0,
+                 keepalive: float = 15.0, con=None):
+    """INVALIDATION stream for the dashboard board (DESIGN §3).
+
+    The one stream here that carries no payload. It yields a frame only when
+    ``meta.board_revision`` moves, and the frame says nothing but the new
+    number: the client then REFETCHES ``GET /api/snapshot``. Keeping the
+    state on the one snapshot route keeps auth, shape, version and gzip in
+    one place — an SSE mirror of the payload would be a second surface to
+    keep honest, and the board is a whole-fleet read, not an append-only log
+    like a trace.
+
+    ``after`` is the client's ``Last-Event-ID``. A reconnect with a stale
+    revision gets its frame on the first pass, which is why the comparison is
+    ``!=`` and not ``>``: a rebuilt database counts from zero again and the
+    board must still resync rather than go silent forever.
+
+    Never ends on its own — the board outlives every run — so the keepalive
+    comment is what stops an idle intermediary from dropping the connection.
+    """
+    owned = con is None
+    con = con or db.connect()
+    try:
+        yield f"retry: {SSE_RETRY_MS}\n\n"
+        quiet = 0.0
+        while stop is None or not stop.is_set():
+            current = db.board_revision(con)
+            if current != after:
+                after, quiet = current, 0.0
+                yield sse({"revision": current}, event="board", event_id=current)
+            else:
+                quiet += poll
+                if quiet >= keepalive:
+                    quiet = 0.0
+                    yield ": keepalive\n\n"
             _pause(stop, poll)
     finally:
         if owned:

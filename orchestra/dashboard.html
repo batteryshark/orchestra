@@ -22,11 +22,13 @@
      global. STATISTICS is a popup on the runs page rather than a card on
      health, and follows the picker.
 
-     Everything it knows comes from
-     GET /api/snapshot on a 4s poll, except the two live streams: the
-     selected run's normalized trace (GET /api/runs/<id>/stream) and the
-     daemon's own log (GET /api/log/stream), both SSE. EventSource cannot set
-     headers, so those two ride the same-origin cookie the key form parks. -->
+     Everything it knows comes from GET /api/snapshot, refetched when the
+     daemon says so: GET /api/board/stream pushes a revision number and
+     nothing else, so the board asks again only when something changed. The
+     other two streams carry content — the selected run's normalized trace
+     (GET /api/runs/<id>/stream) and the daemon's own log (GET
+     /api/log/stream). All three are SSE, and EventSource cannot set headers,
+     so all three ride the same-origin cookie the key form parks. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -552,7 +554,11 @@
 
 <script>
 "use strict";
-const POLL_MS = 4000;
+// The board is PUSHED, not polled (DESIGN §3): /api/board/stream sends a
+// bare revision number and this page refetches /api/snapshot. The slow
+// poll below runs only while that stream is broken, so a dropped
+// connection degrades to a stale board instead of a frozen one.
+const SLOW_POLL_MS = 30000;
 const $ = (id) => document.getElementById(id);
 
 // --- credential -------------------------------------------------------------
@@ -2208,6 +2214,7 @@ $("keyform").onsubmit = (e) => {
   KEY = $("keyinput").value.trim();
   saveKey(KEY);
   tick();
+  watchBoard();  // a 401 CLOSED the stream for good; the new cookie reopens it
 };
 
 async function tick() {
@@ -2231,9 +2238,27 @@ if (location.search.includes("key=")) {
   history.replaceState(null, "", location.pathname);
 }
 if (KEY) saveKey(KEY);
+// --- the board's invalidation stream ---------------------------------------
+// No payload crosses this: the frame is a revision, the refetch is the
+// existing tick(). Keeping the state on /api/snapshot keeps auth, the
+// version field and gzip in one place.
+let board = null, slowPoll = 0;
+function watchBoard() {
+  if (board) board.close();
+  board = new EventSource("/api/board/stream");
+  // EventSource reconnects by itself with Last-Event-ID, and the daemon
+  // answers a stale revision with an immediate frame, so a reconnect
+  // resyncs rather than waiting for the next change.
+  board.onopen = () => { clearInterval(slowPoll); slowPoll = 0; };
+  board.addEventListener("board", () => tick());
+  board.onerror = () => {
+    if (!slowPoll) slowPoll = setInterval(tick, SLOW_POLL_MS);
+  };
+}
+
 showView("runs");
 tick();
-setInterval(tick, POLL_MS);
+watchBoard();
 // Nothing else polls the providers on a timer, so this is what keeps the
 // stored numbers current for the conductor as well as for the view.
 setInterval(refreshRunway, RUNWAY_MS);

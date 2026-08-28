@@ -55,7 +55,11 @@ ROUTES: dict[str, str] = {
     "GET /":                       BOTH,
     "GET /api/snapshot":           BOTH,
     "GET /api/profiles/options":   BOTH,
-    "GET /api/*/stream":           BOTH,   # the daemon log (W-0165)
+    # The daemon log (W-0165) and the board's invalidation stream. Both are
+    # reads of the SERVICE, so they sit at the level "GET /api/snapshot"
+    # sits at: the board stream carries a revision number and no state,
+    # and the snapshot it tells the caller to refetch is gated here too.
+    "GET /api/*/stream":           BOTH,
     # A run's trace is run-scoped like stop/tell/check: a live run may watch
     # itself work and no sibling's (W-0178). The catch-all above is a READ of
     # the service, so it stays BOTH; this is a read of ONE run's transcript.

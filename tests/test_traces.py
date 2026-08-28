@@ -493,6 +493,64 @@ class SseTests(TraceTestCase):
                 self.assertEqual(traces.parse_daemon_cursor(raw), expected)
 
 
+class BoardStreamTests(TraceTestCase):
+    """The invalidation stream: a revision, never a payload (DESIGN §3)."""
+
+    def bump(self) -> int:
+        self.con.execute(
+            "INSERT INTO runs(profile, backend, requested_by, workdir, status, "
+            "started_at) VALUES('a','codex','human','/p','running',?)", (db.now(),))
+        self.con.commit()
+        return db.board_revision(self.con)
+
+    def test_it_emits_the_revision_and_nothing_else(self) -> None:
+        revision = self.bump()
+        stop = threading.Event()
+        stream = traces.stream_board(0, con=self.con, stop=stop, poll=0)
+        self.assertTrue(next(stream).startswith("retry:"))
+        frame = next(stream)
+        stop.set()
+        stream.close()
+        self.assertIn("event: board", frame)
+        self.assertIn(f"id: {revision}", frame)
+        # The client refetches /api/snapshot; no state crosses this wire.
+        self.assertEqual(json.loads(frame.split("data: ", 1)[1].strip()),
+                         {"revision": revision})
+
+    def test_it_stays_quiet_while_nothing_changes(self) -> None:
+        revision = self.bump()
+        stop = threading.Event()
+        stream = traces.stream_board(revision, con=self.con, stop=stop, poll=1,
+                                     keepalive=1)
+        self.assertTrue(next(stream).startswith("retry:"))
+        # Caught up: the only thing an idle stream may send is the comment
+        # that keeps an intermediary from dropping the connection.
+        for _ in range(3):
+            self.assertEqual(next(stream), ": keepalive\n\n")
+        stop.set()
+        stream.close()
+
+    def test_a_stale_last_event_id_resyncs_at_once(self) -> None:
+        self.bump()
+        revision = self.bump()
+        stop = threading.Event()
+        stream = traces.stream_board(revision - 1, con=self.con, stop=stop,
+                                     poll=0)
+        next(stream)
+        frame = next(stream)
+        stop.set()
+        stream.close()
+        # Not a replay of what it missed — one frame saying "ask again".
+        self.assertIn(f"id: {revision}", frame)
+
+    def test_it_stops_on_the_seams_stop_event(self) -> None:
+        self.bump()
+        stop = threading.Event()
+        stop.set()
+        self.assertEqual(list(traces.stream_board(0, con=self.con, stop=stop)),
+                         [f"retry: {traces.SSE_RETRY_MS}\n\n"])
+
+
 class ProgressTests(TraceTestCase):
     """The one line the board shows for a live run (I-0121)."""
 

@@ -132,6 +132,15 @@ class RouteTableTests(unittest.TestCase):
             method = key.split(" ", 1)[0]
             self.assertEqual(auth.route_key(method, path)[0], key)
 
+    def test_the_board_stream_sits_exactly_where_the_snapshot_sits(self) -> None:
+        """It only tells the caller to refetch /api/snapshot, so it may not be
+        easier to reach than the snapshot itself — nor harder, or a live run
+        watching the board would be pushed back onto a poll."""
+        key = auth.route_key("GET", "/api/board/stream")[0]
+        self.assertEqual(key, "GET /api/*/stream")
+        self.assertEqual(auth.ROUTES[key], auth.ROUTES["GET /api/snapshot"])
+        self.assertIsNone(auth.permit(auth.Identity(auth.RUN, 1), key))
+
     def test_an_unlisted_route_is_the_humans(self) -> None:
         run = auth.Identity(auth.RUN, 1)
         self.assertIsNone(auth.permit(auth.Identity(auth.HUMAN), "POST /api/new"))
