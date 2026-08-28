@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -328,3 +329,47 @@ class CliContractTests(EditCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InsertPointTests(unittest.TestCase):
+    """W-render: a new key lands in its own table, not under the next
+    section's heading. The live config carried the scar — grok-4-6's tier
+    and priority sat below `# --- workhorses ---`, parsing right and
+    reading wrong."""
+
+    SCARRED = (
+        '[profiles.grok-4-6]\n'
+        'backend = "opencode"\n'
+        'model = "xai/grok-4.6"\n'
+        '# OpenCode exposes no effort flag.\n'
+        '\n'
+        '# --- workhorses ---------------------------------------------\n'
+        '\n'
+        '[profiles.luna-max]\n'
+        'backend = "codex"\n'
+    )
+
+    def test_a_new_key_stays_above_the_next_sections_heading(self):
+        after = profile_edit.render(self.SCARRED, "grok-4-6", {"tier": 2})
+        lines = after.splitlines()
+        self.assertLess(lines.index("tier = 2"),
+                        next(i for i, l in enumerate(lines)
+                             if l.startswith("# --- workhorses")))
+        self.assertEqual(tomllib.loads(after)["profiles"]["grok-4-6"]["tier"], 2)
+
+    def test_a_comment_touching_a_key_keeps_the_new_key_below_it(self):
+        after = profile_edit.render(self.SCARRED, "grok-4-6", {"tier": 2})
+        lines = after.splitlines()
+        self.assertLess(lines.index("# OpenCode exposes no effort flag."),
+                        lines.index("tier = 2"))
+
+    def test_the_next_table_is_never_entered(self):
+        after = profile_edit.render(self.SCARRED, "grok-4-6", {"tier": 2})
+        self.assertNotIn("tier", tomllib.loads(after)["profiles"]["luna-max"])
+
+    def test_a_table_at_end_of_file_is_unchanged_in_behaviour(self):
+        text = '[profiles.solo]\nbackend = "codex"\n'
+        after = profile_edit.render(text, "solo", {"tier": 1})
+        self.assertEqual(after, '[profiles.solo]\nbackend = "codex"\ntier = 1\n')
+
+

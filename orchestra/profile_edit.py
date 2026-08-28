@@ -171,6 +171,35 @@ def _key_line(lines: list[str], start: int, end: int, key: str) -> int | None:
     return None
 
 
+def _insert_at(lines: list[str], start: int, end: int) -> int:
+    """Where a NEW key line goes: after the table's own last content.
+
+    Backing over blank lines alone is not enough, and the file carries the
+    scar. A comment block separated from the table's keys by a blank line
+    HEADS THE NEXT SECTION, so inserting under it files the key in the wrong
+    visual group: ``grok-4-6`` gained ``tier``/``priority`` below
+    ``# --- workhorses ---``, which TOML parses correctly and a human reads
+    as a lie about which tier the profile is in. The delete path already knew
+    the hazard ("not the next table's own leading comment block"); this is
+    the same knowledge on the insert side.
+
+    A comment sitting DIRECTLY on the line above annotates it and keeps the
+    new key beneath it — that is the OpenCode effort note, which belongs to
+    the table it trails.
+    """
+    at = end
+    while True:
+        while at > start + 1 and not lines[at - 1].strip():
+            at -= 1
+        block = at
+        while block > start + 1 and lines[block - 1].lstrip().startswith("#"):
+            block -= 1
+        # No comment run, or one a key line touches: it annotates, so stop.
+        if block == at or block <= start + 1 or lines[block - 1].strip():
+            return at
+        at = block  # detached block: it heads what comes next, insert above
+
+
 def render(text: str, name: str, changes: dict, delete: bool = False,
            header: str | None = None) -> str:
     """The edited file text. Only the named table's key lines move.
@@ -211,9 +240,7 @@ def render(text: str, name: str, changes: dict, delete: bool = False,
                 end -= 1
             continue
         if at is None:
-            insert = end
-            while insert > start + 1 and not lines[insert - 1].strip():
-                insert -= 1
+            insert = _insert_at(lines, start, end)
             lines.insert(insert, f"{key} = {_fmt(value)}\n")
             end += 1
             continue
