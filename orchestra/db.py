@@ -113,13 +113,22 @@ Data-model invariants (DESIGN D4):
   trigger: every path that touches a run must bump it. ``runs`` alone —
   everything else the snapshot reads (pause state, runway, health) rides the
   explicit bump ``http.record_health`` makes once per sweeper tick.
+- ``runs.revision`` (schema v22, CONTRACT §7 Enforcement 2) is that same
+  counter STAMPED ON THE ROW: the monotonic marker of when this run last
+  changed. The global number says only THAT something changed; the column
+  says WHICH run, so a consumer keeps a cursor and reads the rows past it
+  (``http.runs_since``, ``GET /api/runs?since=``). It is the whole outbound
+  feed — Orchestra keeps no subscriber list, no endpoint and no delivery
+  state, because the consumer's cursor is the delivery guarantee. Indexed,
+  since every read of it is a range scan. Stamped by the same triggers, for
+  the same reason: every path that touches a run must mark it.
 """
 import sqlite3
 from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "21"
+SCHEMA_VERSION = "22"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -181,6 +190,12 @@ RUNS_V16_COLUMNS = (
 # gets no number.
 RUNS_V18_COLUMNS = (
     ("project_seq", "INTEGER"),
+)
+# Schema v22 (CONTRACT §7 Enforcement 2). The change marker the cursored read
+# scans. Written only by the triggers below; NULL only between the ALTER and
+# the one-shot backfill in ``connect``.
+RUNS_V22_COLUMNS = (
+    ("revision", "INTEGER"),
 )
 RUNS_V17_COLUMNS = (
     ("child_depth", "INTEGER"),
@@ -286,7 +301,8 @@ CREATE TABLE IF NOT EXISTS runs (
   spawn_request_id INTEGER,
   child_wakeup_run INTEGER,
   child_wakeup_message INTEGER,
-  project_seq INTEGER
+  project_seq INTEGER,
+  revision INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
@@ -298,18 +314,27 @@ WHEN NEW.status IN ('done','failed','timeout','killed','halted')
 BEGIN
   UPDATE runs SET run_token_hash=NULL WHERE id=NEW.id;
 END;
--- The board's invalidation counter (DESIGN §3). Any write to runs bumps it;
--- the SSE seam tails it and tells the dashboard to REFETCH the snapshot.
--- Triggers, not a call per writer: runs is written from a dozen modules.
+-- The board's invalidation counter (DESIGN §3) and, since v22, the run's own
+-- change marker (CONTRACT §7 Enforcement 2): every write to runs bumps the
+-- counter AND stamps the new value on the row that changed. The SSE seam
+-- tails the counter; a cursored consumer range-scans the column. Triggers,
+-- not a call per writer: runs is written from a dozen modules.
+--
+-- The INSERT trigger only TOUCHES the new row; the UPDATE trigger below does
+-- the bump and the stamp for both. SQLite stops a trigger re-entering ITSELF
+-- (recursive_triggers is off by default and ``connect`` never turns it on),
+-- not from firing a SIBLING — so an insert that bumped here as well would
+-- advance the counter twice, once here and once through this touch.
 CREATE TRIGGER IF NOT EXISTS bump_board_revision_insert AFTER INSERT ON runs
 BEGIN
-  INSERT INTO meta(key, value) VALUES('board_revision', 1)
-  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+  UPDATE runs SET revision=revision WHERE id=NEW.id;
 END;
 CREATE TRIGGER IF NOT EXISTS bump_board_revision_update AFTER UPDATE ON runs
 BEGIN
   INSERT INTO meta(key, value) VALUES('board_revision', 1)
   ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+  UPDATE runs SET revision=(SELECT CAST(value AS INTEGER) FROM meta
+                            WHERE key='board_revision') WHERE id=NEW.id;
 END;
 CREATE TRIGGER IF NOT EXISTS bump_board_revision_delete AFTER DELETE ON runs
 BEGIN
@@ -317,6 +342,8 @@ BEGIN
   ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
 END;
 CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run);
+-- The cursored read is one range scan on this and nothing else.
+CREATE INDEX IF NOT EXISTS idx_runs_revision ON runs(revision);
 CREATE INDEX IF NOT EXISTS idx_runs_ref ON runs(ref);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 -- Cached Work project list, so an offline CLI still resolves a directory to
@@ -567,7 +594,7 @@ def connect(db_file=None) -> sqlite3.Connection:
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
                                + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS
-                               + RUNS_V18_COLUMNS):
+                               + RUNS_V18_COLUMNS + RUNS_V22_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
         # Schema v21 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, run here and
@@ -639,7 +666,17 @@ def connect(db_file=None) -> sqlite3.Connection:
                 con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
     # Recreate so an older database picks up new terminal statuses in WHEN.
     con.execute("DROP TRIGGER IF EXISTS revoke_run_token")
+    # Both board-revision bodies changed in v22 (they now stamp the row);
+    # CREATE ... IF NOT EXISTS would leave a v19 database on the old pair.
+    con.execute("DROP TRIGGER IF EXISTS bump_board_revision_insert")
+    con.execute("DROP TRIGGER IF EXISTS bump_board_revision_update")
     con.executescript(SCHEMA)
+    if existing and "revision" not in existing:
+        # Schema v22, one shot. A run recorded before the column existed
+        # carries no marker, so a consumer starting at cursor 0 would never
+        # see it. Touch each one and let the trigger stamp it — a table scan
+        # is rowid order, so the markers land in the order the runs happened.
+        con.execute("UPDATE runs SET revision=revision WHERE revision IS NULL")
     con.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (SCHEMA_VERSION,),
