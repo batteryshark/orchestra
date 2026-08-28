@@ -19,7 +19,7 @@ CORE = Path(__file__).resolve().parent.parent / "orchestra"
 
 # The Work adapter. These five are allowed to name a source; being the
 # adapter is their whole job (CONTRACT §7).
-ADAPTER = {"sweeper", "conductor", "verify", "refine", "findings"}
+ADAPTER = {"sweeper", "conductor", "verify", "findings"}
 
 # The Nod client's importers, frozen. This is a RATCHET, like the Work one
 # was: Nod is a specific external notification product, three of these are

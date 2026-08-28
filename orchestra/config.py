@@ -162,13 +162,6 @@ progress_interval = 900
 # Swept runs get an isolated git worktree: nobody is watching a swept
 # dispatch, so it must not share a checkout with a working human.
 worktree = true
-# The refine lane (W-0309). A human tags an item `refine` and one shaping run
-# rewrites its sections to docs/GOAL-STANDARD.md, then drops the tag. Any
-# status, delegated or not: refinement comes before execution.
-# refine_profile names the launch template; unset, the one enabled profile
-# marked tier = 1 (workhorse) takes the run, exactly as [verify] profile
-# falls back. Zero or several tier-1 profiles: the pass says so and skips.
-# refine_profile = "judge"
 
 # --- Sign-off (W-0269, W-0299) --------------------------------------------
 # A verifier run follows every landing: when the sweeper's landed fact moves
