@@ -886,7 +886,8 @@ class PauseTests(ServerCase):
 
 
 class SseSeamTests(ServerCase):
-    """The two live streams (W-0165/W-0178): one run's trace, and the log."""
+    """The live streams (W-0165/W-0178): one run's trace, that run's raw
+    harness output, the daemon's log, and the board's invalidation."""
 
     def a_run_with_a_trace(self, status="done") -> int:
         from orchestra import traces
@@ -932,6 +933,44 @@ class SseSeamTests(ServerCase):
         self.assertIn("text/event-stream", ctype)
         self.assertIn("retry: ", body)  # the reconnect hint leads every stream
         self.assertNotIn("event: end", body)
+
+    def test_a_runs_raw_log_streams_and_resumes_on_a_file_offset(self) -> None:
+        """The tail of the file itself, not the parser's reading of it."""
+        log = self.tmp_path / "raw.log"
+        log.write_text("harness: booting\n")
+        run_id = self.make_run(status="running", backend="claude",
+                               log_path=str(log))
+        status, ctype, body = self.sse(f"/api/runs/{run_id}/log/stream",
+                                       last_event_id=f"{log.name}@0",
+                                       until="booting")
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", ctype)
+        self.assertIn("event: raw", body)
+        self.assertIn("harness: booting", body)
+        cursor = [ln for ln in body.splitlines() if ln.startswith("id:")][0]
+        cursor = cursor.split(":", 1)[1].strip()
+        self.assertIn(f"{log.name}@", cursor)
+        with open(log, "a") as handle:
+            handle.write("harness: still going\n")
+        body = self.sse(f"/api/runs/{run_id}/log/stream", last_event_id=cursor,
+                        until="still going")[2]
+        self.assertNotIn("booting", body)      # nothing before the cursor
+        self.assertIn("still going", body)
+
+    def test_a_terminal_runs_raw_log_ends_and_a_pruned_one_says_so(self) -> None:
+        """Neither one may leave the tab on a stream that never closes."""
+        log = self.tmp_path / "over.log"
+        log.write_text("harness: bye\n")
+        run_id = self.make_run(status="done", backend="claude",
+                               log_path=str(log), finished_at=db.now())
+        body = self.sse(f"/api/runs/{run_id}/log/stream",
+                        last_event_id=f"{log.name}@0")[2]
+        self.assertIn("harness: bye", body)
+        self.assertIn("event: end", body)
+        log.unlink()                            # what prune leaves behind
+        body = self.sse(f"/api/runs/{run_id}/log/stream")[2]
+        self.assertIn("event: pruned", body)
+        self.assertNotIn("event: raw", body)
 
     def test_the_daemon_log_streams_and_resumes_on_a_file_offset(self) -> None:
         self.daemon_log("orchestra: swept")
@@ -988,7 +1027,8 @@ class SseSeamTests(ServerCase):
 
     def test_the_seam_is_authenticated_before_it_is_called(self) -> None:
         with mock.patch.object(mhttp, "sse_stream") as seam:
-            for path in ("/api/log/stream", "/api/runs/1/stream"):
+            for path in ("/api/log/stream", "/api/runs/1/stream",
+                         "/api/runs/1/log/stream"):
                 with self.subTest(path=path):
                     self.assertEqual(self.request(path=path, key=None)[0], 401)
                     self.assertEqual(

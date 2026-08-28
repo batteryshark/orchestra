@@ -54,13 +54,17 @@ Shape:
   of hundreds of runs cheaper on the wire than the old board of thirty.
 
 - **SSE** (W-0165/W-0178) at ``sse_stream``: ``GET /api/runs/<id>/stream`` is
-  one run's normalized trace, ``GET /api/log/stream`` is the daemon's own
-  log, and ``GET /api/board/stream`` is the board's INVALIDATION — a bare
+  one run's normalized trace, ``GET /api/runs/<id>/log/stream`` is that run's
+  RAW harness output — a read-only tail of the log file, which is the surface
+  that answers "what is the CLI actually doing" when a run looks stuck and
+  the parser's reading of it does not — ``GET /api/log/stream`` is the
+  daemon's own log, and ``GET /api/board/stream`` is the board's INVALIDATION — a bare
   revision number, never the snapshot, so the dashboard refetches instead of
   polling every 4 seconds. All three resume from ``Last-Event-ID`` — an
   integer event id for a trace, a ``file@offset`` cursor for the log, the
-  revision for the board — and all three are behind the same gate, with the
-  run trace scoped to the run a token names (``auth.ROUTES``).
+  revision for the board — and all of them are behind the same gate, with the
+  run trace and the run's raw log scoped to the run a token names
+  (``auth.ROUTES``).
 """
 import functools
 import gzip
@@ -186,6 +190,9 @@ _RUN_ROUTE = re.compile(r"^/api/runs/(\d+)/(stop|tell|check)$")
 _BRIEF_ROUTE = re.compile(r"^/api/runs/(\d+)/brief$")
 _DIFF_ROUTE = re.compile(r"^/api/runs/(\d+)/diff$")
 _TRACE_STREAM = re.compile(r"^/api/runs/(\d+)/stream$")
+# The same run, one level down: the RAW harness log rather than the parser's
+# reading of it (DESIGN §7). auth.ROUTES scopes it exactly like the trace.
+_RUN_LOG_STREAM = re.compile(r"^/api/runs/(\d+)/log/stream$")
 LOG_STREAM = "/api/log/stream"
 BOARD_STREAM = "/api/board/stream"
 _PROFILE_ROUTE = re.compile(r"^/api/profiles/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$")
@@ -1229,9 +1236,10 @@ def sse_stream(handler, path: str) -> bool:
     Content-Length, flush per event) and returns True; an unknown stream path
     returns False and the caller answers 501.
 
-    Three routes, three resume cursors, all carried by ``Last-Event-ID``:
-    ``/api/runs/<id>/stream`` resumes on the integer event id it last sent,
-    ``/api/log/stream`` on the composite ``file@offset`` cursor
+    Four routes, three kinds of resume cursor, all carried by
+    ``Last-Event-ID``: ``/api/runs/<id>/stream`` resumes on the integer event
+    id it last sent, ``/api/runs/<id>/log/stream`` and ``/api/log/stream``
+    on the composite ``file@offset`` cursor
     ``traces.parse_daemon_cursor`` decodes, and ``/api/board/stream`` on the
     board revision. A browser's ``EventSource`` replays that header itself,
     which is why the cursor lives there and not in a query string.
@@ -1247,9 +1255,16 @@ def sse_stream(handler, path: str) -> bool:
     resume = (handler.headers.get("Last-Event-ID") or "").strip()
     stop = getattr(handler.server, "sse_stop", None)
     match = _TRACE_STREAM.match(path)
+    raw = _RUN_LOG_STREAM.match(path)
     if match:
         after_id = int(resume) if resume.isdigit() else 0
         frames = traces.stream_run_trace(int(match.group(1)), after_id, stop=stop)
+    elif raw:
+        # Same ``name@offset`` cursor as the daemon log, because the tail
+        # underneath is the same one — only the file differs.
+        frames = traces.stream_run_log(int(raw.group(1)),
+                                       traces.parse_daemon_cursor(resume),
+                                       stop=stop)
     elif path == LOG_STREAM:
         frames = traces.stream_daemon_log(traces.parse_daemon_cursor(resume),
                                           stop=stop)

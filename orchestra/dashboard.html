@@ -4,8 +4,8 @@
 
      Five views, one concern each, reached by the tabs: RUNS (master-detail,
      the default), PROFILES, SETTINGS, RUNWAY, HEALTH. The selected run's detail has a
-     second tab strip of its own (W-0180) — trace, inbox/outbox, merge — under
-     a header that never scrolls. The thread holds the run's whole
+     second tab strip of its own (W-0180) — trace, raw log, inbox/outbox,
+     merge — under a header that never scrolls. The thread holds the run's whole
      conversation: brief first, tells and asks between, handoff last, the
      composer under it. Facts sit behind the ⓘ glyph beside the run's name.
 
@@ -25,10 +25,13 @@
      Everything it knows comes from GET /api/snapshot, refetched when the
      daemon says so: GET /api/board/stream pushes a revision number and
      nothing else, so the board asks again only when something changed. The
-     other two streams carry content — the selected run's normalized trace
-     (GET /api/runs/<id>/stream) and the daemon's own log (GET
-     /api/log/stream). All three are SSE, and EventSource cannot set headers,
-     so all three ride the same-origin cookie the key form parks. -->
+     other streams carry content — the selected run's normalized trace (GET
+     /api/runs/<id>/stream), that run's RAW harness output (GET
+     /api/runs/<id>/log/stream, the same box on the other tab: what the CLI
+     printed, for when the parser's reading of it is the wrong question), and
+     the daemon's own log (GET /api/log/stream). All are SSE, and EventSource
+     cannot set headers, so all ride the same-origin cookie the key form
+     parks. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -257,6 +260,9 @@
                     background: var(--sel); }
   /* Machine chatter (NOISE set) hides until its checkbox shows it. */
   .tracebox:not(.chatter) .titem.noise { display: none; }
+  /* The raw harness log is text, not a parsed feed: one line per line. */
+  .rawbox .rawline { font-family: var(--mono); font-size: 12px;
+                     white-space: pre-wrap; overflow-wrap: anywhere; }
   #ptabs { display: flex; gap: .3rem; flex-wrap: wrap;
            padding: .4rem .8rem; border-bottom: 1px solid var(--line); }
   #ptabs .stop-run { margin-left: auto; }
@@ -1012,6 +1018,7 @@ function renderDiff(text) {
 // beside the header, outside the scrolling body; trace is the default.
 const TABS = [
   ["trace", "trace"],
+  ["raw", "raw log"],
   ["messages", "inbox / outbox"],
   ["merge", "merge"],
 ];
@@ -1054,6 +1061,9 @@ function renderTabs(run) {
 // nothing in it says so, and a tab that cannot apply says why.
 const PANES = {
   trace: tracePane,
+  // Same pane, other stream (W-0165): what the harness PRINTED, beside what
+  // the parsers made of it. openTrace picks the route off the tab.
+  raw: tracePane,
 
   // The whole conversation WITH the run in one place. The brief opens it —
   // it is the first thing put in — tells and asks follow, the handoff closes
@@ -1171,7 +1181,8 @@ function tracePane() {
     TRACE_BOX.classList.toggle("chatter", CHATTER);
   };
   chat.append(cb2, el("span", null, " machine chatter"));
-  h3.append(state, follow, chat);
+  h3.append(state, follow);
+  if (runTab() !== "raw") h3.append(chat);  // nothing is normalized here
   pane.append(h3, TRACE_BOX);
   return pane;
 }
@@ -1234,8 +1245,15 @@ function lineageNode(s, r) {
 // The trace pane is owned by the stream, never by the 4s poll: the box node is
 // kept across re-renders so appended events and open <details> survive.
 const TRACE_BOX = el("div", "tracebox");
-let TRACE = null, TRACE_RUN = null, TRACE_STATE = "", FOLLOW = true,
+let TRACE = null, TRACE_KEY = null, TRACE_STATE = "", FOLLOW = true,
     CHATTER = false;
+// The two per-run streams, by tab: the normalized trace, and the RAW harness
+// output. One box, one owner, one connection — switching tabs swaps it.
+const STREAM_TABS = {trace: "/stream", raw: "/log/stream"};
+const IDLE = {
+  trace: "no events — nothing the parsers recognise has been written",
+  raw: "nothing written yet — the harness has printed nothing",
+};
 
 function setTraceState(text) {
   TRACE_STATE = text;
@@ -1244,34 +1262,53 @@ function setTraceState(text) {
 }
 
 // The one place that decides whether a stream should exist: only the selected
-// run, only while its trace tab is the visible one. Nothing is left connected
-// behind a hidden tab. TRACE_RUN is the run the box holds, so a stream that
+// run, only while a streaming tab of its is the visible one. Nothing is left
+// connected behind a hidden tab. TRACE_KEY is run AND tab, so switching
+// between the trace and the raw log swaps the connection, and a stream that
 // ended on its own is not reopened by the next call.
 function syncTrace() {
-  const want = (VIEW === "runs" && SELECTED !== null && runTab() === "trace")
-             ? SELECTED : null;
-  if (want === TRACE_RUN) return;
+  const tab = runTab();
+  const want = (VIEW === "runs" && SELECTED !== null && STREAM_TABS[tab])
+             ? SELECTED + ":" + tab : null;
+  if (want === TRACE_KEY) return;
   closeTrace();
-  if (want !== null) openTrace(want);
+  if (want !== null) openTrace(SELECTED, tab);
 }
 
-function openTrace(runId) {
-  TRACE_RUN = runId;
+function openTrace(runId, tab) {
+  TRACE_KEY = runId + ":" + tab;
+  const raw = tab === "raw";
+  TRACE_BOX.classList.toggle("rawbox", raw);
   TRACE_BOX.replaceChildren(el("p", "dim", "connecting…"));
   setTraceState("· live");
   let empty = true;
-  const src = new EventSource("/api/runs/" + runId + "/stream");
+  const src = new EventSource("/api/runs/" + runId + STREAM_TABS[tab]);
   TRACE = src;
-  src.addEventListener("trace", (e) => {
-    if (empty) { TRACE_BOX.replaceChildren(); empty = false; }
+  const append = (e, build) => {
     let row;
     try { row = JSON.parse(e.data); } catch (err) { return; }
-    TRACE_BOX.appendChild(traceItem(row));
+    if (empty) { TRACE_BOX.replaceChildren(); empty = false; }
+    TRACE_BOX.appendChild(build(row));
+    // A long run's raw log has no bound; the tail is what is watched.
+    while (raw && TRACE_BOX.childElementCount > 500)
+      TRACE_BOX.removeChild(TRACE_BOX.firstChild);
     if (FOLLOW) $("pbody").scrollTop = $("pbody").scrollHeight;
+  };
+  src.addEventListener("trace", (e) => append(e, traceItem));
+  src.addEventListener("raw", (e) => append(e, (row) =>
+    el("div", "rawline", row.line)));
+  // A terminal run's raw log ages out (DESIGN §7). Say so — an empty pane
+  // here would read as the hung run this tab exists to rule out.
+  src.addEventListener("pruned", () => {
+    TRACE_BOX.replaceChildren(el("p", "dim",
+      "the raw log was pruned — the trace tab is what is left of this run"));
+    empty = false;
+    setTraceState("· pruned");
+    src.close();
+    if (TRACE === src) TRACE = null;
   });
   src.addEventListener("end", () => {
-    if (empty) TRACE_BOX.replaceChildren(
-      el("p", "dim", "no events — this run wrote nothing the parsers recognised"));
+    if (empty) TRACE_BOX.replaceChildren(el("p", "dim", IDLE[tab]));
     setTraceState("· ended");
     src.close();
     if (TRACE === src) TRACE = null;
@@ -1282,14 +1319,13 @@ function openTrace(runId) {
   src.onopen = () => {
     if (TRACE !== src) return;
     setTraceState("· live");
-    if (empty) TRACE_BOX.replaceChildren(el("p", "dim",
-      "no events yet — nothing the parsers recognise has been written"));
+    if (empty) TRACE_BOX.replaceChildren(el("p", "dim", IDLE[tab]));
   };
 }
 
 function closeTrace() {
   if (TRACE) { TRACE.close(); TRACE = null; }
-  TRACE_RUN = null;
+  TRACE_KEY = null;
   setTraceState("");
 }
 

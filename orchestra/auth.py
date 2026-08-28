@@ -64,6 +64,11 @@ ROUTES: dict[str, str] = {
     # itself work and no sibling's (W-0178). The catch-all above is a READ of
     # the service, so it stays BOTH; this is a read of ONE run's transcript.
     "GET /api/runs/{run}/stream":  SELF,
+    # The RAW harness log is that same read one level down — the file the
+    # trace was parsed out of — so it is scoped identically. The catch-all
+    # above would otherwise swallow it: it matches any /api/**/stream, and
+    # BOTH would hand a run token every sibling's raw output.
+    "GET /api/runs/{run}/log/stream": SELF,
     # A brief or diff is one run's mission/work, not the service's, so a run
     # token reads its own and no sibling's.
     "GET /api/runs/{run}/brief":   SELF,
@@ -81,7 +86,8 @@ ROUTES: dict[str, str] = {
 }
 DEFAULT_LEVEL = ONLY_HUMAN
 
-_RUN_PATH = re.compile(r"^/api/runs/(\d+)/(stop|tell|check|stream|brief|diff)$")
+_RUN_PATH = re.compile(
+    r"^/api/runs/(\d+)/(stop|tell|check|stream|log/stream|brief|diff)$")
 _PROFILE_PATH = re.compile(r"^/api/profiles/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
