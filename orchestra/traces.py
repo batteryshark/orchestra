@@ -10,8 +10,9 @@ undocumented and drift, so a parser is best-effort by contract: an unknown
 or malformed line is counted and skipped, never raised, and ``expand()``
 always goes back to the file for the untruncated value.
 
-Retention: normalized events are kept indefinitely; raw logs age out after
-``raw_log_retention_days`` for TERMINAL runs only.
+Retention: normalized events are kept indefinitely. Raw logs are kept
+forever by default (``raw_log_retention_days = 0``); a positive value ages
+them out, for TERMINAL runs only, when `orchestra traces prune` runs.
 
 HTTP seam (DESIGN §3, item W-0100): ``http.py`` calls
 ``stream_run_trace()``, ``stream_daemon_log()``, ``stream_run_log()``,
@@ -33,7 +34,11 @@ KINDS = ("assistant_text", "reasoning", "tool_call", "tool_result",
 
 MAX_PAYLOAD = 2048          # ~2KB truncated payload (DESIGN §7)
 MAX_CHUNK = 4_000_000       # bytes read per ingest pass
-DEFAULT_RAW_RETENTION_DAYS = 30
+# 0 means KEEP FOREVER, and it is the default: raw logs are the full-detail
+# record of every run's input and output, kept for later analysis. Pruning is
+# opt-in — a positive day count in the config, and a human running
+# `orchestra traces prune`.
+DEFAULT_RAW_RETENTION_DAYS = 0
 SSE_RETRY_MS = 3000
 DAEMON_LOGS = ("daemon.out.log", "daemon.err.log")
 
@@ -770,7 +775,7 @@ def retention_days(cfg: dict | None = None) -> int:
                                 DEFAULT_RAW_RETENTION_DAYS))
     except (TypeError, ValueError):
         days = DEFAULT_RAW_RETENTION_DAYS
-    return max(1, days)
+    return max(0, days)
 
 
 def prune_raw_logs(con, days: int | None = None, cfg: dict | None = None,
@@ -779,9 +784,13 @@ def prune_raw_logs(con, days: int | None = None, cfg: dict | None = None,
 
     Normalized events are kept indefinitely, so pruning loses only the
     expand-in-place detail. Ingest runs once more per candidate first, so
-    nothing unread is thrown away.
+    nothing unread is thrown away. ``days == 0`` is keep-forever, the
+    default: the call refuses to prune anything rather than reading zero as
+    "everything is old enough".
     """
     days = days if days is not None else retention_days(cfg)
+    if days <= 0:
+        return []
     cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = list(con.execute(

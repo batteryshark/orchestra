@@ -33,7 +33,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-from orchestra import brief, config, db, paths, worktree
+from orchestra import brief, config, db, paths, project, worktree
 
 REQUESTED_BY = "spawn"
 DEFAULTS = {"child_max_depth": 1, "child_max_per_run": 3, "child_max_active": 3}
@@ -176,16 +176,15 @@ def create(con, root: Path, cfg: dict, parent, targets: list[str],
                 # Branched from the PARENT's branch: the child starts from the
                 # work its lead has already done, not from main.
                 wt, branch = worktree.create(
-                    root, run_id, parent["project_id"] or str(root),
+                    root, run_id, project.dir_key_for(con, run),
                     start_point=parent["branch"] or None,
                     backend=profile["backend"])
                 workdir = str(wt)
             text = brief.compose_child(root, run, profile, mission,
                                        parent=parent, context=context,
                                        workdir=workdir, cfg=cfg)
-            bp = paths.briefs_dir() / f"run-{run_id}.md"
+            bp, lp = project.run_artifacts(con, run)
             bp.write_text(text)
-            lp = paths.logs_dir() / f"run-{run_id}.jsonl"
             lp.touch()
             con.execute(
                 "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=? "

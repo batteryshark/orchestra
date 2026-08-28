@@ -376,6 +376,16 @@ class RetentionTests(TraceTestCase):
         self.assertEqual(len(pruned), 1)
         self.assertTrue(log.is_file())
 
+    def test_zero_retention_keeps_everything_forever(self) -> None:
+        """0 is keep-forever AND the default: raw logs are the full-detail
+        analysis record, so nothing ages out unless the owner opts in."""
+        log = write_jsonl(self.dir / "ancient.jsonl", CODEX)
+        self.make_run("codex", log, status="done", finished_at=self.old(4000))
+        self.assertEqual(traces.retention_days(None), 0)
+        self.assertEqual(traces.prune_raw_logs(self.con, days=0), [])
+        self.assertEqual(traces.prune_raw_logs(self.con), [])  # the default
+        self.assertTrue(log.is_file())
+
     def test_retention_days_default_and_override(self) -> None:
         cases = [
             (None, traces.DEFAULT_RAW_RETENTION_DAYS),

@@ -29,8 +29,12 @@ class PathsTests(unittest.TestCase):
         self.assertEqual(paths.db_path(), self.home / "orchestra.db")
         self.assertEqual(paths.briefs_dir(), self.home / "briefs")
         self.assertEqual(paths.logs_dir(), self.home / "logs")
+        self.assertEqual(paths.project_dir("demo"),
+                         self.home / "projects" / "demo")
         self.assertEqual(paths.worktrees_dir("demo"),
-                         self.home / "worktrees" / "demo")
+                         self.home / "projects" / "demo" / "worktrees")
+        self.assertEqual(paths.workspace_dir("demo"),
+                         self.home / "projects" / "demo" / "workspace")
 
     @unittest.skipUnless(os.name == "posix", "POSIX mode bits")
     def test_state_directories_are_owner_only_and_existing_modes_are_repaired(self) -> None:
@@ -79,12 +83,13 @@ class PathsTests(unittest.TestCase):
             os.chdir(current)
         self.assertEqual(stat.S_IMODE(scratch.stat().st_mode), before)
 
-    def test_worktree_dir_is_keyed_by_the_immutable_project_id(self) -> None:
-        """The Work id is mutable, so renaming a project would strand its
-        worktree directory; the projectId UUID never changes."""
+    def test_worktree_dir_is_keyed_by_the_stable_key(self) -> None:
+        """Renaming a project folder must not strand its worktree directory:
+        the key is the stable slug (or, pre-v27, the projectId UUID), and
+        either lands under the one per-project area."""
         uuid = "53efe3c3-6def-4797-8560-3dce073d7d63"
         self.assertEqual(paths.worktrees_dir(uuid),
-                         self.home / "worktrees" / uuid)
+                         self.home / "projects" / uuid / "worktrees")
         self.assertTrue(paths.worktrees_dir(uuid).is_dir())
 
     def test_home_default_is_dot_orchestra_in_the_user_home(self) -> None:
@@ -524,7 +529,9 @@ class StoreOnlyProjectTests(unittest.TestCase):
                           {"projectId": "p-other", "id": "docs",
                            "name": "Theirs", "path": "docs"}])
         found = project.by_source_ref(self.con, "Group/docs")
-        self.assertEqual(paths.workspace_dir("p-orch"), found.path)
+        # p-orch minted its slug at first registration; a later refresh under
+        # a new name never rewrites it (the slug keys this very directory).
+        self.assertEqual(paths.workspace_dir("orchestra"), found.path)
         self.assertEqual(shared, project.by_source_ref(self.con, "docs").path,
                          "the project that owns the folder still gets it")
 
@@ -534,7 +541,7 @@ class StoreOnlyProjectTests(unittest.TestCase):
         sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "p-flat", "id": "errands",
                            "name": "Errands", "path": "errands"}])
-        self.assertEqual(paths.workspace_dir("p-flat"),
+        self.assertEqual(paths.workspace_dir("errands"),
                          project.by_source_ref(self.con, "errands").path)
 
     def test_a_linked_checkout_answers_for_the_work_path(self) -> None:
@@ -591,3 +598,100 @@ class StoreOnlyProjectTests(unittest.TestCase):
         repo.mkdir()
         with self.assertRaises(SystemExit):
             project.link(self.con, "no/such/project", repo)
+
+
+class SlugTests(unittest.TestCase):
+    """Schema v27: the slug is the project's one human address."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name).resolve()
+        self.workspace = self.tmp_path / "workspace"
+        self.workspace.mkdir()
+        self.env = mock.patch.dict(os.environ, {
+            "ORCHESTRA_HOME": str(self.tmp_path / "home"),
+            "ORCHESTRA_CONFIG": str(self.tmp_path / "global.toml")})
+        self.env.start()
+        self.con = db.connect()
+
+    def tearDown(self) -> None:
+        self.con.close()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_adopt_mints_a_kebab_slug_and_dedupes(self) -> None:
+        first = self.workspace / "My Project!"
+        first.mkdir()
+        adopted = project.adopt(self.con, first)
+        self.assertEqual(adopted.slug, "my-project")
+        twin = self.workspace / "elsewhere" / "My_Project"
+        twin.mkdir(parents=True)
+        self.assertEqual(project.adopt(self.con, twin, "My Project").slug,
+                         "my-project-2")
+        # Idempotent: re-adding the path returns the row, slug untouched.
+        self.assertEqual(project.adopt(self.con, first).slug, "my-project")
+
+    def test_find_resolves_slug_then_id_then_path(self) -> None:
+        root = self.workspace / "demo"
+        root.mkdir()
+        adopted = project.adopt(self.con, root)
+        for selector in ("demo", adopted.project_id, str(root)):
+            hit = project.find(self.con, selector)
+            self.assertIsNotNone(hit, selector)
+            self.assertEqual(hit.project_id, adopted.project_id, selector)
+        self.assertIsNone(project.find(self.con, "no-such-project"))
+
+    def test_a_refresh_or_rename_never_rewrites_a_slug(self) -> None:
+        sweeper.remember_projects(self.con, str(self.workspace), [
+            {"projectId": DEMO_ID, "id": "demo", "name": "Demo", "path": "demo"}])
+        self.assertEqual(project.by_slug(self.con, "demo").project_id, DEMO_ID)
+        sweeper.remember_projects(self.con, str(self.workspace), [
+            {"projectId": DEMO_ID, "id": "demo", "name": "Renamed",
+             "path": "demo"}])
+        self.assertEqual(project.by_slug(self.con, "demo").project_id, DEMO_ID)
+        self.assertIsNone(project.by_slug(self.con, "renamed"))
+
+    def test_link_shares_the_project_slug(self) -> None:
+        sweeper.remember_projects(self.con, str(self.workspace), [
+            {"projectId": DEMO_ID, "id": "Group/demo", "name": "Demo",
+             "path": "Group/demo"}])
+        checkout = self.workspace / "checkout"
+        checkout.mkdir()
+        linked = project.link(self.con, "Group/demo", checkout)
+        self.assertEqual(linked.slug, "demo")
+        self.assertEqual(project.by_slug(self.con, "demo").project_id, DEMO_ID)
+
+    def test_dir_key_for_prefers_the_slug(self) -> None:
+        root = self.workspace / "demo"
+        root.mkdir()
+        adopted = project.adopt(self.con, root)
+        run = {"project_id": adopted.project_id, "workdir": str(root)}
+        self.assertEqual(project.dir_key_for(self.con, run), "demo")
+        gone = {"project_id": None, "workdir": str(root / "run-9")}
+        self.assertEqual(project.dir_key_for(self.con, gone), "run-9")
+
+    def test_connect_backfills_one_slug_per_project(self) -> None:
+        import sqlite3
+        db_file = self.tmp_path / "old.db"
+        old = sqlite3.connect(db_file)
+        old.executescript("""
+            CREATE TABLE projects (
+              path TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+              source_ref TEXT, name TEXT, refreshed_at TEXT NOT NULL,
+              archived INTEGER NOT NULL DEFAULT 0, archived_override INTEGER);
+            INSERT INTO projects VALUES
+              ('/a/My Tool', 'p-1', 'g/tool', 'My Tool', 't', 0, NULL),
+              ('/b/alias',   'p-1', 'g/tool', 'My Tool', 't', 0, NULL),
+              ('/c/my-tool', 'p-2', NULL,     'My Tool', 't', 0, NULL);
+        """)
+        old.commit()
+        old.close()
+        con = db.connect(db_file)
+        rows = {r["path"]: r["slug"] for r in con.execute(
+            "SELECT path, slug FROM projects")}
+        con.close()
+        # One slug per project id — the alias row shares it — and the second
+        # project with the same name gets the suffix.
+        self.assertEqual(rows["/a/My Tool"], rows["/b/alias"])
+        self.assertEqual(rows["/a/My Tool"], "my-tool")
+        self.assertEqual(rows["/c/my-tool"], "my-tool-2")

@@ -500,13 +500,19 @@
   <!-- The REGISTRY, which is not the picker. The picker in the header is
        derived from the runs on the board (W-0186), so a project nobody has
        kicked anything off from is missing from it — and that is exactly the
-       project a human comes here to park. A local project gets the archive
-       control; a source-backed one gets the server's refusal instead,
-       because the source owns the flag. -->
+       project a human comes here to park. Every row gets the archive
+       control: the server parks ANY project, source-backed or not, by
+       writing the owner's own override (DESIGN §1). -->
   <section class="view vstack" id="view-projects" hidden>
     <div class="card grow">
       <h2>projects <span class="dim" style="text-transform:none;letter-spacing:0"
             >· the registry, archived rows included</span></h2>
+      <div class="pad" id="projadd" style="display:flex;gap:.5rem">
+        <input id="projpath" placeholder="/path/to/checkout" class="mono"
+               style="flex:1">
+        <input id="projname" placeholder="name (optional)">
+        <button id="projaddbtn">add project</button>
+      </div>
       <div class="pad" id="projbody"></div>
     </div>
   </section>
@@ -2269,10 +2275,11 @@ async function loadProjects() {
   rows.sort((a, b) => (a.archived - b.archived) ||
     (a.name || a.path).toLowerCase().localeCompare((b.name || b.path).toLowerCase()));
   $("projbody").replaceChildren(table(
-    ["project", "path", "origin", "state", ""],
+    ["slug", "project", "path", "origin", "state", ""],
     rows.map((p) => {
       const quiet = (n) => { if (p.archived) n.classList.add("dim"); return n; };
       return [
+        {node: quiet(el("span", "mono", p.slug || "-"))},
         {node: quiet(el("span", null, p.name || p.path.split("/").pop()))},
         {node: quiet(el("span", "mono", p.path)), cls: "grow"},
         p.source_ref ? "source" : "local",
@@ -2291,6 +2298,22 @@ async function loadProjects() {
       ];
     })));
 }
+
+// Registering was CLI-only; the panel can now do what `orchestra project
+// add` does. The server answers idempotently for a path already registered.
+$("projaddbtn").onclick = async () => {
+  const path = $("projpath").value.trim();
+  if (!path) return;
+  const b = $("projaddbtn");
+  b.disabled = true;
+  try {
+    await api("/api/projects/add", {method: "POST", body: JSON.stringify(
+      {path, name: $("projname").value.trim() || null})});
+    $("projpath").value = ""; $("projname").value = "";
+    await loadProjects();
+  } catch (e) { fail(e); }
+  b.disabled = false;
+};
 
 function archiveButton(p) {
   const b = el("button", p.archived ? null : "danger",

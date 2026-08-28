@@ -227,6 +227,17 @@ PROJECT_ROUTE = "/api/project"
 # auth.ROUTES, so the human's alone: DESIGN §1 parks a project, and a run
 # must never park the project it is running in.
 PROJECTS_ROUTE = "/api/projects"
+# ``POST /api/projects/add`` registers a directory, exactly as `orchestra
+# project add` does — the dashboard's (and a future native client's) way to
+# bring a project into the registry at all. Unlisted in auth.ROUTES, so the
+# human's alone.
+PROJECTS_ADD_ROUTE = "/api/projects/add"
+# ``POST /api/dispatch`` starts one run: the same admission and launch path
+# the CLI uses, addressed by project slug (or id, or registered path).
+# Unlisted in auth.ROUTES, so the human's alone — a run token must never
+# dispatch work for itself (DESIGN §5: nothing grants itself what it asks
+# for). Distinct from the pause switch at /api/dispatch/pause|resume.
+DISPATCH_ROUTE = "/api/dispatch"
 # ``GET /api/turns?project=<projectId>&layer=<layer>&limit=<n>`` (I-0081) —
 # the control turns themselves, newest first. The snapshot pins one turn per
 # project; this is the series behind it, so the observer's decisions read as a
@@ -986,6 +997,7 @@ def projects_registry(con=None) -> dict:
         return {
             "projects": [{
                 "project_id": p.project_id,
+                "slug": p.slug,
                 "path": str(p.path),
                 "name": p.name,
                 "source_ref": p.source_ref,
@@ -994,6 +1006,94 @@ def projects_registry(con=None) -> dict:
             } for p in rows],
             "generated_at": db.now(),
         }
+    finally:
+        if own:
+            con.close()
+
+
+def add_project(root: str, name=None, con=None) -> dict:
+    """``POST /api/projects/add`` — adopt a directory into the registry.
+
+    The same ``project.adopt`` the CLI calls: idempotent on a registered
+    path, refused (as an error payload, not a crash) on a path that is not a
+    directory. Registration was CLI-only, so the dashboard could park a
+    project but never create one.
+    """
+    root = str(root or "").strip()
+    if not root:
+        return {"error": "POST /api/projects/add needs path"}
+    own = con is None
+    con = db.connect() if own else con
+    try:
+        try:
+            p = project.adopt(con, Path(root), (str(name).strip() or None)
+                              if name else None)
+        except SystemExit as exc:
+            return {"error": str(exc)}
+        return {"project_id": p.project_id, "slug": p.slug,
+                "path": str(p.path), "name": p.name}
+    finally:
+        if own:
+            con.close()
+
+
+def dispatch_run(body: dict, launcher=None, con=None) -> dict:
+    """``POST /api/dispatch`` — start one run where the caller NAMES the
+    project, by slug, id, or registered path.
+
+    The same admission gates the CLI applies, in the same order: staffing
+    through the project's enabled set, the pause switch, ``create_run``'s
+    write-lock reservation, then ``prepare_launch`` and a detached
+    supervisor. ``launcher`` is injectable for tests only.
+    """
+    launcher = launcher or supervise.spawn_supervisor
+    selector = str(body.get("project") or "").strip()
+    mission = str(body.get("mission") or "").strip()
+    profile_name = str(body.get("profile") or "").strip()
+    if not (selector and mission and profile_name):
+        return {"error": "POST /api/dispatch needs project, profile, mission"}
+    own = con is None
+    con = db.connect() if own else con
+    try:
+        hit = project.find(con, selector)
+        if hit is None:
+            return {"error": f"no project matches {selector!r} — "
+                             "GET /api/projects names them"}
+        proj = project.workdir_for(con, hit)
+        pcfg = config.load(proj.project_id)
+        try:
+            profile = config.staff_profile(pcfg, profile_name)
+        except SystemExit as exc:
+            return {"error": str(exc)}
+        title = str(body.get("title") or "").strip() \
+            or mission.splitlines()[0][:80]
+        run, blocked = supervise.create_run(
+            con, profile=profile_name, backend=profile["backend"],
+            model=profile.get("model"), title=title,
+            requested_by=pcfg.get("settings", {}).get("default_requester",
+                                                      "human"),
+            workdir=str(proj.path), project_id=proj.project_id)
+        if run is None:
+            return {"error": f"run not admitted ({blocked})"}
+        run_id = int(run["id"])
+        isolate = bool(body.get("worktree", True)) \
+            and not project.is_workspace(proj.path)
+        context = body.get("context")
+        try:
+            supervise.prepare_launch(
+                con, proj.path, pcfg, run, mission=mission,
+                context=str(context) if context else None,
+                use_worktree=isolate)
+            con.commit()
+            launcher(proj.path, run_id)
+        except BaseException as exc:
+            supervise.fail_launch(con, proj.path, run_id, exc)
+            return {"error": str(exc)[:1000] or exc.__class__.__name__}
+        return {"run": run_id, "slug": run["slug"], "project": proj.slug,
+                "project_id": proj.project_id,
+                # DESIGN §1: parking stops the unattended lanes; a human
+                # dispatch outranks it, so this is a notice, never a refusal.
+                "archived": proj.archived or None}
     finally:
         if own:
             con.close()
@@ -1802,6 +1902,12 @@ class Handler(BaseHTTPRequestHandler):
             names = body.get("enabled_profiles")
             result = profile_edit.set_enabled(project_id, names)
             return self._json(result, 400 if result.get("error") else 200)
+        if path == PROJECTS_ADD_ROUTE:
+            result = add_project(body.get("path"), body.get("name"))
+            return self._json(result, 400 if "error" in result else 200)
+        if path == DISPATCH_ROUTE:
+            result = dispatch_run(body)
+            return self._json(result, 400 if "error" in result else 200)
         if path == PROJECTS_ROUTE:
             # Park or unpark ONE project, source-backed or not (DESIGN §1).
             # No rule is restated here: project.set_archived is the same call

@@ -9,10 +9,11 @@ present when nothing is running dispatches the pass again.
 """
 import json
 import unittest
+from pathlib import Path
 import urllib.error
 import urllib.request
 
-from orchestra import brief, db
+from orchestra import db, refine
 from tests.test_sweeper import SweeperFixture
 
 
@@ -192,10 +193,9 @@ class RefineLaneTests(SweeperFixture, unittest.TestCase):
     def test_the_brief_carries_the_standard_and_the_refine_rules(self) -> None:
         self.tag_item()
         self.sweep()
-        text = (self.tmp_path / "home" / "briefs" /
-                f"run-{self.refine_runs()[0]['id']}.md").read_text()
+        text = Path(self.refine_runs()[0]["brief_path"]).read_text()
         slug = self.refine_runs()[0]["slug"]
-        self.assertIn(str(brief.GOAL_STANDARD), text)
+        self.assertIn(str(refine.GOAL_STANDARD), text)
         self.assertIn("W-0001", text)
         self.assertIn("VERBATIM", text)
         self.assertIn("`Q:` line", text)
@@ -210,11 +210,11 @@ class RefineLaneTests(SweeperFixture, unittest.TestCase):
         self.assertNotIn("work check", text)
 
     def test_the_vendored_standard_is_there_and_named_by_path(self) -> None:
-        self.assertTrue(brief.GOAL_STANDARD.is_file())
+        self.assertTrue(refine.GOAL_STANDARD.is_file())
         self.assertIn("The four properties",
-                      brief.GOAL_STANDARD.read_text(encoding="utf-8"))
+                      refine.GOAL_STANDARD.read_text(encoding="utf-8"))
         self.assertNotIn("The four properties",
-                         brief.REFINE_MISSION)  # referenced, never copied
+                         refine.REFINE_MISSION)  # referenced, never copied
 
     # --- Work's tag-scoped allowance (mirrored in FakeWork) -----------------
 

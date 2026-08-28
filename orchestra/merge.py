@@ -12,7 +12,9 @@ uncommitted work, is never touched.
 
 Self-contained by design: the git helpers live here, not in worktree.py.
 
-Per-project configuration, in ``.orchestra/config.toml``::
+Per-project configuration, in a ``[project."<projectId>"]`` table of the
+global ``~/.config/orchestra/config.toml`` (projects have no state directory
+of their own — DESIGN §2)::
 
     [merge]
     base = "main"            # default: the branch the project root has checked out

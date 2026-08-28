@@ -65,21 +65,46 @@ def slugify(raw: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", raw or "").strip("-") or "project"
 
 
-def worktrees_dir(project_id: str) -> Path:
-    """Keyed by Work's immutable projectId, never by the Work id: the id is
-    mutable, so a renamed project would strand its worktree directory."""
-    return _owner_dir(_sub("worktrees") / slugify(project_id))
+def kebab(raw: str) -> str:
+    """A human-readable lowercase kebab-case slug: ``My Project!`` ->
+    ``my-project``. Empty input gets the honest placeholder."""
+    return re.sub(r"[^a-z0-9]+", "-", (raw or "").lower()).strip("-") or "project"
 
 
-def workspace_dir(project_id: str) -> Path:
+def project_dir(slug: str) -> Path:
+    """ONE per-project area: ``~/.orchestra/projects/<slug>/``.
+
+    Worktrees and the ephemeral workspace live inside it, and any future
+    per-project artifact lands beside them. Keyed by the registry's stable
+    ``projects.slug``; per-RUN artifacts (briefs, logs) stay in the central
+    ``briefs/`` and ``logs/`` because they are pruned per run, not per project.
+    """
+    return _owner_dir(_sub("projects") / slugify(slug))
+
+
+def run_dir(slug: str, seq: int) -> Path:
+    """One run's own artifacts — brief, raw log, future outputs — filed under
+    its project by the PROJECT's run number, the number the board shows and
+    the one humans quote. Globally unique as a pair: the slug is unique
+    across projects, the number inside its project."""
+    return _owner_dir(project_dir(slug) / "runs" / f"run-{seq}")
+
+
+def worktrees_dir(slug: str) -> Path:
+    """Keyed by the project's stable slug, never by its path: the path is
+    mutable, so a renamed project folder would strand its worktree directory."""
+    return _owner_dir(project_dir(slug) / "worktrees")
+
+
+def workspace_dir(slug: str) -> Path:
     """Where a project with no checkout of its own runs (W-0312).
 
-    A store-only Work project — a trip to book, a will to finalize — has an
-    organizational path and no directory anywhere. It still needs somewhere
-    to put a file, so it gets one here, keyed by the immutable project id and
+    A store-only project — a trip to book, a will to finalize — has an
+    organizational reference and no directory anywhere. It still needs
+    somewhere to put a file, so it gets one here, keyed by the stable slug and
     kept across runs so a second pass sees what the first one wrote.
     """
-    return _owner_dir(_sub("workspaces") / slugify(project_id))
+    return _owner_dir(project_dir(slug) / "workspace")
 
 
 def hooks_dir() -> Path:

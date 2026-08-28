@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from orchestra import cli, db, dispatch, supervise
@@ -432,3 +433,99 @@ class PauseSwitchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NamedProjectDispatchTests(SweeperFixture, unittest.TestCase):
+    """`--project <slug>` and POST /api/dispatch: a caller NAMES the target
+    project instead of standing in its directory."""
+
+    def _args(self, **over):
+        from argparse import Namespace
+        base = dict(mission=["do the thing"], to="stub", after=None,
+                    brief_file=None, context=None, title=None, worktree=False,
+                    sync=False, project="demo")
+        base.update(over)
+        return Namespace(**base)
+
+    def test_cli_dispatch_by_slug_needs_no_cwd(self) -> None:
+        # The test process's cwd is nowhere near the fixture project.
+        with mock.patch.object(supervise, "spawn_supervisor") as spawn:
+            cli.cmd_dispatch(self._args())
+        con = db.connect()
+        run = con.execute("SELECT * FROM runs ORDER BY id DESC").fetchone()
+        con.close()
+        self.assertEqual(run["project_id"], PROJECT_ID)
+        self.assertEqual(run["workdir"], str(self.root))
+        spawn.assert_called_once()
+        # Artifacts file under the project by ITS run number — the number a
+        # human quotes from the board — not the global row id.
+        home = Path(os.environ["ORCHESTRA_HOME"])
+        base = home / "projects" / "demo" / "runs" / f"run-{run['project_seq']}"
+        self.assertEqual(Path(run["brief_path"]), base / "brief.md")
+        self.assertEqual(Path(run["log_path"]), base / "log.jsonl")
+        self.assertTrue(base.joinpath("brief.md").is_file())
+
+    def test_cli_dispatch_names_the_miss(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            cli.cmd_dispatch(self._args(project="no-such"))
+        self.assertIn("no project matches 'no-such'", str(caught.exception))
+        self.assertIn("orchestra project list", str(caught.exception))
+
+    def _warm_registry(self) -> None:
+        # The route answers from the registry cache, as the daemon's own
+        # refresh keeps it; only the CLI carries the refresh-on-miss seam.
+        from orchestra import sweeper
+        con = db.connect()
+        sweeper.refresh_projects(con, self.cfg)
+        con.close()
+
+    def test_http_dispatch_run_uses_the_same_path(self) -> None:
+        from orchestra import http
+        self._warm_registry()
+        launched = []
+        result = http.dispatch_run(
+            {"project": "demo", "profile": "stub", "mission": "do the thing",
+             "worktree": False},
+            launcher=lambda root, run_id: launched.append((root, run_id)))
+        self.assertNotIn("error", result)
+        self.assertEqual(result["project"], "demo")
+        con = db.connect()
+        run = con.execute("SELECT * FROM runs WHERE id=?",
+                          (result["run"],)).fetchone()
+        con.close()
+        self.assertEqual(run["project_id"], PROJECT_ID)
+        self.assertEqual(launched, [(self.root, result["run"])])
+
+    def test_http_dispatch_refusals_are_payloads(self) -> None:
+        from orchestra import http
+        self._warm_registry()
+        noop = lambda root, run_id: None
+        self.assertIn("needs project, profile, mission",
+                      http.dispatch_run({}, launcher=noop)["error"])
+        self.assertIn("no project matches",
+                      http.dispatch_run({"project": "nope", "profile": "stub",
+                                         "mission": "m"},
+                                        launcher=noop)["error"])
+        con = db.connect()
+        dispatch.pause(con, "hold")
+        con.close()
+        try:
+            result = http.dispatch_run({"project": "demo", "profile": "stub",
+                                        "mission": "m"}, launcher=noop)
+            self.assertIn("paused", result["error"])
+        finally:
+            con = db.connect()
+            dispatch.resume(con)
+            con.close()
+
+    def test_http_add_project_registers_and_repeats(self) -> None:
+        from orchestra import http
+        fresh = self.workspace / "brand new"
+        fresh.mkdir()
+        made = http.add_project(str(fresh))
+        self.assertEqual(made["slug"], "brand-new")
+        again = http.add_project(str(fresh))
+        self.assertEqual(again["project_id"], made["project_id"])
+        self.assertIn("error", http.add_project(""))
+        self.assertIn("error",
+                      http.add_project(str(self.workspace / "missing")))

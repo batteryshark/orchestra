@@ -17,10 +17,10 @@ functions rather than reimplementing them:
   is recorded with the reason it waits. It stays out of ``in_progress``: an
   item transitions there only at actual dispatch, because a board that
   claims something is running while it waits stops being trusted.
-- **Order**, which matters only for items that must wait: dependencies first
-  (a hard constraint), then ready-lane board order exactly as Work returned
-  it — Work has no priority field by design, so the board's order *is* the
-  priority signal — then FIFO by how long the item has waited.
+- **Order** lives in the ADAPTER (``sweeper.plan``), not here: which item
+  blocks which, and what a board's lane order means, is the source's own
+  schema (CONTRACT §7). This module only records who waits and why, with
+  ``item_id`` as an opaque string.
 """
 import json
 
@@ -28,11 +28,8 @@ from orchestra import db
 
 PAUSE_KEY = "dispatch_paused"
 
-# A prerequisite in any of these is settled; anything else still blocks.
-DONE_STATUSES = frozenset({"done", "closed", "cancelled", "resolved"})
-
-# Sorts after every real board position, so an item Work did not return in
-# this pass falls to the end and is ordered by FIFO alone.
+# Sorts after every real board position, so an item the source did not return
+# in this pass falls to the end and is ordered by FIFO alone.
 NO_LANE = 1 << 30
 
 
@@ -150,78 +147,10 @@ def release(con, item_id: str) -> None:
     con.commit()
 
 
-# --- dependencies -----------------------------------------------------------
+# --- FIFO position ----------------------------------------------------------
 
-def prerequisites(item: dict) -> list[str]:
-    """Work item ids this item must wait for. ``dependsOn`` is the one edge
-    Work serves; the legacy reverse-edge record folds into it on Work's read
-    (Work, lib/local-workspace.mjs), so the runner never reads a
-    second key. Tolerant of both a bare id list and a list of
-    ``{"id": ...}``."""
-    found: list[str] = []
-    for dep in item.get("dependsOn") or []:
-        if isinstance(dep, dict):
-            dep = dep.get("id")
-        if dep and dep != item.get("id") and dep not in found:
-            found.append(dep)
-    return found
-
-
-def statuses(items) -> dict[str, str | None]:
-    """Status by id for everything this pass fetched (tasks carry ``status``,
-    issues carry ``state``)."""
-    return {item["id"]: (item.get("status") or item.get("state"))
-            for _, item in items}
-
-
-def unmet(item: dict, known: dict, lookup=None) -> list[str]:
-    """Prerequisites that are not finished yet.
-
-    ``known`` is filled in as it goes, so one lookup serves every dependent.
-    ponytail: a prerequisite id Work does not know (deleted, typo) reads as
-    unfinished and holds the item forever — visibly, in the waiting queue
-    with its reason. Upgrade path is a distinct 'unknown dependency' reason
-    once Work can tell 404 from unfinished.
-    """
-    blocked = []
-    for dep in prerequisites(item):
-        if dep not in known and lookup is not None:
-            fetched = lookup(dep) or {}
-            known[dep] = fetched.get("status") or fetched.get("state")
-        if known.get(dep) not in DONE_STATUSES:
-            blocked.append(dep)
-    return blocked
-
-
-# --- order ------------------------------------------------------------------
-
-def plan(con, candidates, known: dict, lookup=None) -> list[tuple]:
-    """Order claimable items and say which of them must wait.
-
-    ``candidates`` is ``[(kind, item, lane_index)]`` in the order Work served
-    them. Returns ``[(kind, item, lane_index, reason)]`` where ``reason`` is
-    None for anything that starts now, else ``(reason, detail)``.
-
-    Sort key is dependencies first (nothing blocked outranks something
-    ready), then ready-lane board order, then FIFO by how long the item has
-    already waited. Order only ever matters for the items that must wait —
-    everything else dispatches as soon as it is claimed, all of it at once,
-    with no cap and no artificial delay.
-    """
-    pause = pause_state(con)
-    seq = {r["item_id"]: r["id"]
-           for r in con.execute("SELECT id, item_id FROM dispatch_queue")}
-    planned = []
-    for kind, item, lane in candidates:
-        blocked = unmet(item, known, lookup)
-        if blocked:
-            reason = ("dependency", ", ".join(blocked))
-        elif pause is not None:
-            reason = ("paused", pause.get("note"))
-        else:
-            reason = None
-        planned.append((kind, item, lane, reason))
-    planned.sort(key=lambda e: (e[3] is not None,
-                                e[2] if e[2] is not None else NO_LANE,
-                                seq.get(e[1]["id"], NO_LANE)))
-    return planned
+def queue_seq(con) -> dict[str, int]:
+    """Queue row id by item id — how long each waiting item has waited, for
+    the adapter's ordering. Opaque ids in, opaque ids out."""
+    return {r["item_id"]: r["id"]
+            for r in con.execute("SELECT id, item_id FROM dispatch_queue")}

@@ -430,7 +430,11 @@ class WorktreeRemovalTests(unittest.TestCase):
         self.con.commit()
         report = worktree.prune(self.con)
         self.assertFalse(project_dir.exists())
-        self.assertEqual([str(project_dir)], report["dirs"])
+        # The worktrees container goes first, then the project's own dir,
+        # which holds nothing else here.
+        self.assertEqual([str(project_dir), str(project_dir.parent)],
+                         report["dirs"])
+        self.assertFalse(project_dir.parent.exists())
 
 
 if __name__ == "__main__":

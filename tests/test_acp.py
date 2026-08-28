@@ -324,7 +324,7 @@ class AcpEndToEndTest(unittest.TestCase):
 
     def _sent(self, run_id: int, method: str) -> int:
         """How many times Orchestra sent this method, read off the raw log."""
-        path = self.tmp_path / "home" / "logs" / f"run-{run_id}.jsonl"
+        path = Path(self._row(run_id)["log_path"])
         count = 0
         for line in path.read_text(errors="replace").splitlines():
             if not line.startswith("{"):
@@ -384,7 +384,7 @@ class AcpEndToEndTest(unittest.TestCase):
         self.assertIn("stub acp turn complete", expanded["payload"])
         self.assertEqual(
             cursor["byte_offset"],
-            (self.tmp_path / "home" / "logs" / f"run-{run_id}.jsonl").stat().st_size)
+            Path(self._row(run_id)["log_path"]).stat().st_size)
 
     def test_opencode_uses_the_same_transport_and_delivers_at_turn_end(self) -> None:
         """OpenCode rides the same transport, but has no steer, so its

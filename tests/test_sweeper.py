@@ -286,7 +286,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         log = "\n".join(e["message"] for e in self.work.tasks["W-0001"]["log"])
         self.assertIn(f"dispatched run {run['id']}", log)
         text = Path(run["brief_path"]).read_text()
-        self.assertIn("## Work item snapshot", text)
+        self.assertIn("## Item snapshot", text)
         self.assertIn("Make CI green again.", text)
 
     def test_a_parent_with_children_is_ordinary_work(self) -> None:
@@ -360,7 +360,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         supervise.prepare_launch(
             con, self.root, self.cfg, pending, mission="prepared before crash",
             use_worktree=False,
-            work_snapshot=sweeper.render_snapshot(
+            snapshot=sweeper.render_snapshot(
                 self.work.tasks["W-0001"], "task"))
         con.commit()
         prepared = dict(con.execute("SELECT * FROM runs WHERE id=?",
@@ -1048,11 +1048,11 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                            goal="x" * 5000)
         self.assertLessEqual(
             len(sweeper.render_snapshot(self.work.tasks["W-0001"], "task")),
-            brief.WORK_SNAPSHOT_MAX_CHARS)
+            brief.SNAPSHOT_MAX_CHARS)
         self.sweep()
         run = self.db_run()
         frozen = Path(run["brief_path"]).read_text()
-        self.assertLessEqual(frozen.count("x"), brief.WORK_SNAPSHOT_MAX_CHARS)
+        self.assertLessEqual(frozen.count("x"), brief.SNAPSHOT_MAX_CHARS)
         self.work.human_log("W-0001", "changed after dispatch")
         self.sweep()
         self.assertEqual(Path(run["brief_path"]).read_text(), frozen)
@@ -1292,6 +1292,6 @@ class StoreOnlyDispatchTests(SweeperFixture, unittest.TestCase):
         self.assertEqual("p-store", run["project_id"])
         workdir = Path(run["workdir"])
         self.assertTrue(workdir.is_dir(), "the run has a real directory")
-        self.assertEqual(paths.workspace_dir("p-store"), workdir)
+        self.assertEqual(paths.workspace_dir("paperwork"), workdir)
         self.assertFalse(run["branch"], "no worktree without a repository")
         self.assertEqual([workdir], [r for r, _ in self.launched])

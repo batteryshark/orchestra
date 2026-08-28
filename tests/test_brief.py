@@ -41,11 +41,21 @@ class BriefContentTests(unittest.TestCase):
         self.assertIn("## Protocol", text)
         self.assertIn("calm_otter", text)
 
-    def test_work_snapshot_seam_is_capped(self) -> None:
-        # Phase-2 seam: the sweeper passes the frozen Work snapshot here.
-        text = _compose(mission="m", work_snapshot="s" * 5000)
-        self.assertIn("## Work item snapshot", text)
-        self.assertNotIn("s" * (brief.WORK_SNAPSHOT_MAX_CHARS + 1), text)
+    def test_snapshot_seam_is_capped(self) -> None:
+        # Phase-2 seam: the source adapter passes the frozen snapshot here.
+        text = _compose(mission="m", snapshot="s" * 5000)
+        self.assertIn("## Item snapshot", text)
+        self.assertNotIn("s" * (brief.SNAPSHOT_MAX_CHARS + 1), text)
+
+    def test_snapshot_protocol_is_injected_verbatim(self) -> None:
+        # The checklist card is the ADAPTER's rendering (CONTRACT §7); the
+        # core injects it beside the snapshot and knows nothing about it.
+        text = _compose(mission="m", snapshot="W-1 · t [ready]",
+                        snapshot_protocol="account for every criterion")
+        self.assertIn("account for every criterion", text)
+        # No snapshot, no protocol: a brief never teaches a verb it cannot use.
+        bare = _compose(mission="m", snapshot_protocol="account for it")
+        self.assertNotIn("account for it", bare)
 
     def test_spawn_is_never_advertised(self) -> None:
         text = _compose(mission="m")

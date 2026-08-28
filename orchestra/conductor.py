@@ -666,7 +666,9 @@ def _dispatch(con, cfg: dict, client, goal: dict, board: dict, decision: dict,
     snapshot = sweeper.render_snapshot(item, "task")
     try:
         supervise.prepare_launch(con, proj.path, pcfg, run, mission=mission,
-                                 use_worktree=isolate, work_snapshot=snapshot)
+                                 use_worktree=isolate, snapshot=snapshot,
+                                 snapshot_protocol=sweeper.checklist_protocol(
+                                     "task", item_id, proj.path))
     except (Exception, SystemExit) as exc:
         error = str(exc)[:1000] or exc.__class__.__name__
         supervise.fail_launch(con, proj.path, run_id, error)

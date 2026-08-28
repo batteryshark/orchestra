@@ -35,10 +35,17 @@ Data-model invariants (DESIGN D4):
   somewhere else. ``pending`` / ``claimed`` / ``abandoned`` describe the run's
   own lifecycle; the core never learns what the claim was made against, so the
   name stopped saying Work (CONTRACT §7 Enforcement 1).
-- ``runs.project_id`` (schema v4, the daemon) is Work's immutable
-  ``projectId``. Rows key on it, never on a path: one central database now
-  holds every project's runs, and renaming a folder must lose nothing.
+- ``runs.project_id`` (schema v4, the daemon) is the registry's stable
+  project id — a local UUID, or whatever id a source adapter cached. Rows key
+  on it, never on a path: one central database now holds every project's
+  runs, and renaming a folder must lose nothing.
   ``runs.workdir`` stays a path because it is where a process actually ran.
+- ``projects.slug`` (schema v27) is the project's HUMAN address: lowercase
+  kebab-case, minted once from the project's name and never rewritten by a
+  refresh. Unique across project ids (alias rows of one project share it) —
+  enforced at mint time, not by SQL, exactly because those alias rows share
+  it. ``dispatch --project``, the HTTP dispatch route, and the per-project
+  directory ``~/.orchestra/projects/<slug>/`` all key on it.
 - ``dispatch_queue`` (schema v8, DESIGN §4) holds Work items that cannot
   start yet, with the reason. It is queue state only: nothing dispatches
   from a row here, and the run row appears at actual dispatch.
@@ -140,10 +147,11 @@ Data-model invariants (DESIGN D4):
 """
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import PurePath
 
 from orchestra import paths
 
-SCHEMA_VERSION = "26"
+SCHEMA_VERSION = "27"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -243,6 +251,12 @@ PROJECTS_V20_COLUMNS = (
 # the COALESCE (2026-08-28, why ``_retire_resurrected`` exists).
 PROJECTS_V26_COLUMNS = (
     ("archived_override", "INTEGER"),
+)
+
+# Schema v27. The human address (see the data-model note above). Backfilled
+# once by ``_backfill_project_slugs``; new rows are minted in ``project.py``.
+PROJECTS_V27_COLUMNS = (
+    ("slug", "TEXT"),
 )
 
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
@@ -404,7 +418,8 @@ CREATE TABLE IF NOT EXISTS projects (
   name TEXT,
   refreshed_at TEXT NOT NULL,
   archived INTEGER NOT NULL DEFAULT 0,
-  archived_override INTEGER
+  archived_override INTEGER,
+  slug TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_projects_project_id ON projects(project_id);
 CREATE TABLE IF NOT EXISTS messages (
@@ -674,6 +689,29 @@ def _retire_resurrected(con: sqlite3.Connection) -> None:
         con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
 
 
+def _backfill_project_slugs(con: sqlite3.Connection) -> None:
+    """Schema v27, one shot: every registered project gets its human address.
+
+    One slug per project id — alias and link rows of one project share it —
+    minted from the project's name (else its folder name) and deduplicated
+    with a numeric suffix. Never re-run: a slug keys the project's own
+    directory under ``~/.orchestra/projects/``, so rewriting one strands it.
+    """
+    taken = {r["slug"] for r in con.execute(
+        "SELECT DISTINCT slug FROM projects WHERE slug IS NOT NULL")}
+    rows = con.execute(
+        "SELECT project_id, MIN(name) AS name, MIN(path) AS path FROM projects "
+        "WHERE slug IS NULL GROUP BY project_id ORDER BY MIN(path)").fetchall()
+    for row in rows:
+        base = paths.kebab(row["name"] or PurePath(row["path"]).name)
+        slug, n = base, 2
+        while slug in taken:
+            slug, n = f"{base}-{n}", n + 1
+        taken.add(slug)
+        con.execute("UPDATE projects SET slug=? WHERE project_id=?",
+                    (slug, row["project_id"]))
+
+
 def connect(db_file=None) -> sqlite3.Connection:
     """The central database (DESIGN §2). ``db_file`` opens another file, for
     tests."""
@@ -765,9 +803,12 @@ def connect(db_file=None) -> sqlite3.Connection:
                 con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
     known = {r["name"] for r in con.execute("PRAGMA table_info(projects)")}
     if known:
-        for name, sql_type in PROJECTS_V20_COLUMNS + PROJECTS_V26_COLUMNS:
+        for name, sql_type in (PROJECTS_V20_COLUMNS + PROJECTS_V26_COLUMNS
+                               + PROJECTS_V27_COLUMNS):
             if name not in known:
                 con.execute(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
+        if "slug" not in known:
+            _backfill_project_slugs(con)
         # Schema v24 (CONTRACT §6, §7). ONE SHOT: the column that held a
         # source's own project identifier stops carrying that source's name.
         # No reader below accepts the old spelling — that tolerance is the

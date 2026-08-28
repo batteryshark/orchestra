@@ -28,7 +28,8 @@ orchestra project add .
 orchestra project list
 ```
 
-`project list` labels each entry as local or Work-backed. Local registration
+`project list` labels each entry as local or Work-backed, and shows each
+project's slug — its stable lowercase kebab-case address. Local registration
 is enough for direct dispatch.
 
 ## Dispatch
@@ -36,6 +37,13 @@ is enough for direct dispatch.
 ```sh
 orchestra profiles
 orchestra dispatch --to <profile> "<mission>"
+```
+
+Dispatch resolves the project from the current directory. To target another
+project from anywhere, name it by slug:
+
+```sh
+orchestra dispatch --project <slug> --to <profile> "<mission>"
 ```
 
 Dispatch is isolated by default. Use `--shared` only for read-only research or

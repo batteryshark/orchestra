@@ -50,6 +50,16 @@ source-backed rows is adapter work: `project.remember_source` is the one seam
 it writes through, and nothing in the core learns a source's entry shape
 (CONTRACT §7 Enforcement).
 
+Every project also carries a SLUG (schema v27): lowercase kebab-case, minted
+once from the project's name, unique across project ids, and never rewritten
+by a refresh or rename — alias and link rows of one project share it. The
+slug is the HUMAN address: `dispatch --project <slug>` targets a project from
+any directory, `POST /api/dispatch` addresses it the same way, and the
+project's own state directory is keyed by it, so troubleshooting starts from
+a name instead of a UUID. `project_id` stays the machine key everything
+else joins on. Registration reaches every surface: `orchestra project add`,
+`POST /api/projects/add`, and the dashboard's projects panel.
+
 A registered project may be ARCHIVED, which means parked rather than hidden.
 The source's flag is the DEFAULT, not the owner: a source marks its own
 projects archived and serves the flag, the adapter's refresh copies it into
@@ -102,6 +112,24 @@ Configuration lives at `~/.config/orchestra/config.toml`. Projects do not need
 a local Orchestra state directory. On POSIX systems, the state root and its
 managed containers are owner-only (`0700`) traversal boundaries.
 
+Per-project state lives under one slug-keyed area,
+`~/.orchestra/projects/<slug>/`. A worker run's own artifacts — `brief.md`
+and the raw `log.jsonl`, with room for future outputs beside them — file at
+`runs/run-<seq>/`, named by the PROJECT's run number because that is the
+number humans quote from the board; `worktrees/run-<id>` holds isolated
+checkouts (named by the row id, which is also the branch number), and
+`workspace` serves a project with no folder of its own. A row with no
+project number — a control turn, a pre-v27 run — keeps the flat `briefs/`
+and `logs/` layout keyed by the globally unique row id, and readers never
+derive either path: the run row's `brief_path`/`log_path` are the record.
+Pre-v27 directories (`worktrees/<id>`, `workspaces/<id>`) are still read
+and pruned where they already exist; nothing is moved under a live run.
+
+Raw logs are kept forever by default (`raw_log_retention_days = 0`): they
+are the full-detail record of every run's input and output, held for later
+analysis. Pruning is opt-in — a positive day count, plus a human running
+`orchestra traces prune`.
+
 A direct run follows this path:
 
 ```text
@@ -137,7 +165,10 @@ been released. This keeps a resumed harness session out of a stale path.
 The daemon serves a versioned snapshot API, trace streams, action routes, and
 the static dashboard on one port. Reads and actions require either the human
 secret or a scoped per-run token. A run token can read shared state but can act
-only on its own run; termination revokes it.
+only on its own run; termination revokes it. `POST /api/projects/add`
+registers a directory and `POST /api/dispatch` starts a run against a named
+project — both human-key only, the same admission path the CLI uses, so a
+client that is not a terminal can create a project and put work into it.
 
 The dashboard and iOS app are optional clients of that API. The iOS bundle
 identifier and Keychain service keep their shipped string for upgrade and
@@ -231,9 +262,9 @@ harness-native behavior. Orchestra has no replacement child launcher yet.
 
 Parsers turn raw harness output into common trace events for the CLI, dashboard,
 iOS client, messages, and usage accounting. Normalized events provide the
-durable shared view. Raw logs preserve harness-specific detail while retained
-and may be pruned for terminal runs. Normalization does not make harness-native
-tools identical.
+durable shared view. Raw logs preserve harness-specific detail and are kept
+forever by default; pruning terminal runs' logs is opt-in (§2). Normalization
+does not make harness-native tools identical.
 
 The supervisor enforces configurable hard and stall timeouts and runs
 mechanical loop checks. A manual `check` can add an out-of-band model judgment

@@ -204,7 +204,7 @@ def create(root: Path, run_id: int, project_id: str,
            backend: str | None = None) -> tuple[Path, str]:
     """Create a git worktree for an isolated run; returns (workdir, branch).
 
-    Worktrees live centrally at ~/.orchestra/worktrees/<project-slug>/run-N
+    Worktrees live centrally at ~/.orchestra/projects/<slug>/worktrees/run-N
     (DESIGN §2), never inside the project.
     """
     if not (root / ".git").exists():
@@ -384,21 +384,35 @@ def _base_branch(root: Path) -> str | None:
 
 
 def prune(con, force: bool = False) -> dict:
-    """Sweep ~/.orchestra/worktrees: orphan checkouts, then empty project dirs.
+    """Sweep every worktree container: ~/.orchestra/projects/<slug>/worktrees
+    and the pre-v27 ~/.orchestra/worktrees/<key> layout — orphan checkouts
+    first, then the directories the removals emptied.
 
     An orphan is a worktree whose run row is terminal or gone. A live run's
     worktree is skipped and reported, never removed — not even with --force.
     """
-    base_dir = paths.home() / "worktrees"
+    home = paths.home()
     out = {"worktrees": [], "dirs": []}
-    if not base_dir.is_dir():
-        return out
-    for project_dir in sorted(p for p in base_dir.iterdir() if p.is_dir()):
-        for wt in sorted(p for p in project_dir.iterdir() if p.is_dir()):
+    legacy = home / "worktrees"
+    containers = []
+    if legacy.is_dir():
+        containers += sorted(p for p in legacy.iterdir() if p.is_dir())
+    projects = home / "projects"
+    if projects.is_dir():
+        containers += sorted(p / "worktrees" for p in projects.iterdir()
+                             if (p / "worktrees").is_dir())
+    for container in containers:
+        for wt in sorted(p for p in container.iterdir() if p.is_dir()):
             out["worktrees"].append(_prune_one(con, wt, force))
-        if not any(project_dir.iterdir()):
-            project_dir.rmdir()
-            out["dirs"].append(str(project_dir))
+        if not any(container.iterdir()):
+            container.rmdir()
+            out["dirs"].append(str(container))
+            parent = container.parent
+            # The project's own dir goes only when NOTHING else lives in it —
+            # a workspace or a future artifact keeps it.
+            if parent not in (legacy, home) and not any(parent.iterdir()):
+                parent.rmdir()
+                out["dirs"].append(str(parent))
     return out
 
 
