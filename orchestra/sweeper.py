@@ -660,7 +660,7 @@ def _report_ready(con, result) -> bool:
     if retry is not None and retry["action"] == "deferred":
         return False
     if result["status"] == "done" and result["branch"] \
-            and result["landing_status"] not in ("ok", "failed"):
+            and result["landing_status"] not in ("ok", "failed", "skipped"):
         return False
     return True
 
@@ -690,6 +690,37 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
     comment = "\n\n".join(
         [f"{tag} run {result['id']} finished: {result['status']}", summary]
         + _landing_detail(con, result) + _stranded_detail(con, result))[:19000]
+    if result["status"] == "done" and result["branch"] \
+            and result["landing_status"] == "skipped":
+        # Landing is off ([merge] enabled = false): the branch is the
+        # deliverable and the lifecycle fact belongs to whatever lands it —
+        # an external lander posts its own `fact: landed`. The result
+        # comment still reaches the thread, once, and the criteria stay
+        # unanswered for that later landing to account for.
+        try:
+            remote = (client.task(item_id) if kind == "task"
+                      else client.issue(item_id))
+            if remote is None:
+                return False, None
+            entries = (remote.get("log") if kind == "task"
+                       else remote.get("messages")) or []
+            sent = {entry.get("message" if kind == "task" else "body")
+                    for entry in entries}
+            if comment not in sent:
+                posted = (client.log_task(item_id, comment) if kind == "task"
+                          else client.reply_issue(item_id, comment))
+                if posted is None:
+                    return False, None
+        except WorkError as exc:
+            if work_client.retryable(exc):
+                print(f"orchestra sweep: report {item_id} temporarily "
+                      f"refused ({exc})")
+                return False, None
+            print(f"orchestra sweep: report {item_id} refused ({exc}) — "
+                  f"marked reported")
+        _mark_reported(con, result)
+        return True, {"action": "report", "item": item_id,
+                      "run": result["id"], "to": "kept"}
     target = ("review" if success else "blocked") if kind == "task" \
         else ("closed" if success else "needs_human")
     verb = ("landed" if success else

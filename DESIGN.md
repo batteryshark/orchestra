@@ -324,6 +324,15 @@ on the run row and writes its report into the run's own thread. A source
 adapter reads that receipt and posts the fact, because rebasing a branch and
 moving a ref must not know a record system exists (CONTRACT §7 Enforcement).
 
+Landing is a POLICY, and `[merge] enabled = false` turns the automatic path
+off: the run then ends at its branch and a `landing_status` of `skipped`,
+kept for whatever lands it — a human, or an external agentic lander that
+reads the receipts and posts its own facts. Dependents still release on a
+skipped landing, the adapter's report posts the result comment but no
+lifecycle fact, and no checklist criterion is declined on the run's behalf.
+An explicit retry (`retry_landing`) still lands: the switch gates the
+automatic path, never the owner's own hand.
+
 Every successful run's final handoff is parsed. Findings and proposals are filed
 only when Work is configured and the run has Work context. They have no local
 durable collection, so the dashboard and iOS client do not present one.
