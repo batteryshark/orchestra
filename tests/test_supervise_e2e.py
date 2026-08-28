@@ -651,6 +651,45 @@ class FollowupAfterCleanupTests(unittest.TestCase):
             finally:
                 con.close()
 
+    def test_a_missing_harness_binary_refuses_before_a_worktree_exists(self) -> None:
+        """DESIGN §4: presence of the harness CLI is decided first, so the
+        refusal costs a PATH lookup instead of a dead run and an orphan."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _seed_repo(tmp)
+            con = db.connect()
+            try:
+                cur = con.execute(
+                    "INSERT INTO runs(profile, backend, requested_by, workdir, "
+                    "status, started_at) VALUES('p','codex','human',?,"
+                    "'spawning',?)", (str(root), db.now()))
+                run_id = cur.lastrowid
+                run = con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run_id,)).fetchone()
+                cfg = {"profiles": {"p": {"backend": "codex"}}}
+                with mock.patch.object(supervise, "which", return_value=None), \
+                        self.assertRaisesRegex(RuntimeError, "codex.*did not start"):
+                    supervise.prepare_launch(
+                        con, root, cfg, run, mission="x", use_worktree=True)
+                worktrees = subprocess.run(
+                    ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+                    check=True, capture_output=True, text=True).stdout
+                self.assertNotIn("/run-", worktrees,
+                                 "no worktree may exist for a refused launch")
+                row = con.execute("SELECT * FROM runs WHERE id=?",
+                                  (run_id,)).fetchone()
+                self.assertIsNone(row["branch"])
+                self.assertIsNone(row["brief_path"])
+                self.assertIsNone(row["log_path"])
+                # The refusal takes the isolation-failure path, unchanged.
+                supervise.fail_launch(con, root, run_id, "harness 'codex' is "
+                                      "not installed")
+                failed = con.execute("SELECT * FROM runs WHERE id=?",
+                                     (run_id,)).fetchone()
+                self.assertEqual(failed["status"], "failed")
+                self.assertTrue(supervise.never_started(failed))
+            finally:
+                con.close()
+
     def test_a_gone_isolated_worktree_never_falls_back_to_shared(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _seed_repo(tmp)
