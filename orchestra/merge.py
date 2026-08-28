@@ -33,7 +33,7 @@ Per-project configuration, in ``.orchestra/config.toml``::
     test = "uv run python -m unittest discover -s tests"
     lint = "ruff check ."
 
-Result shape (a plain dict, ready for the caller to post to Work)::
+Result shape (a plain dict, consumed by this module alone)::
 
     {"ok", "stage", "escalation", "base", "branch", "commit", "files_changed",
      "checks", "checks_skipped", "tripwires", "conflicts",
@@ -46,11 +46,15 @@ when the base already contained the branch — then there is no merge commit and
 no ``revert_command``, because a revert line aimed at a commit the run did not
 create either errors or undoes somebody else's work (I-0077). ``refresh`` reports what happened to a checkout sitting on the base
 branch (refreshed | skipped | refused, always with a reason). ``merge_run``
-never posts to Work and never resolves a conflict.
+never posts anywhere and never resolves a conflict.
 
 ``at_completion`` is the other half (W-0174): the seam ``supervise.py`` calls
-when a run reaches ``done``, which lands the branch and then *reports* —
-Work thread, item transition, Nod card. Nothing in it may break finalization.
+when a run reaches ``done``. It lands the branch, files a Nod card when a
+human must choose, writes the report into the run's own thread, and stamps
+the landing receipt — ``landing_status`` plus ``landing_commit`` — on the run
+row. It reports to no source: rebasing a branch and moving a ref must not
+know a record system exists (CONTRACT §7 Enforcement). Whoever reports a run
+to its source reads the receipt. Nothing in here may break finalization.
 """
 import inspect
 import os
@@ -60,8 +64,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from orchestra import db, nod, paths, project, work_client
-from orchestra.work_client import WorkError
+from orchestra import db, nod, paths, project
 
 SWAP_ATTEMPTS = 3
 MAX_REPLAY_DROPS = 100
@@ -250,6 +253,13 @@ def judge_tripwires(cfg: dict | None, mission: str, fired: list[str],
 
 
 # --- the merge --------------------------------------------------------------
+
+def revert_command(root: Path, sha: str) -> str:
+    """The escape hatch for a landed merge (DESIGN §9). One spelling, because
+    the report that names it and the receipt that carries the sha are read by
+    different modules."""
+    return f"git -C {root} revert -m 1 {sha}"
+
 
 def blank_result(base: str, branch: str, checks_skipped: bool = True) -> dict:
     """The result shape, before anything has happened to it."""
@@ -499,7 +509,7 @@ def merge_run(root: Path, branch: str, item_id: str | None = None,
                     if overlapped else "")
             result["note"] = (f"{result['refresh']['why']}; refresh it with "
                               f"`{result['refresh']['command']}`.{kept}")
-        result["revert_command"] = f"git -C {root} revert -m 1 {merge_sha}"
+        result["revert_command"] = revert_command(root, merge_sha)
     # Anchor the run's own commits before the branch name goes away. A run that
     # committed its own work leaves nothing for the checkpoint to record, so
     # the branch WAS the only pointer and `orchestra show --changes` lost the
@@ -647,15 +657,20 @@ def _recovered_landing(root: Path, cfg: dict, run: dict) -> dict | None:
         "kept_ref": kept_ref if kept.returncode == 0 else None,
     })
     if merge_sha:
-        result["revert_command"] = f"git -C {root} revert -m 1 {merge_sha}"
+        result["revert_command"] = revert_command(root, merge_sha)
     else:
         result["note"] = f"already on {base}; nothing to merge"
     return result
 
 
 def _record_landing(con, run: dict, status: str | None,
-                    note: str | None = None) -> None:
+                    note: str | None = None, commit: str | None = None) -> None:
     """Stamp the landing receipt and keep its human reason on the result row.
+
+    The receipt is the WHOLE outbound interface of this module (CONTRACT §7
+    Enforcement): verdict, merge commit, and the human line, all on the run
+    row. Whoever reports a run to its source reads them there — this module
+    knows git and nothing about a board.
 
     ``status=None`` records the note WITHOUT closing the receipt: an
     exception is not a landing verdict, but its reason still belongs on the
@@ -671,8 +686,8 @@ def _record_landing(con, run: dict, status: str | None,
             summary = f"{summary}\n\n{note}" if summary else note
     con.execute(
         "UPDATE runs SET landing_status=COALESCE(?, landing_status), "
-        "summary=? WHERE id=?",
-        (status, (summary or "")[:2000] or None, run["id"]))
+        "landing_commit=COALESCE(?, landing_commit), summary=? WHERE id=?",
+        (status, commit, (summary or "")[:2000] or None, run["id"]))
     con.commit()
 
 
@@ -784,16 +799,13 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
             result["auto_resolver"] = resolved_id
         else:
             request_id = _file_card(con, cfg, run, result)
-    report = _report_text(run, result, request_id)
-    _thread(con, int(run["id"]), report)
-    work_settled = _post_to_work(con, cfg, run, result, report)
+    _thread(con, int(run["id"]), _report_text(run, result, request_id))
     note = _note(run, result, request_id)
-    # A failed verdict is deliberate and final — the receipt closes now, and
-    # sweeper.report_result carries it to Work once Work is reachable. A
-    # success with Work unreachable leaves the receipt open instead: daemon
-    # replay re-proves the landing from Git and redelivers the report.
-    if work_settled or not result["ok"]:
-        _record_landing(con, run, "ok" if result["ok"] else "failed", note)
+    # The verdict is deliberate and final either way, so the receipt closes
+    # here and nothing waits on a remote system being reachable. Delivery is
+    # the consumer's cursor, not this path's retry (CONTRACT §7 Enforcement 2).
+    _record_landing(con, run, "ok" if result["ok"] else "failed", note,
+                    commit=result["commit"])
     return note
 
 
@@ -919,89 +931,3 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
               file=sys.stderr)
         return None
     return created.get("request_id")
-
-
-def _claim_writeback(con, run_id: int) -> None:
-    """Mark this run's Work writeback as done, so the sweeper's report pass
-    does not append a second one.
-
-    ``work_marks`` is the Work ADAPTER's table (schema v21), and this module is
-    core — a leak, and a known one: everything in ``_report_to_work`` posts
-    Work facts from inside the git landing path, which CONTRACT 0.10 names and
-    a later wave removes whole. The write travels with the function; it is not
-    a new place the core learned about Work.
-    """
-    con.execute("INSERT INTO work_marks(run_id, reported_at) VALUES(?,?) "
-                "ON CONFLICT(run_id) DO UPDATE SET "
-                "reported_at=COALESCE(work_marks.reported_at, excluded.reported_at)",
-                (run_id, db.now()))
-    con.commit()
-
-
-def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> bool:
-    """Thread comment, then the run's fact: ``landed`` with the sha that
-    reverts it, or ``halted`` with the escalation. This is the only place that
-    knows the sha, so it is the only fact that can name one."""
-    item = run.get("ref")
-    if not item:
-        return True
-    client = work_client.from_cfg(cfg)
-    if client is None:
-        return True
-    tag = f"[{client.identity}/{run.get('slug') or run['id']}]"
-    verb = "landed" if result["ok"] else "halted"
-    marker = f"{tag} merge:{verb}"
-    comment = f"{marker}\n\n{report}"[:19000]
-    try:
-        if not item.startswith("W-"):
-            issue = client.issue(item)
-            if issue is None:
-                return False
-            sent = {entry.get("body") for entry in issue.get("messages") or []}
-            if not any(marker in (body or "") for body in sent):
-                if client.reply_issue(item, comment) is None:
-                    return False
-            # ponytail: an issue's outcome is the sweeper's own report fact.
-            return True
-
-        task = client.task(item)
-        if task is None:
-            return False
-        sent = {entry.get("message") for entry in task.get("log") or []}
-        if not any(marker in (message or "") for message in sent) \
-                and client.log_task(item, comment) is None:
-            return False
-        # Work refuses a landing while a criterion is unaccounted (CONTRACT
-        # §3 verb 2). The worker was told to answer; what it left open is
-        # declined on its behalf, by name, before the fact goes up.
-        if result["ok"]:
-            declined = client.decline_unaccounted(
-                item, f"not accounted for by run {run['id']} before it landed")
-            if declined is None:
-                return False
-            if declined:
-                print(f"orchestra: run {run['id']} left {declined} checklist "
-                      f"item(s) on {item} unaccounted; declined on its behalf",
-                      file=sys.stderr)
-        fact = (work_client.fact_line(tag, "landed", sha=result["commit"],
-                                      revert=result["revert_command"])
-                if result["ok"] else
-                work_client.fact_line(tag, "halted",
-                                      reason=_note(run, result, None)[:300]))
-        fact_marker = f"{tag} fact: {verb}"
-        posted = (task if any((message or "").startswith(fact_marker)
-                              for message in sent)
-                  else client.log_task(item, fact))
-    except WorkError as exc:
-        print(f"orchestra: run {run['id']} fact for {item} refused: {exc}",
-              file=sys.stderr)
-        if work_client.retryable(exc):
-            return False
-        _claim_writeback(con, int(run["id"]))
-        return True
-    if posted is not None and not result["ok"]:
-        # The run itself succeeded, so the sweeper's completion report would
-        # append `landed` and bury the escalation. Claim the writeback here:
-        # this comment IS the report for that run.
-        _claim_writeback(con, int(run["id"]))
-    return posted is not None

@@ -12,8 +12,12 @@ injected back through the hook as the next instruction. Nod's ``expires_at``
 IS the declared fallback: when it passes, the worker is told to proceed on
 its own judgement rather than being left hanging.
 
-Both sides of an ``ask`` are mirrored into the Work item thread, because a
-decision that only exists on a phone is not a record.
+Both sides of an ``ask`` belong in the source item's thread, because a
+decision that only exists on a phone is not a record. This module does not
+put them there: it records the question and the answer as ``ask``/``answer``
+rows on the run, and the source's ADAPTER carries them (CONTRACT §7
+Enforcement). Neither row is deleted when it is carried, so the mirror is a
+read, not a queue.
 
 Undeliverable is a state, not a deletion. A message whose run ended before
 delivery is marked with a reason and surfaced (``orchestra show``,
@@ -28,7 +32,7 @@ human only.
 import os
 import sqlite3
 
-from orchestra import db, nod, traces, work_client
+from orchestra import db, nod, traces
 
 DELIVERY_KIND = "interrupt"   # a tell, delivered by exec boundary or live ACP
 ASK_KIND = "ask"              # the run's question (outbound)
@@ -197,8 +201,7 @@ def file_question(con: sqlite3.Connection, cfg: dict, run, question: str,
         "INSERT INTO messages(run_id, sender, body, kind, created_at, delivered_at) "
         "VALUES(?,?,?,?,?,?)",
         (run_id, f"run {run_id}", question, ASK_KIND, db.now(), db.now()))
-    con.commit()
-    mirror_to_work(cfg, run["ref"], f"Question for the human:\n\n{question}")
+    con.commit()   # the adapter reads this row and mirrors it (CONTRACT §7)
     return created["request_id"], seconds
 
 
@@ -252,32 +255,10 @@ def await_answer(con: sqlite3.Connection, cfg: dict, request, *,
     con.commit()
     if request["run_id"] is not None:
         traces.record_injection(con, int(request["run_id"]), "human", answer)
-    if mirror_to_work(cfg, request["work_item"], answer):
-        nod.mark_mirrored(con, request_id)
-    return answer
+    return answer   # the ``answer`` row above is what the adapter mirrors
 
 
 def _fallback_text(why: str) -> str:
     return ("No answer arrived — " + why + ". This was the declared fallback: "
             "proceed on your own best judgement, and write down the assumption "
             "you made so the human can correct it afterwards.")
-
-
-def mirror_to_work(cfg: dict, work_item: str | None, text: str) -> bool:
-    """Put an ask or its answer into the Work item's thread. Best effort:
-    Work being down must never break a live session."""
-    if not work_item:
-        return False
-    client = work_client.from_cfg(cfg)
-    if client is None:
-        return False
-    try:
-        # Same split as sweeper.item_kind, inlined: sweeper imports supervise,
-        # and supervise imports this module.
-        if work_item.startswith("W-"):
-            posted = client.log_task(work_item, text)
-        else:
-            posted = client.reply_issue(work_item, text)
-    except work_client.WorkError:
-        return False
-    return posted is not None
