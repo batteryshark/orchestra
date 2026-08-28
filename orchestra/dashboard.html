@@ -20,7 +20,10 @@
      editable here, and what a project chooses is WHICH of them it may staff
      a run with. Runway and daemon health are the machine's, so they stay
      global. STATISTICS is a popup on the runs page rather than a card on
-     health, and follows the picker.
+     health, and follows the picker. PROJECTS is a second popup beside it,
+     and reads the REGISTRY (GET /api/projects) rather than the picker: the
+     picker only holds what has runs, and the project worth archiving is the
+     one that does not.
 
      Everything it knows comes from GET /api/snapshot, refetched when the
      daemon says so: GET /api/board/stream pushes a revision number and
@@ -117,12 +120,12 @@
      Statistics left the health view: health is the daemon's pulse, and
      numbers about runs belong to the runs page. <dialog> is the platform's
      own modal — Esc, the backdrop and focus trapping come with it. */
-  #statsdlg { width: min(56rem, 92vw); max-height: 86vh; padding: 0;
+  #statsdlg, #projdlg { width: min(56rem, 92vw); max-height: 86vh; padding: 0;
               background: var(--panel); color: var(--text);
               border: 1px solid var(--line); border-radius: 8px;
               overflow: hidden; }
-  #statsdlg::backdrop { background: rgba(0, 0, 0, .55); }
-  #statsdlg .card { border: 0; border-radius: 0; max-height: 86vh; }
+  #statsdlg::backdrop, #projdlg::backdrop { background: rgba(0, 0, 0, .55); }
+  #statsdlg .card, #projdlg .card { border: 0; border-radius: 0; max-height: 86vh; }
 
   button { font: inherit; font-size: 12px; color: var(--text); background: #262b33;
            border: 1px solid var(--line); border-radius: 6px;
@@ -434,7 +437,9 @@
       <h2>runs <span class="dim" id="runcount"></span>
         <span class="spacer"></span>
         <button id="statsbtn" style="text-transform:none;letter-spacing:0"
-                >statistics</button></h2>
+                >statistics</button>
+        <button id="projbtn" style="text-transform:none;letter-spacing:0"
+                >projects</button></h2>
       <div id="runlist"></div>
     </div>
     <div class="card">
@@ -548,6 +553,23 @@
       <button id="statsclose" style="text-transform:none;letter-spacing:0"
               >close</button></h2>
     <div class="pad" id="stats"></div>
+  </div>
+</dialog>
+
+<!-- The projects panel: the REGISTRY, which is not the picker. The picker in
+     the header is derived from the runs on the board (W-0186), so a project
+     nobody has kicked anything off from is missing from it — and that is
+     exactly the project a human comes here to park. A local project gets the
+     archive control; a source-backed one gets the server's refusal instead,
+     because the source owns the flag. -->
+<dialog id="projdlg" aria-labelledby="projtitle">
+  <div class="card">
+    <h2 id="projtitle">projects <span class="dim" style="text-transform:none;letter-spacing:0"
+          >· the registry, archived rows included</span>
+      <span class="spacer"></span>
+      <button id="projclose" style="text-transform:none;letter-spacing:0"
+              >close</button></h2>
+    <div class="pad" id="projbody"></div>
   </div>
 </dialog>
 
@@ -2227,12 +2249,75 @@ $("cfgsave").onclick = async () => {
   setTimeout(() => { b.disabled = false; }, 6000);
 };
 
+// --- the projects panel -----------------------------------------------------
+// GET /api/projects is the whole registry, read when the panel opens rather
+// than carried on the snapshot: it changes when a human registers or parks a
+// project, not every 4 seconds. Archiving POSTs the same path, and the server
+// calls the same project.set_archived the CLI does — so a source-backed
+// project is refused there, and this only shows the refusal.
+async function loadProjects() {
+  $("projbody").replaceChildren(el("p", "dim", "loading…"));
+  let rows;
+  try {
+    rows = (await api("/api/projects")).projects;
+  } catch (e) {
+    return $("projbody").replaceChildren(el("p", "bad", String(e.message || e)));
+  }
+  if (!rows.length) {
+    return $("projbody").replaceChildren(el("p", "dim",
+      "no projects registered — `orchestra project add .` registers one"));
+  }
+  // Useful rows first: parked ones sink, and read dim once they are down there.
+  rows.sort((a, b) => (a.archived - b.archived) ||
+    (a.name || a.path).toLowerCase().localeCompare((b.name || b.path).toLowerCase()));
+  $("projbody").replaceChildren(table(
+    ["project", "path", "origin", "state", ""],
+    rows.map((p) => {
+      const quiet = (n) => { if (p.archived) n.classList.add("dim"); return n; };
+      return [
+        {node: quiet(el("span", null, p.name || p.path.split("/").pop()))},
+        {node: quiet(el("span", "mono", p.path)), cls: "grow"},
+        p.source_ref ? "source" : "local",
+        {node: el("span", p.archived ? "warn" : "dim",
+                 p.archived ? "archived" : "active")},
+        // No dead button on a source-backed row: the source owns the flag,
+        // so the row carries the server's own sentence saying where to go.
+        // Only the CLI's "orchestra: " prefix is dropped — this is not a
+        // terminal, and the wording after it is the refusal verbatim.
+        {node: p.source_ref ? blockedCell(p) : archiveButton(p)},
+      ];
+    })));
+}
+
+function blockedCell(p) {
+  const n = el("span", "dim", p.blocked.replace(/^orchestra: /, ""));
+  n.title = p.blocked;
+  return n;
+}
+
+function archiveButton(p) {
+  const b = el("button", p.archived ? null : "danger",
+               p.archived ? "unarchive" : "archive");
+  b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await api("/api/projects", {method: "POST", body: JSON.stringify(
+        {path: p.path, archived: !p.archived})});
+      await loadProjects();
+      await refresh();   // the picker drops a project that just left it
+    } catch (e) { fail(e); b.disabled = false; }
+  };
+  return b;
+}
+
 $("addprofile").onclick = () => openEditor("");
 $("runwayrefresh").onclick = () => refreshRunway();
 // <dialog> is the platform's own modal: Esc, the backdrop and the focus trap
 // come with it, so this is the whole popup.
 $("statsbtn").onclick = () => $("statsdlg").showModal();
 $("statsclose").onclick = () => $("statsdlg").close();
+$("projbtn").onclick = () => { $("projdlg").showModal(); loadProjects(); };
+$("projclose").onclick = () => $("projdlg").close();
 $("sweep").onclick = () => act("/api/sweep", {method: "POST"});
 $("pause").onclick = () => act("/api/dispatch/" + (paused ? "resume" : "pause"),
                                {method: "POST"});

@@ -132,6 +132,19 @@ def adopt(con, root: Path, name: str | None = None) -> "Project":
         "SELECT * FROM projects WHERE path=?", (str(root),)).fetchone())
 
 
+def source_owned(root, source_ref: str, verb: str = "archive") -> str:
+    """Why a source-backed row refuses a local edit — ONE wording.
+
+    Named, not described: the human reading this has to know WHERE to go, and
+    the identifier the source gave the project is the only address this module
+    has (CONTRACT §7 — it is not parsed, just quoted back). The CLI raises it,
+    the HTTP surface returns it, and the dashboard prints it in the row where
+    a local project would show its archive control.
+    """
+    return (f"orchestra: {root} comes from the work source that owns "
+            f"{source_ref!r}; {verb} it there, not here")
+
+
 def forget(con, root: Path) -> bool:
     """Drop a locally adopted project. Refuses one a work source owns, since
     the next refresh would put it back and the removal would look broken."""
@@ -141,13 +154,7 @@ def forget(con, root: Path) -> bool:
     if row is None:
         return False
     if row["source_ref"]:
-        # Named, not described: the human reading this has to know WHERE to
-        # go, and the identifier the source gave the project is the only
-        # address this module has (CONTRACT §7 — it is not parsed, just
-        # quoted back).
-        raise SystemExit(
-            f"orchestra: {root} comes from the work source that owns "
-            f"{row['source_ref']!r}; remove it there, not here")
+        raise SystemExit(source_owned(root, row["source_ref"], "remove"))
     con.execute("DELETE FROM projects WHERE path=?", (str(root),))
     con.commit()
     return True
@@ -163,9 +170,7 @@ def set_archived(con, root: Path, archived: bool) -> bool:
     if row is None:
         return False
     if row["source_ref"]:
-        raise SystemExit(
-            f"orchestra: {root} comes from the work source that owns "
-            f"{row['source_ref']!r}; archive it there, not here")
+        raise SystemExit(source_owned(root, row["source_ref"]))
     con.execute("UPDATE projects SET archived=? WHERE path=?",
                 (int(archived), str(root)))
     con.commit()

@@ -633,6 +633,100 @@ class ProjectPickerTests(ServerCase):
                                               body=body)[0], 403)
 
 
+class ProjectRegistryTests(ServerCase):
+    """``GET/POST /api/projects``: the registry panel behind the dashboard.
+
+    Not the picker. The picker is derived from the runs (W-0186) and the
+    project a human wants to park is the one with no recent run, so the panel
+    reads the registry and archives through the same call the CLI makes.
+    """
+
+    def register(self, name: str, source_ref: str | None = None,
+                 archived: bool = False) -> Path:
+        root = self.tmp_path / name
+        root.mkdir(exist_ok=True)
+        self.con.execute(
+            "INSERT INTO projects(path, project_id, source_ref, name, "
+            "refreshed_at, archived) VALUES(?,?,?,?,?,?)",
+            (str(root), f"pid-{name}", source_ref, name, db.now(),
+             int(archived)))
+        self.con.commit()
+        return root
+
+    def rows(self) -> dict:
+        _, payload = self.json_request(path="/api/projects")
+        return {r["name"]: r for r in payload["projects"]}
+
+    def test_the_listing_carries_local_and_source_rows_with_their_state(self) -> None:
+        self.register("alpha")
+        self.register("bravo", archived=True)
+        self.register("charlie", source_ref="P-9")
+        rows = self.rows()
+        self.assertEqual(set(rows), {"alpha", "bravo", "charlie"})
+        self.assertFalse(rows["alpha"]["archived"])
+        self.assertTrue(rows["bravo"]["archived"], "a parked row must still list")
+        self.assertIsNone(rows["alpha"]["source_ref"])
+        self.assertIsNone(rows["alpha"]["blocked"], "a local row has a control")
+        self.assertEqual(rows["charlie"]["source_ref"], "P-9")
+        self.assertIn("archive it there", rows["charlie"]["blocked"])
+
+    def test_archiving_through_the_post_takes_the_project_off_the_picker(self) -> None:
+        root = self.register("alpha")
+        self.make_run(project_id="pid-alpha")
+        _, before = self.json_request()
+        self.assertEqual([p["project_id"] for p in before["projects"]],
+                         ["pid-alpha"])
+        status, said = self.json_request(method="POST", path="/api/projects",
+                                         body={"path": str(root),
+                                               "archived": True})
+        self.assertEqual(status, 200, said)
+        self.assertTrue(said["archived"])
+        _, after = self.json_request()
+        self.assertEqual(after["projects"], [], "the picker kept a parked project")
+        self.assertEqual(len(after["runs"]), 1, "parking hid a run")
+        self.assertTrue(self.rows()["alpha"]["archived"])
+        # and back again, through the same route
+        self.json_request(method="POST", path="/api/projects",
+                          body={"path": str(root), "archived": False})
+        _, back = self.json_request()
+        self.assertEqual([p["project_id"] for p in back["projects"]],
+                         ["pid-alpha"])
+
+    def test_a_source_backed_project_is_refused_in_the_cli_s_words(self) -> None:
+        """The HTTP layer restates no rule: project.set_archived refuses, and
+        the refusal that reaches the browser is the sentence the CLI prints."""
+        root = self.register("charlie", source_ref="P-9")
+        status, text = self.request(method="POST", path="/api/projects",
+                                    body={"path": str(root), "archived": True})
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            text.strip(),
+            f"orchestra: {root} comes from the work source that owns "
+            f"'P-9'; archive it there, not here")
+        self.assertFalse(self.rows()["charlie"]["archived"])
+
+    def test_an_unregistered_path_is_a_404_not_a_silent_success(self) -> None:
+        status, text = self.request(method="POST", path="/api/projects",
+                                    body={"path": str(self.tmp_path / "nope"),
+                                          "archived": True})
+        self.assertEqual(status, 404)
+        self.assertIn("not a registered project", text)
+
+    def test_both_routes_normalize_to_themselves_and_are_the_humans(self) -> None:
+        """No catch-all swallows them — neither ends in /stream nor looks like
+        a profile — so they fall to auth.DEFAULT_LEVEL, and a run token that
+        parked its own project would park itself mid-run."""
+        for method in ("GET", "POST"):
+            key, target = auth.route_key(method, mhttp.PROJECTS_ROUTE)
+            self.assertEqual(key, f"{method} /api/projects")
+            self.assertIsNone(target)
+            self.assertNotIn(key, auth.ROUTES)
+            self.assertEqual(auth.ROUTES.get(key, auth.DEFAULT_LEVEL),
+                             auth.ONLY_HUMAN)
+            self.assertIsNone(auth.permit(auth.Identity(auth.HUMAN), key))
+            self.assertIn("human", auth.permit(auth.Identity(auth.RUN, 1), key))
+
+
 class StopRunTests(unittest.TestCase):
     """Process ownership checks need no socket or server thread."""
 
