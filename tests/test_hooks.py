@@ -282,10 +282,10 @@ class HookRuntimeTests(HookFixture):
             run_id=1, slug="brave_otter", profile={"name": "stub"},
             mission="Work task W-0001: demo item", requester="human",
             root=self.tmp_path, workdir=str(self.tmp_path),
-            work_item="W-0001", recent_commits=["secret landed detail"],
+            recent_commits=["secret landed detail"],
             extra_context="secret additional context",
-            work_snapshot=("W-0001 · demo item [ready]\n\n## goal\nKeep the brief."
-                           "\n\n## acceptanceCriteria\n- next turn has context"))
+            snapshot=("W-0001 · demo item [ready]\n\n## goal\nKeep the brief."
+                      "\n\n## acceptanceCriteria\n- next turn has context"))
         path = self.tmp_path / "brief.md"
         path.write_text(text)
         self.con.execute("UPDATE runs SET brief_path=? WHERE id=1", (str(path),))

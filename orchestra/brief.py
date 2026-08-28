@@ -23,7 +23,7 @@ PROTOCOL_CARD = """\
 - finding: {claim, where, confidence: observed|suspected, why_not_fixed}. proposal: {title, why}.
 """
 
-WORK_SNAPSHOT_MAX_CHARS = 2000
+SNAPSHOT_MAX_CHARS = 2000
 RECENT_COMMITS_MAX_CHARS = 900
 POSTCOMPACT_MAX_CHARS = 5000  # about 1,000 tokens; never inject the full brief
 
@@ -31,90 +31,6 @@ POSTCOMPACT_MAX_CHARS = 5000  # about 1,000 tokens; never inject the full brief
 # is an edit to every brief, with no code change (W-0250).
 # ponytail: repo-relative path; a wheel install would need package_data.
 WRITEBACK_STYLE = Path(__file__).resolve().parent.parent / "docs/WRITEBACK-STYLE.md"
-
-# Only runs carrying a Work item get this: a worker with no item has no
-# checklist to answer, and a brief never teaches a verb it cannot use.
-WORK_CHECKLIST_PROTOCOL = """\
-Before you stop, account for every requirement and acceptance criterion above.
-Tick each one you verified: `work check {item} requirement|acceptance <index> --root {root}`
-(indexes count from 0, as `work show {item} --root {root}` lists them). Decline
-each one you did not: `work check {item} requirement|acceptance <index> --root {root} --decline "not attempted, blocked on X"`.
-Declining is expected and is not a failure — leaving an item unanswered is.
-Whatever you leave unanswered is declined for you, naming your run as the one
-that did not account for it.
-"""
-
-
-# The goal standard the refine lane writes to (W-0309), vendored beside the
-# house style and referenced the same way: by path, never copied into a
-# string here.
-# ponytail: the run reads it from outside its working directory. Inline the
-# 5 KB into the mission if a harness sandbox ever refuses that read.
-GOAL_STANDARD = Path(__file__).resolve().parent.parent / "docs/GOAL-STANDARD.md"
-
-# The refine lane's mission (W-0309). A refinement run shapes ONE Work item
-# and touches no code: it reads the item and the repository, rewrites the six
-# sections around the owner's own words, and drops the tag that asked for it.
-# The rules are the refine-work-item skill's, distilled — evidence or a `Q:`
-# line, never an invention.
-REFINE_MISSION = """\
-Refine Work item {item} to the goal standard. This is a shaping pass, not
-execution: change no file in this project, run no build, write no code.
-
-1. Read the item whole: `work show {item} --json --root {root}` — every
-   section, both checklists, and the whole progress log. A late log line
-   outranks the description where the two disagree.
-2. Read the standard at `{standard}`. It defines every term below.
-3. Gather evidence: the files, modules and commands the item names,
-   `work list --root {root}` for neighbouring or blocking items, and
-   `git log` on the named paths. Recon that finds little is a result.
-4. Rewrite the six sections — description, goal, requirements,
-   acceptanceCriteria, plan, notes — as far as that evidence reaches.
-
-Rules that outrank the standard:
-
-- Preserve the owner's phrasing VERBATIM inside the description. Clarify
-  around their words. Never delete, reword, or tidy what they wrote.
-- Never invent an answer. Every point the evidence cannot settle becomes one
-  `Q:` line in notes, phrased so a one-line answer closes it; add your
-  recommended answer on the same line when recon supports one. An empty
-  section beats a fabricated one.
-- Every acceptance criterion states its verification method — a command or
-  an observation. No method available, no criterion: write a `Q:` line.
-- At most 6 requirements and 5 acceptance criteria, one condition each.
-  Sending either list REPLACES the whole list and drops its ticks, so send
-  every item you keep, in order.
-- Never tick, untick or decline a checkbox. Never set delegated, never move
-  status, never change the title. Those stay the owner's.
-
-Then write back, in this order, and stop. Every call carries your identity:
-
-    curl -sS -X PATCH {api}/api/tasks/{item} \\
-      -H 'X-Work-Agent: {agent}' -H 'Content-Type: application/json' -d @BODY.json
-
-1. Sections: one PATCH whose body carries only the sections you changed
-   (`requirements` and `acceptanceCriteria` are lists of strings). Work
-   permits this edit ONLY while the `refine` tag is present.
-2. Confirm with `work show {item} --json --root {root}` that your text
-   landed and both checklists survived.
-3. Two log entries — `work log {item} "<text>" --root {root}`:
-   - `{tag} refined {item}` — what you filled, then one line per open `Q:`,
-     in the house style below.
-   - `{tag} fact: refined`
-4. The tag, last: one PATCH sending `tags` as the item's current tags minus
-   `refine`, with nothing else in the body. The allowance dies with the tag,
-   so this call ends the pass. Drop the tag even when the evidence settled
-   nothing — say so in the comment instead. A tag left in place dispatches
-   this whole pass again.
-"""
-
-
-def refine_mission(*, item: str, root: Path, api: str, agent: str,
-                   tag: str) -> str:
-    """Fill the refine template for one item (W-0309)."""
-    return REFINE_MISSION.format(item=item, root=root, api=api.rstrip("/"),
-                                 agent=agent, tag=tag,
-                                 standard=GOAL_STANDARD)
 
 
 def writeback_section() -> str:
@@ -163,7 +79,10 @@ def _section(text: str, heading: str) -> str:
 
 def postcompact_context(text: str) -> str:
     """The frozen parts of a run brief that must survive compaction."""
-    item = re.search(r"(?m)^(W-[0-9]+)\s*·\s*(.*?)\s*\[[^\n]*\]$", text)
+    # The snapshot's first line is ``<id> · <title> [<state>]``. The id is an
+    # opaque ref — the shape of the line, not a source's id format, is what
+    # is matched here (CONTRACT §7 Enforcement 1).
+    item = re.search(r"(?m)^([A-Za-z0-9_.:-]+)\s*·\s*(.*?)\s*\[[^\n]*\]$", text)
     identity = (f"Item: {item.group(1)}\nTitle: {item.group(2)}" if item else
                 _section(text, "Mission").split("\n\n", 1)[0])
     checklist = re.search(
@@ -187,8 +106,8 @@ def postcompact_context(text: str) -> str:
 def compose(*, run_id: int, slug: str | None, profile: dict, mission: str,
             requester: str, root: Path, workdir: str,
             extra_context: str | None = None,
-            work_snapshot: str | None = None,
-            work_item: str | None = None,
+            snapshot: str | None = None,
+            snapshot_protocol: str | None = None,
             recent_commits: list[str] | None = None,
             cfg: dict | None = None) -> str:
     run_label = f"{run_id} · {slug}" if slug else str(run_id)
@@ -213,12 +132,14 @@ Project: `{root}` · Working directory: `{workdir}`.
                      "Read this before you start. Work already done is not "
                      "your mission, and repeating it is worse than skipping "
                      "it.\n")
-    if work_snapshot:
-        # Phase-2 seam: the sweeper freezes the Work item snapshot at
-        # dispatch and passes it here, capped at 2,000 chars (D6).
-        parts.append(f"## Work item snapshot\n\n{work_snapshot[:WORK_SNAPSHOT_MAX_CHARS]}\n")
-        if work_item:
-            parts.append(WORK_CHECKLIST_PROTOCOL.format(item=work_item, root=root))
+    if snapshot:
+        # Phase-2 seam: the source adapter freezes the item snapshot at
+        # dispatch and passes it here, capped at 2,000 chars (D6). The
+        # protocol beside it — the source's own checklist verbs — is rendered
+        # by the adapter too; this file knows no source (CONTRACT §7).
+        parts.append(f"## Item snapshot\n\n{snapshot[:SNAPSHOT_MAX_CHARS]}\n")
+        if snapshot_protocol:
+            parts.append(snapshot_protocol)
     if extra_context:
         parts.append(f"## Additional context\n\n{extra_context}\n")
     parts.append(writeback_section())
@@ -241,7 +162,6 @@ def compose_child(root: Path, run, profile: dict, mission: str, *,
                    mission=mission, requester=f"run {parent['id']} "
                                               f"({parent['profile']})",
                    root=root, workdir=workdir, extra_context=context,
-                   work_item=parent["ref"],
                    # A child is at the depth limit already; a brief never
                    # teaches a verb it cannot use.
                    cfg=None)

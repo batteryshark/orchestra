@@ -2,9 +2,9 @@
 
 Merge order: built-in defaults <- ~/.config/orchestra/config.toml <-
 that file's [project."<projectId>"] table (shallow, per table). Per-project
-settings key on the central registry id. Work-backed projects use Work's
-immutable projectId. Settings live in Orchestra's config, never in the project
-directory or in .work/ (DESIGN §2).
+settings key on the central registry id — a local UUID, or the id a source
+adapter cached. Settings live in Orchestra's config, never in the project
+directory (DESIGN §2).
 
 **Profiles are GLOBAL presets (W-0187).** A project does not change what a
 profile IS; it chooses WHICH of them it may staff, with one key:
@@ -104,10 +104,11 @@ default_requester = "human"
 # them explicitly, usually in a [project."<projectId>".settings] table. A
 # profile may override the list. OpenCode ignores this setting with a warning.
 # add_dirs = ["~/Projects/reference-repo"]
-# Raw backend JSONL ages out after this many days, for TERMINAL runs only
-# (DESIGN §7). Normalized trace events are kept indefinitely; pruning only
-# loses expand-in-place detail. Run it with `orchestra traces prune`.
-raw_log_retention_days = 30
+# Raw backend JSONL is the full-detail record of every run and is KEPT
+# FOREVER by default (0). A positive day count lets `orchestra traces prune`
+# age out TERMINAL runs' logs after that many days. Normalized trace events
+# are kept indefinitely either way; pruning only loses expand-in-place detail.
+raw_log_retention_days = 0
 # Optional observer policy. There are no budgets and no run ceilings: a
 # long run is a good run, and this is what catches a feral one instead.
 # observer_profile picks the model that judges transcripts out of band;

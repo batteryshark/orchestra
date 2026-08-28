@@ -229,7 +229,8 @@ def spawn_supervisor(root: Path, run_id: int) -> None:
 
 def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
                    context: str | None = None, use_worktree: bool = False,
-                   work_snapshot: str | None = None) -> None:
+                   snapshot: str | None = None,
+                   snapshot_protocol: str | None = None) -> None:
     """Create the workdir, brief, and log for a run row about to launch."""
     run_id = int(run["id"])
     profile = config.profile_cfg(cfg, run["profile"])
@@ -249,8 +250,7 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
             f"PATH; run {run_id} did not start")
     workdir, branch = str(root), None
     base_commit = None
-    bp = paths.briefs_dir() / f"run-{run_id}.md"
-    lp = paths.logs_dir() / f"run-{run_id}.jsonl"
+    bp, lp = project.run_artifacts(con, run)
     created = None
     try:
         if use_worktree:
@@ -263,17 +263,16 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
                 base_commit = worktree.head(Path(workdir))
             except RuntimeError:
                 base_commit = None  # fresh repository with no commits yet
-        # The Work snapshot is frozen here, at dispatch; it is never re-read at
-        # resume (the immutability is load-bearing — Orchestra learned it the
-        # hard way).
-        # Only a Work TASK carries a checklist; issues do not, so only a task id
-        # earns the checklist protocol in the brief.
-        item = run["ref"] if "ref" in run.keys() else None
+        # The item snapshot is frozen here, at dispatch; it is never re-read
+        # at resume (the immutability is load-bearing — Orchestra learned it
+        # the hard way). The protocol beside it is the source adapter's own
+        # rendering: whether this run's ref carries a checklist is the
+        # source's schema, which this module may not read (CONTRACT §7).
         text = brief.compose(
             run_id=run_id, slug=run["slug"], profile=profile,
             mission=mission, requester=run["requested_by"], root=root,
-            workdir=workdir, extra_context=context, work_snapshot=work_snapshot,
-            work_item=item if (item or "").startswith("W-") else None,
+            workdir=workdir, extra_context=context, snapshot=snapshot,
+            snapshot_protocol=snapshot_protocol,
             recent_commits=worktree.recent_commits(Path(workdir)),
             cfg=cfg)
         bp.write_text(text, encoding="utf-8")
@@ -401,8 +400,7 @@ def reserve_followup(con, root: Path, parent, requester: str,
 def prepare_followup(con, root: Path, parent, run, text: str) -> int:
     """Freeze and re-home an already reserved continuation."""
     run_id = int(run["id"])
-    bp = paths.briefs_dir() / f"run-{run_id}.md"
-    lp = paths.logs_dir() / f"run-{run_id}.jsonl"
+    bp, lp = project.run_artifacts(con, run)
     workdir, branch, base_commit, created = str(root), None, None, False
     try:
         workdir, branch, base_commit, created = rehome(

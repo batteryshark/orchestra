@@ -44,7 +44,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import config, db, dispatch, nod, paths, runners, traces
+from orchestra import config, db, dispatch, nod, paths, project, runners, traces
 
 # Layer (c) cadence: first look five minutes in, then every half hour (§7).
 # A workhorse (tier 1) gets looked at much sooner: a heavy model thinking for
@@ -1163,8 +1163,7 @@ def _retry_row(con, run, root) -> tuple[int | None, str | None]:
     except BaseException:
         con.rollback()
         raise
-    brief = paths.briefs_dir() / f"run-{run_id}.md"
-    log = paths.logs_dir() / f"run-{run_id}.jsonl"
+    brief, log = project.run_artifacts(con, retry)
     workdir, branch, base_commit, created = str(root), None, None, False
     try:
         workdir, branch, base_commit, created = supervise.rehome(

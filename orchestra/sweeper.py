@@ -174,9 +174,31 @@ def is_delegated(item: dict, identity: str) -> bool:
 
 # --- snapshot ---------------------------------------------------------------
 
+# Only a run carrying a Work TASK gets this — issues have no checklist, and a
+# brief never teaches a verb it cannot use. Lives in the adapter because the
+# `work check` verbs are Work's own CLI (CONTRACT §7); the core injects it
+# verbatim as the snapshot's protocol.
+CHECKLIST_PROTOCOL = """\
+Before you stop, account for every requirement and acceptance criterion above.
+Tick each one you verified: `work check {item} requirement|acceptance <index> --root {root}`
+(indexes count from 0, as `work show {item} --root {root}` lists them). Decline
+each one you did not: `work check {item} requirement|acceptance <index> --root {root} --decline "not attempted, blocked on X"`.
+Declining is expected and is not a failure — leaving an item unanswered is.
+Whatever you leave unanswered is declined for you, naming your run as the one
+that did not account for it.
+"""
+
+
+def checklist_protocol(kind: str, item_id: str, root) -> str | None:
+    """The checklist card for a task, None for anything else."""
+    if kind != "task":
+        return None
+    return CHECKLIST_PROTOCOL.format(item=item_id, root=root)
+
+
 def render_snapshot(item: dict, kind: str) -> str:
     """Compact Work-item snapshot for the brief; frozen at dispatch, capped
-    at brief.WORK_SNAPSHOT_MAX_CHARS (D6)."""
+    at brief.SNAPSHOT_MAX_CHARS (D6)."""
     state = item.get("status") if kind == "task" else item.get("state")
     lines = [f"{item['id']} · {item.get('title', '')} [{state}]"]
     if item.get("projectPath"):
@@ -202,7 +224,7 @@ def render_snapshot(item: dict, kind: str) -> str:
                 author = (m.get("author") or {}).get("name") or \
                     (m.get("author") or {}).get("kind", "?")
                 lines.append(f"- {m.get('createdAt', '')} {author}: {m.get('body', '')}")
-    return "\n".join(lines)[:brief.WORK_SNAPSHOT_MAX_CHARS]
+    return "\n".join(lines)[:brief.SNAPSHOT_MAX_CHARS]
 
 
 def _mission(item: dict, kind: str) -> str:
@@ -298,6 +320,85 @@ human_comments = _new_human_comments
 # run is staffed. It returns the [work] profile unchanged on every failure, so
 # this seam can never stop a dispatch — see router.choose.
 staff = router.choose
+
+
+# --- claim order (Work's item schema; moved out of dispatch.py, which is
+# core and must not know a source's edges or status vocabulary — CONTRACT §7)
+
+# A prerequisite in any of these is settled; anything else still blocks.
+DONE_STATUSES = frozenset({"done", "closed", "cancelled", "resolved"})
+
+
+def prerequisites(item: dict) -> list[str]:
+    """Work item ids this item must wait for. ``dependsOn`` is the one edge
+    Work serves; the legacy reverse-edge record folds into it on Work's read
+    (Work, lib/local-workspace.mjs), so the runner never reads a
+    second key. Tolerant of both a bare id list and a list of
+    ``{"id": ...}``."""
+    found: list[str] = []
+    for dep in item.get("dependsOn") or []:
+        if isinstance(dep, dict):
+            dep = dep.get("id")
+        if dep and dep != item.get("id") and dep not in found:
+            found.append(dep)
+    return found
+
+
+def statuses(items) -> dict[str, str | None]:
+    """Status by id for everything this pass fetched (tasks carry ``status``,
+    issues carry ``state``)."""
+    return {item["id"]: (item.get("status") or item.get("state"))
+            for _, item in items}
+
+
+def unmet(item: dict, known: dict, lookup=None) -> list[str]:
+    """Prerequisites that are not finished yet.
+
+    ``known`` is filled in as it goes, so one lookup serves every dependent.
+    ponytail: a prerequisite id Work does not know (deleted, typo) reads as
+    unfinished and holds the item forever — visibly, in the waiting queue
+    with its reason. Upgrade path is a distinct 'unknown dependency' reason
+    once Work can tell 404 from unfinished.
+    """
+    blocked = []
+    for dep in prerequisites(item):
+        if dep not in known and lookup is not None:
+            fetched = lookup(dep) or {}
+            known[dep] = fetched.get("status") or fetched.get("state")
+        if known.get(dep) not in DONE_STATUSES:
+            blocked.append(dep)
+    return blocked
+
+
+def plan(con, candidates, known: dict, lookup=None) -> list[tuple]:
+    """Order claimable items and say which of them must wait.
+
+    ``candidates`` is ``[(kind, item, lane_index)]`` in the order Work served
+    them. Returns ``[(kind, item, lane_index, reason)]`` where ``reason`` is
+    None for anything that starts now, else ``(reason, detail)``.
+
+    Sort key is dependencies first (nothing blocked outranks something
+    ready), then ready-lane board order, then FIFO by how long the item has
+    already waited. Order only ever matters for the items that must wait —
+    everything else dispatches as soon as it is claimed, all of it at once,
+    with no cap and no artificial delay.
+    """
+    pause = dispatch.pause_state(con)
+    seq = dispatch.queue_seq(con)
+    planned = []
+    for kind, item, lane in candidates:
+        blocked = unmet(item, known, lookup)
+        if blocked:
+            reason = ("dependency", ", ".join(blocked))
+        elif pause is not None:
+            reason = ("paused", pause.get("note"))
+        else:
+            reason = None
+        planned.append((kind, item, lane, reason))
+    planned.sort(key=lambda e: (e[3] is not None,
+                                e[2] if e[2] is not None else dispatch.NO_LANE,
+                                seq.get(e[1]["id"], dispatch.NO_LANE)))
+    return planned
 
 
 # --- the three sub-passes ---------------------------------------------------
@@ -649,7 +750,9 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
                     # fails closed — that guard stays exactly as it was.
                     use_worktree=bool(work_cfg(pcfg).get("worktree", True))
                     and not project.is_workspace(root),
-                    work_snapshot=render_snapshot(item, kind))
+                    snapshot=render_snapshot(item, kind),
+                    snapshot_protocol=checklist_protocol(kind, item["id"],
+                                                         root))
         mark(con, run_id, "seen_ts", item.get("updatedAt") or db.now())
     except (Exception, SystemExit) as exc:
         error = str(exc)[:1000] or exc.__class__.__name__
@@ -738,8 +841,8 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                 dispatch.release(con, item["id"])  # no longer a candidate
             continue
         candidates.append((kind, item, lane))
-    planned = dispatch.plan(con, candidates, dispatch.statuses(items),
-                            lookup=_dep_lookup(client))
+    planned = plan(con, candidates, statuses(items),
+                   lookup=_dep_lookup(client))
     for kind, item, _lane, reason in planned:
         item_id = item["id"]
         if reason:

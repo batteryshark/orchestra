@@ -29,11 +29,12 @@ class Project:
     """One cached (path -> projectId) mapping. ``path`` is a lookup key only."""
 
     __slots__ = ("project_id", "path", "source_ref", "name", "archived",
-                 "archived_override")
+                 "archived_override", "slug")
 
     def __init__(self, project_id: str, path: Path, source_ref: str | None,
                  name: str | None, archived: bool = False,
-                 archived_override: bool | None = None):
+                 archived_override: bool | None = None,
+                 slug: str | None = None):
         self.project_id = project_id
         self.path = path
         # The source's own identifier for this project, or None when the row
@@ -49,10 +50,11 @@ class Project:
         # only thing a surface needs the raw columns for: a row parked with
         # no override was parked by the source, not by the owner.
         self.archived_override = archived_override
-
-    @property
-    def slug(self) -> str:
-        return self.source_ref or self.name or self.path.name
+        # The HUMAN address (schema v27): lowercase kebab-case, unique across
+        # project ids, minted once and stable — it keys the project's own
+        # directory under ~/.orchestra/projects/. None only on a row a stale
+        # pre-v27 writer inserted; display falls back, lookups do not.
+        self.slug = slug or name or path.name
 
     def __repr__(self) -> str:
         return f"Project({self.project_id} @ {self.path})"
@@ -77,10 +79,32 @@ def _row(row) -> Project | None:
                    row["name"],
                    _effective(row),
                    None if row["archived_override"] is None
-                   else bool(row["archived_override"]))
+                   else bool(row["archived_override"]),
+                   slug=row["slug"])
 
 
 # --- cache ------------------------------------------------------------------
+
+def mint_slug(con, base: str, project_id: str) -> str:
+    """Mint the project's one human address (schema v27).
+
+    Lowercase kebab-case from ``base``, unique across project ids, suffixed
+    ``-2``/``-3`` on a collision. A project that already has a slug keeps it:
+    the slug keys ``~/.orchestra/projects/<slug>/``, so a rename or refresh
+    must never rewrite it.
+    """
+    row = con.execute(
+        "SELECT slug FROM projects WHERE project_id=? AND slug IS NOT NULL "
+        "LIMIT 1", (project_id,)).fetchone()
+    if row is not None:
+        return row["slug"]
+    want = paths.kebab(base)
+    slug, n = want, 2
+    while con.execute("SELECT 1 FROM projects WHERE slug=? AND project_id<>?",
+                      (slug, project_id)).fetchone():
+        slug, n = f"{want}-{n}", n + 1
+    return slug
+
 
 def remember_source(con, rows: list) -> int:
     """Write the source-backed rows of the registry. Returns rows written.
@@ -95,19 +119,27 @@ def remember_source(con, rows: list) -> int:
     from orchestra import db  # local: db imports paths, not project
 
     ts, count, seen = db.now(), 0, []
+    minted: dict[str, str] = {}
     for path, project_id, source_ref, name, archived in rows:
         if not project_id or not source_ref:
             continue  # a row with no source identity is not source-backed
+        if project_id not in minted:
+            minted[project_id] = mint_slug(
+                con, name or Path(path).name, project_id)
         # UPSERT, not INSERT OR REPLACE: REPLACE deletes the row first, which
         # would drop ``archived_override`` — the owner's answer — on every
         # refresh. The source still writes its own mirror column (DESIGN §1).
+        # ``slug`` keeps its first value the same way: minted once, then the
+        # row's own copy wins over whatever this refresh would have minted.
         con.execute(
             "INSERT INTO projects(path, project_id, source_ref, name, "
-            "refreshed_at, archived) VALUES(?,?,?,?,?,?) "
+            "refreshed_at, archived, slug) VALUES(?,?,?,?,?,?,?) "
             "ON CONFLICT(path) DO UPDATE SET project_id=excluded.project_id, "
             "source_ref=excluded.source_ref, name=excluded.name, "
-            "refreshed_at=excluded.refreshed_at, archived=excluded.archived",
-            (str(path), project_id, source_ref, name, ts, int(bool(archived))))
+            "refreshed_at=excluded.refreshed_at, archived=excluded.archived, "
+            "slug=COALESCE(projects.slug, excluded.slug)",
+            (str(path), project_id, source_ref, name, ts, int(bool(archived)),
+             minted[project_id]))
         seen.append(str(path))
         count += 1
     # A source-backed row whose path the source no longer names is stale — a
@@ -151,10 +183,12 @@ def adopt(con, root: Path, name: str | None = None) -> "Project":
         "SELECT * FROM projects WHERE path=?", (str(root),)).fetchone())
     if existing is not None:
         return existing
+    project_id = str(uuid.uuid4())
     con.execute(
-        "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at) "
-        "VALUES(?,?,NULL,?,?)",
-        (str(root), str(uuid.uuid4()), name or root.name, db.now()))
+        "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at, "
+        "slug) VALUES(?,?,NULL,?,?,?)",
+        (str(root), project_id, name or root.name, db.now(),
+         mint_slug(con, name or root.name, project_id)))
     con.commit()
     return _row(con.execute(
         "SELECT * FROM projects WHERE path=?", (str(root),)).fetchone())
@@ -285,6 +319,34 @@ def by_id(con, project_id: str | None) -> Project | None:
         (project_id,)).fetchone())
 
 
+def by_slug(con, slug: str | None) -> Project | None:
+    """Resolve the human address. Alias and link rows share one slug, so the
+    pick mirrors ``link``'s preference: the source-backed row first, then the
+    shortest path; ``workdir_for`` turns either into a usable checkout."""
+    if not slug:
+        return None
+    return _row(con.execute(
+        "SELECT * FROM projects WHERE slug=? "
+        "ORDER BY source_ref IS NULL, LENGTH(path) LIMIT 1",
+        (slug,)).fetchone())
+
+
+def find(con, selector: str) -> Project | None:
+    """The project a caller NAMES: slug first, then project id, then a
+    registered path. This is `dispatch --project` and the HTTP dispatch
+    route; returns the registered row, so callers that need a directory a
+    run can work in pass it through ``workdir_for``."""
+    hit = by_slug(con, selector) or by_id(con, selector)
+    if hit is not None:
+        return hit
+    try:
+        target = str(Path(selector).expanduser().resolve())
+    except (OSError, ValueError):
+        return None
+    return _row(con.execute("SELECT * FROM projects WHERE path=?",
+                            (target,)).fetchone())
+
+
 def by_source_ref(con, ref: str | None) -> Project | None:
     """Resolve a source's own project reference to a checkout.
 
@@ -324,10 +386,11 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
        human tells Orchestra something it can see.
     3. A checkout bound with ``link`` — the escape hatch for a repository
        that lives somewhere its name does not give away.
-    4. An ephemeral workspace under ~/.orchestra/workspaces, for a project
-       with no folder anywhere, which is most of them. It is not a git
-       repository, and the dispatch skips isolation there rather than
-       failing the way run 59 did.
+    4. An ephemeral workspace — ~/.orchestra/projects/<slug>/workspace, or
+       the pre-v27 ~/.orchestra/workspaces/<id> when one already holds
+       state — for a project with no folder anywhere, which is most of
+       them. It is not a git repository, and the dispatch skips isolation
+       there rather than failing the way run 59 did.
 
     A LINK WINS EVEN WHEN ITS DIRECTORY IS GONE — it outranks discovery for
     that reason. Linking is how a checkout is claimed, so a claim that stops
@@ -351,10 +414,16 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
     found = _discover(con, proj)
     if found is not None:
         return Project(proj.project_id, found, proj.source_ref, proj.name,
-                       proj.archived, proj.archived_override)
-    return Project(proj.project_id, paths.workspace_dir(proj.project_id),
-                   proj.source_ref, proj.name, proj.archived,
-                   proj.archived_override)
+                       proj.archived, proj.archived_override, slug=proj.slug)
+    # Pre-v27 workspaces were keyed by project id under ~/.orchestra/
+    # workspaces. One that exists keeps its state where it already lives — a
+    # run may be standing in it — so only a project with no workspace yet
+    # gets the slug-keyed directory under ~/.orchestra/projects/.
+    legacy = paths.home().expanduser() / "workspaces" \
+        / paths.slugify(proj.project_id)
+    ws = legacy if legacy.is_dir() else paths.workspace_dir(proj.slug)
+    return Project(proj.project_id, ws, proj.source_ref, proj.name,
+                   proj.archived, proj.archived_override, slug=proj.slug)
 
 
 def _discover(con, proj: "Project") -> Path | None:
@@ -395,8 +464,13 @@ def is_workspace(root: Path) -> bool:
     thing that guard exists to prevent.
     """
     try:
-        return Path(root).resolve().is_relative_to(
-            (paths.home() / "workspaces").expanduser().resolve())
+        home = paths.home().expanduser().resolve()
+        target = Path(root).resolve()
+        if target.is_relative_to(home / "workspaces"):
+            return True  # pre-v27 layout, kept where its state lives
+        parts = target.relative_to(home / "projects").parts \
+            if target.is_relative_to(home / "projects") else ()
+        return len(parts) >= 2 and parts[1] == "workspace"
     except (OSError, ValueError):
         return False
 
@@ -424,8 +498,8 @@ def link(con, project_path: str, root: Path) -> "Project":
             "`orchestra project list` names them")
     con.execute(
         "INSERT OR REPLACE INTO projects(path, project_id, source_ref, name, "
-        "refreshed_at) VALUES(?,?,NULL,?,?)",
-        (str(root), row["project_id"], row["name"], db.now()))
+        "refreshed_at, slug) VALUES(?,?,NULL,?,?,?)",
+        (str(root), row["project_id"], row["name"], db.now(), row["slug"]))
     con.commit()
     return _row(con.execute("SELECT * FROM projects WHERE path=?",
                             (str(root),)).fetchone())
@@ -438,7 +512,34 @@ def root_for(con, run) -> Path:
     return hit.path if hit else Path(run["workdir"])
 
 
+def run_artifacts(con, run) -> tuple[Path, Path]:
+    """Where one run's brief and raw log live: (brief_path, log_path).
+
+    A worker run files under its project by the project's own run number —
+    ``projects/<slug>/runs/run-<seq>/`` — because that number is the one
+    humans quote from the board. A row with no project number or no project
+    (a control turn, a pre-v27 row) stays in the flat ``briefs/`` and
+    ``logs/`` layout, keyed by the globally unique row id. Readers never
+    derive these paths: the run row's ``brief_path``/``log_path`` are the
+    record, so the two layouts coexist without a shim.
+    """
+    seq = run["project_seq"] if "project_seq" in run.keys() else None
+    if seq and run["project_id"]:
+        base = paths.run_dir(dir_key_for(con, run), int(seq))
+        return base / "brief.md", base / "log.jsonl"
+    run_id = int(run["id"])
+    return (paths.briefs_dir() / f"run-{run_id}.md",
+            paths.logs_dir() / f"run-{run_id}.jsonl")
+
+
 def dir_key_for(con, run) -> str:
-    """The worktree directory key: the immutable projectId. A run whose project
-    left the source falls back to its workdir name so it stays supervisable."""
+    """The worktree directory key: the project's slug (schema v27). A row a
+    stale writer left slugless falls back to the stable project id, and a run
+    whose project left the registry falls back to its workdir name so it
+    stays supervisable."""
+    row = con.execute(
+        "SELECT slug FROM projects WHERE project_id=? AND slug IS NOT NULL "
+        "LIMIT 1", (run["project_id"],)).fetchone() if run["project_id"] else None
+    if row is not None:
+        return row["slug"]
     return run["project_id"] or Path(run["workdir"]).name

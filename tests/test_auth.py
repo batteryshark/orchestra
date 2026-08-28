@@ -61,7 +61,7 @@ class TokenSecretTests(unittest.TestCase):
                      "spawn_profiles": ["cheap"]},
             mission="do the thing", requester="human",
             root=Path(self.tmp.name), workdir=self.tmp.name,
-            extra_context="context", work_snapshot="snapshot")
+            extra_context="context", snapshot="snapshot")
         brief_path = paths.briefs_dir() / f"run-{run_id}.md"
         brief_path.parent.mkdir(parents=True, exist_ok=True)
         brief_path.write_text(text)

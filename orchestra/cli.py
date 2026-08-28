@@ -27,8 +27,22 @@ def _here(con) -> tuple:
     return proj, config.load(proj.project_id if proj else None)
 
 
-def _require_project(con):
-    """Same, but a command that has to run somewhere refuses to guess."""
+def _require_project(con, selector: str | None = None):
+    """Same, but a command that has to run somewhere refuses to guess.
+
+    ``selector`` names a project outright — slug, project id, or registered
+    path — so a dispatch does not have to stand in the project's directory.
+    """
+    if selector:
+        hit = project.find(con, selector)
+        if hit is None and sweeper.refresh_projects(con, config.load()):
+            hit = project.find(con, selector)
+        if hit is None:
+            raise SystemExit(
+                f"orchestra: no project matches {selector!r} — "
+                "`orchestra project list` names them")
+        proj = project.workdir_for(con, hit)
+        return proj, config.load(proj.project_id)
     proj = project.resolve(con, config.load(),
                            refresh=sweeper.refresh_projects)
     return proj, config.load(proj.project_id)
@@ -149,7 +163,7 @@ def cmd_init(args):
 
 def cmd_dispatch(args):
     con = db.connect()
-    proj, cfg = _require_project(con)
+    proj, cfg = _require_project(con, getattr(args, "project", None))
     root = proj.path
     requester = _requester(cfg)
     if proj.archived:
@@ -162,6 +176,10 @@ def cmd_dispatch(args):
         mission = Path(args.brief_file).read_text(encoding="utf-8")
     if not mission.strip():
         raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
+    # An ephemeral workspace has no repository to branch from and never had
+    # one (W-0312) — the same skip the sweeper applies, now that --project
+    # can aim a dispatch at a store-only project from anywhere.
+    isolate = args.worktree and not project.is_workspace(root)
     # A staffing moment (W-0187): the project's enabled set gates it, and a
     # profile it has not enabled is refused by name rather than swapped.
     profile = config.staff_profile(cfg, args.to)
@@ -196,7 +214,7 @@ def cmd_dispatch(args):
         con.execute(
             "INSERT INTO deferred_dispatches(run_id, mission, context, use_worktree, "
             "created_at) VALUES(?,?,?,?,?)",
-            (run_id, mission, args.context, int(bool(args.worktree)), db.now()))
+            (run_id, mission, args.context, int(bool(isolate)), db.now()))
         con.commit()
         print(f"run {run_id} ({slug}): {args.to} queued after "
               f"{','.join(map(str, after_ids))}")
@@ -207,7 +225,7 @@ def cmd_dispatch(args):
 
     try:
         supervise.prepare_launch(con, root, cfg, run, mission=mission,
-                                 context=args.context, use_worktree=args.worktree)
+                                 context=args.context, use_worktree=isolate)
         con.commit()
     except BaseException as exc:
         supervise.fail_launch(con, root, run_id, exc)
@@ -319,7 +337,7 @@ def cmd_runs(args):
         where.append("project_id IS ?")
         params.append(proj.project_id if proj else None)
     rows = list(con.execute(
-        "SELECT r.*, (SELECT source_ref FROM projects p WHERE p.project_id=r.project_id "
+        "SELECT r.*, (SELECT slug FROM projects p WHERE p.project_id=r.project_id "
         "LIMIT 1) AS project FROM runs r"
         + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id", params))
     if args.json:
@@ -1158,11 +1176,12 @@ def cmd_project(args):
                 print("no projects. `orchestra project add .` registers this one.")
                 return
             width = max(len(str(r.path)) for r in rows)
+            slugw = max(len(r.slug or "") for r in rows)
             for r in rows:
                 source = "source" if r.source_ref else "local"
                 mark = "  (archived)" if r.archived else ""
-                print(f"{str(r.path):<{width}}  {source:<5}  "
-                      f"{r.project_id}  {r.name or ''}{mark}")
+                print(f"{r.slug or '-':<{slugw}}  {str(r.path):<{width}}  "
+                      f"{source:<6}  {r.project_id}  {r.name or ''}{mark}")
             return
         if args.action in ("archive", "unarchive"):
             target = Path(args.path or ".").expanduser().resolve()
@@ -1185,9 +1204,11 @@ def cmd_project(args):
             return
         adopted = project.adopt(con, Path(args.path or "."), args.name)
         print(f"{adopted.path}\n  project id: {adopted.project_id}"
+              f"\n  slug:       {adopted.slug}"
               f"\n  name:       {adopted.name}")
         print("\nDispatch into it with:\n"
-              f"  orchestra dispatch --to <profile> \"<mission>\"")
+              f"  orchestra dispatch --project {adopted.slug} "
+              "--to <profile> \"<mission>\"")
     finally:
         con.close()
 
@@ -1218,6 +1239,10 @@ def cmd_traces(args):
     days = args.days if args.days is not None else traces.retention_days(config.load())
     pruned = traces.prune_raw_logs(con, days=days, dry_run=args.dry_run)
     con.close()
+    if days <= 0:
+        print("traces: raw logs are kept forever (raw_log_retention_days = 0);"
+              " set a positive day count, or pass --days, to prune")
+        return
     if not pruned:
         print(f"traces: no raw log older than {days}d on a terminal run")
         return
@@ -1330,6 +1355,9 @@ def main():
     s = sub.add_parser("dispatch", help="dispatch a mission to a worker profile, async")
     s.add_argument("mission", nargs="*")
     s.add_argument("--to", required=True, metavar="PROFILE", help="launch profile name")
+    s.add_argument("--project", metavar="SLUG",
+                   help="target project by slug, id, or registered path "
+                        "(default: the current directory's project)")
     s.add_argument("--after", type=int, action="append", metavar="RUN",
                    help="launch only after this run succeeds (repeatable)")
     s.add_argument("--brief-file", help="read the mission from a file")

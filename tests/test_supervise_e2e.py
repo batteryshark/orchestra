@@ -251,8 +251,7 @@ class E2ETestCase(unittest.TestCase):
                 [e["payload"] for e in events if e["kind"] == "assistant_text"])
             self.assertIn("lifecycle", {e["kind"] for e in events})
             self.assertEqual(cursor["byte_offset"],
-                             Path(self.tmp_path / "home" / "logs" /
-                                  f"run-{run_id}.jsonl").stat().st_size)
+                             Path(self._run_field(run_id, 'log_path')).stat().st_size)
 
         with self.subTest("the run token dies with the run"):
             token = sink.read_text()
