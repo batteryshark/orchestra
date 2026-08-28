@@ -419,7 +419,7 @@ class LandingTestCase(unittest.TestCase):
         row = self.con.execute(
             "SELECT * FROM nod_requests WHERE request_id='req_1'").fetchone()
         self.assertEqual(("merge_conflict", 1, "W-0001"),
-                         (row["kind"], row["run_id"], row["work_item"]))
+                         (row["kind"], row["run_id"], row["ref"]))
         self.assertIn("req_1", self.item_log())
         result = self.con.execute(
             "SELECT landing_status, summary FROM runs WHERE id=1").fetchone()

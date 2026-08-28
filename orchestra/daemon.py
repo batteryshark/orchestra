@@ -1,7 +1,10 @@
 """The one long-lived process (DESIGN §2).
 
 Foreground loop, launchd-supervised: each tick recovers abandoned admissions,
-resumes held policy work, releases dependency-ready runs, and then checks Work.
+resumes held policy work, releases dependency-ready runs, and then runs the
+adapter passes. It SCHEDULES a work source without knowing one exists: the
+passes take ``cfg`` and answer empty when none is configured, so every tick
+here is complete on a machine with no source at all (CONTRACT §7 Enforcement).
 SIGTERM/SIGINT stop it between ticks, so launchd's stop signal never lands
 mid-pass.
 
@@ -19,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from orchestra import (conductor, config, db, findings, http, merge, nod, observer,
-                         proc, project, supervise, runway, sweeper, work_client,
+                         proc, project, supervise, runway, sweeper,
                          worktree)
 
 DEFAULT_INTERVAL = 60
@@ -174,7 +177,7 @@ def _reap_orphans(con, launcher=None) -> list[int]:
     candidates = list(con.execute(
         "SELECT * FROM runs WHERE status='spawning' "
         "AND supervisor_pid IS NULL "
-        "AND COALESCE(work_claim_status, '')!='pending' ORDER BY id"))
+        "AND COALESCE(claim_status, '')!='pending' ORDER BY id"))
     for candidate in candidates:
         started = _launch_started_at(candidate["started_at"])
         if started is not None and started > cutoff:
@@ -393,7 +396,15 @@ def _act_on_nod_answers(con, cfg: dict) -> list[dict]:
 
 
 def tick() -> dict:
-    """One pass. Returns a small report; never raises for a Work-side fault."""
+    """One pass. Returns a small report; never raises for a source-side fault.
+
+    This is the SCHEDULER and nothing else. It decides when each job runs and
+    in what order; it does not know a work source exists, cannot name one, and
+    builds no client for one. The adapter passes below take ``cfg`` and answer
+    with an empty list when no source is configured, so a tick is complete and
+    reports every job on a machine with Work switched off entirely
+    (CONTRACT §7 Enforcement 3).
+    """
     cfg = config.load()
     report = {"swept": [], "conducted": [], "released": [], "reaped": [],
               "recovered_results": [], "resumed_results": [],
@@ -424,14 +435,12 @@ def tick() -> dict:
         sweeper.refresh_projects(con, cfg)
     finally:
         con.close()
-    client = work_client.from_cfg(cfg)
-    if client is not None:
-        report["swept"] = sweeper.sweep(cfg, client)
-        # The conductor rides the same tick (DESIGN §10). It reads the board
-        # and costs ZERO tokens unless a goal has an event worth judging.
-        # ponytail: that is a second whole-board GET per tick; share the
-        # sweeper's fetch once one of the two passes owns it.
-        report["conducted"] = conductor.pass_once(cfg, client)
+    report["swept"] = sweeper.sweep(cfg)
+    # The conductor rides the same tick (DESIGN §10). It reads the board
+    # and costs ZERO tokens unless a goal has an event worth judging.
+    # ponytail: that is a second whole-board GET per tick; share the
+    # sweeper's fetch once one of the two passes owns it.
+    report["conducted"] = conductor.pass_once(cfg)
     return report
 
 

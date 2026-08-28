@@ -772,7 +772,7 @@ def escalate(con, run, *, title: str, detail: str, cfg: dict | None = None,
             return out
         file_card = nod.alert if alert_only else nod.failure
         filed = file_card(target, detail, title=title, con=con, run_id=run_id,
-                          work_item=run["ref"] if run is not None else None)
+                          ref=run["ref"] if run is not None else None)
         out["nod"] = filed.get("request_id")
     except Exception as exc:  # a dead Nod must not swallow the reasoning
         out["nod_error"] = f"{exc.__class__.__name__}: {exc}"

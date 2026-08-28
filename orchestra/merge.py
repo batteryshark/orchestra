@@ -923,7 +923,7 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
     try:
         created = nod.merge_conflict(
             channels, "\n\n".join(detail), con=con, run_id=int(run["id"]),
-            work_item=run.get("ref"),
+            ref=run.get("ref"),
             title=f"{result['branch']} did not land on {result['base']}",
             summary=result["escalation"][:200], **staged)
     except (nod.NodError, nod.NodChannelError) as exc:

@@ -28,6 +28,13 @@ Data-model invariants (DESIGN D4):
   exactly as ``conductor_turns`` is owned by ``conductor.py``; nothing in the
   core reads it, and a second source's adapter brings its own table rather
   than columns on ``runs``.
+- ``runs.claim_status`` (schema v16 as ``work_claim_status``, renamed in v25)
+  is the ADMISSION GATE, and it stayed on ``runs`` when the watermarks left
+  because the core genuinely reads it: ``daemon._reap_orphans`` must not reap
+  a run parked in ``spawning`` while its dispatch is still being confirmed
+  somewhere else. ``pending`` / ``claimed`` / ``abandoned`` describe the run's
+  own lifecycle; the core never learns what the claim was made against, so the
+  name stopped saying Work (CONTRACT §7 Enforcement 1).
 - ``runs.project_id`` (schema v4, the daemon) is Work's immutable
   ``projectId``. Rows key on it, never on a path: one central database now
   holds every project's runs, and renaming a folder must lose nothing.
@@ -95,8 +102,11 @@ Data-model invariants (DESIGN D4):
   write them; synthetic terminal rows do not become replay candidates merely
   because their status changed. Historical rows remain NULL.
 - ``nod_requests`` (schema v7, the human loop) maps a Nod request id to the
-  run and Work item it escalated, so a decision can be mirrored into the
-  Work thread. ``channel`` is stored because a Nod issuer token is scoped to
+  run and the ``ref`` it escalated, so a source adapter can carry the answer
+  onward. That column was ``work_item`` until schema v25 and is now the same
+  OPAQUE string ``runs.ref`` is: the caller supplies it, the core stores and
+  echoes it, and only an adapter knows it spells a Work id today (CONTRACT §7
+  Enforcement 1). ``channel`` is stored because a Nod issuer token is scoped to
   exactly one channel: a later decision/wait/cancel read has to pick the
   credential for the channel the card was filed to, never guess.
   ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
@@ -131,7 +141,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "24"
+SCHEMA_VERSION = "25"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -167,9 +177,11 @@ RUNS_V13_COLUMNS = (
 RUNS_V15_COLUMNS = (
     ("layer", "TEXT"),
 )
-# Schema v16 (W-0295). Landing, handoff, worker recovery, and Work claim
-# handoff all stamp the plain run row; no result object or replay table is
-# needed.
+# Schema v16 (W-0295). Landing, handoff, worker recovery, and claim handoff
+# all stamp the plain run row; no result object or replay table is needed.
+# ``claim_status`` (v16's ``work_claim_status``) is deliberately NOT in this
+# list: v25 either RENAMES the old column or adds the new one, never both —
+# see ``connect``.
 RUNS_V16_COLUMNS = (
     ("landing_status", "TEXT"),
     ("handoff_processed_at", "TEXT"),
@@ -177,7 +189,6 @@ RUNS_V16_COLUMNS = (
     ("supervisor_pid_identity", "TEXT"),
     ("worker_status", "TEXT"),
     ("worker_exit_code", "INTEGER"),
-    ("work_claim_status", "TEXT"),
 )
 # Schema v17. A run may ask for HELP: a weaker profile to take a bounded
 # piece while it keeps the mission. ``parent_run`` already says who spawned
@@ -317,7 +328,7 @@ CREATE TABLE IF NOT EXISTS runs (
   handoff_processed_at TEXT,
   worker_status TEXT,
   worker_exit_code INTEGER,
-  work_claim_status TEXT,
+  claim_status TEXT,
   child_depth INTEGER,
   spawn_request_id INTEGER,
   child_wakeup_run INTEGER,
@@ -518,7 +529,7 @@ CREATE TABLE IF NOT EXISTS nod_requests (
   kind TEXT NOT NULL,
   channel TEXT NOT NULL,
   run_id INTEGER REFERENCES runs(id),
-  work_item TEXT,
+  ref TEXT,
   dedupe_key TEXT,
   title TEXT,
   body TEXT,
@@ -532,7 +543,7 @@ CREATE TABLE IF NOT EXISTS nod_requests (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nod_requests_run ON nod_requests(run_id);
-CREATE INDEX IF NOT EXISTS idx_nod_requests_work ON nod_requests(work_item);
+CREATE INDEX IF NOT EXISTS idx_nod_requests_ref ON nod_requests(ref);
 -- Schema v9 (DESIGN §9). ``fingerprint`` is the hash of (project, where,
 -- normalized claim); ``issue_id`` is the Work issue the first occurrence
 -- filed, which every repeat comments on instead of duplicating.
@@ -646,6 +657,15 @@ def connect(db_file=None) -> sqlite3.Connection:
                 con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
         elif "ref" not in existing:
             con.execute("ALTER TABLE runs ADD COLUMN ref TEXT")
+        # Schema v25 (CONTRACT §6, §7 Enforcement 1). ONE SHOT: the admission
+        # gate keeps its place on ``runs`` — the reaper reads it — and stops
+        # naming the one source that happens to confirm the claim. Same rule
+        # as v21: rename OR add, never a reader that accepts both spellings.
+        if "work_claim_status" in existing:
+            con.execute(
+                "ALTER TABLE runs RENAME COLUMN work_claim_status TO claim_status")
+        elif "claim_status" not in existing:
+            con.execute("ALTER TABLE runs ADD COLUMN claim_status TEXT")
         if upgrading_v16:
             # A historical completion notice proves the old finalizer reached
             # its durable result boundary. Settle only those rows: replaying
@@ -700,6 +720,15 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in NOD_REQUESTS_V14_COLUMNS + NOD_REQUESTS_V24_COLUMNS:
             if name not in cards:
                 con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
+        # Schema v25 (CONTRACT §6, §7 Enforcement 1). ONE SHOT: an escalation
+        # carries the same OPAQUE ref a run does, so the column stops spelling
+        # one source's name. The index is recreated under its new name by
+        # SCHEMA below; no reader accepts the old spelling.
+        if "work_item" in cards:
+            con.execute("DROP INDEX IF EXISTS idx_nod_requests_work")
+            con.execute("ALTER TABLE nod_requests RENAME COLUMN work_item TO ref")
+        elif "ref" not in cards:
+            con.execute("ALTER TABLE nod_requests ADD COLUMN ref TEXT")
     # Recreate so an older database picks up new terminal statuses in WHEN.
     con.execute("DROP TRIGGER IF EXISTS revoke_run_token")
     # Both board-revision bodies changed in v22 (they now stamp the row);

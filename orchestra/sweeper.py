@@ -537,7 +537,7 @@ def _mark_claim_pending(con, run):
     """Commit the local reservation and its remote-claim phase together."""
     try:
         changed = con.execute(
-            "UPDATE runs SET status='pending', work_claim_status='pending' "
+            "UPDATE runs SET status='pending', claim_status='pending' "
             "WHERE id=?", (run["id"],))
         if changed.rowcount != 1:
             raise RuntimeError(f"run {run['id']} disappeared during claim reservation")
@@ -582,7 +582,7 @@ def _confirm_claim(con, client: WorkClient, kind: str, item: dict, run) -> str:
             return "deferred"
     con.execute(
         "UPDATE runs SET status='spawning', started_at=? WHERE id=? "
-        "AND work_claim_status='pending' AND status IN ('pending','spawning')",
+        "AND claim_status='pending' AND status IN ('pending','spawning')",
         (db.now(), run["id"]))
     con.commit()
     return "claimed"
@@ -606,7 +606,7 @@ def _abandon_claim(con, run) -> None:
         con.execute(
             "UPDATE runs SET status='killed', "
             "worker_status=COALESCE(worker_status, 'killed'), "
-            "work_claim_status='abandoned', "
+            "claim_status='abandoned', "
             "summary=?, finished_at=COALESCE(finished_at, ?) WHERE id=?",
             (reason, db.now(), current["id"]))
         mark(con, int(current["id"]), "reported_at", db.now(), once=True)
@@ -655,7 +655,7 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
         error = str(exc)[:1000] or exc.__class__.__name__
         if prior is None:
             supervise.fail_launch(con, root, run_id, error)
-        con.execute("UPDATE runs SET work_claim_status='claimed' WHERE id=?",
+        con.execute("UPDATE runs SET claim_status='claimed' WHERE id=?",
                     (run_id,))
         con.commit()
         print(f"orchestra sweep: {item['id']} launch setup failed: {error}")
@@ -682,7 +682,7 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
     except BaseException as exc:
         error = str(exc)[:1000] or exc.__class__.__name__
         supervise.fail_launch(con, root, run_id, error)
-        con.execute("UPDATE runs SET work_claim_status='claimed' WHERE id=?",
+        con.execute("UPDATE runs SET claim_status='claimed' WHERE id=?",
                     (run_id,))
         con.commit()
         actions.append({"action": "launch_failed", "item": item["id"],
@@ -691,7 +691,7 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
         return "failed"
     # A crash before this receipt may start another detached supervisor, but
     # supervise() admits exactly one of them before either can start a worker.
-    con.execute("UPDATE runs SET work_claim_status='claimed' WHERE id=?",
+    con.execute("UPDATE runs SET claim_status='claimed' WHERE id=?",
                 (run_id,))
     con.commit()
     actions.append({"action": "dispatch", "item": item["id"], "run": run_id,
@@ -708,7 +708,7 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
     ok = True
     by_id = {item["id"]: (kind, item) for kind, item in items}
     pending = list(con.execute(
-        f"SELECT * FROM runs WHERE work_claim_status='pending' "
+        f"SELECT * FROM runs WHERE claim_status='pending' "
         f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id"))
     for run in pending:
         found = by_id.get(run["ref"])
@@ -865,7 +865,7 @@ def _ferry(con, client: WorkClient, items: list, actions: list) -> bool:
         # A claim still pending confirmation never receives tells: nothing has
         # launched, and _finish_claim folds these same comments into the
         # mission it launches with — ferrying now would deliver them twice.
-        if run["work_claim_status"] == "pending":
+        if run["claim_status"] == "pending":
             continue
         news = _new_human_comments(item, kind, seen, client.identity)
         if not news:
@@ -1017,12 +1017,23 @@ def _progress(con, cfg: dict, client: WorkClient, actions: list) -> None:
 
 # --- one pass ---------------------------------------------------------------
 
-def sweep(cfg: dict, client: WorkClient,
+def sweep(cfg: dict, client: WorkClient | None = None,
           launcher=supervise.spawn_supervisor) -> list[dict]:
     """One incremental pass over the whole workspace. Returns the actions
     taken. Never raises for a Work-side failure; the cursor simply does not
-    advance."""
+    advance.
+
+    The client is BUILT HERE when the caller does not hand one in, and an
+    unconfigured Work is an empty pass, not an error. That is what lets the
+    daemon schedule this pass without knowing a source exists: it decides
+    WHEN, the adapter decides WHO to talk to (CONTRACT §7 Enforcement 3).
+    ``refresh_projects`` above has worked this way since v21.
+    """
     actions: list[dict] = []
+    if client is None:
+        client = from_cfg(cfg)
+        if client is None:
+            return actions
     con = db.connect()
     try:
         # Before the report: the report's own receipt is what bounds the
@@ -1040,7 +1051,7 @@ def sweep(cfg: dict, client: WorkClient,
         # pass reads the whole board. That read is also what supplies
         # ready-lane order, since Work serves the lane in board order.
         unresolved_claim = con.execute(
-            f"SELECT 1 FROM runs WHERE work_claim_status='pending' "
+            f"SELECT 1 FROM runs WHERE claim_status='pending' "
             f"AND status NOT IN {db.TERMINAL_SQL} LIMIT 1").fetchone()
         full = (dispatch.paused(con) or bool(dispatch.waiting_ids(con))
                 or unresolved_claim is not None)

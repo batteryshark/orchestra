@@ -48,7 +48,7 @@ from datetime import datetime
 from orchestra import (config, db, dispatch, findings, names, nod, observer, paths,
                          profiles as profiles_mod, project, runway as runway_mod,
                          supervise, sweeper, work_client)
-from orchestra.work_client import WorkError
+from orchestra.work_client import WorkError, from_cfg
 
 # The packet is ~5x the 300-token worker brief: a planner deciding what to
 # spend needs the state (DESIGN §10). The cap is HARD — oldest detail is
@@ -729,7 +729,7 @@ def _ask_human(con, cfg: dict, client, goal: dict, decision: dict,
             filed = nod.blocked_run(
                 target, question, title=f"{goal['id']}: {goal.get('title', '')}"[:200],
                 summary=decision.get("rationale", "")[:500], con=con,
-                work_item=goal["id"])
+                ref=goal["id"])
             out["nod"] = filed.get("request_id")
     except Exception as exc:  # a dead Nod must not swallow the question
         out["nod_error"] = f"{exc.__class__.__name__}: {exc}"
@@ -874,11 +874,20 @@ def _project_id(con, item: dict) -> str | None:
     return hit.project_id if hit else None
 
 
-def pass_once(cfg: dict, client, *, turn=None,
+def pass_once(cfg: dict, client=None, *, turn=None,
               launcher=supervise.spawn_supervisor,
               floor: int = TURN_FLOOR_SECONDS) -> list[dict]:
-    """One conductor pass over every open goal. Never raises for one goal."""
+    """One conductor pass over every open goal. Never raises for one goal.
+
+    Builds its own client when the caller hands none in, and an unconfigured
+    Work is an empty pass: the daemon schedules this without naming a source
+    (CONTRACT §7 Enforcement 3), exactly as ``sweeper.sweep`` does.
+    """
     actions: list[dict] = []
+    if client is None:
+        client = from_cfg(cfg)
+        if client is None:
+            return actions
     tasks = client.tasks()
     if tasks is None:
         return actions

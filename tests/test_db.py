@@ -118,6 +118,57 @@ class DbTests(unittest.TestCase):
                          ("ok", "done-at"))
         con.close()
 
+    def test_v24_source_named_columns_are_renamed_once_and_keep_their_values(
+            self) -> None:
+        """Schema v25 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, both tables.
+
+        ``runs.work_claim_status`` becomes ``claim_status`` and
+        ``nod_requests.work_item`` becomes ``ref``: same values, same index
+        coverage, and the old spelling is gone rather than tolerated. §6
+        forbids a reader that accepts two shapes, so the old names must not
+        survive the upgrade.
+        """
+        v24 = (db.SCHEMA
+               .replace("  claim_status TEXT,", "  work_claim_status TEXT,", 1)
+               .replace("  ref TEXT,\n  dedupe_key TEXT,",
+                        "  work_item TEXT,\n  dedupe_key TEXT,", 1)
+               .replace("CREATE INDEX IF NOT EXISTS idx_nod_requests_ref "
+                        "ON nod_requests(ref);",
+                        "CREATE INDEX IF NOT EXISTS idx_nod_requests_work "
+                        "ON nod_requests(work_item);", 1))
+        legacy = self.legacy_db(
+            "v24.db", v24,
+            (INSERT_MIN, ("t",)),
+            ("UPDATE runs SET work_claim_status='pending'", ()),
+            ("INSERT INTO nod_requests(request_id, kind, channel, run_id, "
+             "work_item, status, created_at) VALUES(?,?,?,?,?,?,?)",
+             ("req_1", "failure", "C1", 1, "W-0168", "pending", db.now())))
+        con = db.connect(legacy)
+        con.row_factory = sqlite3.Row
+        runs = {r["name"] for r in con.execute("PRAGMA table_info(runs)")}
+        cards = {r["name"] for r in con.execute("PRAGMA table_info(nod_requests)")}
+        self.assertIn("claim_status", runs)
+        self.assertNotIn("work_claim_status", runs)
+        self.assertIn("ref", cards)
+        self.assertNotIn("work_item", cards)
+        self.assertEqual(
+            con.execute("SELECT claim_status FROM runs").fetchone()[0], "pending")
+        self.assertEqual(
+            con.execute("SELECT ref FROM nod_requests").fetchone()[0], "W-0168")
+        indexes = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='nod_requests'")}
+        self.assertIn("idx_nod_requests_ref", indexes)
+        self.assertNotIn("idx_nod_requests_work", indexes)
+        con.close()
+        again = db.connect(legacy)  # the one shot does not fire twice
+        self.addCleanup(again.close)
+        self.assertEqual(
+            again.execute("SELECT ref FROM nod_requests").fetchone()[0], "W-0168")
+        self.assertEqual(
+            again.execute("SELECT value FROM meta WHERE key='schema_version'"
+                          ).fetchone()[0], db.SCHEMA_VERSION)
+
     def test_run_round_trip_carries_project_id_and_slug_is_unique(self) -> None:
         insert = ("INSERT INTO runs(slug, profile, backend, model, title, "
                   "requested_by, workdir, project_id, status, started_at) "
@@ -134,7 +185,7 @@ class DbTests(unittest.TestCase):
              "53efe3c3-6def-4797-8560-3dce073d7d63"))
         for column in ("finished_at", "landing_status", "handoff_processed_at",
                        "pid_identity", "supervisor_pid_identity", "worker_status",
-                       "worker_exit_code", "work_claim_status"):
+                       "worker_exit_code", "claim_status"):
             self.assertIsNone(run[column], column)
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute(insert, row)  # slug is UNIQUE
