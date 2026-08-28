@@ -89,15 +89,15 @@ class SweeperFixture:
     def sweep(self):
         return sweeper.sweep(self.cfg, self.client, launcher=self.launcher)
 
-    def archive_project(self, work_id="demo", archived=True) -> None:
+    def archive_project(self, source_ref="demo", archived=True) -> None:
         """The owner archives the project IN WORK (DESIGN §1). Orchestra
         copies the flag on its next refresh and never writes it back."""
         for entry in self.work.projects:
-            if entry["id"] == work_id:
+            if entry["id"] == source_ref:
                 entry["archived"] = archived
         con = db.connect()
         try:
-            self.assertTrue(project.refresh(con, self.cfg))
+            self.assertTrue(sweeper.refresh_projects(con, self.cfg))
         finally:
             con.close()
 
@@ -1141,7 +1141,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.add_config(OTHER_PROFILE_ONLY)
         con = db.connect()
         try:
-            self.assertTrue(project.refresh(con, config.load()))
+            self.assertTrue(sweeper.refresh_projects(con, config.load()))
         finally:
             con.close()
         args = Namespace(mission=["do the thing"], to="stub", after=None,

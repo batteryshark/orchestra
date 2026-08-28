@@ -21,7 +21,7 @@ CORE = Path(__file__).resolve().parent.parent / "orchestra"
 ADAPTER = {"sweeper", "conductor", "verify", "refine", "findings"}
 
 # Every other module that imports the Work client today. Shrink only.
-LEAKING = {"daemon", "profile_edit", "project"}
+LEAKING = {"daemon"}
 
 
 def _imports_work_client(path: Path) -> bool:

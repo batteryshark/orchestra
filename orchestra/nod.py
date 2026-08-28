@@ -37,6 +37,7 @@ test|show|cancel`` is the manual surface.
 import json
 import os
 import sqlite3
+import uuid
 import sys
 import urllib.error
 import urllib.parse
@@ -425,7 +426,8 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
                             **card)
     if con is not None:
         record(con, created["request_id"], kind=kind, channel=client.channel_id,
-               run_id=run_id, work_item=work_item, dedupe_key=dedupe_key)
+               run_id=run_id, work_item=work_item, dedupe_key=dedupe_key,
+               title=title, body=card.get("body_markdown"))
     return created
 
 
@@ -450,21 +452,84 @@ def _rfc3339(when) -> str:
 
 
 # --- persistence (db.nod_requests, schema v6) -------------------------------
-# Nod is the input device; Work stays the ledger. This table is the bridge:
-# it remembers which run and which Work item a Nod request id belongs to, so
-# a decision can be mirrored into the Work thread later.
+# THE ESCALATION RECORD. Nod is one delivery of one escalation, not the
+# escalation itself: a row here is written whether or not a card was ever
+# pushed, and since v24 it carries what the escalation SAID. That is what
+# makes it durable enough to be written BEFORE any delivery is attempted
+# (``record_escalation``), which is the ordering DESIGN §5's profile
+# escalations depend on — the refusal used to survive while the thing being
+# refused did not.
+# It also remembers which run and which Work item a Nod request id belongs
+# to, so a decision can be mirrored into the Work thread later.
 # `channel` is what makes a later read possible at all: the token is scoped
 # to one channel, so the channel has to be remembered, not inferred.
 # No token is stored in this table, and no column exists for one.
 
 def record(con: sqlite3.Connection, request_id: str, *, kind: str, channel: str,
            run_id: int | None = None, work_item: str | None = None,
-           dedupe_key: str | None = None) -> None:
+           dedupe_key: str | None = None, title: str | None = None,
+           body: str | None = None, status: str = "pending") -> None:
+    """One escalation, stored (schema v24 adds ``title``/``body``).
+
+    The row keeps WHAT WAS SAID, not just where it was sent: a reader that
+    carries the same escalation onward — a source adapter filing a decision —
+    reads it here rather than asking Nod, and the module that filed it never
+    learns who reads it (CONTRACT §7 Enforcement 2).
+    """
+    # Same request id means Nod deduped onto the card already filed, so the
+    # two once-only stamps SURVIVE the re-record: a retried ask must not
+    # re-arm an action that already ran or re-file a decision already filed.
     con.execute(
-        "INSERT OR REPLACE INTO nod_requests(request_id, kind, channel, run_id, "
-        "work_item, dedupe_key, status, created_at) VALUES(?,?,?,?,?,?,'pending',?)",
-        (request_id, kind, channel, run_id, work_item, dedupe_key, _now()))
+        "INSERT INTO nod_requests(request_id, kind, channel, run_id, "
+        "work_item, dedupe_key, title, body, status, created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(request_id) DO UPDATE SET kind=excluded.kind, "
+        "channel=excluded.channel, run_id=excluded.run_id, "
+        "work_item=excluded.work_item, dedupe_key=excluded.dedupe_key, "
+        "title=excluded.title, body=excluded.body, status=excluded.status, "
+        "created_at=excluded.created_at",
+        (request_id, kind, channel, run_id, work_item, dedupe_key, title, body,
+         status, _now()))
     con.commit()
+
+
+# A profile change an agent asked for and may not make itself (DESIGN §5).
+# It is never a Nod card — dismiss-only push for something the human has to
+# go and apply is noise — so it has no entry in KIND_ROLE and reaches the
+# human as `orchestra profiles` plus the decision a source adapter files off
+# the record.
+PROFILE_CHANGE = "profile_change"
+
+# A row that was RECORDED and never pushed. Deliberately not ``pending``:
+# every other reader of this table keys on ``pending`` (the startup wait
+# backstop) or on a Nod-side status (``unmirrored``, the answers pass), and a
+# row with no card behind it must be inert to all of them.
+RECORDED = "recorded"
+
+
+def record_escalation(con: sqlite3.Connection, *, kind: str, title: str,
+                      body: str, dedupe_key: str) -> str:
+    """Write one escalation down. No network, no channel, no failure path.
+
+    THE DURABLE WRITE COMES FIRST. An escalation that attempts delivery
+    before it records itself loses its own content the moment delivery fails
+    — the caller is still told a human is needed, and nobody can say what for
+    (2026-08-28: an agent's profile request reached neither Work nor any local
+    row, and the values are unrecoverable). Whoever delivers it reads the row
+    afterwards and may retry as long as it likes; nothing here waits on them.
+
+    Re-asking the same thing updates the row that is still undelivered rather
+    than adding a second one. Once it HAS been delivered the next ask is new
+    news and gets its own row.
+    """
+    row = con.execute(
+        "SELECT request_id FROM nod_requests WHERE dedupe_key=? AND kind=? "
+        "AND mirrored_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        (dedupe_key, kind)).fetchone()
+    request_id = row["request_id"] if row else f"local:{uuid.uuid4()}"
+    record(con, request_id, kind=kind, channel="", dedupe_key=dedupe_key,
+           title=title, body=body, status=RECORDED)
+    return request_id
 
 
 def save_decision(con: sqlite3.Connection, request_id: str, view: dict) -> None:
@@ -497,6 +562,20 @@ def unmirrored(con: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(con.execute(
         "SELECT * FROM nod_requests WHERE status!='pending' AND mirrored_at IS NULL "
         "AND work_item IS NOT NULL ORDER BY created_at"))
+
+
+def unmirrored_of_kind(con: sqlite3.Connection, kind: str) -> list[sqlite3.Row]:
+    """Escalations of one kind that no source has been told about yet.
+
+    Same watermark as ``unmirrored`` and for the same reason: ``mirrored_at``
+    means "a record system has this", so nothing invents a second delivery
+    state. Unlike ``unmirrored`` these are listed whatever their status — the
+    escalation itself is the news, not its answer. Also the human's offline
+    view (``pending_escalations``), which is why it selects the whole row.
+    """
+    return list(con.execute(
+        "SELECT * FROM nod_requests WHERE kind=? AND mirrored_at IS NULL "
+        "ORDER BY created_at", (kind,)))
 
 
 # --- the acting half (DESIGN §9): a tapped merge card does something --------

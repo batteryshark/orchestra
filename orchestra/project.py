@@ -1,31 +1,42 @@
 """Resolve a directory through Orchestra's central project registry.
 
-Projects may be adopted locally or cached from Work. The deepest registered
-path containing the current directory wins. Everything downstream uses the
-stored project id, so renaming a Work-backed project folder loses no settings.
+The registry is Orchestra's own (DESIGN §2). A row is either adopted locally
+or backed by a work source, and the two differ by exactly one column:
+``source_ref``, the SOURCE'S OWN identifier for the project. It is opaque
+here, like ``runs.ref`` — this module compares it, groups by it and hands it
+back, and never parses it for meaning beyond the path shape ``_discover``
+documents. Filling source-backed rows is the adapter's job (CONTRACT §7
+Enforcement); ``remember_source`` is the one seam it writes through, and
+nothing in this file knows which source is on the other side.
+
+The deepest registered path containing the current directory wins. Everything
+downstream uses the stored project id, so renaming a project folder loses no
+settings.
 """
 import os
 import uuid
 from pathlib import Path
 
-from orchestra import paths, work_client
+from orchestra import paths
 
 MISS_HINT = """\
 orchestra: {path} is not inside a registered project.
-Run `orchestra project add .`, or enable [work] and point api_url at a Work
-server that knows this directory, then retry."""
+Run `orchestra project add .`, or configure a work source that knows this
+directory and refresh, then retry."""
 
 
 class Project:
     """One cached (path -> projectId) mapping. ``path`` is a lookup key only."""
 
-    __slots__ = ("project_id", "path", "work_id", "name", "archived")
+    __slots__ = ("project_id", "path", "source_ref", "name", "archived")
 
-    def __init__(self, project_id: str, path: Path, work_id: str | None,
+    def __init__(self, project_id: str, path: Path, source_ref: str | None,
                  name: str | None, archived: bool = False):
         self.project_id = project_id
         self.path = path
-        self.work_id = work_id
+        # The source's own identifier for this project, or None when the row
+        # was adopted locally. Opaque (CONTRACT §7 Enforcement 1).
+        self.source_ref = source_ref
         self.name = name
         # DESIGN §1: parked, not deleted. Read by the unattended lanes and
         # the listing surfaces; nothing that reads history looks at it.
@@ -33,7 +44,7 @@ class Project:
 
     @property
     def slug(self) -> str:
-        return self.work_id or self.name or self.path.name
+        return self.source_ref or self.name or self.path.name
 
     def __repr__(self) -> str:
         return f"Project({self.project_id} @ {self.path})"
@@ -42,67 +53,66 @@ class Project:
 def _row(row) -> Project | None:
     if row is None:
         return None
-    return Project(row["project_id"], Path(row["path"]), row["work_id"], row["name"],
+    return Project(row["project_id"], Path(row["path"]), row["source_ref"],
+                   row["name"],
                    bool(row["archived"]))
 
 
 # --- cache ------------------------------------------------------------------
 
-def remember(con, workspace_root: str, entries: list) -> int:
-    """Cache Work's project list. Relative paths resolve against the workspace
-    root; each aliasPath gets its own row so it resolves too."""
+def remember_source(con, rows: list) -> int:
+    """Write the source-backed rows of the registry. Returns rows written.
+
+    The ONE seam an adapter writes the registry through (CONTRACT §7
+    Enforcement): each entry is a plain
+    ``(path, project_id, source_ref, name, archived)`` tuple, already
+    resolved to an absolute path by whoever knows the source's shape. This
+    module owns the table and its rules; it learns nothing about the source
+    to enforce them.
+    """
     from orchestra import db  # local: db imports paths, not project
 
-    root = Path(workspace_root).expanduser()
-    ts, count = db.now(), 0
-    seen: list = []
-    for entry in entries:
-        project_id = entry.get("projectId")
-        if not project_id:
-            continue  # a project Work has not stamped yet is not addressable
-        for rel in [entry.get("path"), *(entry.get("aliasPaths") or [])]:
-            if not rel:
-                continue
-            p = Path(rel).expanduser()
-            absolute = p if p.is_absolute() else root / p
-            # Work owns the archived flag (DESIGN §1); every refresh copies
-            # it, so archiving there parks the project here and unarchiving
-            # brings it back, with no local action either way.
-            con.execute(
-                "INSERT OR REPLACE INTO projects(path, project_id, work_id, name, "
-                "refreshed_at, archived) VALUES(?,?,?,?,?,?)",
-                (str(absolute), project_id, entry.get("id"), entry.get("name"), ts,
-                 int(entry.get("archived") is True)))
-            seen.append(str(absolute))
-            count += 1
-    # A Work-sourced row whose path Work no longer names is stale — a moved or
-    # deleted project, or a worktree copy that briefly won discovery (I-0013's
-    # ghost lived here long after Work was fixed). Prune those; locally
-    # adopted rows (work_id NULL) are never Work's to delete.
+    ts, count, seen = db.now(), 0, []
+    for path, project_id, source_ref, name, archived in rows:
+        if not project_id or not source_ref:
+            continue  # a row with no source identity is not source-backed
+        con.execute(
+            "INSERT OR REPLACE INTO projects(path, project_id, source_ref, name, "
+            "refreshed_at, archived) VALUES(?,?,?,?,?,?)",
+            (str(path), project_id, source_ref, name, ts, int(bool(archived))))
+        seen.append(str(path))
+        count += 1
+    # A source-backed row whose path the source no longer names is stale — a
+    # moved or deleted project, or a worktree copy that briefly won discovery
+    # (I-0013's ghost lived here long after the source was fixed). Prune
+    # those; locally adopted rows (``source_ref`` NULL) are never a source's
+    # to delete.
     if seen:
         marks = ",".join("?" * len(seen))
         con.execute(
-            f"DELETE FROM projects WHERE work_id IS NOT NULL AND path NOT IN ({marks})",
-            seen)
+            "DELETE FROM projects WHERE source_ref IS NOT NULL "
+            f"AND path NOT IN ({marks})", seen)
     con.commit()
     return count
 
 
 def adopt(con, root: Path, name: str | None = None) -> "Project":
-    """Register a project Orchestra owns itself, with no Work behind it.
+    """Register a project Orchestra owns itself, with no source behind it.
 
-    Work is the system of record when it is there, and ``remember`` caches its
-    list. But the projects table was the ONLY way to address a directory, and
-    the only writer was Work — so without it ``dispatch`` could not resolve
-    anything and the tool did not run standalone at all.
+    A work source is the system of record when one is configured, and
+    ``remember_source`` caches its list. But the projects table was the ONLY
+    way to address a directory, and the only writer was that source — so
+    without it ``dispatch`` could not resolve anything and the tool did not
+    run standalone at all.
 
-    A locally adopted project is the same row with ``work_id`` NULL. Nothing
-    downstream cares: a run resolves by path and carries ``project_id``, and
-    writeback is skipped for a run with no Work item anyway. ``remember`` only
-    ever inserts or replaces the paths Work names, and the stale-row prune
-    skips work_id-NULL rows, so a later refresh cannot delete this row — and
-    if Work is ever told about the same directory, its entry replaces this
-    one, which is the right precedence.
+    A locally adopted project is the same row with ``source_ref`` NULL.
+    Nothing downstream cares: a run resolves by path and carries
+    ``project_id``, and writeback is skipped for a run with no ref anyway.
+    ``remember_source`` only ever inserts or replaces the paths the source
+    names, and the stale-row prune skips source_ref-NULL rows, so a later
+    refresh cannot delete this row — and if the source is ever told about the
+    same directory, its entry replaces this one, which is the right
+    precedence.
     """
     from orchestra import db  # local: db imports paths, not project
 
@@ -114,7 +124,7 @@ def adopt(con, root: Path, name: str | None = None) -> "Project":
     if existing is not None:
         return existing
     con.execute(
-        "INSERT INTO projects(path, project_id, work_id, name, refreshed_at) "
+        "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at) "
         "VALUES(?,?,NULL,?,?)",
         (str(root), str(uuid.uuid4()), name or root.name, db.now()))
     con.commit()
@@ -123,33 +133,39 @@ def adopt(con, root: Path, name: str | None = None) -> "Project":
 
 
 def forget(con, root: Path) -> bool:
-    """Drop a locally adopted project. Refuses one that came from Work, since
+    """Drop a locally adopted project. Refuses one a work source owns, since
     the next refresh would put it back and the removal would look broken."""
     root = Path(root).expanduser().resolve()
-    row = con.execute("SELECT work_id FROM projects WHERE path=?",
+    row = con.execute("SELECT source_ref FROM projects WHERE path=?",
                       (str(root),)).fetchone()
     if row is None:
         return False
-    if row["work_id"]:
+    if row["source_ref"]:
+        # Named, not described: the human reading this has to know WHERE to
+        # go, and the identifier the source gave the project is the only
+        # address this module has (CONTRACT §7 — it is not parsed, just
+        # quoted back).
         raise SystemExit(
-            f"orchestra: {root} comes from Work; remove it there, not here")
+            f"orchestra: {root} comes from the work source that owns "
+            f"{row['source_ref']!r}; remove it there, not here")
     con.execute("DELETE FROM projects WHERE path=?", (str(root),))
     con.commit()
     return True
 
 
 def set_archived(con, root: Path, archived: bool) -> bool:
-    """Park or unpark a locally adopted project. Refuses one that came from
-    Work, which owns the flag: the next refresh would overwrite the local
-    answer and the change would look broken."""
+    """Park or unpark a locally adopted project. Refuses one a work source
+    owns, since that source owns the flag: the next refresh would overwrite
+    the local answer and the change would look broken."""
     root = Path(root).expanduser().resolve()
-    row = con.execute("SELECT work_id FROM projects WHERE path=?",
+    row = con.execute("SELECT source_ref FROM projects WHERE path=?",
                       (str(root),)).fetchone()
     if row is None:
         return False
-    if row["work_id"]:
+    if row["source_ref"]:
         raise SystemExit(
-            f"orchestra: {root} comes from Work; archive it there, not here")
+            f"orchestra: {root} comes from the work source that owns "
+            f"{row['source_ref']!r}; archive it there, not here")
     con.execute("UPDATE projects SET archived=? WHERE path=?",
                 (int(archived), str(root)))
     con.commit()
@@ -160,19 +176,6 @@ def all_projects(con, include_archived: bool = False) -> list:
     where = "" if include_archived else " WHERE archived=0"
     return [_row(r) for r in con.execute(
         f"SELECT * FROM projects{where} ORDER BY path")]
-
-
-def refresh(con, cfg: dict) -> int:
-    """Re-read the project list from Work. Returns rows cached (0 when Work
-    is off or unreachable — an offline miss must not crash the CLI)."""
-    client = work_client.from_cfg(cfg)
-    if client is None:
-        return 0
-    root = client.workspace_root()
-    entries = client.projects()
-    if root is None or entries is None:
-        return 0
-    return remember(con, root, entries)
 
 
 # --- lookups ----------------------------------------------------------------
@@ -194,20 +197,30 @@ def start_dir(explicit: str | None = None) -> Path:
     return Path(raw).expanduser().resolve()
 
 
-def resolve(con, cfg: dict, explicit: str | None = None) -> Project:
-    """The project containing this directory. Refreshes once on a miss."""
+def resolve(con, cfg: dict, explicit: str | None = None,
+            refresh=None) -> Project:
+    """The project containing this directory. Refreshes once on a miss.
+
+    ``refresh`` is the adapter's ``(con, cfg) -> int`` re-read of its source's
+    project list. Passing it is how a caller that HAS a source keeps the
+    warm-the-cold-cache behaviour; omitting it means the registry answers
+    from what it already holds. Core code cannot reach a source itself
+    (CONTRACT §7 Enforcement 3), and a callable in the signature is smaller
+    than a registry of listeners.
+    """
     start = start_dir(explicit)
     hit = _deepest(con, start)
-    if hit is None and refresh(con, cfg):
+    if hit is None and refresh is not None and refresh(con, cfg):
         hit = _deepest(con, start)
     if hit is None:
         raise SystemExit(MISS_HINT.format(path=start))
     return hit
 
 
-def try_resolve(con, cfg: dict, explicit: str | None = None) -> Project | None:
+def try_resolve(con, cfg: dict, explicit: str | None = None,
+                refresh=None) -> Project | None:
     try:
-        return resolve(con, cfg, explicit)
+        return resolve(con, cfg, explicit, refresh)
     except SystemExit:
         return None
 
@@ -233,39 +246,43 @@ def by_id(con, project_id: str | None) -> Project | None:
         (project_id,)).fetchone())
 
 
-def by_work_path(con, project_path: str | None) -> Project | None:
-    """Resolve the ``projectPath`` a Work item carries (its Work project id,
-    or an absolute local path)."""
-    if not project_path:
+def by_source_ref(con, ref: str | None) -> Project | None:
+    """Resolve a source's own project reference to a checkout.
+
+    The ref is matched as itself first and as an absolute local path second,
+    because a source is free to use either and this module is not allowed to
+    know which one it did (CONTRACT §7 Enforcement 1).
+    """
+    if not ref:
         return None
-    row = con.execute("SELECT * FROM projects WHERE work_id=? ORDER BY LENGTH(path) "
-                      "LIMIT 1", (project_path,)).fetchone()
+    row = con.execute(
+        "SELECT * FROM projects WHERE source_ref=? ORDER BY LENGTH(path) LIMIT 1",
+        (ref,)).fetchone()
     if row is None:
         row = con.execute("SELECT * FROM projects WHERE path=?",
-                          (str(Path(project_path).expanduser()),)).fetchone()
+                          (str(Path(ref).expanduser()),)).fetchone()
     return workdir_for(con, _row(row))
 
 
 def workdir_for(con, proj: "Project | None") -> "Project | None":
     """The project with a directory a run can actually work in (W-0312).
 
-    Work's project path is ORGANIZATIONAL, not a filesystem path: since the
-    store-only reset a project is a record, and `projects.mjs` hardcodes
-    empty aliasPaths because a store project has no filesystem markers at
-    all. Orchestra still had to derive a checkout from that path, so grouping
-    the two tools under "Agentic Engineering" pointed every dispatch at a
+    A source's project reference is ORGANIZATIONAL, not a filesystem path: a
+    record system groups projects and may hold no filesystem marker at all.
+    Orchestra still had to derive a checkout from that reference, so grouping
+    two tools under "Agentic Engineering" pointed every dispatch at a
     directory that was never there (I-0302, runs 59 and 60: one died on the
     worktree guard, the other spawned a supervisor with a cwd that did not
     exist and vanished before writing a byte).
 
-    So the path Work names is a hint, and this is the answer, in order:
+    So the reference is a hint, and this is the answer, in order:
 
-    1. Work's own path, when it IS a directory — the common case, unchanged.
-    2. The workspace root plus the path's LAST segment. Grouping is Work's
-       business; the folder keeps its own name. "Agentic Engineering/
-       orchestra" finds ~/Projects/orchestra by itself, which is what should
-       have happened the moment the two tools were grouped — no human tells
-       Orchestra something it can see.
+    1. The reference itself, when it IS a directory — the common case.
+    2. The workspace root plus the reference's LAST segment. Grouping is the
+       source's business; the folder keeps its own name. "Agentic
+       Engineering/orchestra" finds ~/Projects/orchestra by itself, which is
+       what should have happened the moment the two tools were grouped — no
+       human tells Orchestra something it can see.
     3. A checkout bound with ``link`` — the escape hatch for a repository
        that lives somewhere its name does not give away.
     4. An ephemeral workspace under ~/.orchestra/workspaces, for a project
@@ -284,35 +301,37 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
     if proj is None or proj.path.is_dir():
         return proj
     linked = con.execute(
-        "SELECT * FROM projects WHERE project_id=? AND work_id IS NULL",
+        "SELECT * FROM projects WHERE project_id=? AND source_ref IS NULL",
         (proj.project_id,)).fetchone()
     if linked is not None:
         hit = _row(linked)
         # Parking belongs to the PROJECT, not to the row that holds its
-        # address: a linked checkout does not unpark what Work archived.
+        # address: a linked checkout does not unpark what the source parked.
         hit.archived = hit.archived or proj.archived
         return hit
     found = _discover(con, proj)
     if found is not None:
-        return Project(proj.project_id, found, proj.work_id, proj.name,
+        return Project(proj.project_id, found, proj.source_ref, proj.name,
                        proj.archived)
     return Project(proj.project_id, paths.workspace_dir(proj.project_id),
-                   proj.work_id, proj.name, proj.archived)
+                   proj.source_ref, proj.name, proj.archived)
 
 
 def _discover(con, proj: "Project") -> Path | None:
-    """The folder Work's path names WITHOUT its grouping, if it is one.
+    """The folder the source's reference names WITHOUT its grouping.
 
-    Work stores "Group/thing" and Orchestra cached it under the workspace
-    root, so the root is that path with the Work id's segments removed. The
-    same root plus the last segment is where the folder actually sits.
+    A source stores "Group/thing" and Orchestra cached it under the workspace
+    root, so the root is that path with the reference's segments removed. The
+    same root plus the last segment is where the folder actually sits. This
+    is the ONE place the ref's path shape is read, and it reads it as shape
+    alone — segments, not meaning (CONTRACT §7 Enforcement 1).
 
     A directory another project already claims is not this one's: two
     projects named "docs" under different groups must not collapse onto the
     same checkout, so an ambiguous hit is declined and the workspace answers
     instead.
     """
-    rel = Path(proj.work_id or "")
+    rel = Path(proj.source_ref or "")
     depth = len(rel.parts)
     if depth < 2 or depth >= len(proj.path.parts):
         return None  # nothing was grouped, so there is nothing to strip
@@ -343,11 +362,12 @@ def is_workspace(root: Path) -> bool:
 
 
 def link(con, project_path: str, root: Path) -> "Project":
-    """Bind a Work project to the checkout it actually lives in.
+    """Bind a source-backed project to the checkout it actually lives in.
 
-    The row carries Work's project id with ``work_id`` NULL, so a refresh
-    neither replaces it (it inserts by path) nor prunes it (the prune skips
-    locally owned rows). Work keeps organizing; Orchestra keeps the address.
+    The row carries the same ``project_id`` with ``source_ref`` NULL, so a
+    refresh neither replaces it (it inserts by path) nor prunes it (the prune
+    skips locally owned rows). The source keeps organizing; Orchestra keeps
+    the address.
     """
     from orchestra import db  # local: db imports paths, not project
 
@@ -355,15 +375,15 @@ def link(con, project_path: str, root: Path) -> "Project":
     if not root.is_dir():
         raise SystemExit(f"orchestra: {root} is not a directory")
     row = con.execute(
-        "SELECT * FROM projects WHERE work_id=? OR project_id=? "
-        "ORDER BY work_id IS NULL LIMIT 1",
+        "SELECT * FROM projects WHERE source_ref=? OR project_id=? "
+        "ORDER BY source_ref IS NULL LIMIT 1",
         (project_path, project_path)).fetchone()
     if row is None:
         raise SystemExit(
             f"orchestra: no project matches {project_path!r} — "
             "`orchestra project list` names them")
     con.execute(
-        "INSERT OR REPLACE INTO projects(path, project_id, work_id, name, "
+        "INSERT OR REPLACE INTO projects(path, project_id, source_ref, name, "
         "refreshed_at) VALUES(?,?,NULL,?,?)",
         (str(root), row["project_id"], row["name"], db.now()))
     con.commit()
@@ -373,12 +393,12 @@ def link(con, project_path: str, root: Path) -> "Project":
 
 def root_for(con, run) -> Path:
     """A run's project checkout. Falls back to its recorded workdir so a run
-    whose project left Work is still supervisable."""
+    whose project left the source is still supervisable."""
     hit = workdir_for(con, by_id(con, run["project_id"]))
     return hit.path if hit else Path(run["workdir"])
 
 
 def dir_key_for(con, run) -> str:
     """The worktree directory key: the immutable projectId. A run whose project
-    left Work falls back to its workdir name so it stays supervisable."""
+    left the source falls back to its workdir name so it stays supervisable."""
     return run["project_id"] or Path(run["workdir"]).name

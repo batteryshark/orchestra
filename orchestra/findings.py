@@ -522,9 +522,11 @@ def at_completion(con, cfg: dict, run_result) -> dict:
         _mark_processed(con, run["id"])
         return result  # Work off: the protocol is still enforced, locally
     hit = project.by_id(con, run["project_id"])
-    if hit is None and project.refresh(con, cfg):  # a supervisor may hold a cold cache
+    from orchestra import sweeper  # local: the adapter owns the refresh
+
+    if hit is None and sweeper.refresh_projects(con, cfg):  # a supervisor may hold a cold cache
         hit = project.by_id(con, run["project_id"])
-    project_path = hit.work_id if hit else None
+    project_path = hit.source_ref if hit else None
     result["findings"] = file_findings(con, client, run, entries, project_path)
     ceiling = int(cfg.get("settings", {}).get("proposal_child_ceiling",
                                               DEFAULT_CHILD_CEILING))

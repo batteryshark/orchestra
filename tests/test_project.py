@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, paths, project
+from orchestra import config, db, paths, project, sweeper
 from tests.fake_work import FakeWork
 
 DEMO_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
@@ -114,11 +114,16 @@ class ProjectResolutionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def seed(self, entries=None):
-        return project.remember(self.con, str(self.workspace), entries or [
+        return sweeper.remember_projects(self.con, str(self.workspace), entries or [
             {"projectId": DEMO_ID, "id": "demo", "name": "Demo", "path": "demo"}])
 
     def resolve(self, where):
         return project.resolve(self.con, {}, str(where))
+
+    def resolve_live(self, cfg, where):
+        """As the CLI resolves: the adapter's refresher warms a cold cache."""
+        return project.resolve(self.con, cfg, str(where),
+                               refresh=sweeper.refresh_projects)
 
     def test_a_moved_project_leaves_no_stale_work_row(self) -> None:
         """A worktree copy that briefly won discovery cached a wrong path, and
@@ -181,7 +186,7 @@ class ProjectResolutionTests(unittest.TestCase):
         url = work.start()
         try:
             cfg = {"work": {"enabled": True, "api_url": url}}
-            hit = project.resolve(self.con, cfg, str(self.workspace / "demo" / "src"))
+            hit = self.resolve_live(cfg, self.workspace / "demo" / "src")
             self.assertEqual(hit.project_id, DEMO_ID)
             self.assertIn(("GET", "/api/projects"), work.requests)
         finally:
@@ -210,12 +215,12 @@ class ProjectResolutionTests(unittest.TestCase):
 
     def test_work_ref_project_path_maps_to_the_project_id(self) -> None:
         self.seed()
-        self.assertEqual(project.by_work_path(self.con, "demo").project_id, DEMO_ID)
+        self.assertEqual(project.by_source_ref(self.con, "demo").project_id, DEMO_ID)
         self.assertEqual(
-            project.by_work_path(self.con, str(self.workspace / "demo")).project_id,
+            project.by_source_ref(self.con, str(self.workspace / "demo")).project_id,
             DEMO_ID)
-        self.assertIsNone(project.by_work_path(self.con, "no-such-project"))
-        self.assertIsNone(project.by_work_path(self.con, None))
+        self.assertIsNone(project.by_source_ref(self.con, "no-such-project"))
+        self.assertIsNone(project.by_source_ref(self.con, None))
 
     def test_a_project_work_has_not_stamped_is_not_cached(self) -> None:
         self.assertEqual(self.seed([{"id": "demo", "path": "demo"}]), 0)
@@ -238,7 +243,7 @@ class CliSurfaceTests(unittest.TestCase):
             "ORCHESTRA_ROOT": str(self.project_dir)})
         self.env.start()
         con = db.connect()
-        project.remember(con, str(self.workspace),
+        sweeper.remember_projects(con, str(self.workspace),
                          [{"projectId": DEMO_ID, "id": "demo", "name": "Demo",
                            "path": "demo"}])
         con.close()
@@ -308,7 +313,7 @@ class AdoptTests(unittest.TestCase):
     def test_an_adopted_directory_resolves(self) -> None:
         adopted = project.adopt(self.con, self.repo)
         self.assertEqual(self.repo, Path(adopted.path))
-        self.assertIsNone(adopted.work_id)
+        self.assertIsNone(adopted.source_ref)
         self.assertTrue(adopted.project_id)
         found = project.resolve(self.con, {}, str(self.repo))
         self.assertEqual(adopted.project_id, found.project_id)
@@ -323,7 +328,7 @@ class AdoptTests(unittest.TestCase):
         adopted = project.adopt(self.con, self.repo)
         other = self.root / "from-work"
         other.mkdir()
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "w-1", "id": 7, "name": "theirs",
                            "path": "from-work"}])
         paths = {str(p.path) for p in project.all_projects(self.con)}
@@ -333,28 +338,36 @@ class AdoptTests(unittest.TestCase):
 
     def test_work_wins_when_it_names_the_same_directory(self) -> None:
         project.adopt(self.con, self.repo)
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "w-1", "id": 7, "name": "theirs",
                            "path": "repo"}])
         found = project.resolve(self.con, {}, str(self.repo))
         self.assertEqual("w-1", found.project_id)
-        # work_id is a TEXT column, so an integer id round-trips as a string.
-        self.assertEqual("7", str(found.work_id))
+        # source_ref is a TEXT column, so an integer id round-trips as a string.
+        self.assertEqual("7", str(found.source_ref))
 
-    def test_work_owns_the_archived_flag_and_a_refresh_flips_it_both_ways(self) -> None:
-        """DESIGN §1: parking a project in Work parks it here, with no local
-        action — and unparking it there brings it back the same way."""
+    def test_the_source_owns_the_archived_flag_and_a_refresh_flips_it(self) -> None:
+        """DESIGN §1: parking a project at the source parks it here, with no
+        local action — and unparking it there brings it back the same way.
+        The core reads a plain boolean and never asks who set it (CONTRACT §7);
+        only the adapter's ``remember_projects`` writes it."""
         def refresh(**flag):
-            project.remember(self.con, str(self.root),
+            sweeper.remember_projects(self.con, str(self.root),
                              [{"projectId": "w-1", "id": 7, "name": "theirs",
                                "path": "repo", **flag}])
             return project.resolve(self.con, {}, str(self.repo)).archived
 
         self.assertFalse(refresh(archived=False))
         self.assertTrue(refresh(archived=True))
-        self.assertFalse(refresh(archived=False), "back on Work's word alone")
+        # Parked at the source HIDES it, exactly as a local archive does; the
+        # 2026-08-27 bill CONTRACT 0.10 names was this flag never arriving.
+        self.assertEqual([], project.all_projects(self.con))
+        self.assertEqual([self.repo], [p.path for p in project.all_projects(
+            self.con, include_archived=True)])
+        self.assertFalse(refresh(archived=False), "back on the source's word alone")
+        self.assertEqual([self.repo], [p.path for p in project.all_projects(self.con)])
         self.assertTrue(refresh(archived=True))
-        # An older Work that serves no flag at all is not an archived project.
+        # An older source that serves no flag at all is not an archived project.
         self.assertFalse(refresh())
 
     def test_an_archived_project_is_off_the_list_until_all_asks(self) -> None:
@@ -373,12 +386,14 @@ class AdoptTests(unittest.TestCase):
     def test_archive_refuses_a_work_backed_project(self) -> None:
         """Work owns the flag, so archiving here would be overwritten by the
         next refresh — refused the same way ``forget`` refuses."""
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "w-1", "id": 7, "name": "theirs",
                            "path": "repo"}])
         with self.assertRaises(SystemExit) as caught:
             project.set_archived(self.con, self.repo, True)
-        self.assertIn("comes from Work", str(caught.exception))
+        self.assertIn("comes from the work source", str(caught.exception))
+        self.assertIn("'7'", str(caught.exception),
+                      "the refusal names WHERE to go instead")
         self.assertFalse(project.set_archived(self.con, self.root / "nowhere", True))
 
     def test_forget_drops_a_local_project_but_refuses_one_from_work(self) -> None:
@@ -387,7 +402,7 @@ class AdoptTests(unittest.TestCase):
         self.assertEqual([], project.all_projects(self.con))
         self.assertFalse(project.forget(self.con, self.repo))
 
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "w-1", "id": 7, "name": "theirs",
                            "path": "repo"}])
         with self.assertRaises(SystemExit):
@@ -427,19 +442,19 @@ class StoreOnlyProjectTests(unittest.TestCase):
         self.con = db.connect()
         self.addCleanup(self.con.close)
         # Exactly what Work serves: a grouped path, no aliases, no directory.
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "p-orch", "id": "Group/orchestra",
                            "name": "Orchestra", "path": "Group/orchestra"}])
 
     def test_a_project_with_no_directory_gets_an_ephemeral_workspace(self) -> None:
         """No checkout anywhere: the run still gets somewhere to work, keyed
         by the project id so a second pass sees the first one's files."""
-        proj = project.by_work_path(self.con, "Group/orchestra")
+        proj = project.by_source_ref(self.con, "Group/orchestra")
         self.assertTrue(proj.path.is_dir(), "the run has somewhere to work")
         self.assertEqual(0o700, proj.path.stat().st_mode & 0o777,
                          "owner-only, like every directory paths hands out")
         self.assertEqual(proj.path,
-                         project.by_work_path(self.con, "Group/orchestra").path,
+                         project.by_source_ref(self.con, "Group/orchestra").path,
                          "the same project comes back to the same workspace")
         self.assertEqual("p-orch", proj.project_id,
                          "Work's id survives, so settings and writeback line up")
@@ -451,7 +466,7 @@ class StoreOnlyProjectTests(unittest.TestCase):
         should have to tell it."""
         repo = self.root / "orchestra"
         repo.mkdir()
-        found = project.by_work_path(self.con, "Group/orchestra")
+        found = project.by_source_ref(self.con, "Group/orchestra")
         self.assertEqual(repo, found.path)
         self.assertEqual("p-orch", found.project_id)
 
@@ -461,24 +476,24 @@ class StoreOnlyProjectTests(unittest.TestCase):
         workspace answers instead."""
         shared = self.root / "docs"
         shared.mkdir()
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "p-orch", "id": "Group/docs",
                            "name": "Ours", "path": "Group/docs"},
                           {"projectId": "p-other", "id": "docs",
                            "name": "Theirs", "path": "docs"}])
-        found = project.by_work_path(self.con, "Group/docs")
+        found = project.by_source_ref(self.con, "Group/docs")
         self.assertEqual(paths.workspace_dir("p-orch"), found.path)
-        self.assertEqual(shared, project.by_work_path(self.con, "docs").path,
+        self.assertEqual(shared, project.by_source_ref(self.con, "docs").path,
                          "the project that owns the folder still gets it")
 
     def test_an_ungrouped_project_with_no_folder_gets_a_workspace(self) -> None:
         """Nothing to strip: a flat path that names no directory is a
         store-only project, not a misplaced checkout."""
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "p-flat", "id": "errands",
                            "name": "Errands", "path": "errands"}])
         self.assertEqual(paths.workspace_dir("p-flat"),
-                         project.by_work_path(self.con, "errands").path)
+                         project.by_source_ref(self.con, "errands").path)
 
     def test_a_linked_checkout_answers_for_the_work_path(self) -> None:
         """The repository Work cannot name: link it once, and every dispatch
@@ -489,7 +504,7 @@ class StoreOnlyProjectTests(unittest.TestCase):
         elsewhere.mkdir(parents=True)
         linked = project.link(self.con, "Group/orchestra", elsewhere)
         self.assertEqual("p-orch", linked.project_id)
-        found = project.by_work_path(self.con, "Group/orchestra")
+        found = project.by_source_ref(self.con, "Group/orchestra")
         self.assertEqual(elsewhere, found.path,
                          "an explicit binding outranks a lucky name match")
 
@@ -500,10 +515,10 @@ class StoreOnlyProjectTests(unittest.TestCase):
         repo = self.root / "orchestra"
         repo.mkdir()
         project.link(self.con, "Group/orchestra", repo)
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "p-orch", "id": "Group/orchestra",
                            "name": "Orchestra", "path": "Group/orchestra"}])
-        self.assertEqual(repo, project.by_work_path(self.con,
+        self.assertEqual(repo, project.by_source_ref(self.con,
                                                     "Group/orchestra").path)
 
     def test_a_real_directory_still_wins_untouched(self) -> None:
@@ -511,10 +526,10 @@ class StoreOnlyProjectTests(unittest.TestCase):
         used exactly as before, with no workspace and no link involved."""
         real = self.root / "plain"
         real.mkdir()
-        project.remember(self.con, str(self.root),
+        sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "p-plain", "id": "plain",
                            "name": "Plain", "path": "plain"}])
-        self.assertEqual(real, project.by_work_path(self.con, "plain").path)
+        self.assertEqual(real, project.by_source_ref(self.con, "plain").path)
 
     def test_a_link_whose_directory_is_gone_fails_loudly(self) -> None:
         """An unmounted volume must not become an empty workspace: linking is
@@ -524,7 +539,7 @@ class StoreOnlyProjectTests(unittest.TestCase):
         repo.mkdir()
         project.link(self.con, "Group/orchestra", repo)
         repo.rmdir()  # the volume goes away
-        found = project.by_work_path(self.con, "Group/orchestra")
+        found = project.by_source_ref(self.con, "Group/orchestra")
         self.assertEqual(repo, found.path)
         self.assertFalse(found.path.exists(),
                          "no workspace is substituted for a claimed checkout")

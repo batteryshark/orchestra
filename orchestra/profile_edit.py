@@ -17,11 +17,20 @@ dict write:
   note or an effort *downwards*, and nothing else. Adding a provider/model
   entry commits spend — and so does raising an effort, W-0176, or moving the
   tier/priority a planner routes on, W-0181 — so an agent asking for any of
-  those gets a Work decision filed for the human and *no* config write. The
+  those gets an ESCALATION filed for the human and *no* config write. The
   split is enforced here, at the one function both the HTTP route
   and the CLI call; *who is asking* is answered by ``auth`` from the
   credential, never from a header or an environment variable the caller
   chose.
+
+  The escalation is one row in ``nod_requests``, the escalation record
+  (DESIGN §8), written before anything can fail and carrying the requested
+  VALUES. Editing config must not know a record system exists (CONTRACT §7
+  Enforcement), so this module records and stops; a source adapter reads the
+  record and files the decision the human answers, and `orchestra profiles`
+  prints it meanwhile. It is the shape 44c8335 established — the core writes
+  the durable thing, the adapter does the source-facing half — with the
+  ordering the 2026-08-28 loss made non-negotiable.
 
 Discovery feeds the model/effort pickers (``profiles.discover``); this
 module re-checks the picked values server-side, because a picker is a
@@ -35,7 +44,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import config, harnesses, paths, profiles, work_client
+from orchestra import config, db, harnesses, nod, paths, profiles
 from orchestra.proc import chmod
 
 # The harnesses. The config KEY is still `backend`; "harness" is the word
@@ -45,14 +54,14 @@ BACKENDS = harnesses.SUPPORTED
 # What an agent may retune on its own (DESIGN §5): the cheap knobs. Anything
 # else — a model, a harness, a new profile, and the tier/priority a planner
 # routes on — commits spend or widens authority and
-# goes to the human as a Work decision.
+# goes to the human as an escalation.
 #
 # ``effort`` is here with a direction (W-0176). An agent may LOWER a
 # profile's effort freely, and lowering is the only move it can make alone:
 # raising one is a spend commitment with no new model entry to catch it, and
 # principle 5 says nothing can grant itself the thing it asks for — a worker
 # moving its own profile from `low` to `ultra` is exactly that. A raise files
-# a Work decision like a model change does. See ``raises_effort``.
+# an escalation like a model change does. See ``raises_effort``.
 AGENT_KEYS = frozenset({"note", "effort"})
 
 # Cheapest first; the order every harness reports its own subset of. An
@@ -507,9 +516,23 @@ def _file_profiles(text: str) -> dict:
 
 
 def _decide(cfg: dict, name: str, changes: dict, keys: set[str],
-            client=None) -> dict:
-    """An agent asked for a change that commits spend: file it, do not do it."""
-    client = work_client.from_cfg(cfg) if client is None else client
+            con=None) -> dict:
+    """An agent asked for a change that commits spend: record it, do not do it.
+
+    ONE DURABLE WRITE, AND NO DELIVERY. The record carries the profile, the
+    keys and their VALUES, and it is written before anything could fail —
+    that ordering is the whole point. The old shape filed a Work decision
+    first and kept the request only in its own return value, so every failure
+    path (Work down, Work refusing, ``[work]`` off) reported "a human is
+    needed" while destroying what for (2026-08-28; the values were
+    unrecoverable and the owner could not approve a change nobody could name).
+
+    Delivery is somebody else's later, retryable step: a source adapter reads
+    the record and files the decision (CONTRACT §7 Enforcement — config
+    editing knows no record system), and `orchestra profiles` prints it
+    meanwhile, so with every source down a human can still read exactly what
+    was asked for.
+    """
     detail = "\n".join(
         [f"An agent asked Orchestra to change profile '{name}':"]
         + [f"  {k} = {changes[k]!r}" if k in changes else f"  {k}"
@@ -518,35 +541,30 @@ def _decide(cfg: dict, name: str, changes: dict, keys: set[str],
            "so does raising a reasoning effort, so DESIGN §5 keeps it a human "
            "call. Apply it from the dashboard (profiles → edit) or with "
            "`orchestra profiles set`."])
-    result = {"applied": False, "authority": "agent", "profile": name,
-              "needs": sorted(keys), "detail": detail}
-    if client is None:
-        result["error"] = ("this change needs a human, and [work] is not "
-                           "enabled, so no decision could be filed")
-        return result
+    title = f"Orchestra profile '{name}': {', '.join(sorted(keys))}"[:300]
+    own = con is None
+    con = db.connect() if own else con
     try:
-        created = client.create_decision(
-            title=f"Orchestra profile '{name}': {', '.join(sorted(keys))}"[:300],
-            detail=detail[:19000],
-            options=["Apply it", "Decline"],
-            # Work refuses an agent decision without a recommendationReason.
-            recommendation_reason=("No lean: this change commits spend, which "
-                                   "DESIGN §5 keeps a human call."))
-    except work_client.WorkError as exc:
-        result["error"] = f"work rejected the decision ({exc.code})"
-        return result
-    result["decision"] = (created or {}).get("id") if isinstance(created, dict) else None
-    result["filed"] = created is not None
-    return result
+        request_id = nod.record_escalation(
+            con, kind=nod.PROFILE_CHANGE, title=title, body=detail,
+            # Asking the same thing twice updates the undelivered row rather
+            # than filing a second decision; a different key is different news.
+            dedupe_key=f"orchestra:profile:{name}:{','.join(sorted(keys))}")
+    finally:
+        if own:
+            con.close()
+    return {"applied": False, "authority": "agent", "profile": name,
+            "needs": sorted(keys), "detail": detail, "title": title,
+            "escalation": request_id, "filed": True}
 
 
 def save(name: str, changes: dict, *, authority: str = "human",
          delete: bool = False, options: dict | None = None,
-         work=None) -> dict:
+         con=None) -> dict:
     """Add, edit or remove one profile in the config FILE.
 
     Returns ``{"applied": True, ...}``, or a dict carrying ``error``, or —
-    for an agent asking for a spend-committing change — the filed decision.
+    for an agent asking for a spend-committing change — the filed escalation.
     """
     path = config.ensure_global_config()
     text = path.read_text(encoding="utf-8")
@@ -559,7 +577,7 @@ def save(name: str, changes: dict, *, authority: str = "human",
         if name not in current:
             return {"applied": False, "error": f"no profile '{name}' to remove"}
         if authority == "agent":
-            return _decide(config.load(), name, {}, {"remove the profile"}, work)
+            return _decide(config.load(), name, {}, {"remove the profile"}, con)
         try:
             after = render(text, name, {}, delete=True)
             _verify(text, after, name, None)
@@ -598,7 +616,7 @@ def save(name: str, changes: dict, *, authority: str = "human",
                                                  clean.get("effort")):
             needs = needs | {"effort"}
         if needs:
-            return _decide(config.load(), name, clean, needs, work)
+            return _decide(config.load(), name, clean, needs, con)
 
     merged = {k: v for k, v in {**existing, **clean}.items() if v is not None}
     error = validate(name, merged, clean, options)

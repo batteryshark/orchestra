@@ -421,7 +421,7 @@ def tick() -> dict:
         # ponytail: one project-list fetch per tick keeps the cache warm at the
         # cost of an HTTP round trip a minute; drive it off a Work event when
         # phase 3's hooks land.
-        project.refresh(con, cfg)
+        sweeper.refresh_projects(con, cfg)
     finally:
         con.close()
     client = work_client.from_cfg(cfg)

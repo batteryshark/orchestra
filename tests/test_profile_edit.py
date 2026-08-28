@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, profile_edit
+from orchestra import config, db, nod, profile_edit, sweeper, work_client
 
 
 FOUND = {
@@ -54,6 +54,9 @@ class EditCase(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {
             "ORCHESTRA_CONFIG": str(self.path),
             "ORCHESTRA_HOME": str(Path(self.tmp.name) / "home"),
+            # Never the default path: that one is the developer's real
+            # Nod credentials.
+            "ORCHESTRA_NOD_SECRETS_FILE": str(Path(self.tmp.name) / "none.env"),
         })
         self.env.start()
         self.options = profile_edit.picker_options(FOUND)
@@ -147,23 +150,28 @@ class ValidationTests(EditCase):
 
 
 class AuthorityTests(EditCase):
-    class FakeWork:
-        def __init__(self) -> None:
-            self.filed = []
+    """DESIGN §5's split, and where a refused change goes.
 
-        def create_decision(self, **kwargs) -> dict:
-            self.filed.append(kwargs)
-            return {"id": "W-9001"}
+    ``profile_edit`` writes ONE durable record and knows nothing about a
+    record system (CONTRACT §7 Enforcement). The record is what survives; a
+    source adapter files the decision off it later.
+    """
+
+    def cards(self) -> list:
+        con = db.connect()
+        try:
+            return list(con.execute("SELECT * FROM nod_requests ORDER BY rowid"))
+        finally:
+            con.close()
 
     def test_agent_authority_boundary(self) -> None:
         allowed = ({"note": "use it"}, {"effort": "low"})
         for changes in allowed:
             with self.subTest(allowed=changes):
                 self.path.write_text(CONFIG)
-                work = self.FakeWork()
                 self.assertTrue(self.save(
-                    "thinker", changes, authority="agent", work=work)["applied"])
-                self.assertEqual(work.filed, [])
+                    "thinker", changes, authority="agent")["applied"])
+                self.assertEqual(self.cards(), [])
 
         protected = (
             ("thinker", {"effort": "ultra"}, False),
@@ -173,17 +181,87 @@ class AuthorityTests(EditCase):
             ("newone", {"backend": "codex", "model": "gpt-5.6-sol"}, False),
             ("cheap", {}, True),
         )
-        for name, changes, delete in protected:
+        for i, (name, changes, delete) in enumerate(protected, start=1):
             with self.subTest(protected=name, changes=changes, delete=delete):
                 self.path.write_text(CONFIG)
                 before = self.path.read_text()
-                work = self.FakeWork()
                 result = self.save(name, changes, delete=delete,
-                                   authority="agent", work=work)
+                                   authority="agent")
                 self.assertFalse(result["applied"])
-                self.assertEqual(result["decision"], "W-9001")
+                self.assertTrue(result["filed"])
                 self.assertEqual(self.path.read_text(), before)
-                self.assertEqual(len(work.filed), 1)
+                cards = self.cards()
+                self.assertEqual(len(cards), i)
+                self.assertEqual(cards[-1]["request_id"], result["escalation"])
+                self.assertEqual(cards[-1]["kind"], nod.PROFILE_CHANGE)
+                self.assertEqual(cards[-1]["status"], nod.RECORDED)
+                self.assertIn(name, cards[-1]["title"])
+                # The VALUES, not just the refusal. This is what was lost.
+                for key, value in changes.items():
+                    self.assertIn(repr(value), cards[-1]["body"])
+
+    def test_the_values_survive_when_the_source_cannot_be_reached(self) -> None:
+        """The 2026-08-28 loss: filing failed and took the request with it.
+
+        The record is written before anything can fail, so a source that
+        refuses every call changes nothing about what a human can read back.
+        """
+        result = self.save("thinker", {"model": "gpt-5.6-luna", "tier": 3},
+                           authority="agent")
+        self.assertTrue(result["filed"])
+
+        class Refusing:
+            def create_decision(self, **kwargs):
+                raise work_client.WorkError(503, "unavailable", "try again")
+
+        con = db.connect()
+        try:
+            sweeper._escalations(con, Refusing(), [])
+            row = con.execute("SELECT * FROM nod_requests WHERE request_id=?",
+                              (result["escalation"],)).fetchone()
+        finally:
+            con.close()
+        self.assertIsNone(row["mirrored_at"], "an unfiled record was consumed")
+        self.assertIn("thinker", row["title"])
+        self.assertIn("'gpt-5.6-luna'", row["body"])
+        self.assertIn("tier = 3", row["body"])
+
+        # And a human reads it back from the CLI with no source at all.
+        printed = CliContractTests.run_cli(["profiles"])
+        self.assertIn("waiting on you", printed)
+        self.assertIn("'gpt-5.6-luna'", printed)
+        self.assertIn("tier = 3", printed)
+
+    def test_the_adapter_turns_the_record_into_a_decision_once(self) -> None:
+        """The other half (CONTRACT §7 Enforcement): the source adapter reads
+        the record and files the decision the human answers."""
+        result = self.save("thinker", {"model": "gpt-5.6-luna"},
+                           authority="agent")
+
+        class Client:
+            def __init__(self) -> None:
+                self.filed = []
+
+            def create_decision(self, **kwargs) -> dict:
+                self.filed.append(kwargs)
+                return {"id": "W-9001"}
+
+        client, actions = Client(), []
+        con = db.connect()
+        try:
+            sweeper._escalations(con, client, actions)
+            sweeper._escalations(con, client, actions)  # watermark holds
+        finally:
+            con.close()
+        self.assertEqual(len(client.filed), 1)
+        self.assertIn("thinker", client.filed[0]["title"])
+        self.assertIn("'gpt-5.6-luna'", client.filed[0]["detail"])
+        self.assertTrue(client.filed[0]["recommendation_reason"])
+        self.assertEqual(actions, [{"action": "decide",
+                                    "escalation": result["escalation"],
+                                    "decision": "W-9001"}])
+        # Filed, so it stops printing as waiting on the human.
+        self.assertNotIn("waiting on you", CliContractTests.run_cli(["profiles"]))
 
 
 class EnabledSetTests(EditCase):
@@ -216,31 +294,36 @@ class EnabledSetTests(EditCase):
 
 
 class CliContractTests(EditCase):
-    def cli(self, argv: list[str]) -> str:
+    @staticmethod
+    def run_cli(argv: list[str], options=None) -> str:
         from orchestra import cli
 
         output = io.StringIO()
-        with mock.patch.object(cli.profile_edit, "discovery_options",
-                               return_value=self.options), \
-                mock.patch.object(cli.sys, "argv", ["orchestra", *argv]), \
-                contextlib.redirect_stdout(output):
+        patches = [mock.patch.object(cli.sys, "argv", ["orchestra", *argv]),
+                   contextlib.redirect_stdout(output)]
+        if options is not None:
+            patches.insert(0, mock.patch.object(
+                cli.profile_edit, "discovery_options", return_value=options))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
             cli.main()
         return output.getvalue()
+
+    def cli(self, argv: list[str]) -> str:
+        return self.run_cli(argv, self.options)
 
     def test_picker_and_agent_authority_reach_the_shared_write_path(self) -> None:
         with mock.patch("builtins.input", return_value="2"):
             self.cli(["profiles", "set", "thinker", "--model"])
         self.assertEqual(self.table("thinker")["model"], "gpt-5.6-luna")
 
-        work = AuthorityTests.FakeWork()
-        with mock.patch.dict(os.environ, {"ORCHESTRA_RUN_ID": "12"}), \
-                mock.patch.object(profile_edit.work_client, "from_cfg",
-                                  return_value=work):
+        with mock.patch.dict(os.environ, {"ORCHESTRA_RUN_ID": "12"}):
             output = self.cli([
                 "profiles", "set", "thinker", "--model", "gpt-5.6-sol"])
-        self.assertIn("Work decision", output)
+        self.assertIn("recorded for the human", output)
         self.assertEqual(self.table("thinker")["model"], "gpt-5.6-luna")
-        self.assertEqual(len(work.filed), 1)
+        self.assertIn("'gpt-5.6-sol'", self.run_cli(["profiles"]))
 
 
 if __name__ == "__main__":

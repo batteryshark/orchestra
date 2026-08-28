@@ -618,9 +618,9 @@ def _dispatch(con, cfg: dict, client, goal: dict, board: dict, decision: dict,
                    f"{db.TERMINAL_SQL} LIMIT 1", (item_id,)).fetchone():
         return {"action": "skipped", "item": item_id,
                 "reason": "a run for this item is already in flight"}
-    proj = project.by_work_path(con, item.get("projectPath"))
-    if proj is None and project.refresh(con, cfg):
-        proj = project.by_work_path(con, item.get("projectPath"))
+    proj = project.by_source_ref(con, item.get("projectPath"))
+    if proj is None and sweeper.refresh_projects(con, cfg):
+        proj = project.by_source_ref(con, item.get("projectPath"))
     if proj is None:
         return {"action": "skipped", "item": item_id,
                 "reason": f"no known project for {item.get('projectPath')!r}"}
@@ -865,12 +865,12 @@ def _archived(con, item: dict) -> bool:
     """DESIGN §1: an archived project is parked, so no planner turn fires for
     its goals — the same shape as the pause check above, and for the same
     reason: the trigger is not consumed, so it is still there on unarchive."""
-    hit = project.by_work_path(con, item.get("projectPath"))
+    hit = project.by_source_ref(con, item.get("projectPath"))
     return bool(hit and hit.archived)
 
 
 def _project_id(con, item: dict) -> str | None:
-    hit = project.by_work_path(con, item.get("projectPath"))
+    hit = project.by_source_ref(con, item.get("projectPath"))
     return hit.project_id if hit else None
 
 

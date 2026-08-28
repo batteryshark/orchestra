@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, observer, supervise
+from orchestra import config, db, observer, supervise, sweeper
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -837,7 +837,7 @@ class RetryTests(ObserverCase):
                        capture_output=True)
         subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "init"],
                        check=True, capture_output=True)
-        project.remember(self.con, str(self.tmp_path / "workspace"),
+        sweeper.remember_projects(self.con, str(self.tmp_path / "workspace"),
                          [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
                            "path": "demo"}])
 
@@ -1088,7 +1088,7 @@ class SupervisedRunTests(unittest.TestCase):
             "STUB_EXIT": "0"})
         self.env.start()
         con = db.connect()
-        project.remember(con, str(self.tmp_path / "workspace"),
+        sweeper.remember_projects(con, str(self.tmp_path / "workspace"),
                          [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
                            "path": "demo"}])
         con.close()
