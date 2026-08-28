@@ -1,7 +1,7 @@
 """In-process fake of Work's local agent API (stdlib http.server).
 
 Mirrors the route shapes and server-side authority rules of
-work-management's local-api.mjs that the sweeper depends on:
+Work's local-api.mjs that the sweeper depends on:
 
 - **stored status has one writer class: humans** (CONTRACT 0.8). An agent
   identity appends a run FACT — a task progress line, an issue message — and
@@ -125,7 +125,7 @@ class FakeWork:
         # ``dependsOn`` is the single ordering edge a dispatcher must honor
         # (DESIGN §4). Work's read path folds a legacy ``blockedBy`` record
         # into ``dependsOn`` and never serves the key itself
-        # (work-management, lib/local-workspace.mjs) — mirror that here.
+        # (Work, lib/local-workspace.mjs) — mirror that here.
         ts = self.now()
         # First-occurrence order, deduped — exactly Work's read fold.
         folded = list(dict.fromkeys(list(depends_on) + list(blocked_by)))
