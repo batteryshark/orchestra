@@ -120,12 +120,12 @@
      Statistics left the health view: health is the daemon's pulse, and
      numbers about runs belong to the runs page. <dialog> is the platform's
      own modal — Esc, the backdrop and focus trapping come with it. */
-  #statsdlg, #projdlg { width: min(56rem, 92vw); max-height: 86vh; padding: 0;
+  #statsdlg { width: min(56rem, 92vw); max-height: 86vh; padding: 0;
               background: var(--panel); color: var(--text);
               border: 1px solid var(--line); border-radius: 8px;
               overflow: hidden; }
-  #statsdlg::backdrop, #projdlg::backdrop { background: rgba(0, 0, 0, .55); }
-  #statsdlg .card, #projdlg .card { border: 0; border-radius: 0; max-height: 86vh; }
+  #statsdlg::backdrop { background: rgba(0, 0, 0, .55); }
+  #statsdlg .card { border: 0; border-radius: 0; max-height: 86vh; }
 
   button { font: inherit; font-size: 12px; color: var(--text); background: #262b33;
            border: 1px solid var(--line); border-radius: 6px;
@@ -424,6 +424,7 @@
   <nav id="tabs">
     <button class="tab on" data-view="runs">runs</button>
     <button class="tab" data-view="profiles">profiles</button>
+    <button class="tab" data-view="projects">projects</button>
     <button class="tab" data-view="settings">settings</button>
     <button class="tab" data-view="runway">runway</button>
     <button class="tab" data-view="health">health</button>
@@ -437,9 +438,7 @@
       <h2>runs <span class="dim" id="runcount"></span>
         <span class="spacer"></span>
         <button id="statsbtn" style="text-transform:none;letter-spacing:0"
-                >statistics</button>
-        <button id="projbtn" style="text-transform:none;letter-spacing:0"
-                >projects</button></h2>
+                >statistics</button></h2>
       <div id="runlist"></div>
     </div>
     <div class="card">
@@ -497,6 +496,21 @@
   </section>
 
   <!-- ================= RUNWAY ================= -->
+  <!-- ================= PROJECTS ================= -->
+  <!-- The REGISTRY, which is not the picker. The picker in the header is
+       derived from the runs on the board (W-0186), so a project nobody has
+       kicked anything off from is missing from it — and that is exactly the
+       project a human comes here to park. A local project gets the archive
+       control; a source-backed one gets the server's refusal instead,
+       because the source owns the flag. -->
+  <section class="view vstack" id="view-projects" hidden>
+    <div class="card grow">
+      <h2>projects <span class="dim" style="text-transform:none;letter-spacing:0"
+            >· the registry, archived rows included</span></h2>
+      <div class="pad" id="projbody"></div>
+    </div>
+  </section>
+
   <section class="view vstack" id="view-runway" hidden>
     <div class="card grow">
       <h2>provider runway
@@ -553,23 +567,6 @@
       <button id="statsclose" style="text-transform:none;letter-spacing:0"
               >close</button></h2>
     <div class="pad" id="stats"></div>
-  </div>
-</dialog>
-
-<!-- The projects panel: the REGISTRY, which is not the picker. The picker in
-     the header is derived from the runs on the board (W-0186), so a project
-     nobody has kicked anything off from is missing from it — and that is
-     exactly the project a human comes here to park. A local project gets the
-     archive control; a source-backed one gets the server's refusal instead,
-     because the source owns the flag. -->
-<dialog id="projdlg" aria-labelledby="projtitle">
-  <div class="card">
-    <h2 id="projtitle">projects <span class="dim" style="text-transform:none;letter-spacing:0"
-          >· the registry, archived rows included</span>
-      <span class="spacer"></span>
-      <button id="projclose" style="text-transform:none;letter-spacing:0"
-              >close</button></h2>
-    <div class="pad" id="projbody"></div>
   </div>
 </dialog>
 
@@ -694,7 +691,7 @@ function statusChip(run) {
 let VIEW = "runs";
 function showView(name) {
   VIEW = name;
-  ["runs", "profiles", "settings", "runway", "health"].forEach((v) => {
+  ["runs", "profiles", "projects", "settings", "runway", "health"].forEach((v) => {
     $("view-" + v).hidden = v !== name;
   });
   document.querySelectorAll("#tabs .tab").forEach((b) => {
@@ -703,6 +700,7 @@ function showView(name) {
   // Neither stream runs behind a view nobody is looking at.
   if (name === "health") { openLog(); loadTurns(); } else closeLog();
   if (name === "runway") refreshRunway();  // opening the view is a request
+  if (name === "projects") loadProjects();  // the registry, read on open
   if (name === "settings") { loadConfig(); loadSeats(); }
   syncTrace();
 }
@@ -2289,8 +2287,12 @@ async function loadProjects() {
     })));
 }
 
+// A short label, not the sentence. The server's refusal names the project and
+// its source path, so rendering it on every source-backed row repeated the
+// same paragraph a dozen times and buried the one row that HAS a control.
+// The full sentence stays, on hover, where it is read once and on purpose.
 function blockedCell(p) {
-  const n = el("span", "dim", p.blocked.replace(/^orchestra: /, ""));
+  const n = el("span", "dim", "archive at the source");
   n.title = p.blocked;
   return n;
 }
@@ -2316,8 +2318,10 @@ $("runwayrefresh").onclick = () => refreshRunway();
 // come with it, so this is the whole popup.
 $("statsbtn").onclick = () => $("statsdlg").showModal();
 $("statsclose").onclick = () => $("statsdlg").close();
-$("projbtn").onclick = () => { $("projdlg").showModal(); loadProjects(); };
-$("projclose").onclick = () => $("projdlg").close();
+// The registry is a VIEW, not a dialog: showView("projects") loads it. There
+// is deliberately no handler here — an earlier revision bound one to
+// `projbtn`, which is the PICKER's button, so the picker stopped opening its
+// own menu and the new control did nothing.
 $("sweep").onclick = () => act("/api/sweep", {method: "POST"});
 $("pause").onclick = () => act("/api/dispatch/" + (paused ? "resume" : "pause"),
                                {method: "POST"});
