@@ -94,7 +94,7 @@ class LandingTestCase(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.con = db.connect()
         self.addCleanup(self.con.close)
-        project.remember(self.con, str(self.workspace),
+        sweeper.remember_projects(self.con, str(self.workspace),
                          [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
                            "path": "demo"}])
         self.cfg = config.load(PROJECT_ID)

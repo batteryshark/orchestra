@@ -543,8 +543,8 @@ def _seconds(started: str | None, finished: str | None) -> float | None:
 
 _RUN_SELECT = (
     "SELECT r.*, "
-    "(SELECT work_id FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
-    "AS project_work_id, "
+    "(SELECT source_ref FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
+    "AS project_source_ref, "
     "(SELECT name FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
     "AS project_name, "
     # W-0304, second pick: how many machine turns sit between this worker
@@ -583,7 +583,7 @@ def _run_payload(con, r, blocked: dict) -> dict:
         "title": r["title"],
         "ref": r["ref"],
         "project_id": r["project_id"],
-        "project": r["project_work_id"] or r["project_name"],
+        "project": r["project_source_ref"] or r["project_name"],
         "workdir": r["workdir"],
         "branch": r["branch"],
         "isolation": run_isolation(r),

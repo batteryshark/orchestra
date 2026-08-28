@@ -12,6 +12,9 @@ Deterministic code only (DESIGN principle 6) — one pass:
   nothing).
 - **Mirror**: both sides of an ``ask`` reach the item's thread. ``messaging``
   records them on the run and posts nothing; this pass carries them.
+- **Escalate**: a profile change an agent may not make itself becomes a Work
+  decision. ``profile_edit`` files the escalation and posts nothing; this
+  pass reads the record and files the decision (DESIGN §5).
 - **Claim**: an item a human marked ``delegated`` (CONTRACT §2; a legacy
   ``agents`` list is history and never counts as delegation) that sits
   in ``ready`` (task) / ``queued`` (issue) with no live run gets one: a
@@ -64,6 +67,51 @@ def mark(con, run_id: int, column: str, value: str, *,
                 (run_id, value))
     if commit:
         con.commit()
+
+
+# --- the project registry's source-backed rows (CONTRACT §7) ---------------
+# ``projects`` is Orchestra's own registry and stays core. Its ``source_ref``
+# rows are Work's, and only this module knows Work's entry shape — the
+# workspace root a relative path resolves against, ``projectId``, ``id``,
+# ``aliasPaths``, and the ``archived`` flag Work owns (DESIGN §1). The core
+# reads ``archived`` as a plain boolean and never learns who set it.
+
+def remember_projects(con, workspace_root: str, entries: list) -> int:
+    """Cache Work's project list into the registry. Returns rows written.
+
+    Relative paths resolve against the workspace root; each aliasPath gets its
+    own row so it resolves too. Every refresh copies ``archived``, so
+    archiving in Work parks the project here and unarchiving brings it back,
+    with no local action either way — the 2026-08-27 bill CONTRACT 0.10 names
+    was a cached copy of this list that never learned.
+    """
+    root = Path(workspace_root).expanduser()
+    rows = []
+    for entry in entries:
+        project_id = entry.get("projectId")
+        if not project_id:
+            continue  # a project Work has not stamped yet is not addressable
+        for rel in [entry.get("path"), *(entry.get("aliasPaths") or [])]:
+            if not rel:
+                continue
+            p = Path(rel).expanduser()
+            rows.append((p if p.is_absolute() else root / p, project_id,
+                         entry.get("id"), entry.get("name"),
+                         entry.get("archived") is True))
+    return project.remember_source(con, rows)
+
+
+def refresh_projects(con, cfg: dict) -> int:
+    """Re-read the project list from Work. Returns rows cached (0 when Work
+    is off or unreachable — an offline miss must not crash the CLI)."""
+    client = from_cfg(cfg)
+    if client is None:
+        return 0
+    root = client.workspace_root()
+    entries = client.projects()
+    if root is None or entries is None:
+        return 0
+    return remember_projects(con, root, entries)
 
 
 def seen_ts(con, run_id: int) -> str | None:
@@ -703,9 +751,9 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             continue
         # Which checkout the run gets is the item's project, not the caller's
         # directory: one daemon sweeps the whole workspace (DESIGN §2).
-        proj = project.by_work_path(con, item.get("projectPath"))
-        if proj is None and project.refresh(con, cfg):
-            proj = project.by_work_path(con, item.get("projectPath"))
+        proj = project.by_source_ref(con, item.get("projectPath"))
+        if proj is None and refresh_projects(con, cfg):
+            proj = project.by_source_ref(con, item.get("projectPath"))
         if proj is not None and proj.archived:
             # DESIGN §1: the project is parked, so this lane leaves its items
             # alone. Held rather than printed — the queue row is what makes
@@ -726,7 +774,7 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             print(f"orchestra sweep: {item_id} has no known project "
                   f"({item.get('projectPath')!r}) — skipped")
             continue
-        # A store-only project has no checkout of its own; by_work_path
+        # A store-only project has no checkout of its own; by_source_ref
         # hands it an ephemeral workspace instead (W-0312).
         root = proj.path
         # Per-project settings key on projectId (DESIGN §2), and so does the
@@ -851,6 +899,39 @@ def _mark_answers_mirrored(con, run_id: int) -> None:
             nod.mark_mirrored(con, request["request_id"])
 
 
+def _escalations(con, client: WorkClient, actions: list) -> None:
+    """Profile-change escalations reach Work as decisions (DESIGN §5).
+
+    ``profile_edit`` refuses an agent-authority change that commits spend and
+    files ONE escalation; config editing knows no record system (CONTRACT §7
+    Enforcement). This pass reads the record it left and files the decision
+    the human answers.
+
+    ``mirrored_at`` is the watermark — the same column an answered card's
+    decision uses, meaning the same thing: a record system has this. Nothing
+    new is invented, and the row is read, never consumed. Best effort: Work
+    being down leaves the row for the next pass, and the Nod card already
+    reached the human either way.
+    """
+    for row in nod.unmirrored_of_kind(con, nod.PROFILE_CHANGE):
+        try:
+            created = client.create_decision(
+                title=row["title"] or "Orchestra profile change",
+                detail=row["body"] or "",
+                options=["Apply it", "Decline"],
+                # Work refuses an agent decision without a recommendationReason.
+                recommendation_reason=("No lean: this change commits spend, "
+                                       "which DESIGN §5 keeps a human call."))
+        except WorkError as exc:
+            print(f"orchestra sweep: profile decision refused ({exc})")
+            return
+        if created is None:
+            return  # Work went away; the next pass carries it
+        nod.mark_mirrored(con, row["request_id"])
+        actions.append({"action": "decide", "escalation": row["request_id"],
+                        "decision": created.get("id")})
+
+
 def _mirror(con, client: WorkClient, actions: list) -> None:
     """Put both sides of an ``ask`` in the item's thread (CONTRACT §4).
 
@@ -947,6 +1028,7 @@ def sweep(cfg: dict, client: WorkClient,
         # Before the report: the report's own receipt is what bounds the
         # mirror's scan, so a just-reported run must still get its ask across.
         _mirror(con, client, actions)
+        _escalations(con, client, actions)
         ok = _report(con, client, actions)
         verify.after_report(con, cfg, client, actions)
         _progress(con, cfg, client, actions)

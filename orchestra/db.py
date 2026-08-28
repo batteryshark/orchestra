@@ -131,7 +131,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "23"
+SCHEMA_VERSION = "24"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -214,10 +214,11 @@ RUNS_V17_COLUMNS = (
     ("child_wakeup_message", "INTEGER"),
 )
 
-# Schema v20 (DESIGN §1). Work already marks a project archived and serves
-# the flag; ``remember`` copies it, so parking a project in Work parks it here
-# on the next refresh with no local action. A locally adopted project has no
-# Work behind it and is parked with ``orchestra project archive``.
+# Schema v20 (DESIGN §1). A plain boolean: this project is parked. A
+# source-backed row gets it from the source's adapter on every refresh, so
+# parking a project there parks it here with no local action; a locally
+# adopted row is parked with ``orchestra project archive``. Core code reads
+# the flag and never asks who set it (CONTRACT §7).
 PROJECTS_V20_COLUMNS = (
     ("archived", "INTEGER NOT NULL DEFAULT 0"),
 )
@@ -241,6 +242,16 @@ MESSAGES_V9_COLUMNS = (
 # acted on yet, anything else means it must never trigger an action again.
 NOD_REQUESTS_V14_COLUMNS = (
     ("acted_at", "TEXT"),
+)
+
+# Schema v24 (CONTRACT §7 Enforcement). What the card SAID. An escalation
+# record that keeps only a pointer to the push device is not durable: a
+# consumer that carries the same escalation somewhere else — a source
+# adapter filing a decision — has to be able to read it back without asking
+# Nod, and without the filing module knowing who reads it.
+NOD_REQUESTS_V24_COLUMNS = (
+    ("title", "TEXT"),
+    ("body", "TEXT"),
 )
 
 # Declared apart from SCHEMA because the v21 migration below has to fill it
@@ -357,13 +368,17 @@ CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run);
 CREATE INDEX IF NOT EXISTS idx_runs_revision ON runs(revision);
 CREATE INDEX IF NOT EXISTS idx_runs_ref ON runs(ref);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
--- Cached Work project list, so an offline CLI still resolves a directory to
--- a project. One row per local path (an aliasPath gets its own row); the
--- projectId is what everything else keys on.
+-- Orchestra's project registry, so an offline CLI still resolves a directory
+-- to a project. One row per local path (a source's alias path gets its own
+-- row); ``project_id`` is what everything else keys on.
+-- ``source_ref`` (schema v24, CONTRACT §7) is the SOURCE'S OWN identifier for
+-- the project, opaque here exactly like ``runs.ref``: NULL means the row was
+-- adopted locally and no source stands behind it. Only a source's adapter
+-- mints one or reads meaning into it; the core compares it and nothing more.
 CREATE TABLE IF NOT EXISTS projects (
   path TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
-  work_id TEXT,
+  source_ref TEXT,
   name TEXT,
   refreshed_at TEXT NOT NULL,
   archived INTEGER NOT NULL DEFAULT 0
@@ -505,6 +520,8 @@ CREATE TABLE IF NOT EXISTS nod_requests (
   run_id INTEGER REFERENCES runs(id),
   work_item TEXT,
   dedupe_key TEXT,
+  title TEXT,
+  body TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   option_id TEXT,
   option_kind TEXT,
@@ -671,9 +688,16 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in PROJECTS_V20_COLUMNS:
             if name not in known:
                 con.execute(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
+        # Schema v24 (CONTRACT §6, §7). ONE SHOT: the column that held a
+        # source's own project identifier stops carrying that source's name.
+        # No reader below accepts the old spelling — that tolerance is the
+        # leak §6 forbids — so this line is the only code that ever names it.
+        if "work_id" in known:
+            con.execute(
+                "ALTER TABLE projects RENAME COLUMN work_id TO source_ref")
     cards = {r["name"] for r in con.execute("PRAGMA table_info(nod_requests)")}
     if cards:
-        for name, sql_type in NOD_REQUESTS_V14_COLUMNS:
+        for name, sql_type in NOD_REQUESTS_V14_COLUMNS + NOD_REQUESTS_V24_COLUMNS:
             if name not in cards:
                 con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
     # Recreate so an older database picks up new terminal statuses in WHEN.

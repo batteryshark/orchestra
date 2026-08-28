@@ -311,7 +311,7 @@ class SnapshotTests(ServerCase):
 
     def test_runs_carry_status_profile_ref_and_project(self) -> None:
         self.con.execute(
-            "INSERT INTO projects(path, project_id, work_id, name, refreshed_at) "
+            "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at) "
             "VALUES(?,?,?,?,?)",
             (str(self.tmp_path), PROJECT_ID, "P-1", "demo", db.now()))
         live = self.make_run(ref="W-0100", title="build the HTTP surface")
@@ -465,11 +465,11 @@ class ProjectPickerTests(ServerCase):
     statistics — come off ``GET /api/project``.
     """
 
-    def name_project(self, project_id: str, work_id: str, name: str) -> None:
+    def name_project(self, project_id: str, source_ref: str, name: str) -> None:
         self.con.execute(
-            "INSERT INTO projects(path, project_id, work_id, name, refreshed_at) "
+            "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at) "
             "VALUES(?,?,?,?,?)",
-            (str(self.tmp_path / name), project_id, work_id, name, db.now()))
+            (str(self.tmp_path / name), project_id, source_ref, name, db.now()))
         self.con.commit()
 
     def test_the_project_list_is_derived_from_the_runs(self) -> None:

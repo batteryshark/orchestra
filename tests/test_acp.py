@@ -16,7 +16,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-from orchestra import acp, cli, db, messaging, project, supervise, traces
+from orchestra import acp, cli, db, messaging, project, supervise, sweeper, traces
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 FAKE_ACP = Path(__file__).resolve().parent / "fake_acp.py"
@@ -278,7 +278,7 @@ class AcpEndToEndTest(unittest.TestCase):
         })
         self.env.start()
         con = db.connect()
-        project.remember(con, str(self.tmp_path / "workspace"),
+        sweeper.remember_projects(con, str(self.tmp_path / "workspace"),
                          [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
                            "path": "demo"}])
         con.close()

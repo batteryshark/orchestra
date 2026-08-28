@@ -354,7 +354,8 @@ class DaemonTests(unittest.TestCase):
                 mock.patch.object(daemon, "_poll_runway", return_value=2) as runway_, \
                 mock.patch.object(daemon, "_act_on_nod_answers",
                                   return_value=[{"answer": 1}]) as nod_, \
-                mock.patch.object(daemon.project, "refresh", return_value=True) as refresh, \
+                mock.patch.object(daemon.sweeper, "refresh_projects",
+                                  return_value=True) as refresh, \
                 mock.patch.object(daemon.work_client, "from_cfg",
                                   return_value=client), \
                 mock.patch.object(daemon.sweeper, "sweep",

@@ -39,17 +39,25 @@ current behavior rather than the original build plan.
 A project can enter Orchestra's central registry in two ways:
 
 - `orchestra project add .` creates a local project with a generated UUID.
-- With Work enabled, Orchestra caches Work's project list and immutable project
-  ids. A Work mapping takes precedence if Work later names a locally adopted
-  directory.
+- With Work enabled, the Work adapter caches Work's project list and immutable
+  project ids into the same registry. A source mapping takes precedence if the
+  source later names a locally adopted directory.
+
+The registry is Orchestra's own and knows no source. A row carries
+`source_ref` — the source's OWN identifier for that project, opaque exactly
+like `runs.ref` — or NULL when the row was adopted locally. Filling
+source-backed rows is adapter work: `project.remember_source` is the one seam
+it writes through, and nothing in the core learns a source's entry shape
+(CONTRACT §7 Enforcement).
 
 A registered project may be ARCHIVED, which means parked rather than hidden.
-Work already marks its own projects archived and serves the flag; the cached
-refresh copies it, so archiving a project in Work parks it in Orchestra with
-no local action. A locally adopted project, which has no Work behind it, is
-parked with `orchestra project archive` — Orchestra refuses that for a
-Work-backed project the same way it refuses `project forget`, because Work
-owns the flag. A parked project is off `orchestra project list` (`--all` shows
+A source marks its own projects archived and serves the flag; the adapter's
+refresh copies it, so archiving a project there parks it in Orchestra with no
+local action. Core code reads `archived` as a plain boolean and never asks who
+set it. A locally adopted project, which has no source behind it, is parked
+with `orchestra project archive` — Orchestra refuses that for a source-backed
+project the same way it refuses `project forget`, because the source owns the
+flag. A parked project is off `orchestra project list` (`--all` shows
 it, marked) and off the dashboard's project picker, and the three unattended
 lanes — the sweep's claim path, the conductor, and refine — skip its items.
 The sweep says so once per item, through the waiting queue, so a forgotten
@@ -168,6 +176,22 @@ One static capability table records discovery, launch, resume, traces,
 correction, usage, additional-directory support, and transport for the four
 supported harnesses. A completeness test checks the concrete integration
 surfaces against that table. It is product data, not a plug-in framework.
+
+Write authority is split by cost. An agent may retune a note or lower an
+effort; anything that commits spend — a model, a harness, a new profile, a
+raised effort, or the tier/priority a planner routes on — is refused and
+RECORDED instead. Config editing knows no record system: `profile_edit`
+writes one escalation record (§8's `nod_requests`, carrying the profile, the
+keys and their values) and stops. Delivery is a later, retryable read of that
+record: a source adapter files the decision the human answers, and
+`orchestra profiles` prints the request until then, so the values are
+readable from the CLI with every source down.
+
+The durable write comes FIRST, before any delivery is attempted. The earlier
+shape filed the decision and kept the request only in its return value, so
+every failure path reported that a human was needed while destroying what
+for (2026-08-28: an agent's request reached neither Work nor any local row,
+and the values were unrecoverable).
 
 There is no team, roster, council, squad, or other grouping layer.
 

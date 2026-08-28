@@ -22,13 +22,15 @@ def _here(con) -> tuple:
     The project is None outside any registered project: listing runs or profiles
     must still work from an arbitrary directory now that state is central.
     """
-    proj = project.try_resolve(con, config.load())
+    proj = project.try_resolve(con, config.load(),
+                               refresh=sweeper.refresh_projects)
     return proj, config.load(proj.project_id if proj else None)
 
 
 def _require_project(con):
     """Same, but a command that has to run somewhere refuses to guess."""
-    proj = project.resolve(con, config.load())
+    proj = project.resolve(con, config.load(),
+                           refresh=sweeper.refresh_projects)
     return proj, config.load(proj.project_id)
 
 
@@ -130,7 +132,7 @@ def cmd_init(args):
     for line in hook_lines:
         print(f"    {line}")
     if proj:
-        print(f"  project:       {proj.name or proj.work_id} ({proj.project_id})")
+        print(f"  project:       {proj.name or proj.source_ref} ({proj.project_id})")
         print(f"  overrides:     [project.\"{proj.project_id}\"] in the global config")
         # Which profiles this project may STAFF (W-0187). Absent is every
         # profile, and saying so beats printing a list nobody wrote.
@@ -276,7 +278,7 @@ def cmd_resume(args):
 def cmd_status(args):
     con = db.connect()
     proj, _ = _here(con)
-    here = (f"{proj.name or proj.work_id} ({proj.path})"
+    here = (f"{proj.name or proj.source_ref} ({proj.path})"
             if proj else "no registered project")
     # Central state, so this is the whole workspace, not one project.
     print(f"orchestra @ {paths.home()} — here: {here}\n")
@@ -317,7 +319,7 @@ def cmd_runs(args):
         where.append("project_id IS ?")
         params.append(proj.project_id if proj else None)
     rows = list(con.execute(
-        "SELECT r.*, (SELECT work_id FROM projects p WHERE p.project_id=r.project_id "
+        "SELECT r.*, (SELECT source_ref FROM projects p WHERE p.project_id=r.project_id "
         "LIMIT 1) AS project FROM runs r"
         + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id", params))
     if args.json:
@@ -732,9 +734,10 @@ def _report(result: dict, name: str) -> None:
     if result.get("error"):
         raise SystemExit(f"orchestra: {result['error']}")
     if not result.get("applied"):
-        print(f"profile {name}: this change commits spend, so it went to the "
-              f"human as a Work decision ({result.get('decision') or 'filed'}).")
+        print(f"profile {name}: this change commits spend, so it was recorded "
+              f"for the human ({result.get('escalation') or 'filed'}).")
         print("  needs: " + ", ".join(result.get("needs") or []))
+        print("  `orchestra profiles` prints it until a human applies it.")
         return
     if result.get("removed"):
         print(f"profile {name}: removed from {paths.global_config_path()}")
@@ -797,6 +800,18 @@ def _profiles_set(args) -> None:
                               options=options), name)
 
 
+def _print_waiting(rows) -> None:
+    """Profile changes an agent asked for and may not make (DESIGN §5).
+
+    The offline view of the escalation record: with every source down this is
+    still the whole request, values included.
+    """
+    for row in rows:
+        print(f"\nwaiting on you — {row['title']} ({row['request_id']})")
+        for line in (row["body"] or "").splitlines():
+            print(f"  {line}" if line else "")
+
+
 def cmd_profiles(args):
     if args.action == "note":
         _report(profile_edit.save(args.name, {"note": " ".join(args.text)},
@@ -844,10 +859,15 @@ def cmd_profiles(args):
     try:
         entries = _here(con)[1].get("profiles", {})
         polls = {p["provider"]: p for p in runway.latest_polls(con)}
+        # DESIGN §5: a change an agent may not make itself is recorded, not
+        # applied. This is the offline view of that record — with every
+        # source down it is still the whole request, values included.
+        waiting = nod.unmirrored_of_kind(con, nod.PROFILE_CHANGE)
     finally:
         con.close()
     if not entries:
         print("(no profiles configured)")
+        _print_waiting(waiting)  # never hidden: it is the offline record
         return
     burns = runway.profile_burns(entries, polls)
     # Routing order (W-0181): priority first, `nice`-style — lower is more
@@ -867,6 +887,7 @@ def cmd_profiles(args):
             print(f"{'':<12} note: {p['note']}" + (f" ({age})" if age else ""))
         if name in burns:
             print(f"{'':<12} exhausted: {burns[name]}")
+    _print_waiting(waiting)
 
 
 def cmd_doctor(args):
@@ -1081,7 +1102,8 @@ def cmd_review(args):
 
 def cmd_merge(args):
     con = db.connect()
-    proj = project.resolve(con, config.load())
+    proj = project.resolve(con, config.load(),
+                           refresh=sweeper.refresh_projects)
     # The by-hand retry judges tripwires against the same mission the
     # automatic landing does — the row is found by its branch name.
     row = con.execute("SELECT * FROM runs WHERE branch=? ORDER BY id DESC LIMIT 1",
@@ -1137,7 +1159,7 @@ def cmd_project(args):
                 return
             width = max(len(str(r.path)) for r in rows)
             for r in rows:
-                source = "work" if r.work_id else "local"
+                source = "source" if r.source_ref else "local"
                 mark = "  (archived)" if r.archived else ""
                 print(f"{str(r.path):<{width}}  {source:<5}  "
                       f"{r.project_id}  {r.name or ''}{mark}")
