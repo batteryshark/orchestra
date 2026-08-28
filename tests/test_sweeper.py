@@ -1215,15 +1215,15 @@ class ArchivedProjectTests(SweeperFixture, unittest.TestCase):
         con = db.connect()
         try:
             self.assertTrue(sweeper.refresh_projects(con, self.cfg))
-            proj = project.by_source_ref(con, "demo")
-            self.assertTrue(project.set_archived(con, proj.path, True))
+            proj = sweeper.by_source_ref(con, "demo")
+            self.assertTrue(project.set_archived(con, proj.slug, True))
         finally:
             con.close()
         self.assertIn("archived", self.swept_output())
         self.assertEqual([], self.launched, "the lane dispatched a parked item")
         con = db.connect()
         try:
-            project.set_archived(con, project.by_source_ref(con, "demo").path,
+            project.set_archived(con, sweeper.by_source_ref(con, "demo").slug,
                                  False)
         finally:
             con.close()

@@ -155,9 +155,9 @@ def dispatch_one(con, cfg: dict, client: WorkClient, item: dict,
         return True
     from orchestra import sweeper  # local: sweeper imports this module
 
-    proj = project.by_source_ref(con, item.get("projectPath"))
+    proj = sweeper.by_source_ref(con, item.get("projectPath"))
     if proj is None and sweeper.refresh_projects(con, cfg):
-        proj = project.by_source_ref(con, item.get("projectPath"))
+        proj = sweeper.by_source_ref(con, item.get("projectPath"))
     if proj is None:
         print(f"orchestra refine: {item_id} has no known project "
               f"({item.get('projectPath')!r}) — skipped")

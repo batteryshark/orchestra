@@ -567,8 +567,8 @@ def _seconds(started: str | None, finished: str | None) -> float | None:
 
 _RUN_SELECT = (
     "SELECT r.*, "
-    "(SELECT source_ref FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
-    "AS project_source_ref, "
+    "(SELECT slug FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
+    "AS project_slug, "
     "(SELECT name FROM projects p WHERE p.project_id=r.project_id LIMIT 1) "
     "AS project_name, "
     # W-0304, second pick: how many machine turns sit between this worker
@@ -607,7 +607,7 @@ def _run_payload(con, r, blocked: dict) -> dict:
         "title": r["title"],
         "ref": r["ref"],
         "project_id": r["project_id"],
-        "project": r["project_source_ref"] or r["project_name"],
+        "project": r["project_slug"] or r["project_name"],
         "workdir": r["workdir"],
         "branch": r["branch"],
         "isolation": run_isolation(r),
@@ -984,11 +984,12 @@ def projects_registry(con=None) -> dict:
     it — and a project with nothing recent is exactly the one a human comes
     here to park. The panel that archives therefore reads the registry.
 
-    ``source_ref`` stays opaque (CONTRACT §7): it is compared against nothing
-    and parsed for nothing. ``archived`` is already the DERIVED value
-    (DESIGN §1); ``archived_override`` is NULL while the row still follows its
-    source, which is the only way a surface can say "parked by the source"
-    rather than "parked here".
+    Identity only (schema v29): slug, name, provenance (``local``), and the
+    parked flags — plus ``last_root``, the run history's answer to "where
+    does this project run", which is derived, never stored. ``archived`` is
+    already the DERIVED value (DESIGN §1); ``archived_override`` is NULL
+    while the row still follows its source, which is the only way a surface
+    can say "parked by the source" rather than "parked here".
     """
     own = con is None
     con = db.connect() if own else con
@@ -998,9 +999,10 @@ def projects_registry(con=None) -> dict:
             "projects": [{
                 "project_id": p.project_id,
                 "slug": p.slug,
-                "path": str(p.path),
                 "name": p.name,
-                "source_ref": p.source_ref,
+                "local": p.local,
+                "last_root": (str(project.last_root(con, p.project_id) or "")
+                              or None),
                 "archived": p.archived,
                 "archived_override": p.archived_override,
             } for p in rows],
@@ -1011,27 +1013,20 @@ def projects_registry(con=None) -> dict:
             con.close()
 
 
-def add_project(root: str, name=None, con=None) -> dict:
-    """``POST /api/projects/add`` — adopt a directory into the registry.
+def add_project(name, con=None) -> dict:
+    """``POST /api/projects/add`` — mint a project IDENTITY (schema v29).
 
-    The same ``project.adopt`` the CLI calls: idempotent on a registered
-    path, refused (as an error payload, not a crash) on a path that is not a
-    directory. Registration was CLI-only, so the dashboard could park a
-    project but never create one.
+    The same ``project.create`` the CLI calls: idempotent on the same name,
+    no path asked for or stored — the first dispatch supplies a checkout.
     """
-    root = str(root or "").strip()
-    if not root:
-        return {"error": "POST /api/projects/add needs path"}
     own = con is None
     con = db.connect() if own else con
     try:
         try:
-            p = project.adopt(con, Path(root), (str(name).strip() or None)
-                              if name else None)
+            p = project.create(con, str(name or ""))
         except SystemExit as exc:
             return {"error": str(exc)}
-        return {"project_id": p.project_id, "slug": p.slug,
-                "path": str(p.path), "name": p.name}
+        return {"project_id": p.project_id, "slug": p.slug, "name": p.name}
     finally:
         if own:
             con.close()
@@ -1055,18 +1050,26 @@ def dispatch_run(body: dict, launcher=None, con=None) -> dict:
     own = con is None
     con = db.connect() if own else con
     try:
-        hit = project.find(con, selector)
-        if hit is None:
+        proj = project.find(con, selector)
+        if proj is None:
             return {"error": f"no project matches {selector!r} — "
                              "GET /api/projects names them"}
-        proj = project.workdir_for(con, hit)
-        root = proj.path
         if body.get("path"):
-            # A project is not one checkout: the caller may name the
-            # repository this run branches from and lands into.
-            root = Path(str(body["path"])).expanduser().resolve()
+            # A project is not one checkout: the caller names the repository
+            # this run branches from and lands into.
+            try:
+                root = project.guard_run_path(str(body["path"]))
+            except SystemExit as exc:
+                return {"error": str(exc)}
             if not root.is_dir():
                 return {"error": f"path {root} is not a directory"}
+        else:
+            # The default is the runner's own record: where this project
+            # last ran. No stored path exists to fall back on (schema v29).
+            root = project.last_root(con, proj.project_id)
+            if root is None:
+                return {"error": f"{proj.slug} has no run history yet — "
+                                 "pass path for the first dispatch"}
         pcfg = config.load(proj.project_id)
         try:
             profile = config.staff_profile(pcfg, profile_name)
@@ -1910,7 +1913,7 @@ class Handler(BaseHTTPRequestHandler):
             result = profile_edit.set_enabled(project_id, names)
             return self._json(result, 400 if result.get("error") else 200)
         if path == PROJECTS_ADD_ROUTE:
-            result = add_project(body.get("path"), body.get("name"))
+            result = add_project(body.get("name"))
             return self._json(result, 400 if "error" in result else 200)
         if path == DISPATCH_ROUTE:
             result = dispatch_run(body)
@@ -1921,25 +1924,27 @@ class Handler(BaseHTTPRequestHandler):
             # `orchestra project archive` makes, it writes the owner's
             # override, and the lanes that skip a parked project keep reading
             # the one derived value.
-            root = str(body.get("path") or "").strip()
-            if not root:
-                return self._deny(400, "POST /api/projects needs path")
+            selector = str(body.get("project") or "").strip()
+            if not selector:
+                return self._deny(400,
+                                  "POST /api/projects needs project (slug or "
+                                  "project id)")
             want = bool(body.get("archived"))
             con = db.connect()
             try:
-                known = project.set_archived(con, Path(root), want)
+                known = project.set_archived(con, selector, want)
                 # Parking a project changes the picker, and the projects
                 # table has no trigger of its own. Without this bump another
                 # open board keeps the parked project until a RUN happens to
                 # change — the same gap `set_dispatch_paused` closes.
-                if known:
+                if known is not None:
                     db.bump_board_revision(con)
                     con.commit()
             finally:
                 con.close()
-            if not known:
-                return self._deny(404, f"{root} is not a registered project")
-            return self._json({"path": root, "archived": want})
+            if known is None:
+                return self._deny(404, f"no project matches {selector!r}")
+            return self._json({"project": known.slug, "archived": want})
         if path in ("/api/dispatch/pause", "/api/dispatch/resume"):
             con = db.connect()
             try:

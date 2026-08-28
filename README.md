@@ -56,7 +56,7 @@ Captions and the full set: [`docs/screenshots/`](docs/screenshots/README.md).
 - At least one signed-in agent CLI: `codex`, `claude`, `opencode`, or
   `reasonix`. Orchestra uses the CLI's existing authentication.
 - Work only if you want delegated-item intake, project discovery, planning, or
-  writeback. Standalone projects use `orchestra project add .`.
+  writeback. Standalone projects use `orchestra project add <name>`.
 
 `orchestra service` installs a launchd agent on macOS or a per-user Scheduled
 Task on Windows. The daemon can also run in the foreground.
@@ -78,7 +78,8 @@ uv run orchestra init
 uv run orchestra doctor
 ```
 
-Register this checkout if it does not come from Work:
+Mint a project identity if it does not come from Work (no path is stored —
+each dispatch names its checkout, and the run history remembers):
 
 ```sh
 uv run orchestra project add .

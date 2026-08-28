@@ -521,12 +521,20 @@ def at_completion(con, cfg: dict, run_result) -> dict:
     if client is None:
         _mark_processed(con, run["id"])
         return result  # Work off: the protocol is still enforced, locally
-    hit = project.by_id(con, run["project_id"])
     from orchestra import sweeper  # local: the adapter owns the refresh
 
-    if hit is None and sweeper.refresh_projects(con, cfg):  # a supervisor may hold a cold cache
-        hit = project.by_id(con, run["project_id"])
-    project_path = hit.source_ref if hit else None
+    def _label():
+        # The source's own label for this project, from the adapter's map
+        # (schema v29) — findings is adapter code (CONTRACT §7).
+        row = con.execute(
+            "SELECT source_ref FROM checkouts WHERE project_id=? "
+            "AND source_ref IS NOT NULL ORDER BY LENGTH(path) LIMIT 1",
+            (run["project_id"],)).fetchone()
+        return row["source_ref"] if row else None
+
+    project_path = _label()
+    if project_path is None and sweeper.refresh_projects(con, cfg):
+        project_path = _label()  # a supervisor may hold a cold cache
     result["findings"] = file_findings(con, client, run, entries, project_path)
     ceiling = int(cfg.get("settings", {}).get("proposal_child_ceiling",
                                               DEFAULT_CHILD_CEILING))

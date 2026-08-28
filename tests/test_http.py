@@ -311,9 +311,9 @@ class SnapshotTests(ServerCase):
 
     def test_runs_carry_status_profile_ref_and_project(self) -> None:
         self.con.execute(
-            "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at) "
-            "VALUES(?,?,?,?,?)",
-            (str(self.tmp_path), PROJECT_ID, "P-1", "demo", db.now()))
+            "INSERT INTO projects(project_id, slug, name, local, refreshed_at) "
+            "VALUES(?,?,?,0,?)",
+            (PROJECT_ID, "P-1", "demo", db.now()))
         live = self.make_run(ref="W-0100", title="build the HTTP surface")
         done = self.make_run(status="done", finished_at=db.now())
         _, payload = self.json_request()
@@ -465,11 +465,11 @@ class ProjectPickerTests(ServerCase):
     statistics — come off ``GET /api/project``.
     """
 
-    def name_project(self, project_id: str, source_ref: str, name: str) -> None:
+    def name_project(self, project_id: str, slug: str, name: str) -> None:
         self.con.execute(
-            "INSERT INTO projects(path, project_id, source_ref, name, refreshed_at) "
-            "VALUES(?,?,?,?,?)",
-            (str(self.tmp_path / name), project_id, source_ref, name, db.now()))
+            "INSERT INTO projects(project_id, slug, name, local, refreshed_at) "
+            "VALUES(?,?,?,0,?)",
+            (project_id, slug, name, db.now()))
         self.con.commit()
 
     def test_the_project_list_is_derived_from_the_runs(self) -> None:
@@ -641,17 +641,14 @@ class ProjectRegistryTests(ServerCase):
     reads the registry and archives through the same call the CLI makes.
     """
 
-    def register(self, name: str, source_ref: str | None = None,
-                 archived: bool = False) -> Path:
-        root = self.tmp_path / name
-        root.mkdir(exist_ok=True)
+    def register(self, name: str, local: bool = True,
+                 archived: bool = False) -> str:
         self.con.execute(
-            "INSERT INTO projects(path, project_id, source_ref, name, "
+            "INSERT INTO projects(project_id, slug, name, local, "
             "refreshed_at, archived) VALUES(?,?,?,?,?,?)",
-            (str(root), f"pid-{name}", source_ref, name, db.now(),
-             int(archived)))
+            (f"pid-{name}", name, name, int(local), db.now(), int(archived)))
         self.con.commit()
-        return root
+        return f"pid-{name}"
 
     def rows(self) -> dict:
         _, payload = self.json_request(path="/api/projects")
@@ -660,24 +657,24 @@ class ProjectRegistryTests(ServerCase):
     def test_the_listing_carries_local_and_source_rows_with_their_state(self) -> None:
         self.register("alpha")
         self.register("bravo", archived=True)
-        self.register("charlie", source_ref="P-9")
+        self.register("charlie", local=False)
         rows = self.rows()
         self.assertEqual(set(rows), {"alpha", "bravo", "charlie"})
         self.assertFalse(rows["alpha"]["archived"])
         self.assertTrue(rows["bravo"]["archived"], "a parked row must still list")
-        self.assertIsNone(rows["alpha"]["source_ref"])
+        self.assertTrue(rows["alpha"]["local"])
         self.assertIsNone(rows["alpha"]["archived_override"],
                           "an untouched row still follows its source")
-        self.assertEqual(rows["charlie"]["source_ref"], "P-9")
+        self.assertFalse(rows["charlie"]["local"])
 
     def test_archiving_through_the_post_takes_the_project_off_the_picker(self) -> None:
-        root = self.register("alpha")
+        self.register("alpha")
         self.make_run(project_id="pid-alpha")
         _, before = self.json_request()
         self.assertEqual([p["project_id"] for p in before["projects"]],
                          ["pid-alpha"])
         status, said = self.json_request(method="POST", path="/api/projects",
-                                         body={"path": str(root),
+                                         body={"project": "alpha",
                                                "archived": True})
         self.assertEqual(status, 200, said)
         self.assertTrue(said["archived"])
@@ -687,7 +684,7 @@ class ProjectRegistryTests(ServerCase):
         self.assertTrue(self.rows()["alpha"]["archived"])
         # and back again, through the same route
         self.json_request(method="POST", path="/api/projects",
-                          body={"path": str(root), "archived": False})
+                          body={"project": "pid-alpha", "archived": False})
         _, back = self.json_request()
         self.assertEqual([p["project_id"] for p in back["projects"]],
                          ["pid-alpha"])
@@ -696,9 +693,9 @@ class ProjectRegistryTests(ServerCase):
         """DESIGN §1: the board's control works on every row. The override is
         what the payload carries back, so the panel can still say WHICH rows
         are parked by their source rather than by the owner."""
-        root = self.register("charlie", source_ref="P-9")
+        self.register("charlie", local=False)
         status, said = self.json_request(method="POST", path="/api/projects",
-                                         body={"path": str(root),
+                                         body={"project": "charlie",
                                                "archived": True})
         self.assertEqual(status, 200, said)
         row = self.rows()["charlie"]
@@ -708,17 +705,18 @@ class ProjectRegistryTests(ServerCase):
     def test_a_row_parked_by_its_source_carries_no_override(self) -> None:
         """How the panel words "parked at the source": the derived flag is on
         and nobody decided it here."""
-        self.register("delta", source_ref="P-8", archived=True)
+        self.register("delta", local=False, archived=True)
         row = self.rows()["delta"]
         self.assertTrue(row["archived"])
         self.assertIsNone(row["archived_override"])
 
-    def test_an_unregistered_path_is_a_404_not_a_silent_success(self) -> None:
+    def test_an_unknown_project_is_a_404_not_a_silent_success(self) -> None:
         status, text = self.request(method="POST", path="/api/projects",
-                                    body={"path": str(self.tmp_path / "nope"),
+                                    body={"project": "nope",
                                           "archived": True})
         self.assertEqual(status, 404)
-        self.assertIn("not a registered project", text)
+        s = None
+        self.assertIn("no project matches", text)
 
     def test_both_routes_normalize_to_themselves_and_are_the_humans(self) -> None:
         """No catch-all swallows them — neither ends in /stream nor looks like

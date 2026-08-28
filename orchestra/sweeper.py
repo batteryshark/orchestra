@@ -32,6 +32,7 @@ Deterministic code only (DESIGN principle 6) — one pass:
 import datetime
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from orchestra import (brief, config, db, dispatch, merge, messaging, nod,
                          paths, project, refine, router, supervise, traces,
@@ -69,36 +70,182 @@ def mark(con, run_id: int, column: str, value: str, *,
         con.commit()
 
 
-# --- the project registry's source-backed rows (CONTRACT §7) ---------------
-# ``projects`` is Orchestra's own registry and stays core. Its ``source_ref``
-# rows are Work's, and only this module knows Work's entry shape — the
-# workspace root a relative path resolves against, ``projectId``, ``id``,
-# ``aliasPaths``, and the ``archived`` flag Work owns (DESIGN §1). The core
-# reads ``archived`` as a plain boolean and never learns who set it.
+# --- the adapter's label-to-folder map (CONTRACT §7, schema v29) ------------
+# The core ``projects`` table is IDENTITY only; the ``checkouts`` table is
+# THIS adapter's, like ``work_marks``: the source's cached project list plus
+# the owner's ``link`` bindings. Only this module knows Work's entry shape —
+# the workspace root a relative path resolves against, ``projectId``, ``id``,
+# ``aliasPaths``, and the ``archived`` flag Work owns (DESIGN §1). Identity
+# rows are written through the one core seam, ``project.remember_identity``.
+
+class Sited(NamedTuple):
+    """A project identity WITH the folder its unattended runs work in.
+
+    The core registry stores no paths; an unattended dispatch is this
+    adapter resolving its own labels, so the pairing lives here.
+    """
+    project_id: str
+    slug: str
+    name: str | None
+    archived: bool
+    path: Path
+
 
 def remember_projects(con, workspace_root: str, entries: list) -> int:
-    """Cache Work's project list into the registry. Returns rows written.
+    """Cache Work's project list: identities through the core seam, paths
+    into this adapter's own ``checkouts`` table. Returns identities written.
 
-    Relative paths resolve against the workspace root; each aliasPath gets its
-    own row so it resolves too. Every refresh copies ``archived``, so
-    archiving in Work parks the project here and unarchiving brings it back,
-    with no local action either way — the 2026-08-27 bill CONTRACT 0.10 names
-    was a cached copy of this list that never learned.
+    Relative paths resolve against the workspace root; each aliasPath gets
+    its own row so it resolves too. Every refresh copies ``archived``, so
+    archiving in Work parks the project here and unarchiving brings it back
+    with no local action (the 2026-08-27 bill CONTRACT 0.10 names was a
+    cached copy of this list that never learned). A cached path the source
+    no longer names is pruned; ``link`` rows (``source_ref`` NULL) are the
+    owner's and never a source's to delete.
     """
     root = Path(workspace_root).expanduser()
-    rows = []
+    idents: dict[str, tuple] = {}
+    rows, seen, ts = [], [], db.now()
     for entry in entries:
         project_id = entry.get("projectId")
         if not project_id:
             continue  # a project Work has not stamped yet is not addressable
+        idents.setdefault(project_id, (entry.get("name"),
+                                       entry.get("archived") is True))
         for rel in [entry.get("path"), *(entry.get("aliasPaths") or [])]:
-            if not rel:
+            if not rel or not entry.get("id"):
                 continue
             p = Path(rel).expanduser()
-            rows.append((p if p.is_absolute() else root / p, project_id,
-                         entry.get("id"), entry.get("name"),
-                         entry.get("archived") is True))
-    return project.remember_source(con, rows)
+            rows.append((str(p if p.is_absolute() else root / p),
+                         project_id, entry.get("id")))
+    count = project.remember_identity(
+        con, [(pid, name, archived) for pid, (name, archived) in idents.items()])
+    for path, project_id, ref in rows:
+        con.execute(
+            "INSERT INTO checkouts(path, project_id, source_ref, refreshed_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+            "project_id=excluded.project_id, source_ref=excluded.source_ref, "
+            "refreshed_at=excluded.refreshed_at",
+            (path, project_id, ref, ts))
+        seen.append(path)
+    marks = ",".join("?" * len(seen)) or "''"
+    con.execute("DELETE FROM checkouts WHERE source_ref IS NOT NULL "
+                f"AND path NOT IN ({marks})", seen)
+    con.commit()
+    return count
+
+
+def by_source_ref(con, ref: str | None) -> Sited | None:
+    """Resolve the source's own project reference to a working folder.
+
+    The ref is matched as itself first and as an absolute local path second,
+    because Work is free to use either. The folder, in order (W-0312):
+    the cached path when it IS a directory; a ``link`` binding, which wins
+    EVEN WHEN ITS DIRECTORY IS GONE (a claimed checkout on an unmounted
+    volume must fail where a human sees it, never be replaced by an empty
+    workspace an agent would fill); the discovered folder the grouped ref
+    names without its grouping; else the project's ephemeral workspace.
+    """
+    if not ref:
+        return None
+    row = con.execute(
+        "SELECT * FROM checkouts WHERE source_ref=? "
+        "ORDER BY LENGTH(path) LIMIT 1", (ref,)).fetchone()
+    if row is None:
+        row = con.execute("SELECT * FROM checkouts WHERE path=?",
+                          (str(Path(ref).expanduser()),)).fetchone()
+    if row is None:
+        return None
+    proj = project.by_id(con, row["project_id"])
+    if proj is None:
+        return None
+    return _site(con, proj, Path(row["path"]), row["source_ref"])
+
+
+def _site(con, proj, cached: Path, ref: str | None) -> Sited:
+    place = Sited(proj.project_id, proj.slug, proj.name, proj.archived, cached)
+    if cached.is_dir():
+        return place
+    linked = con.execute(
+        "SELECT path FROM checkouts WHERE project_id=? AND source_ref IS NULL",
+        (proj.project_id,)).fetchone()
+    if linked is not None:
+        return place._replace(path=Path(linked["path"]))
+    found = _discover(con, proj.project_id, cached, ref)
+    if found is not None:
+        return place._replace(path=found)
+    # Pre-v27 workspaces were keyed by project id under ~/.orchestra/
+    # workspaces; one that exists keeps its state where it already lives.
+    legacy = paths.home().expanduser() / "workspaces" \
+        / paths.slugify(proj.project_id)
+    return place._replace(
+        path=legacy if legacy.is_dir() else paths.workspace_dir(proj.slug))
+
+
+def _discover(con, project_id: str, cached: Path, ref: str | None) -> Path | None:
+    """The folder the grouped ref names WITHOUT its grouping: the workspace
+    root plus the ref's LAST segment ("Group/orchestra" finds
+    ~/Projects/orchestra by itself). A folder another project's checkout
+    already claims is declined — two projects named "docs" under different
+    groups must not collapse onto one checkout."""
+    rel = Path(ref or "")
+    depth = len(rel.parts)
+    if depth < 2 or depth >= len(cached.parts):
+        return None  # nothing was grouped, so there is nothing to strip
+    candidate = cached.parents[depth - 1] / rel.parts[-1]
+    if not candidate.is_dir():
+        return None
+    taken = con.execute(
+        "SELECT 1 FROM checkouts WHERE path=? AND project_id<>?",
+        (str(candidate), project_id)).fetchone()
+    return None if taken else candidate
+
+
+def link(con, selector: str, root: Path):
+    """Bind a project to the checkout it actually lives in: the escape hatch
+    for a repository whose location its source label does not give away.
+    The binding is this adapter's row (``source_ref`` NULL), so a refresh
+    neither replaces nor prunes it."""
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"orchestra: {root} is not a directory")
+    row = con.execute("SELECT project_id FROM checkouts WHERE source_ref=? "
+                      "LIMIT 1", (selector,)).fetchone()
+    proj = (project.by_id(con, row["project_id"]) if row
+            else project.find(con, selector))
+    if proj is None:
+        raise SystemExit(f"orchestra: no project matches {selector!r} — "
+                         "`orchestra project list` names them")
+    con.execute(
+        "INSERT OR REPLACE INTO checkouts(path, project_id, source_ref, "
+        "refreshed_at) VALUES(?,?,NULL,?)",
+        (str(root), proj.project_id, db.now()))
+    con.commit()
+    return proj
+
+
+def locate(con, proj) -> Path | None:
+    """The folder this adapter's map names for a project, or None when it
+    knows none. The CLI's fallback when a project has no run history yet."""
+    row = con.execute(
+        "SELECT * FROM checkouts WHERE project_id=? "
+        "ORDER BY source_ref IS NULL, LENGTH(path) LIMIT 1",
+        (proj.project_id,)).fetchone()
+    if row is None:
+        return None
+    return _site(con, proj, Path(row["path"]), row["source_ref"]).path
+
+
+def project_for_dir(con, start: Path):
+    """The project whose cached checkout contains this directory — the
+    adapter's half of cwd resolution, for a folder no run has taught the
+    run history yet. Deepest path wins, like the history's own rule."""
+    best, best_len = None, -1
+    for row in con.execute("SELECT path, project_id FROM checkouts"):
+        p = Path(row["path"])
+        if (start == p or p in start.parents) and len(row["path"]) > best_len:
+            best, best_len = row["project_id"], len(row["path"])
+    return project.by_id(con, best)
 
 
 def refresh_projects(con, cfg: dict) -> int:
@@ -854,9 +1001,9 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
             continue
         # Which checkout the run gets is the item's project, not the caller's
         # directory: one daemon sweeps the whole workspace (DESIGN §2).
-        proj = project.by_source_ref(con, item.get("projectPath"))
+        proj = by_source_ref(con, item.get("projectPath"))
         if proj is None and refresh_projects(con, cfg):
-            proj = project.by_source_ref(con, item.get("projectPath"))
+            proj = by_source_ref(con, item.get("projectPath"))
         if proj is not None and proj.archived:
             # DESIGN §1: the project is parked, so this lane leaves its items
             # alone. Held rather than printed — the queue row is what makes

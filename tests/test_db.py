@@ -205,8 +205,8 @@ class DbTests(unittest.TestCase):
         """Schema v20 (DESIGN §1). An older database gains the column in
         place, and every row already in it reads as not archived."""
         self.con.execute(
-            "INSERT INTO projects(path, project_id, refreshed_at) VALUES(?,?,?)",
-            ("/tmp/p", "p-1", db.now()))
+            "INSERT INTO projects(project_id, refreshed_at) VALUES(?,?)",
+            ("p-1", db.now()))
         self.con.commit()
         again = db.connect()
         self.addCleanup(again.close)

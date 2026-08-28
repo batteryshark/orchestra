@@ -36,29 +36,34 @@ current behavior rather than the original build plan.
 
 ## 1. Optional Work integration
 
-A project can enter Orchestra's central registry in two ways:
+Orchestra's registry holds project IDENTITIES and nothing else (schema v29):
+one row per project — slug, name, provenance, parked flags. NO PATHS.
+Orchestra is a runner: the checkout a run works in is the caller's to supply
+at dispatch, and "where does this project usually run" is answered by the
+run history (`runs.repo`), not by stored configuration. A project enters the
+registry two ways:
 
-- `orchestra project add .` creates a local project with a generated UUID.
-- With Work enabled, the Work adapter caches Work's project list and immutable
-  project ids into the same registry. A source mapping takes precedence if the
-  source later names a locally adopted directory.
+- `orchestra project add <name>` mints an owner-local identity (a directory
+  argument contributes only its name).
+- With Work enabled, the adapter caches Work's project identities through
+  the one core seam, `project.remember_identity`. Cached identities the
+  source stops naming are pruned unless runs or an owner's override hold
+  them; owner-minted rows are never a source's to delete.
 
-The registry is Orchestra's own and knows no source. A row carries
-`source_ref` — the source's OWN identifier for that project, opaque exactly
-like `runs.ref` — or NULL when the row was adopted locally. Filling
-source-backed rows is adapter work: `project.remember_source` is the one seam
-it writes through, and nothing in the core learns a source's entry shape
-(CONTRACT §7 Enforcement).
+The label-to-folder map is the ADAPTER's own table, `checkouts` — the
+source's cached paths and aliases plus the owner's `link` bindings — owned
+by `sweeper.py` exactly as `work_marks` is (CONTRACT §7 Enforcement). An
+unattended dispatch is the adapter resolving its own labels; the core never
+reads that table.
 
-Every project also carries a SLUG (schema v27): lowercase kebab-case, minted
-once from the project's name, unique across project ids, and never rewritten
-by a refresh or rename — alias and link rows of one project share it. The
-slug is the HUMAN address: `dispatch --project <slug>` targets a project from
-any directory, `POST /api/dispatch` addresses it the same way, and the
-project's own state directory is keyed by it, so troubleshooting starts from
-a name instead of a UUID. `project_id` stays the machine key everything
-else joins on. Registration reaches every surface: `orchestra project add`,
-`POST /api/projects/add`, and the dashboard's projects panel.
+Every project carries a SLUG (v27): lowercase kebab-case, minted once from
+the name, unique, never rewritten by a refresh or rename. The slug is the
+HUMAN address: `dispatch --project <slug>` targets a project from anywhere,
+`POST /api/dispatch` addresses it the same way, and the project's own state
+directory is keyed by it, so troubleshooting starts from a name instead of
+a UUID. `project_id` stays the machine key everything joins on. Identity
+minting reaches every surface: the CLI, `POST /api/projects/add`, and the
+dashboard's projects panel.
 
 A registered project may be ARCHIVED, which means parked rather than hidden.
 The source's flag is the DEFAULT, not the owner: a source marks its own
@@ -72,7 +77,7 @@ boolean and never asks who set it. `orchestra project archive` parks ANY
 project, source-backed or not, because archiving means "hide this from
 Orchestra and stop dispatching for it" — Orchestra's own decision about its
 own surface, which no refresh may overwrite. `project forget` still refuses a
-source-backed project, since the next refresh would put the row back and the
+source-cached identity, since the next refresh would put the row back and the
 removal would look broken. A parked project is off `orchestra project list` (`--all` shows
 it, marked) and off the dashboard's project picker, and the three unattended
 lanes — the sweep's claim path, the conductor, and refine — skip its items.
@@ -166,9 +171,9 @@ The daemon serves a versioned snapshot API, trace streams, action routes, and
 the static dashboard on one port. Reads and actions require either the human
 secret or a scoped per-run token. A run token can read shared state but can act
 only on its own run; termination revokes it. `POST /api/projects/add`
-registers a directory and `POST /api/dispatch` starts a run against a named
-project — both human-key only, the same admission path the CLI uses, so a
-client that is not a terminal can create a project and put work into it.
+mints a project identity and `POST /api/dispatch` starts a run against a
+named project — both human-key only, the same admission path the CLI uses,
+so a client that is not a terminal can create a project and put work into it.
 
 The dashboard and iOS app are optional clients of that API. The iOS bundle
 identifier and Keychain service keep their shipped string for upgrade and
@@ -195,14 +200,19 @@ choice for read-only work or another case where the caller accepts use of the
 registered checkout. Concurrent mutation is safe only when each run has an
 isolated checkout.
 
-A project is not one checkout. The registered path is only the DEFAULT:
-`dispatch --path` (and `path` on `POST /api/dispatch`) names the repository
-one run branches from and lands into, for a project with several checkouts
-or work inside a shared component. The run row records it as `runs.repo`
-(schema v28), and `project.root_for` prefers that over the registry, so
-landing returns to the checkout the run actually came from. With no
-`--project`, the path also names the project, exactly as the cwd does. The
-worktree and artifacts still file under `~/.orchestra/projects/<slug>/`.
+A project is not one checkout, and the core stores no checkout at all
+(schema v29). The caller supplies the repository: `dispatch --path` (and
+`path` on `POST /api/dispatch`) names it outright; a bare dispatch uses the
+current directory; a dispatch that only NAMES a project (`--project`) uses
+the checkout the project last ran in — the run history, not a setting —
+else the adapter's map, else it asks for `--path` once. The run row records
+its checkout as `runs.repo` (v28, backfilled at v29), and `project.root_for`
+reads it, so landing, retries, and diffs return to the checkout the run
+actually came from. With no `--project`, the checkout also names the
+project: the run history first, then the adapter's map. The worktree and
+artifacts still file under `~/.orchestra/projects/<slug>/`, and a
+caller-named path inside `~/.orchestra` itself is refused (the workspace
+excepted) — a worktree of the run database is never what anyone meant.
 
 An isolated run uses a branch named `orchestra/run-N`. The Work sweeper and
 conductor also request isolation by default. If worktree setup or rehoming
@@ -409,7 +419,7 @@ another subsystem already depends on.
     length of the line each event came from.
 13. Never let the core know a source — only `sweeper`, `conductor`, `verify`,
     `refine` and `findings` may import a source client, and `runs.ref`,
-    `projects.source_ref` and `nod_requests.ref` are opaque strings the core
+    `checkouts.source_ref` and `nod_requests.ref` are opaque strings the core
     stores and never parses; the rule is the contract's (§7 Enforcement) and
     `tests/test_boundary.py` asserts it against the import graph.
 14. Never attempt delivery before the durable write — a record that exists

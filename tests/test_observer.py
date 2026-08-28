@@ -843,7 +843,8 @@ class RetryTests(ObserverCase):
 
         released = checkout / "worktrees" / "run-1"  # given back at finalization
         run_id = self.make_run(status="failed", ref="W-0028",
-                               workdir=str(released), branch="orchestra/run-1")
+                               workdir=str(released), branch="orchestra/run-1",
+                               repo=str(checkout))
         self._brief(run_id)
         self.assertFalse(released.exists())
 
