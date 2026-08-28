@@ -14,9 +14,9 @@ Retention: normalized events are kept indefinitely; raw logs age out after
 ``raw_log_retention_days`` for TERMINAL runs only.
 
 HTTP seam (DESIGN §3, item W-0100): ``http.py`` calls
-``stream_run_trace()``, ``stream_daemon_log()``, ``stream_board()``,
-``events_for_run()`` and ``run_messages()`` from here. Nothing in this module
-imports http. The three streams share ``sse()``, ``SSE_RETRY_MS`` and the
+``stream_run_trace()``, ``stream_daemon_log()``, ``stream_run_log()``,
+``stream_board()``, ``events_for_run()`` and ``run_messages()`` from here. Nothing in this module
+imports http. The four streams share ``sse()``, ``SSE_RETRY_MS`` and the
 stop-aware ``_pause()``; ``stream_board()`` is the odd one — an invalidation,
 not a trace — but it belongs beside the machinery it reuses.
 """
@@ -942,7 +942,7 @@ def parse_daemon_cursor(last_event_id: str | None) -> dict[str, int]:
 
 def stream_daemon_log(after: dict[str, int] | None = None, *, stop=None,
                       poll: float = 1.0, tail_bytes: int = 8192,
-                      files=None):
+                      files=None, event: str = "daemon", done=None):
     """Append-only SSE stream of the daemon's OWN log (DESIGN §7).
 
     Separate from a run trace: this answers "is the service healthy and
@@ -950,6 +950,11 @@ def stream_daemon_log(after: dict[str, int] | None = None, *, stop=None,
     errors. Tails stdout and stderr; with no cursor it starts ``tail_bytes``
     back from the end so a fresh viewer sees recent context, not the year.
     Runs until ``stop`` is set or the consumer closes the generator.
+
+    ``files``/``event``/``done`` are what ``stream_run_log`` borrows: the
+    same tail, pointed at one run's raw log, under its own event name, with
+    an end condition. ``done=None`` is the daemon's own case — its log has no
+    end, so it never leaves this loop on its own.
     """
     after = dict(after or {})
     targets = [Path(f) for f in files] if files else daemon_log_paths()
@@ -962,6 +967,10 @@ def stream_daemon_log(after: dict[str, int] | None = None, *, stop=None,
         offsets[path.name] = after.get(path.name, max(0, size - tail_bytes))
     yield f"retry: {SSE_RETRY_MS}\n\n"
     while stop is None or not stop.is_set():
+        # Sample "is it over" BEFORE the read, so bytes written just before
+        # the run went terminal are still in this pass — the same extra pass
+        # stream_run_trace makes against the same race.
+        ending = done is not None and done()
         moved = False
         for path in targets:
             try:
@@ -979,8 +988,53 @@ def stream_daemon_log(after: dict[str, int] | None = None, *, stop=None,
                 if not line.strip():
                     continue
                 moved = True
-                yield sse({"file": path.name, "line": line}, event="daemon",
+                yield sse({"file": path.name, "line": line}, event=event,
                           event_id=",".join(f"{n}@{o}" for n, o in offsets.items()))
-        if not moved:
-            yield ": keepalive\n\n"
-            _pause(stop, poll)
+        if moved:
+            continue
+        if ending:
+            return  # drained, and the writer has stopped writing
+        yield ": keepalive\n\n"
+        _pause(stop, poll)
+
+
+def stream_run_log(run_id: int, after: dict[str, int] | None = None, *,
+                   stop=None, poll: float = 1.0, tail_bytes: int = 8192,
+                   con=None):
+    """Append-only SSE tail of ONE run's RAW harness output (DESIGN §7).
+
+    The normalized trace says what the PARSER understood. When a run looks
+    stuck that is the wrong surface, because the question is what the CLI is
+    doing, not what we made of it. So this is the raw log the supervisor
+    already writes, tailed read-only and rendered as text — no PTY, no
+    terminal emulator, nothing that could write back into the run. The
+    machinery is ``stream_daemon_log``'s, including the ``tail_bytes`` start:
+    a fresh viewer of a gigabyte log reads one page, never the file.
+
+    Two ways it ends instead of polling forever. ``pruned`` when the raw log
+    aged out — DESIGN §7 keeps the normalized events and drops the file, and
+    a silent empty stream would read as the hung run this route exists to
+    disprove. ``end`` once the run is terminal and the tail is drained.
+    """
+    owned = con is None
+    con = con or db.connect()
+    try:
+        row = con.execute("SELECT log_path FROM runs WHERE id=?",
+                          (run_id,)).fetchone()
+        path = Path(row["log_path"]) if row and row["log_path"] else None
+        cur = cursor(con, run_id)
+        # A live run may not have opened its log yet, so a missing file is
+        # only "pruned" once the run is over.
+        if path is None or (cur and cur["raw_pruned_at"]) or (
+                not path.is_file() and _terminal(con, run_id)):
+            yield sse({"run_id": run_id, "reason": "pruned"}, event="pruned")
+            return
+        yield from stream_daemon_log(after, stop=stop, poll=poll,
+                                     tail_bytes=tail_bytes, files=[path],
+                                     event="raw",
+                                     done=lambda: _terminal(con, run_id))
+        if stop is None or not stop.is_set():
+            yield sse({"run_id": run_id, "reason": "terminal"}, event="end")
+    finally:
+        if owned:
+            con.close()

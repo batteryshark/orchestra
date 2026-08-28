@@ -481,6 +481,85 @@ class SseTests(TraceTestCase):
         self.assertTrue(any("swept" in f for f in frames))
         self.assertFalse(any("pid 1" in f for f in frames))  # never re-sent
 
+    def test_a_runs_raw_log_tails_and_resumes_at_an_offset(self) -> None:
+        """W-0165 borrowed: the same tail, pointed at one run's own log."""
+        log = self.dir / "run.log"
+        log.write_text("harness: starting up\n")
+        run_id = self.make_run("claude", log)          # still live
+        stop = threading.Event()
+        stream = traces.stream_run_log(run_id, {log.name: 0}, con=self.con,
+                                       stop=stop, poll=0)
+        self.assertTrue(next(stream).startswith("retry:"))
+        first = next(stream)
+        self.assertIn("event: raw", first)
+        self.assertIn("starting up", first)
+        cursor = traces.parse_daemon_cursor(
+            first.splitlines()[0].split(":", 1)[1].strip())
+        self.assertEqual(cursor, {log.name: len("harness: starting up\n")})
+        with open(log, "a") as handle:
+            handle.write("harness: running tests\n")
+        frames = []
+        for frame in stream:
+            frames.append(frame)
+            if "running tests" in frame:
+                stop.set()
+        self.assertFalse(any("starting up" in f for f in frames))  # never resent
+        # A fresh viewer resuming at that cursor sees only what came after.
+        resumed = traces.stream_run_log(run_id, cursor, con=self.con,
+                                        stop=threading.Event(), poll=0)
+        body = "".join(f for _, f in zip(range(3), resumed))
+        self.assertIn("running tests", body)
+        self.assertNotIn("starting up", body)
+
+    def test_a_fresh_viewer_starts_near_the_end_of_a_large_log(self) -> None:
+        """tail_bytes, not the file: a gigabyte log costs one page."""
+        log = self.dir / "big.log"
+        log.write_text("".join(f"line {n}\n" for n in range(20000)))
+        run_id = self.make_run("claude", log)
+        stop = threading.Event()
+        stream = traces.stream_run_log(run_id, con=self.con, stop=stop,
+                                       poll=0, tail_bytes=200)
+        next(stream)
+        body = "".join(f for _, f in zip(range(30), stream))
+        self.assertIn("line 19990", body)
+        self.assertNotIn("line 100", body)   # the head of the file is never read
+        stop.set()
+        stream.close()
+
+    def test_a_pruned_raw_log_says_pruned_rather_than_nothing(self) -> None:
+        """DESIGN §7 keeps the events and drops the file. An empty stream
+        would read as the hung run this surface exists to disprove."""
+        log = write_jsonl(self.dir / "gone.jsonl", CODEX)
+        run_id = self.make_run("codex", log, status="done",
+                               finished_at="2020-01-01T00:00:00Z")
+        traces.prune_raw_logs(self.con, days=1)
+        self.assertFalse(log.is_file())
+        frames = list(traces.stream_run_log(run_id, con=self.con, poll=0))
+        self.assertEqual(len(frames), 1)
+        self.assertIn("event: pruned", frames[0])
+        self.assertNotIn("event: end", frames[0])
+
+    def test_a_terminal_runs_raw_tail_ends_instead_of_polling(self) -> None:
+        log = self.dir / "done.log"
+        log.write_text("harness: bye\n")
+        run_id = self.make_run("claude", log, status="done",
+                               finished_at=db.now())
+        frames = list(traces.stream_run_log(run_id, con=self.con, poll=0))
+        self.assertTrue(frames[0].startswith("retry:"))
+        self.assertIn("harness: bye", "".join(frames))
+        self.assertIn("event: end", frames[-1])
+
+    def test_the_daemon_log_still_never_ends_on_its_own(self) -> None:
+        """The borrow left the daemon caller alone: its log has no end."""
+        out = self.dir / "daemon.out.log"
+        out.write_text("orchestra daemon: pid 1\n")
+        stop = threading.Event()
+        stream = traces.stream_daemon_log({}, stop=stop, files=[out], poll=0)
+        next(stream)
+        self.assertIn(": keepalive", "".join(f for _, f in zip(range(4), stream)))
+        stop.set()
+        stream.close()
+
     def test_daemon_cursor_round_trip(self) -> None:
         cases = [
             ("daemon.out.log@12,daemon.err.log@0",

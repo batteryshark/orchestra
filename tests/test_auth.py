@@ -114,6 +114,7 @@ class RouteTableTests(unittest.TestCase):
         "GET /api/profiles/options": "/api/profiles/options",
         "GET /api/*/stream": "/api/log/stream",
         "GET /api/runs/{run}/stream": "/api/runs/4/stream",
+        "GET /api/runs/{run}/log/stream": "/api/runs/4/log/stream",
         "GET /api/runs/{run}/brief": "/api/runs/4/brief",
         "GET /api/runs/{run}/diff": "/api/runs/4/diff",
         "POST /api/runs/{run}/stop": "/api/runs/4/stop",
@@ -209,6 +210,28 @@ class RunTokenRouteTests(ServerCase):
         self.assertEqual(status, 403)
         self.assertIn(f"not on run {self.sibling}", text)
         self.assertNotIn(self.token, text)
+
+    def test_a_run_may_watch_its_own_raw_log_but_never_a_siblings(self) -> None:
+        """The raw log is the trace's own source file, so the catch-all
+        ``GET /api/*/stream`` must NOT be what the normalizer folds it to —
+        that key is BOTH, and would hand a token every sibling's output."""
+        self.assertEqual(auth.route_key("GET", f"/api/runs/{self.run_id}/log/stream"),
+                         ("GET /api/runs/{run}/log/stream", self.run_id))
+        log = self.tmp_path / "raw.log"
+        log.write_text("secret harness chatter\n")
+        for run_id in (self.run_id, self.sibling):
+            self.con.execute("UPDATE runs SET log_path=? WHERE id=?",
+                             (str(log), run_id))
+        self.con.commit()
+        status, ctype, body = self.sse(f"/api/runs/{self.run_id}/log/stream",
+                                       key=self.token, until="retry:")
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", ctype)
+        status, _, text = self.sse(f"/api/runs/{self.sibling}/log/stream",
+                                   key=self.token)
+        self.assertEqual(status, 403)
+        self.assertIn(f"not on run {self.sibling}", text)
+        self.assertNotIn("secret harness chatter", text)
 
     def test_a_run_may_read_its_own_brief_but_never_a_siblings(self) -> None:
         """W-0183: a brief is one run's mission, scoped like its trace."""
