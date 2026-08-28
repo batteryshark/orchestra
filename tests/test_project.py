@@ -444,11 +444,15 @@ class MigrationV29Tests(unittest.TestCase):
 
     def test_old_runs_keep_a_landing_target(self) -> None:
         """``runs.repo`` is backfilled from the registry BEFORE the paths
-        leave the core, so ``root_for`` never loses an old run's repo."""
+        leave the core — but only from a path that IS a directory: a
+        source's cached path is often an organizational label that never
+        existed on disk, and stamping that would aim root_for at nothing."""
+        real = self.tmp_path / "tool"
+        real.mkdir()
         db_file = self.tmp_path / "old.db"
         db.connect(db_file).close()  # a real runs table, current shape
         old = sqlite3.connect(db_file)
-        old.executescript("""
+        old.executescript(f"""
             DROP TABLE projects;
             DROP TABLE checkouts;
             CREATE TABLE projects (
@@ -456,20 +460,25 @@ class MigrationV29Tests(unittest.TestCase):
               source_ref TEXT, name TEXT, refreshed_at TEXT NOT NULL,
               archived INTEGER NOT NULL DEFAULT 0, archived_override INTEGER);
             INSERT INTO projects VALUES
-              ('/w/tool', 'p-1', 'g/tool', 'Tool', 't', 0, NULL);
+              ('/w/Group/tool', 'p-1', 'Group/tool', 'Tool', 't', 0, NULL),
+              ('{real}',        'p-1', NULL,         'Tool', 't', 0, NULL),
+              ('/w/ghost',      'p-2', 'g/ghost',    'Ghost', 't', 0, NULL);
             INSERT INTO runs(id, profile, backend, requested_by, workdir,
                              status, started_at, project_id)
               VALUES (1, 'p', 'codex', 'human', '/w/wt/run-1', 'done', 't',
-                      'p-1');
+                      'p-1'),
+                     (2, 'p', 'codex', 'human', '/w/wt/run-2', 'done', 't',
+                      'p-2');
         """)
         old.commit()
         old.close()
 
         con = db.connect(db_file)
         try:
-            self.assertEqual(con.execute(
-                "SELECT repo FROM runs WHERE id=1").fetchone()["repo"],
-                "/w/tool")
+            rows = {r["id"]: r["repo"] for r in con.execute(
+                "SELECT id, repo FROM runs")}
+            self.assertEqual(rows[1], str(real))  # the one that exists
+            self.assertIsNone(rows[2])  # a label is not a landing target
         finally:
             con.close()
 

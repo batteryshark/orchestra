@@ -153,7 +153,7 @@ Data-model invariants (DESIGN D4):
 """
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from orchestra import paths
 
@@ -757,11 +757,18 @@ def _rebuild_projects_v29(con: sqlite3.Connection) -> None:
     con.executescript(CHECKOUTS_SQL)
     if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                    "AND name='runs'").fetchone():
-        con.execute(
-            "UPDATE runs SET repo = ("
-            " SELECT p.path FROM projects p WHERE p.project_id = runs.project_id"
-            " ORDER BY p.source_ref IS NULL, LENGTH(p.path) LIMIT 1) "
-            "WHERE repo IS NULL AND project_id IS NOT NULL")
+        # Only a path that IS a directory backfills: a source's cached path
+        # is often an organizational label ("Group/thing") that never
+        # existed on disk, and stamping that would aim root_for at nothing.
+        # A project with no real path leaves repo NULL, where root_for's
+        # history-then-workdir fallback still answers.
+        for row in con.execute(
+                "SELECT project_id, path FROM projects "
+                "ORDER BY source_ref IS NULL, LENGTH(path)").fetchall():
+            if not Path(row["path"]).is_dir():
+                continue
+            con.execute("UPDATE runs SET repo=? WHERE repo IS NULL "
+                        "AND project_id=?", (row["path"], row["project_id"]))
     con.execute(
         "INSERT OR IGNORE INTO checkouts(path, project_id, source_ref, "
         "refreshed_at) SELECT path, project_id, source_ref, refreshed_at "
