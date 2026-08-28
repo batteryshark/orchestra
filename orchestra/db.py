@@ -617,6 +617,51 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _retire_resurrected(con: sqlite3.Connection) -> None:
+    """Fold away an old column name a stale process put back (2026-08-28).
+
+    v21 and v25 rename in ONE SHOT and no reader tolerates the old spelling
+    (CONTRACT §6). That holds for readers; it did not survive a WRITER left
+    running across the upgrade. A supervisor started before the upgrade keeps
+    pre-v21 code in memory, and its own ``connect`` re-adds every column it
+    expects. All five came back on the owner's database, and one of them,
+    ``work_reported_at``, came back carrying 276 rows, because the missing
+    columns also re-triggered the v16 backfill.
+
+    So "both spellings exist" is a REAL state, and crashing on it took the
+    daemon down. This stays a migration rather than the read-path shim §6
+    forbids: it FOLDS the twin into the live column and DROPS it, so the old
+    shape is gone by the time this returns. Folding instead of dropping means
+    it never matters which side happened to hold the value.
+    """
+    names = {r["name"] for r in con.execute("PRAGMA table_info(runs)")}
+    if "work_item" in names and "ref" in names:
+        con.execute("UPDATE runs SET ref = COALESCE(ref, work_item) "
+                    "WHERE work_item IS NOT NULL")
+        # The stale writer's SCHEMA rebuilt the old index too, and SQLite
+        # refuses to drop a column an index still names.
+        con.execute("DROP INDEX IF EXISTS idx_runs_work_item")
+        con.execute("ALTER TABLE runs DROP COLUMN work_item")
+    if "work_claim_status" in names and "claim_status" in names:
+        con.execute("UPDATE runs SET claim_status = "
+                    "COALESCE(claim_status, work_claim_status) "
+                    "WHERE work_claim_status IS NOT NULL")
+        con.execute("ALTER TABLE runs DROP COLUMN work_claim_status")
+    for column, mark in (("work_seen_ts", "seen_ts"),
+                         ("work_reported_at", "reported_at"),
+                         ("work_progress_at", "progress_at")):
+        if column not in names:
+            continue
+        # The adapter's own table is the home. A mark already there WINS: it
+        # was written by code that understood the new shape, where the twin
+        # may hold a value an old backfill re-derived.
+        con.execute(f"INSERT INTO work_marks(run_id, {mark}) "
+                    f"SELECT id, {column} FROM runs WHERE {column} IS NOT NULL "
+                    f"ON CONFLICT(run_id) DO UPDATE SET "
+                    f"{mark} = COALESCE(work_marks.{mark}, excluded.{mark})")
+        con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+
+
 def connect(db_file=None) -> sqlite3.Connection:
     """The central database (DESIGN §2). ``db_file`` opens another file, for
     tests."""
@@ -644,7 +689,7 @@ def connect(db_file=None) -> sqlite3.Connection:
         # §6 forbids — so this branch is the only code that ever names them.
         # It runs BEFORE the v16 backfill: real receipts move first, and the
         # backfill then fills only what is still missing.
-        if "work_item" in existing:
+        if "work_item" in existing and "ref" not in existing:
             con.execute("ALTER TABLE runs RENAME COLUMN work_item TO ref")
             con.execute("DROP INDEX IF EXISTS idx_runs_work_item")
             con.execute(
@@ -661,11 +706,14 @@ def connect(db_file=None) -> sqlite3.Connection:
         # gate keeps its place on ``runs`` — the reaper reads it — and stops
         # naming the one source that happens to confirm the claim. Same rule
         # as v21: rename OR add, never a reader that accepts both spellings.
-        if "work_claim_status" in existing:
+        if "work_claim_status" in existing and "claim_status" not in existing:
             con.execute(
                 "ALTER TABLE runs RENAME COLUMN work_claim_status TO claim_status")
         elif "claim_status" not in existing:
             con.execute("ALTER TABLE runs ADD COLUMN claim_status TEXT")
+        # Both spellings can coexist when a pre-upgrade WRITER re-adds the old
+        # one. Fold the twin away before anything below reads either.
+        _retire_resurrected(con)
         if upgrading_v16:
             # A historical completion notice proves the old finalizer reached
             # its durable result boundary. Settle only those rows: replaying
