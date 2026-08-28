@@ -394,7 +394,7 @@ def _assert_actionable(kind: str, options) -> None:
 
 def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options,
                     con: sqlite3.Connection | None = None,
-                    run_id: int | None = None, work_item: str | None = None,
+                    run_id: int | None = None, ref: str | None = None,
                     dedupe_key: str | None = None, **card) -> dict:
     """File one card on the channel its kind belongs to, and record it.
 
@@ -414,7 +414,7 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
     _assert_actionable(kind, options)
     if dedupe_key is None:
         dedupe_key = ":".join(
-            str(p) for p in ("orchestra", kind, run_id, work_item) if p is not None)
+            str(p) for p in ("orchestra", kind, run_id, ref) if p is not None)
         if kind == "merge_conflict" and con is not None and run_id is not None:
             attempt = con.execute(
                 "SELECT COUNT(*) FROM nod_requests WHERE run_id=? AND "
@@ -426,7 +426,7 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
                             **card)
     if con is not None:
         record(con, created["request_id"], kind=kind, channel=client.channel_id,
-               run_id=run_id, work_item=work_item, dedupe_key=dedupe_key,
+               run_id=run_id, ref=ref, dedupe_key=dedupe_key,
                title=title, body=card.get("body_markdown"))
     return created
 
@@ -459,14 +459,17 @@ def _rfc3339(when) -> str:
 # (``record_escalation``), which is the ordering DESIGN §5's profile
 # escalations depend on — the refusal used to survive while the thing being
 # refused did not.
-# It also remembers which run and which Work item a Nod request id belongs
-# to, so a decision can be mirrored into the Work thread later.
+# It also remembers which run and which ``ref`` a Nod request id belongs to.
+# ``ref`` is the same OPAQUE string ``runs.ref`` carries (schema v25, CONTRACT
+# §7 Enforcement 1): a caller hands it in, this module stores it and never
+# parses it, and the source adapter that reads these rows is the only code
+# that knows what it spells.
 # `channel` is what makes a later read possible at all: the token is scoped
 # to one channel, so the channel has to be remembered, not inferred.
 # No token is stored in this table, and no column exists for one.
 
 def record(con: sqlite3.Connection, request_id: str, *, kind: str, channel: str,
-           run_id: int | None = None, work_item: str | None = None,
+           run_id: int | None = None, ref: str | None = None,
            dedupe_key: str | None = None, title: str | None = None,
            body: str | None = None, status: str = "pending") -> None:
     """One escalation, stored (schema v24 adds ``title``/``body``).
@@ -481,14 +484,14 @@ def record(con: sqlite3.Connection, request_id: str, *, kind: str, channel: str,
     # re-arm an action that already ran or re-file a decision already filed.
     con.execute(
         "INSERT INTO nod_requests(request_id, kind, channel, run_id, "
-        "work_item, dedupe_key, title, body, status, created_at) "
+        "ref, dedupe_key, title, body, status, created_at) "
         "VALUES(?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(request_id) DO UPDATE SET kind=excluded.kind, "
         "channel=excluded.channel, run_id=excluded.run_id, "
-        "work_item=excluded.work_item, dedupe_key=excluded.dedupe_key, "
+        "ref=excluded.ref, dedupe_key=excluded.dedupe_key, "
         "title=excluded.title, body=excluded.body, status=excluded.status, "
         "created_at=excluded.created_at",
-        (request_id, kind, channel, run_id, work_item, dedupe_key, title, body,
+        (request_id, kind, channel, run_id, ref, dedupe_key, title, body,
          status, _now()))
     con.commit()
 
@@ -558,10 +561,10 @@ def open_requests(con: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def unmirrored(con: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Answered cards whose decision has not reached Work yet."""
+    """Answered cards carrying a ref whose decision no source has yet."""
     return list(con.execute(
         "SELECT * FROM nod_requests WHERE status!='pending' AND mirrored_at IS NULL "
-        "AND work_item IS NOT NULL ORDER BY created_at"))
+        "AND ref IS NOT NULL ORDER BY created_at"))
 
 
 def unmirrored_of_kind(con: sqlite3.Connection, kind: str) -> list[sqlite3.Row]:

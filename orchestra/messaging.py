@@ -188,7 +188,7 @@ def file_question(con: sqlite3.Connection, cfg: dict, run, question: str,
     seconds = ask_seconds(cfg)
     title = f"run {run['slug'] or run_id} is asking"
     created = nod.blocked_run(
-        channels, question, con=con, run_id=run_id, work_item=run["ref"],
+        channels, question, con=con, run_id=run_id, ref=run["ref"],
         title=title,
         summary=(run["title"] or "")[:200],
         expires_at=nod.expires_in(seconds),

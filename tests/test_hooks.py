@@ -338,7 +338,7 @@ class AskTests(HookFixture):
         row = self.con.execute("SELECT * FROM nod_requests WHERE request_id=?",
                                (request_id,)).fetchone()
         self.assertEqual(row["kind"], "blocked")
-        self.assertEqual(row["work_item"], "W-0001")
+        self.assertEqual(row["ref"], "W-0001")
         self.assertIn("which database?",
                       self.work.tasks["W-0001"]["log"][-1]["message"])
 

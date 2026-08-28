@@ -98,7 +98,7 @@ class DaemonTests(unittest.TestCase):
                          "WHERE id=?", (stale,))
         self.con.execute(
             "UPDATE runs SET started_at='2000-01-01T00:00:00+00:00', "
-            "work_claim_status='pending' WHERE id=?", (pending_claim,))
+            "claim_status='pending' WHERE id=?", (pending_claim,))
         self.con.execute("UPDATE runs SET started_at='not-a-time' WHERE id=?",
                          (malformed,))
         self.con.commit()
@@ -328,9 +328,20 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("identity changed", diagnostics.getvalue())
 
     def test_tick_report_contract(self) -> None:
-        """Without Work configured nothing is swept; the nod answers land in
-        the report, and a raising nod pass never ends the tick."""
-        self.assertEqual(daemon.tick()["swept"], [])
+        """With NO source configured the tick still completes and reports
+        every job; the nod answers land in it, and a raising nod pass never
+        ends the tick.
+
+        The empty ``swept``/``conducted`` come from the adapter passes
+        themselves: the daemon builds no client and cannot tell whether a
+        source exists (CONTRACT §7 Enforcement 3).
+        """
+        report = daemon.tick()
+        self.assertEqual((report["swept"], report["conducted"]), ([], []))
+        self.assertEqual(set(report), {
+            "swept", "conducted", "released", "reaped", "recovered_results",
+            "resumed_results", "resumed_retries", "resumed_judgments",
+            "paused", "runway", "nod_answers"})
         acted = [{"request_id": "req_1", "action": "retry", "outcome": "landed"}]
         cases = {
             "the answers are carried": ({"return_value": acted}, acted),
@@ -349,15 +360,12 @@ class DaemonTests(unittest.TestCase):
         dead = self._run(supervisor_pid=_free_pid())
         self.con.commit()
         dispatch.pause(self.con, "maintenance")
-        client = object()
         with mock.patch.object(daemon.supervise, "process_ready") as ready, \
                 mock.patch.object(daemon, "_poll_runway", return_value=2) as runway_, \
                 mock.patch.object(daemon, "_act_on_nod_answers",
                                   return_value=[{"answer": 1}]) as nod_, \
                 mock.patch.object(daemon.sweeper, "refresh_projects",
                                   return_value=True) as refresh, \
-                mock.patch.object(daemon.work_client, "from_cfg",
-                                  return_value=client), \
                 mock.patch.object(daemon.sweeper, "sweep",
                                   return_value=[{"action": "report"}]) as swept, \
                 mock.patch.object(daemon.conductor, "pass_once",
@@ -373,8 +381,11 @@ class DaemonTests(unittest.TestCase):
         runway_.assert_called_once()
         nod_.assert_called_once()
         refresh.assert_called_once()
-        swept.assert_called_once()
-        conducted.assert_called_once()
+        # CONTRACT §7 Enforcement 3: the scheduler hands over cfg and
+        # nothing else — no client, no source name.
+        for called in (swept, conducted):
+            called.assert_called_once()
+            self.assertEqual(called.call_args, mock.call(mock.ANY))
 
     def test_once_runs_a_single_tick_even_a_failing_one_and_returns_zero(self) -> None:
         cases = {"a clean tick": {"return_value": {}},

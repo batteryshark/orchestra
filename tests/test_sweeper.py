@@ -323,14 +323,14 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                 side_effect=WorkError(503, "unavailable", "try again")):
             self.assertEqual(self.sweep(), [])
         pending = self.db_run()
-        self.assertEqual(pending["work_claim_status"], "pending")
+        self.assertEqual(pending["claim_status"], "pending")
 
         with self.lose_response(marker=" fact: claimed"):
             self.assertEqual(self.sweep(), [])
         still_pending = self.db_run()
         self.assertEqual(still_pending["id"], pending["id"])
         self.assertEqual(still_pending["status"], "pending")
-        self.assertEqual(still_pending["work_claim_status"], "pending")
+        self.assertEqual(still_pending["claim_status"], "pending")
         self.assertIsNone(still_pending["brief_path"])
         self.assertEqual(self.launched, [])
 
@@ -339,7 +339,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                                     "run": pending["id"], "resumed": False}])
         settled = self.db_run()
         self.assertEqual(settled["id"], pending["id"])
-        self.assertEqual(settled["work_claim_status"], "claimed")
+        self.assertEqual(settled["claim_status"], "claimed")
         self.assertEqual(self.launched, [(self.root, pending["id"])])
         claim = f"fact: claimed run={pending['id']}"
         self.assertEqual(sum(claim in entry["message"]
@@ -372,7 +372,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(self.sweep(), [])
         abandoned = self.db_run(pending["id"])
         self.assertEqual(abandoned["status"], "killed")
-        self.assertEqual(abandoned["work_claim_status"], "abandoned")
+        self.assertEqual(abandoned["claim_status"], "abandoned")
         self.assertFalse(Path(prepared["brief_path"]).exists())
         self.assertEqual(self.db_one(
             "SELECT COUNT(*) FROM observations WHERE run_id=? AND layer='retry'",
@@ -384,7 +384,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         with self.lose_response(method="claim_issue"):
             self.assertEqual(self.sweep(), [])
         pending = self.db_run()
-        self.assertEqual((pending["status"], pending["work_claim_status"]),
+        self.assertEqual((pending["status"], pending["claim_status"]),
                          ("pending", "pending"))
         self.assertEqual(self.work.issues["issue_once"]["claimedBy"],
                          {"kind": "agent", "name": "orchestra"})
@@ -394,7 +394,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual(actions, [{"action": "dispatch", "item": "issue_once",
                                     "run": pending["id"], "resumed": False}])
         self.assertEqual(self.db_run()["id"], pending["id"])
-        self.assertEqual(self.db_run()["work_claim_status"], "claimed")
+        self.assertEqual(self.db_run()["claim_status"], "claimed")
         bodies = [entry["body"]
                   for entry in self.work.issues["issue_once"]["messages"]]
         self.assertEqual(sum("fact: claimed" in body for body in bodies), 1)
@@ -921,7 +921,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         pending = self.db_run()
         self.assertEqual(pending["parent_run"], first["id"])
         self.assertEqual(pending["session_ref"], "sess-42")
-        self.assertEqual((pending["status"], pending["work_claim_status"]),
+        self.assertEqual((pending["status"], pending["claim_status"]),
                          ("pending", "pending"))
 
         actions = self.sweep()
@@ -929,7 +929,7 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
                                     "run": pending["id"], "resumed": True}])
         resumed = self.db_run()
         self.assertEqual(resumed["id"], pending["id"])
-        self.assertEqual(resumed["work_claim_status"], "claimed")
+        self.assertEqual(resumed["claim_status"], "claimed")
         self.assertIn("Use Okta.", Path(resumed["brief_path"]).read_text())
 
     def test_failed_issue_continuation_releases_ownership_to_the_human(self) -> None:

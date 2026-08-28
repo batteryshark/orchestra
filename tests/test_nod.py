@@ -243,9 +243,9 @@ class EscalationKindTests(NodTestCase):
 
     def test_dedupe_key_stops_a_retried_run_buzzing_twice(self) -> None:
         first = nod.blocked_run(self.channels, "q", title="t", run_id=7,
-                                work_item="W-0168", con=self.con)
+                                ref="W-0168", con=self.con)
         second = nod.blocked_run(self.channels, "q", title="t", run_id=7,
-                                 work_item="W-0168", con=self.con)
+                                 ref="W-0168", con=self.con)
         self.assertEqual(first["request_id"], second["request_id"])
         self.assertTrue(second["deduped"])
         self.assertEqual(len(self.nod.requests), 1)
@@ -266,11 +266,11 @@ class CallbackTests(NodTestCase):
 class PersistenceTests(NodTestCase):
     def test_mapping_survives_for_the_work_mirror(self) -> None:
         got = nod.blocked_run(self.channels, "q?", title="Run 7 blocked",
-                              con=self.con, run_id=7, work_item="W-0168")
+                              con=self.con, run_id=7, ref="W-0168")
         row = self.con.execute("SELECT * FROM nod_requests WHERE request_id=?",
                                (got["request_id"],)).fetchone()
         self.assertEqual(row["run_id"], 7)
-        self.assertEqual(row["work_item"], "W-0168")
+        self.assertEqual(row["ref"], "W-0168")
         self.assertEqual(row["kind"], "blocked")
         self.assertEqual(row["channel"], DECISIONS_CHANNEL)
         self.assertEqual(row["status"], "pending")
@@ -279,7 +279,7 @@ class PersistenceTests(NodTestCase):
 
     def test_decision_is_saved_then_marked_mirrored(self) -> None:
         got = nod.blocked_run(self.channels, "q?", title="t", con=self.con,
-                              run_id=7, work_item="W-0168")
+                              run_id=7, ref="W-0168")
         rid = got["request_id"]
         self.nod.resolve(rid, option_id="answer", text="use postgres")
         client = self.channels.for_request(self.con, rid)
@@ -461,7 +461,7 @@ class ActingTestCase(NodTestCase):
     def _merge_card(self, run_id=7, item="W-0201", dedupe_key=None) -> str:
         got = nod.merge_conflict(
             self.channels, "conflict detail", con=self.con, run_id=run_id,
-            work_item=item, title=f"run {run_id} did not land",
+            ref=item, title=f"run {run_id} did not land",
             dedupe_key=dedupe_key or f"test:{run_id}")
         return got["request_id"]
 
