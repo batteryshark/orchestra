@@ -528,8 +528,7 @@ class MergeTestCase(unittest.TestCase):
             with mock.patch.object(merge, "merge_run", return_value=result) as land, \
                     mock.patch.object(merge.project, "root_for", return_value=self.root), \
                     mock.patch.object(merge.nod, "withdraw_merge_cards"), \
-                    mock.patch.object(merge, "_thread"), \
-                    mock.patch.object(merge, "_post_to_work"):
+                    mock.patch.object(merge, "_thread"):
                 note = merge._land(con, {}, run, "done")
             land.assert_called_once()
             self.assertIn("Merged", note)

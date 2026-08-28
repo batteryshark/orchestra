@@ -5,7 +5,13 @@ Deterministic code only (DESIGN principle 6) — one pass:
 - **Report**: a finished run posts an attributed comment and appends its
   fact — ``landed`` / ``halted`` / ``failed``, or ``resolved`` /
   ``needs_human`` on an issue. A run never writes status (CONTRACT 0.8);
-  Work derives the board from the facts and the human's own move.
+  Work derives the board from the facts and the human's own move. The comment
+  carries the landing detail and any correction the run never received; the
+  ``landed`` fact carries the sha and the revert line, read off the receipt
+  ``merge.py`` stamped (CONTRACT §7 Enforcement: the landing path posts
+  nothing).
+- **Mirror**: both sides of an ``ask`` reach the item's thread. ``messaging``
+  records them on the run and posts nothing; this pass carries them.
 - **Claim**: an item a human marked ``delegated`` (CONTRACT §2; a legacy
   ``agents`` list is history and never counts as delegation) that sits
   in ``ready`` (task) / ``queued`` (issue) with no live run gets one: a
@@ -24,8 +30,9 @@ import datetime
 import time
 from pathlib import Path
 
-from orchestra import (brief, config, db, dispatch, messaging, paths, project,
-                         refine, router, supervise, traces, verify, work_client)
+from orchestra import (brief, config, db, dispatch, merge, messaging, nod,
+                         paths, project, refine, router, supervise, traces,
+                         verify, work_client)
 from orchestra.work_client import WorkClient, WorkError, fact_line, from_cfg
 
 CURSOR_KEYS = {"task": "work_cursor_tasks", "issue": "work_cursor_issues"}
@@ -289,6 +296,54 @@ def _decline_unaccounted(client: WorkClient, item_id: str, run,
     return declined
 
 
+def _landing_detail(con, run) -> list[str]:
+    """The landing report ``merge.py`` wrote into the run's own thread.
+
+    DESIGN §9 names its contents — merge commit, files changed, check results,
+    the revert command — and the landing path is the only writer that has
+    them. It stopped posting them itself (CONTRACT §7 Enforcement), so the
+    report comment carries them, once, beside the run's summary.
+    """
+    return [row["body"] for row in con.execute(
+        "SELECT body FROM messages WHERE run_id=? AND kind='merge' ORDER BY id",
+        (int(run["id"]),))]
+
+
+def _stranded_detail(con, run) -> list[str]:
+    """Corrections the run ended before receiving.
+
+    They live in ``messages`` and never on the run row, so a cursored read of
+    run rows cannot surface them on its own. The report comment carries them
+    instead of a second channel: it posts exactly once per run, gated by the
+    same ``work_marks.reported_at`` receipt as everything else in it, so the
+    notice inherits that delivery guarantee rather than inventing one.
+    """
+    rows = messaging.undeliverable(con, int(run["id"]))
+    if not rows:
+        return []
+    lines = [f"{len(rows)} message(s) never reached the run:"]
+    lines += [f"- from {row['sender']}: "
+              f"{' '.join((row['body'] or '').split())[:200]} "
+              f"({row['undeliverable_reason']})" for row in rows[:5]]
+    if len(rows) > 5:
+        lines.append(f"- {len(rows) - 5} more: `orchestra show {run['id']}`")
+    return ["\n".join(lines)]
+
+
+def _landed_fields(con, run) -> dict:
+    """The sha a ``landed`` fact names, and the line that reverts it.
+
+    ``runs.landing_commit`` is the receipt (schema v23). It is NULL when the
+    base already contained the branch: then no merge commit exists, and a
+    revert line aimed at one would undo somebody else's work (I-0077).
+    """
+    sha = run["landing_commit"]
+    if not sha:
+        return {}
+    return {"sha": sha,
+            "revert": merge.revert_command(project.root_for(con, run), sha)}
+
+
 def _report_ready(con, result) -> bool:
     """True once this is the Work item's latest settled result."""
     if not result["handoff_processed_at"]:
@@ -336,8 +391,9 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
     item_id, kind = result["ref"], item_kind(result["ref"])
     success, summary = _completion_outcome(result)
     tag = f"[{client.identity}/{result['slug'] or result['id']}]"
-    comment = (f"{tag} run {result['id']} finished: {result['status']}\n\n"
-               f"{summary}")[:19000]
+    comment = "\n\n".join(
+        [f"{tag} run {result['id']} finished: {result['status']}", summary]
+        + _landing_detail(con, result) + _stranded_detail(con, result))[:19000]
     target = ("review" if success else "blocked") if kind == "task" \
         else ("closed" if success else "needs_human")
     verb = ("landed" if success else
@@ -346,6 +402,7 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
         if kind == "task" else ("resolved" if success else "needs_human")
     fact = (fact_line(
         tag, verb,
+        **(_landed_fields(con, result) if verb == "landed" else {}),
         reason=None if success else _headline(result, summary))
         if kind == "task" else fact_line(
             tag, verb,
@@ -786,6 +843,63 @@ def _ferry(con, client: WorkClient, items: list, actions: list) -> bool:
     return True
 
 
+def _mark_answers_mirrored(con, run_id: int) -> None:
+    """``nod.unmirrored`` lists answered cards whose decision has not reached
+    the thread. This run's answer just did, so stop listing them."""
+    for request in nod.unmirrored(con):
+        if request["run_id"] == run_id:
+            nod.mark_mirrored(con, request["request_id"])
+
+
+def _mirror(con, client: WorkClient, actions: list) -> None:
+    """Put both sides of an ``ask`` in the item's thread (CONTRACT §4).
+
+    ``messaging`` records the question and the human's answer as ``ask`` and
+    ``answer`` rows on the run and posts nothing, because the ask verb is
+    core and the thread is Work's (CONTRACT §7 Enforcement). This pass reads
+    those rows and appends what the thread does not already hold.
+
+    THE THREAD IS THE WATERMARK. The same content check ``report_result``
+    makes is what stops a second post, so neither side keeps delivery state
+    and a crash between the post and the next pass costs nothing. The rows
+    are never consumed or moved, so this is a read, not a queue.
+
+    Best effort, exactly as the inline mirror was: Work being down must never
+    break a live session, and the next pass carries what this one could not.
+    The scan is bounded by work in flight — live runs, plus terminal runs
+    whose report has not gone up — never by history.
+    """
+    rows = list(con.execute(
+        "SELECT m.kind, m.body, r.ref, r.id AS run_id FROM messages m "
+        "JOIN runs r ON r.id = m.run_id "
+        "WHERE r.ref IS NOT NULL AND m.kind IN (?,?) "
+        f"AND (r.status NOT IN {db.TERMINAL_SQL} OR r.id NOT IN "
+        "(SELECT run_id FROM work_marks WHERE reported_at IS NOT NULL)) "
+        "ORDER BY m.id", (messaging.ASK_KIND, messaging.ANSWER_KIND)))
+    for item_id in dict.fromkeys(row["ref"] for row in rows):
+        kind = item_kind(item_id)
+        try:
+            remote = (client.task(item_id) if kind == "task"
+                      else client.issue(item_id))
+            if remote is None:
+                continue
+            for row in (r for r in rows if r["ref"] == item_id):
+                body = (f"Question for the human:\n\n{row['body']}"
+                        if row["kind"] == messaging.ASK_KIND else row["body"])
+                if _thread_contains(remote, kind, body):
+                    continue
+                posted = (client.log_task(item_id, body) if kind == "task"
+                          else client.reply_issue(item_id, body))
+                if posted is None:
+                    break   # Work went away mid-item; the next pass retries
+                if row["kind"] == messaging.ANSWER_KIND:
+                    _mark_answers_mirrored(con, int(row["run_id"]))
+                actions.append({"action": "mirror", "item": item_id,
+                                "run": row["run_id"], "kind": row["kind"]})
+        except WorkError as exc:
+            print(f"orchestra sweep: mirror {item_id} refused ({exc})")
+
+
 def _iso_ago(seconds: int) -> str:
     return datetime.datetime.fromtimestamp(
         time.time() - seconds, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -830,6 +944,9 @@ def sweep(cfg: dict, client: WorkClient,
     actions: list[dict] = []
     con = db.connect()
     try:
+        # Before the report: the report's own receipt is what bounds the
+        # mirror's scan, so a just-reported run must still get its ask across.
+        _mirror(con, client, actions)
         ok = _report(con, client, actions)
         verify.after_report(con, cfg, client, actions)
         _progress(con, cfg, client, actions)

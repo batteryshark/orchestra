@@ -1006,7 +1006,9 @@ def _feed_payload(r) -> dict:
 
     The fields are the ones ``sweeper``'s reporting path actually reads off a
     run row — ``ref`` (which item), ``status``/``summary``/``landing_status``
-    (what happened, and whether the landing settled), ``branch`` and
+    (what happened, and whether the landing settled), ``landing_commit``
+    (the merge commit that landing produced, which is the only place a
+    ``landed`` fact can get its sha and its revert line), ``branch`` and
     ``handoff_processed_at`` (whether the result is settled at all),
     ``requested_by`` (which lane reports itself), ``slug`` and ``no`` (the tag
     and the human number in every comment it posts), ``layer`` (a control
@@ -1032,6 +1034,7 @@ def _feed_payload(r) -> dict:
         "title": r["title"],
         "branch": r["branch"],
         "landing_status": r["landing_status"],
+        "landing_commit": r["landing_commit"],
         "handoff_processed_at": r["handoff_processed_at"],
         "requested_by": r["requested_by"],
         "exit_code": r["exit_code"],

@@ -229,6 +229,11 @@ declared checks plus mechanical tripwires, with an optional mission-alignment
 judgment for tripped limits. Output identifies the checks and tripwires that
 actually ran.
 
+Landing reports to no source. It stamps `landing_status` and `landing_commit`
+on the run row and writes its report into the run's own thread. A source
+adapter reads that receipt and posts the fact, because rebasing a branch and
+moving a ref must not know a record system exists (CONTRACT §7 Enforcement).
+
 Every successful run's final handoff is parsed. Findings and proposals are filed
 only when Work is configured and the run has Work context. They have no local
 durable collection, so the dashboard and iOS client do not present one.

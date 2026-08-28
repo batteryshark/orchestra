@@ -82,7 +82,10 @@ Data-model invariants (DESIGN D4):
 - ``runs.landing_status``/``handoff_processed_at`` (schema v16, W-0295) are
   the two durable policy receipts on the terminal result row. NULL means that
   policy has not settled yet; landing records ``ok`` or ``failed``, while
-  handoff processing records its completion timestamp. ``pid_identity`` is
+  handoff processing records its completion timestamp. ``landing_commit``
+  (schema v23) is the merge commit that verdict produced, NULL when the
+  landing made none. It is the whole receipt a reporting consumer needs: the
+  landing path writes it and posts nothing (CONTRACT §7 Enforcement). ``pid_identity`` is
   the worker process's kernel creation token; orphan recovery matches it before
   signaling the stored PID, which may otherwise have been reused.
   ``supervisor_pid_identity`` applies the same reuse check to the process that
@@ -128,7 +131,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "22"
+SCHEMA_VERSION = "23"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -196,6 +199,13 @@ RUNS_V18_COLUMNS = (
 # the one-shot backfill in ``connect``.
 RUNS_V22_COLUMNS = (
     ("revision", "INTEGER"),
+)
+# Schema v23 (CONTRACT §7 Enforcement). The merge commit a landing produced,
+# beside the ``ok``/``failed`` verdict that already sits there. The landing
+# path used to keep this fact to itself and post it to Work directly; now it
+# writes the receipt and a consumer reads it.
+RUNS_V23_COLUMNS = (
+    ("landing_commit", "TEXT"),
 )
 RUNS_V17_COLUMNS = (
     ("child_depth", "INTEGER"),
@@ -302,7 +312,8 @@ CREATE TABLE IF NOT EXISTS runs (
   child_wakeup_run INTEGER,
   child_wakeup_message INTEGER,
   project_seq INTEGER,
-  revision INTEGER
+  revision INTEGER,
+  landing_commit TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
@@ -594,7 +605,8 @@ def connect(db_file=None) -> sqlite3.Connection:
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
                                + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS
-                               + RUNS_V18_COLUMNS + RUNS_V22_COLUMNS):
+                               + RUNS_V18_COLUMNS + RUNS_V22_COLUMNS
+                               + RUNS_V23_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
         # Schema v21 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, run here and

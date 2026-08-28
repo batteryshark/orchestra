@@ -15,7 +15,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, dispatch, merge, project, sweeper
+from orchestra import (config, db, dispatch, merge, messaging, project,
+                       sweeper)
 from orchestra.work_client import WorkClient
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.fake_work import FakeWork
@@ -132,6 +133,31 @@ class LandingTestCase(unittest.TestCase):
             "SELECT body FROM messages WHERE run_id=1 AND kind='merge'").fetchall()
         return "\n".join(r["body"] for r in rows)
 
+    def row(self) -> dict:
+        return dict(self.con.execute("SELECT * FROM runs WHERE id=1").fetchone())
+
+    def client(self) -> WorkClient:
+        return WorkClient(self.work_url, identity="orchestra")
+
+    def report(self, client: WorkClient | None = None) -> None:
+        """The ADAPTER's report pass.
+
+        ``merge.py`` stamps the landing receipt and posts nothing (CONTRACT §7
+        Enforcement), so the board moves only once ``sweeper`` reads the run
+        row. The two rows below are what ``supervise`` finalization writes;
+        ``_report_ready`` waits for them.
+        """
+        self.con.execute(
+            "UPDATE runs SET handoff_processed_at=COALESCE(handoff_processed_at,?)"
+            " WHERE id=1", (db.now(),))
+        self.con.execute(
+            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
+            "SELECT 1,'orchestra','finished','completion',? WHERE NOT EXISTS("
+            "SELECT 1 FROM messages WHERE run_id=1 AND kind='completion')",
+            (db.now(),))
+        self.con.commit()
+        sweeper.report_result(self.con, client or self.client(), self.row())
+
     def item_log(self) -> str:
         return "\n".join(e["message"] for e in self.work.tasks["W-0001"]["log"])
 
@@ -145,6 +171,9 @@ class LandingTestCase(unittest.TestCase):
         run = self.add_run()
 
         note = merge.at_completion(self.con, self.cfg, run)
+        self.assertEqual(0, self.work.mutation_count(),
+                         "the landing path posts nothing (CONTRACT §7)")
+        self.report()
 
         head = git(self.root, "rev-parse", "main")
         self.assertIn(f"Merged {BRANCH} into main", note)
@@ -169,6 +198,50 @@ class LandingTestCase(unittest.TestCase):
         self.assertEqual(self.con.execute(
             "SELECT landing_status FROM runs WHERE id=1").fetchone()["landing_status"],
                          "ok")
+
+    def test_the_landed_fact_comes_from_the_receipt_not_the_landing_path(self):
+        """CONTRACT §7 Enforcement: ``merge.py`` writes ``landing_status`` and
+        ``landing_commit`` and stops. The adapter reads that receipt and posts
+        the fact — with the landing path wired to explode if it runs again."""
+        self.run_branch({"feature.py": "x = 1\n"})
+        merge.at_completion(self.con, self.cfg, self.add_run())
+        head = git(self.root, "rev-parse", "main")
+        self.assertEqual(head, self.row()["landing_commit"])
+        self.assertEqual(0, self.work.mutation_count())
+
+        with mock.patch.object(merge, "merge_run",
+                               side_effect=AssertionError("landing replayed")):
+            self.report()
+
+        log = self.item_log()
+        self.assertIn(f"fact: landed sha={head} revert=git ", log)
+        self.assertIn(f"revert -m 1 {head}", log)
+        self.assertIn("files changed (1): `feature.py`", log)
+        self.assertEqual("review", self.work.tasks["W-0001"]["status"])
+
+    def test_an_undelivered_correction_surfaces_on_the_item(self) -> None:
+        """A correction the run never received lives in ``messages``, never on
+        the run row, so a cursored read of run rows cannot surface it alone.
+        The report comment carries it: one channel, one exactly-once receipt.
+        """
+        self.run_branch({"feature.py": "x = 1\n"})
+        self.add_run(status="running")
+        messaging.queue_tell(self.con, 1, "human", "use postgres", None)
+        self.con.execute("UPDATE runs SET status='done' WHERE id=1")
+        self.assertEqual(1, messaging.mark_undeliverable(
+            self.con, 1, "run ended (done) before the message reached a boundary"))
+        self.con.commit()
+
+        merge.at_completion(self.con, self.cfg, self.row())
+        self.report()
+
+        log = self.item_log()
+        self.assertIn("1 message(s) never reached the run:", log)
+        self.assertIn("- from human: use postgres", log)
+        self.assertIn("run ended (done)", log)
+        # and it is still marked on the row it lives on, for `orchestra show`
+        self.assertEqual(["use postgres"],
+                         [r["body"] for r in messaging.undeliverable(self.con, 1)])
 
     def test_replay_recovers_a_landing_that_deleted_its_branch(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
@@ -215,15 +288,18 @@ class LandingTestCase(unittest.TestCase):
             "SELECT landing_status FROM runs WHERE id=1").fetchone()["landing_status"],
                          "ok")
 
-    def test_work_report_replay_recovers_lost_responses_once(self) -> None:
-        run = self.add_run()
-        result = merge.blank_result("main", BRANCH)
-        result.update(ok=True, stage="merged", commit="a" * 40,
-                      revert_command="git revert " + "a" * 40)
-        report = merge._report_text(run, result, None)
+    def test_report_replay_recovers_lost_responses_once(self) -> None:
+        """A response lost in transit must never become a second post.
+
+        No delivery state exists on this side (CONTRACT §7 Enforcement 2):
+        the thread's own content is the watermark, so the retry finds the
+        comment and the fact it already committed and appends neither twice.
+        """
+        self.run_branch({"feature.py": "x = 1\n"})
+        merge.at_completion(self.con, self.cfg, self.add_run())
         client = WorkClient(self.work_url, identity="orchestra")
         real_log = client.log_task
-        lost = {"merge:landed", "fact: landed"}
+        lost = {"finished: done", "fact: landed"}
 
         def commit_without_response(item, message):
             response = real_log(item, message)
@@ -233,37 +309,19 @@ class LandingTestCase(unittest.TestCase):
                 return None
             return response
 
-        with mock.patch.object(merge.work_client, "from_cfg", return_value=client), \
-                mock.patch.object(client, "log_task",
-                                  side_effect=commit_without_response):
-            merge._post_to_work(self.con, self.cfg, run, result, report)
-            merge._post_to_work(self.con, self.cfg, run, result, report)
-            merge._post_to_work(self.con, self.cfg, run, result, report)
+        with mock.patch.object(client, "log_task",
+                               side_effect=commit_without_response):
+            for _ in range(3):
+                self.report(client)
 
         messages = [entry["message"] for entry in
                     self.work.tasks["W-0001"]["log"]]
-        self.assertEqual(1, sum("merge:landed" in message
-                                for message in messages))
-        self.assertEqual(1, sum("fact: landed" in message
-                                for message in messages))
+        self.assertEqual(1, sum("finished: done" in m for m in messages))
+        self.assertEqual(1, sum("fact: landed" in m for m in messages))
         self.assertEqual(set(), lost)
-
-        self.con.execute(
-            "UPDATE runs SET landing_status='ok', handoff_processed_at=? WHERE id=1",
-            (db.now(),))
-        self.con.execute(
-            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
-            "VALUES(1, 'orchestra', 'finished', 'completion', ?)", (db.now(),))
-        self.con.commit()
-        settled, action = sweeper.report_result(
-            self.con, client,
-            dict(self.con.execute("SELECT * FROM runs WHERE id=1").fetchone()))
-        self.assertTrue(settled)
-        self.assertEqual(action["action"], "report")
-        messages = [entry["message"] for entry in
-                    self.work.tasks["W-0001"]["log"]]
-        self.assertEqual(1, sum("fact: landed" in message for message in messages))
-        self.assertFalse(any(" finished: done" in message for message in messages))
+        self.assertIsNotNone(
+            self.con.execute("SELECT reported_at FROM work_marks "
+                             "WHERE run_id=1").fetchone()["reported_at"])
 
     def test_a_settled_landing_is_not_consumed_again(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
@@ -288,6 +346,7 @@ class LandingTestCase(unittest.TestCase):
         self.run_branch({"feature.py": "x = 1\n"})
 
         merge.at_completion(self.con, self.cfg, self.add_run())
+        self.report()
 
         self.assertIn("checks: test ok", self.item_log())
         self.assertEqual("review", self.work.tasks["W-0001"]["status"])
@@ -339,6 +398,7 @@ class LandingTestCase(unittest.TestCase):
         run = self.add_run()
 
         note = merge.at_completion(self.con, self.cfg, run)
+        self.report()
 
         self.assertIn("Merge escalated at rebase", note)
         self.assertIn(BRANCH, self.branches())          # branch left intact
@@ -379,6 +439,7 @@ class LandingTestCase(unittest.TestCase):
         before = git(self.root, "rev-parse", "main")
 
         note = merge.at_completion(self.con, self.cfg, self.add_run())
+        self.report()
 
         self.assertIn("Merge escalated at checks", note)
         self.assertEqual(before, git(self.root, "rev-parse", "main"))
@@ -395,6 +456,7 @@ class LandingTestCase(unittest.TestCase):
         dispatch.pause(self.con, note="hands off")
 
         note = merge.at_completion(self.con, self.cfg, self.add_run())
+        self.report()
 
         after = git(self.root, "rev-parse", "main")
         self.assertIn(f"Merged {BRANCH} into main", note)
@@ -467,6 +529,7 @@ class LandingTestCase(unittest.TestCase):
                 merge, "merge_run",
                 side_effect=RuntimeError("git update-ref failed: stale ref")):
             note = merge.at_completion(self.con, self.cfg, run)
+        self.report()
         self.assertIn("Merge escalated at merge", note)
         self.assertIn(BRANCH, self.branches())
         self.assertEqual("blocked", self.work.tasks["W-0001"]["status"])

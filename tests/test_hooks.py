@@ -12,8 +12,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import brief, config, db, hooks, messaging, runners, traces
+from orchestra import (brief, config, db, hooks, messaging, runners,
+                       sweeper, traces)
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
+from orchestra.work_client import WorkClient
 from tests.fake_work import FakeWork
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
@@ -86,6 +88,15 @@ class HookFixture(unittest.TestCase):
 
     def run_row(self):
         return self.con.execute("SELECT * FROM runs WHERE id=1").fetchone()
+
+    def mirror(self) -> list:
+        """The ADAPTER's mirror pass. ``messaging`` records an ask and its
+        answer on the run and posts nothing (CONTRACT §7 Enforcement); the
+        thread only sees them once the sweeper carries them."""
+        actions: list = []
+        sweeper._mirror(self.con, WorkClient(self.work_url, identity="orchestra"),
+                        actions)
+        return actions
 
     def as_run(self, run_id=1):
         return mock.patch.dict(os.environ, {"ORCHESTRA_RUN_ID": str(run_id)})
@@ -315,6 +326,10 @@ class AskTests(HookFixture):
 
     def test_question_is_filed_and_mirrored_into_the_work_thread(self) -> None:
         request_id, seconds = self.file_one()
+        self.assertEqual([], self.work.tasks["W-0001"]["log"],
+                         "the ask verb posts nothing itself (CONTRACT §7)")
+        self.assertEqual(1, len(self.mirror()))
+        self.assertEqual([], self.mirror())   # the thread is the watermark
         self.assertLessEqual(seconds, messaging.MAX_ASK_SECONDS)
         card = self.nod.requests[request_id]
         self.assertEqual(card["channel_id"], DECISIONS_CHANNEL)
@@ -336,7 +351,11 @@ class AskTests(HookFixture):
         row = self.con.execute("SELECT * FROM nod_requests WHERE request_id=?",
                                (request_id,)).fetchone()
         self.assertEqual(row["status"], "resolved")
-        self.assertIsNotNone(row["mirrored_at"])
+        self.assertIsNone(row["mirrored_at"])   # nothing posted from the core
+        self.assertEqual(2, len(self.mirror()))
+        self.assertIsNotNone(
+            self.con.execute("SELECT mirrored_at FROM nod_requests WHERE "
+                             "request_id=?", (request_id,)).fetchone()["mirrored_at"])
         kinds = [m["kind"] for m in traces.run_messages(self.con, 1)]
         self.assertEqual(kinds, ["ask", "answer"])
         # Both sides reached the Work thread.
