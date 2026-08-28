@@ -19,14 +19,17 @@ server that knows this directory, then retry."""
 class Project:
     """One cached (path -> projectId) mapping. ``path`` is a lookup key only."""
 
-    __slots__ = ("project_id", "path", "work_id", "name")
+    __slots__ = ("project_id", "path", "work_id", "name", "archived")
 
     def __init__(self, project_id: str, path: Path, work_id: str | None,
-                 name: str | None):
+                 name: str | None, archived: bool = False):
         self.project_id = project_id
         self.path = path
         self.work_id = work_id
         self.name = name
+        # DESIGN §1: parked, not deleted. Read by the unattended lanes and
+        # the listing surfaces; nothing that reads history looks at it.
+        self.archived = archived
 
     @property
     def slug(self) -> str:
@@ -39,7 +42,8 @@ class Project:
 def _row(row) -> Project | None:
     if row is None:
         return None
-    return Project(row["project_id"], Path(row["path"]), row["work_id"], row["name"])
+    return Project(row["project_id"], Path(row["path"]), row["work_id"], row["name"],
+                   bool(row["archived"]))
 
 
 # --- cache ------------------------------------------------------------------
@@ -61,10 +65,14 @@ def remember(con, workspace_root: str, entries: list) -> int:
                 continue
             p = Path(rel).expanduser()
             absolute = p if p.is_absolute() else root / p
+            # Work owns the archived flag (DESIGN §1); every refresh copies
+            # it, so archiving there parks the project here and unarchiving
+            # brings it back, with no local action either way.
             con.execute(
                 "INSERT OR REPLACE INTO projects(path, project_id, work_id, name, "
-                "refreshed_at) VALUES(?,?,?,?,?)",
-                (str(absolute), project_id, entry.get("id"), entry.get("name"), ts))
+                "refreshed_at, archived) VALUES(?,?,?,?,?,?)",
+                (str(absolute), project_id, entry.get("id"), entry.get("name"), ts,
+                 int(entry.get("archived") is True)))
             seen.append(str(absolute))
             count += 1
     # A Work-sourced row whose path Work no longer names is stale — a moved or
@@ -130,9 +138,28 @@ def forget(con, root: Path) -> bool:
     return True
 
 
-def all_projects(con) -> list:
+def set_archived(con, root: Path, archived: bool) -> bool:
+    """Park or unpark a locally adopted project. Refuses one that came from
+    Work, which owns the flag: the next refresh would overwrite the local
+    answer and the change would look broken."""
+    root = Path(root).expanduser().resolve()
+    row = con.execute("SELECT work_id FROM projects WHERE path=?",
+                      (str(root),)).fetchone()
+    if row is None:
+        return False
+    if row["work_id"]:
+        raise SystemExit(
+            f"orchestra: {root} comes from Work; archive it there, not here")
+    con.execute("UPDATE projects SET archived=? WHERE path=?",
+                (int(archived), str(root)))
+    con.commit()
+    return True
+
+
+def all_projects(con, include_archived: bool = False) -> list:
+    where = "" if include_archived else " WHERE archived=0"
     return [_row(r) for r in con.execute(
-        "SELECT * FROM projects ORDER BY path")]
+        f"SELECT * FROM projects{where} ORDER BY path")]
 
 
 def refresh(con, cfg: dict) -> int:
@@ -260,12 +287,17 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
         "SELECT * FROM projects WHERE project_id=? AND work_id IS NULL",
         (proj.project_id,)).fetchone()
     if linked is not None:
-        return _row(linked)
+        hit = _row(linked)
+        # Parking belongs to the PROJECT, not to the row that holds its
+        # address: a linked checkout does not unpark what Work archived.
+        hit.archived = hit.archived or proj.archived
+        return hit
     found = _discover(con, proj)
     if found is not None:
-        return Project(proj.project_id, found, proj.work_id, proj.name)
+        return Project(proj.project_id, found, proj.work_id, proj.name,
+                       proj.archived)
     return Project(proj.project_id, paths.workspace_dir(proj.project_id),
-                   proj.work_id, proj.name)
+                   proj.work_id, proj.name, proj.archived)
 
 
 def _discover(con, proj: "Project") -> Path | None:

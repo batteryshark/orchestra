@@ -518,5 +518,25 @@ class JudgmentTests(ConductorFixture, unittest.TestCase):
             con.close()
 
 
+class ArchivedProjectTests(ConductorFixture, unittest.TestCase):
+    """DESIGN §1: a parked project gets no planner turn at all."""
+
+    def test_no_turn_fires_and_the_trigger_survives_the_park(self) -> None:
+        self.add_goal()
+        self.archive_project()
+        dispatch = {"action": "dispatch", "rationale": "start it",
+                    "item": "W-0100", "mission": "do the thing"}
+        self.assertEqual([], self.conduct(dispatch))
+        self.assertEqual([], self.turns(), "a parked goal took a planner turn")
+        self.assertEqual([], self.prompts, "a parked goal cost a model call")
+        self.assertEqual([], self.launched)
+
+        # Unparking finds the same trigger waiting, exactly like a resume.
+        self.archive_project(archived=False)
+        self.conduct(dispatch)
+        self.assertEqual(1, len(self.turns()))
+        self.assertEqual(1, len(self.launched))
+
+
 if __name__ == "__main__":
     unittest.main()

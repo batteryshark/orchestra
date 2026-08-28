@@ -5,6 +5,8 @@ each item's project from Work, and writes to one database under
 ``ORCHESTRA_HOME``. The fixture therefore builds a workspace with a project
 directory in it, not a project with a state directory.
 """
+import contextlib
+import io
 import json
 import os
 import queue
@@ -86,6 +88,18 @@ class SweeperFixture:
 
     def sweep(self):
         return sweeper.sweep(self.cfg, self.client, launcher=self.launcher)
+
+    def archive_project(self, work_id="demo", archived=True) -> None:
+        """The owner archives the project IN WORK (DESIGN §1). Orchestra
+        copies the flag on its next refresh and never writes it back."""
+        for entry in self.work.projects:
+            if entry["id"] == work_id:
+                entry["archived"] = archived
+        con = db.connect()
+        try:
+            self.assertTrue(project.refresh(con, self.cfg))
+        finally:
+            con.close()
 
     def race_admissions(self, calls, locked_write=None):
         """Run admissions after every contender has reached its first BEGIN.
@@ -1152,6 +1166,70 @@ class SweeperTestCase(SweeperFixture, unittest.TestCase):
         self.assertEqual([a["action"] for a in self.sweep()], ["report"])
         self.assertEqual(self.db_run(run_id)["profile"], "stub")
         self.assertEqual(self.work.tasks["W-0001"]["status"], "review")
+
+
+class ArchivedProjectTests(SweeperFixture, unittest.TestCase):
+    """DESIGN §1: a parked project stops receiving unattended dispatch, and
+    says so once — the daemon sweeps every 60s, so a per-pass line would be
+    the loudest thing in the log."""
+
+    def swept_output(self) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.sweep()
+        return buffer.getvalue()
+
+    def test_a_delegated_item_is_skipped_and_the_notice_never_repeats(self) -> None:
+        self.work.add_task("W-0001", "parked work", delegated=True)
+        self.archive_project()
+        said = self.swept_output()
+        self.assertEqual([], self.launched, "the lane dispatched a parked item")
+        self.assertIn("W-0001", said)
+        self.assertIn("archived", said)
+        con = db.connect()
+        held = con.execute("SELECT * FROM dispatch_queue WHERE item_id='W-0001'"
+                           ).fetchone()
+        con.close()
+        self.assertEqual("archived", held["reason"])
+
+        self.assertNotIn("archived", self.swept_output(),
+                         "the notice repeated on the next 60s pass")
+        self.assertEqual([], self.launched)
+
+        # Unarchiving in Work revives the item with no local action.
+        self.archive_project(archived=False)
+        self.sweep()
+        self.assertEqual(1, len(self.launched))
+
+    def test_a_live_run_is_untouched_when_its_project_is_archived(self) -> None:
+        self.work.add_task("W-0001", "already going", delegated=True)
+        self.sweep()
+        run = self.db_run()
+        self.archive_project()
+        self.sweep()
+        after = self.db_run(run["id"])
+        self.assertEqual(tuple(run), tuple(after), "the live run was disturbed")
+        self.assertNotIn(after["status"], db.RUN_TERMINAL)
+
+    def test_manual_dispatch_into_an_archived_project_still_runs(self) -> None:
+        """The human's own move outranks the automation (DESIGN §1): parking
+        stops the unattended lanes, and `orchestra dispatch` is not one."""
+        from argparse import Namespace
+
+        from orchestra import cli
+        self.archive_project()
+        args = Namespace(mission=["do the thing"], to="stub", after=None,
+                         brief_file=None, context=None, title=None,
+                         worktree=False, sync=False)
+        buffer = io.StringIO()
+        with mock.patch.dict(os.environ, {"ORCHESTRA_ROOT": str(self.root)}), \
+                mock.patch("orchestra.supervise.spawn_supervisor") as spawned, \
+                contextlib.redirect_stdout(buffer):
+            cli.cmd_dispatch(args)
+        run = self.db_run()
+        self.assertIsNotNone(run, "a manual dispatch was refused")
+        self.assertEqual(1, spawned.call_count)
+        self.assertIn("is archived", buffer.getvalue())  # told, not refused
 
 
 if __name__ == "__main__":

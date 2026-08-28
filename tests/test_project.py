@@ -341,6 +341,46 @@ class AdoptTests(unittest.TestCase):
         # work_id is a TEXT column, so an integer id round-trips as a string.
         self.assertEqual("7", str(found.work_id))
 
+    def test_work_owns_the_archived_flag_and_a_refresh_flips_it_both_ways(self) -> None:
+        """DESIGN §1: parking a project in Work parks it here, with no local
+        action — and unparking it there brings it back the same way."""
+        def refresh(**flag):
+            project.remember(self.con, str(self.root),
+                             [{"projectId": "w-1", "id": 7, "name": "theirs",
+                               "path": "repo", **flag}])
+            return project.resolve(self.con, {}, str(self.repo)).archived
+
+        self.assertFalse(refresh(archived=False))
+        self.assertTrue(refresh(archived=True))
+        self.assertFalse(refresh(archived=False), "back on Work's word alone")
+        self.assertTrue(refresh(archived=True))
+        # An older Work that serves no flag at all is not an archived project.
+        self.assertFalse(refresh())
+
+    def test_an_archived_project_is_off_the_list_until_all_asks(self) -> None:
+        project.adopt(self.con, self.repo)
+        project.set_archived(self.con, self.repo, True)
+        self.assertEqual([], project.all_projects(self.con))
+        listed = project.all_projects(self.con, include_archived=True)
+        self.assertEqual([self.repo], [p.path for p in listed])
+        self.assertTrue(listed[0].archived)
+        # It still RESOLVES: a directory is addressable whether parked or not,
+        # which is what keeps manual dispatch and every history read working.
+        self.assertTrue(project.resolve(self.con, {}, str(self.repo)).archived)
+        project.set_archived(self.con, self.repo, False)
+        self.assertEqual([self.repo], [p.path for p in project.all_projects(self.con)])
+
+    def test_archive_refuses_a_work_backed_project(self) -> None:
+        """Work owns the flag, so archiving here would be overwritten by the
+        next refresh — refused the same way ``forget`` refuses."""
+        project.remember(self.con, str(self.root),
+                         [{"projectId": "w-1", "id": 7, "name": "theirs",
+                           "path": "repo"}])
+        with self.assertRaises(SystemExit) as caught:
+            project.set_archived(self.con, self.repo, True)
+        self.assertIn("comes from Work", str(caught.exception))
+        self.assertFalse(project.set_archived(self.con, self.root / "nowhere", True))
+
     def test_forget_drops_a_local_project_but_refuses_one_from_work(self) -> None:
         project.adopt(self.con, self.repo)
         self.assertTrue(project.forget(self.con, self.repo))

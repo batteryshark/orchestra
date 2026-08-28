@@ -86,6 +86,14 @@ def dispatch_one(con, cfg: dict, client: WorkClient, item: dict,
         print(f"orchestra refine: {item_id} has no known project "
               f"({item.get('projectPath')!r}) — skipped")
         return True
+    if proj.archived:
+        # DESIGN §1: parked project, so this lane leaves it alone. True and
+        # not False: holding the sweep cursor for a project that may stay
+        # parked for months freezes the watermark for the whole workspace.
+        # ponytail: the tag stays on the item, so unarchiving revives it on
+        # the next full board read or the next edit to the item, not
+        # instantly. Give the lane its own waiting row if that ever matters.
+        return True
     pcfg = config.load(proj.project_id)
     profile_name = _profile_name(pcfg, item_id)
     if not profile_name:

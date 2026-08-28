@@ -593,13 +593,27 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                 actions.append({"action": "hold", "item": item_id,
                                 "reason": reason[0], "detail": reason[1]})
             continue
-        if item_id in queued:
-            dispatch.release(con, item_id)
         # Which checkout the run gets is the item's project, not the caller's
         # directory: one daemon sweeps the whole workspace (DESIGN §2).
         proj = project.by_work_path(con, item.get("projectPath"))
         if proj is None and project.refresh(con, cfg):
             proj = project.by_work_path(con, item.get("projectPath"))
+        if proj is not None and proj.archived:
+            # DESIGN §1: the project is parked, so this lane leaves its items
+            # alone. Held rather than printed — the queue row is what makes
+            # the notice once-only, so a 60s sweep does not repeat it, and a
+            # forgotten `delegated` tick is still said out loud once. Checked
+            # BEFORE the release below, which would reset that row every pass.
+            # The row also keeps this pass reading the WHOLE board, so
+            # unarchiving revives the item with no human touching it.
+            if dispatch.hold(con, item_id, kind, _lane, "archived", proj.slug):
+                print(f"orchestra sweep: {item_id} skipped — project "
+                      f"{proj.slug} is archived")
+                actions.append({"action": "hold", "item": item_id,
+                                "reason": "archived", "detail": proj.slug})
+            continue
+        if item_id in queued:
+            dispatch.release(con, item_id)
         if proj is None:
             print(f"orchestra sweep: {item_id} has no known project "
                   f"({item.get('projectPath')!r}) — skipped")

@@ -487,6 +487,25 @@ class ProjectPickerTests(ServerCase):
              {"project_id": OTHER_PROJECT, "name": "P-2", "runs": 1, "live": 1}])
         self.assertEqual(len(payload["runs"]), 4)
 
+    def test_an_archived_project_is_off_the_picker_but_keeps_its_runs(self) -> None:
+        """DESIGN §1: parking hides the project, never its history. The board
+        still lists its runs under "all projects", and the client drops a
+        scope whose project left the list, so nothing strands."""
+        self.name_project(PROJECT_ID, "P-1", "alpha")
+        self.name_project(OTHER_PROJECT, "P-2", "bravo")
+        self.con.execute("UPDATE projects SET archived=1 WHERE project_id=?",
+                         (OTHER_PROJECT,))
+        self.con.commit()
+        self.make_run()
+        self.make_run(project_id=OTHER_PROJECT)
+        _, payload = self.json_request()
+        self.assertEqual([p["project_id"] for p in payload["projects"]],
+                         [PROJECT_ID])
+        self.assertEqual(len(payload["runs"]), 2, "a parked project lost a run")
+        # Its statistics are still addressable by id — history is untouched.
+        _, scoped = self.json_request(path=f"/api/project?id={OTHER_PROJECT}")
+        self.assertEqual(1, scoped["statistics"]["runs_total"])
+
     def test_the_project_route_carries_the_enabled_set_not_a_profile_list(self) -> None:
         """W-0187: profiles are GLOBAL, so the snapshot's list is the only
         list. What a project changes is which of them it may staff, and the

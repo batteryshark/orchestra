@@ -149,6 +149,18 @@ class DbTests(unittest.TestCase):
             again.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"], 1)
         again.close()
 
+    def test_a_project_carries_an_archived_flag_that_defaults_off(self) -> None:
+        """Schema v20 (DESIGN §1). An older database gains the column in
+        place, and every row already in it reads as not archived."""
+        self.con.execute(
+            "INSERT INTO projects(path, project_id, refreshed_at) VALUES(?,?,?)",
+            ("/tmp/p", "p-1", db.now()))
+        self.con.commit()
+        again = db.connect()
+        self.addCleanup(again.close)
+        row = again.execute("SELECT * FROM projects").fetchone()
+        self.assertEqual(0, row["archived"])
+
     def test_messages_address_run_ids_not_profiles(self) -> None:
         """DESIGN D4: messages address run ids; there is no recipient-name
         column anywhere for a profile to act as a worker identity."""

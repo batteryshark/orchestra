@@ -805,7 +805,7 @@ def conduct_goal(con, cfg: dict, client, goal: dict, board: dict, issues: list,
     which is the common case, and it costs nothing."""
     # A turn may choose dispatch, so do not spend it or consume its trigger
     # while admission is closed. The same event remains available on resume.
-    if dispatch.paused(con):
+    if dispatch.paused(con) or _archived(con, goal):
         return None
     goal_id = goal["id"]
     children = children_of(board.values(), goal_id)
@@ -859,6 +859,14 @@ def conduct_goal(con, cfg: dict, client, goal: dict, board: dict, issues: list,
     return {"goal": goal_id, "trigger": picked["trigger"], "key": picked["key"],
             "turn": turn_id, "slug": slug, "packet_tokens": est_tokens(packet),
             **result}
+
+
+def _archived(con, item: dict) -> bool:
+    """DESIGN §1: an archived project is parked, so no planner turn fires for
+    its goals — the same shape as the pause check above, and for the same
+    reason: the trigger is not consumed, so it is still there on unarchive."""
+    hit = project.by_work_path(con, item.get("projectPath"))
+    return bool(hit and hit.archived)
 
 
 def _project_id(con, item: dict) -> str | None:
