@@ -191,7 +191,13 @@ subscribe and POST without Orchestra learning anything (CONTRACT §7
 Enforcement).
 
 The HTTP server can bind to loopback or a discovered Tailscale address. Host
-checks and the shared key still apply on a tailnet.
+checks still apply on a tailnet — but the shared key does not have to: a
+peer `tailscale whois` resolves to a login is treated as the human, on by
+default, because the tailnet is the boundary and the phone should not carry
+a key. Loopback and this machine's OWN tailscale address never count
+(workers run on this machine — the same hole `trust_local` documents), and
+`[http] tailnet_logins` narrows trust to listed logins. `tailnet_auth =
+false` restores key-only access.
 
 ## 4. Dispatch and isolation
 
