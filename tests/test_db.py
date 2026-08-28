@@ -174,5 +174,43 @@ class DbTests(unittest.TestCase):
         self.assertEqual(n, 2)
 
 
+class BoardRevisionTests(DbTests):
+    """The dashboard's invalidation counter (schema v19, DESIGN §3)."""
+
+    def test_every_write_to_runs_advances_it(self) -> None:
+        self.assertEqual(db.board_revision(self.con), 0)  # a fresh file
+        seen = [0]
+        for sql in (INSERT_MIN.replace("?", "'t'"),
+                    "UPDATE runs SET title='x'",
+                    "DELETE FROM runs"):
+            with self.subTest(sql=sql):
+                self.con.execute(sql)
+                self.con.commit()
+                now = db.board_revision(self.con)
+                self.assertGreater(now, seen[-1], f"{sql} did not bump it")
+                seen.append(now)
+
+    def test_a_read_never_advances_it(self) -> None:
+        """The whole point is silence when nothing changed — and db.connect
+        writes meta.schema_version on EVERY connection, so a trigger on meta
+        would have made the board refetch itself in a loop."""
+        self.con.execute(INSERT_MIN, (db.now(),))
+        self.con.commit()
+        before = db.board_revision(self.con)
+        self.con.execute("SELECT * FROM runs").fetchall()
+        other = db.connect()
+        try:
+            self.assertEqual(db.board_revision(other), before)
+        finally:
+            other.close()
+        self.assertEqual(db.board_revision(self.con), before)
+
+    def test_an_explicit_bump_is_for_what_no_runs_trigger_sees(self) -> None:
+        before = db.board_revision(self.con)
+        db.bump_board_revision(self.con)
+        self.con.commit()
+        self.assertEqual(db.board_revision(self.con), before + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

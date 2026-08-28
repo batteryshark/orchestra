@@ -949,6 +949,38 @@ class SseSeamTests(ServerCase):
         self.assertNotIn("orchestra: swept\"", body)
         self.assertIn("swept again", body)
 
+    def test_the_board_stream_pushes_a_revision_so_the_page_stops_polling(self) -> None:
+        self.make_run()  # any write to runs bumps the counter
+        revision = db.board_revision(self.con)
+        status, ctype, body = self.sse("/api/board/stream", until="event: board")
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", ctype)
+        self.assertIn("retry: ", body)
+        self.assertIn(f"id: {revision}", body)
+        # An invalidation, not a state stream: the client refetches.
+        self.assertNotIn("\"runs\"", body)
+
+    def test_the_board_stream_resumes_on_last_event_id(self) -> None:
+        self.make_run()
+        revision = db.board_revision(self.con)
+        # Caught up: the stream opens with the reconnect hint and waits.
+        body = self.sse("/api/board/stream", last_event_id=str(revision),
+                        until="retry:")[2]
+        self.assertNotIn("event: board", body)
+        # One more run, and the same cursor is stale — a frame arrives at once.
+        self.make_run()
+        body = self.sse("/api/board/stream", last_event_id=str(revision),
+                        until="event: board")[2]
+        self.assertIn(f"id: {db.board_revision(self.con)}", body)
+
+    def test_a_board_change_no_run_write_makes_still_reaches_the_page(self) -> None:
+        """Pause state, runway and health live outside runs. record_health
+        bumps the counter once a tick rather than growing a trigger on meta,
+        which db.connect writes on every connection."""
+        before = db.board_revision(self.con)
+        mhttp.record_health({"swept": []}, con=self.con)
+        self.assertGreater(db.board_revision(self.con), before)
+
     def test_an_unknown_stream_path_is_a_named_501_not_a_silent_404(self) -> None:
         status, text = self.request(path="/api/nothing/stream")
         self.assertEqual(status, 501)

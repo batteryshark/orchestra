@@ -55,9 +55,12 @@ Shape:
 
 - **SSE** (W-0165/W-0178) at ``sse_stream``: ``GET /api/runs/<id>/stream`` is
   one run's normalized trace, ``GET /api/log/stream`` is the daemon's own
-  log. Both resume from ``Last-Event-ID`` — an integer event id for a trace,
-  a ``file@offset`` cursor for the log — and both are behind the same gate,
-  with the run trace scoped to the run a token names (``auth.ROUTES``).
+  log, and ``GET /api/board/stream`` is the board's INVALIDATION — a bare
+  revision number, never the snapshot, so the dashboard refetches instead of
+  polling every 4 seconds. All three resume from ``Last-Event-ID`` — an
+  integer event id for a trace, a ``file@offset`` cursor for the log, the
+  revision for the board — and all three are behind the same gate, with the
+  run trace scoped to the run a token names (``auth.ROUTES``).
 """
 import functools
 import gzip
@@ -184,6 +187,7 @@ _BRIEF_ROUTE = re.compile(r"^/api/runs/(\d+)/brief$")
 _DIFF_ROUTE = re.compile(r"^/api/runs/(\d+)/diff$")
 _TRACE_STREAM = re.compile(r"^/api/runs/(\d+)/stream$")
 LOG_STREAM = "/api/log/stream"
+BOARD_STREAM = "/api/board/stream"
 _PROFILE_ROUTE = re.compile(r"^/api/profiles/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$")
 OPTIONS_ROUTE = "/api/profiles/options"  # reserved: never a profile name
 # ``?refresh=1`` POLLS THE PROVIDERS before answering; without it the route
@@ -479,6 +483,11 @@ def record_health(report: dict, error: str | None = None, con=None) -> dict:
             "started_at": previous.get("started_at") or db.now(),
         }
         db.meta_set(con, HEALTH_KEY, json.dumps(entry))
+        # DESIGN §3: the board's other fields — pause state, runway, health
+        # itself — move without a runs write. One bump per tick caps the
+        # board's staleness at the sweep interval instead of adding triggers
+        # to meta, which db.connect writes on every single connection.
+        db.bump_board_revision(con)
         con.commit()
         return entry
     finally:
@@ -1215,12 +1224,17 @@ def sse_stream(handler, path: str) -> bool:
     Content-Length, flush per event) and returns True; an unknown stream path
     returns False and the caller answers 501.
 
-    Two routes, two resume cursors, both carried by ``Last-Event-ID``:
+    Three routes, three resume cursors, all carried by ``Last-Event-ID``:
     ``/api/runs/<id>/stream`` resumes on the integer event id it last sent,
     ``/api/log/stream`` on the composite ``file@offset`` cursor
-    ``traces.parse_daemon_cursor`` decodes. A browser's ``EventSource``
-    replays that header itself, which is why the cursor lives there and not
-    in a query string.
+    ``traces.parse_daemon_cursor`` decodes, and ``/api/board/stream`` on the
+    board revision. A browser's ``EventSource`` replays that header itself,
+    which is why the cursor lives there and not in a query string.
+
+    The board stream carries NO payload, unlike the other two: it says only
+    that ``meta.board_revision`` moved, and the client refetches
+    ``/api/snapshot``. That is what retired the dashboard's 4s poll without
+    growing a second copy of the snapshot's auth, shape and version.
 
     ``EventSource`` cannot set headers, so this route is reached with the
     cookie the dashboard already holds — hence GET, and hence never a POST.
@@ -1234,6 +1248,9 @@ def sse_stream(handler, path: str) -> bool:
     elif path == LOG_STREAM:
         frames = traces.stream_daemon_log(traces.parse_daemon_cursor(resume),
                                           stop=stop)
+    elif path == BOARD_STREAM:
+        frames = traces.stream_board(int(resume) if resume.isdigit() else 0,
+                                     stop=stop)
     else:
         return False
     return _write_stream(handler, frames)

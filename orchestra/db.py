@@ -88,13 +88,22 @@ Data-model invariants (DESIGN D4):
   ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
   the card's decision — stamped exactly once, so an answered card never
   retriggers on the next tick. Owned by ``nod.py``; carries no issuer token.
+- ``meta['board_revision']`` (schema v19, DESIGN §3) is the dashboard's
+  invalidation counter: three triggers on ``runs`` bump it on every insert,
+  update and delete. It exists so the board can be TOLD something changed
+  instead of asking every four seconds; the number itself is the SSE event id
+  on ``/api/board/stream``, so a reconnect resumes on it. Triggers rather
+  than a call in each writer, for the same reason ``revoke_run_token`` is a
+  trigger: every path that touches a run must bump it. ``runs`` alone —
+  everything else the snapshot reads (pause state, runway, health) rides the
+  explicit bump ``http.record_health`` makes once per sweeper tick.
 """
 import sqlite3
 from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "18"
+SCHEMA_VERSION = "19"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -253,6 +262,24 @@ WHEN NEW.status IN ('done','failed','timeout','killed','halted')
      AND NEW.run_token_hash IS NOT NULL
 BEGIN
   UPDATE runs SET run_token_hash=NULL WHERE id=NEW.id;
+END;
+-- The board's invalidation counter (DESIGN §3). Any write to runs bumps it;
+-- the SSE seam tails it and tells the dashboard to REFETCH the snapshot.
+-- Triggers, not a call per writer: runs is written from a dozen modules.
+CREATE TRIGGER IF NOT EXISTS bump_board_revision_insert AFTER INSERT ON runs
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS bump_board_revision_update AFTER UPDATE ON runs
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS bump_board_revision_delete AFTER DELETE ON runs
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
 END;
 CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run);
 CREATE INDEX IF NOT EXISTS idx_runs_work_item ON runs(work_item);
@@ -560,3 +587,26 @@ def meta_get(con: sqlite3.Connection, key: str) -> str | None:
 
 def meta_set(con: sqlite3.Connection, key: str, value: str) -> None:
     con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, value))
+
+
+BOARD_REVISION = "board_revision"
+
+
+def board_revision(con: sqlite3.Connection) -> int:
+    """The dashboard's invalidation counter (DESIGN §3). 0 on a fresh file."""
+    row = con.execute("SELECT value FROM meta WHERE key=?",
+                      (BOARD_REVISION,)).fetchone()
+    try:
+        return int(row["value"]) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_board_revision(con: sqlite3.Connection) -> None:
+    """Bump it for a board change no ``runs`` trigger sees — pause state,
+    runway, daemon health. ``http.record_health`` is the one caller, so the
+    board's staleness is capped at one sweeper tick even when nothing runs."""
+    con.execute(
+        "INSERT INTO meta(key, value) VALUES(?, 1) "
+        "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        (BOARD_REVISION,))
