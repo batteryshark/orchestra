@@ -651,7 +651,7 @@ def _messages(con, run_id: int) -> list[dict]:
     return out
 
 
-def _projects(runs: list[dict]) -> list[dict]:
+def _projects(con, runs: list[dict]) -> list[dict]:
     """The projects the dashboard's picker offers (W-0186).
 
     DERIVED FROM THE RUNS IN THIS SNAPSHOT, never from Work's project list:
@@ -662,11 +662,18 @@ def _projects(runs: list[dict]) -> list[dict]:
     ``name`` is whatever the run row already resolved (the project's Work id,
     else its name); a run with no ``project_id`` belongs to no project and
     contributes nothing.
+
+    An ARCHIVED project is off the picker (DESIGN §1) — its runs stay on the
+    board under "all projects", and the client drops a scope whose project
+    left this list, so archiving one mid-session falls back rather than
+    stranding the view.
     """
+    parked = {r["project_id"] for r in con.execute(
+        "SELECT project_id FROM projects WHERE archived=1")}
     seen: dict[str, dict] = {}
     for r in runs:
         pid = r.get("project_id")
-        if not pid:
+        if not pid or pid in parked:
             continue
         entry = seen.setdefault(pid, {"project_id": pid, "name": None,
                                       "runs": 0, "live": 0})
@@ -995,7 +1002,7 @@ def snapshot(con=None) -> dict:
             # it is scoped to.
             # v5 (W-0186): what the project picker offers, derived from the
             # runs above — never a roster of every project on the machine.
-            "projects": _projects(runs),
+            "projects": _projects(con, runs),
             "dispatch": pause_state(con),
             "profiles": _profiles(cfg),
             "runway": _runway(con),

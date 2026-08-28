@@ -150,6 +150,10 @@ def cmd_dispatch(args):
     proj, cfg = _require_project(con)
     root = proj.path
     requester = _requester(cfg)
+    if proj.archived:
+        # DESIGN §1: parking stops the UNATTENDED lanes. A human dispatching
+        # by hand outranks that, so this is a notice, never a refusal.
+        print(f"orchestra: {proj.slug} is archived; dispatching anyway")
     _gate_dispatch(con, cfg, requester)
     mission = " ".join(args.mission)
     if args.brief_file:
@@ -1126,15 +1130,26 @@ def cmd_project(args):
     con = db.connect()
     try:
         if args.action == "list":
-            rows = project.all_projects(con)
+            # DESIGN §1: an archived project is parked, so it is off this
+            # list until --all asks for it. Its runs are never hidden.
+            rows = project.all_projects(con, include_archived=args.all)
             if not rows:
                 print("no projects. `orchestra project add .` registers this one.")
                 return
             width = max(len(str(r.path)) for r in rows)
             for r in rows:
                 source = "work" if r.work_id else "local"
+                mark = "  (archived)" if r.archived else ""
                 print(f"{str(r.path):<{width}}  {source:<5}  "
-                      f"{r.project_id}  {r.name or ''}")
+                      f"{r.project_id}  {r.name or ''}{mark}")
+            return
+        if args.action in ("archive", "unarchive"):
+            target = Path(args.path or ".").expanduser().resolve()
+            want = args.action == "archive"
+            if not project.set_archived(con, target, want):
+                print(f"orchestra: {target} was not registered")
+                return
+            print(f"{'archived' if want else 'unarchived'} {target}")
             return
         if args.action == "link":
             linked = project.link(con, args.project, Path(args.path or "."))
@@ -1504,12 +1519,14 @@ def main():
     s = sub.add_parser("project", help="register a local directory Orchestra "
                                        "may dispatch into")
     s.set_defaults(fn=cmd_project, action="add", path=None, name=None,
-               project=None)
+               project=None, all=False)
     psub = s.add_subparsers(dest="action")
     pa = psub.add_parser("add", help="adopt a directory as a project")
     pa.add_argument("path", nargs="?", help="default: the current directory")
     pa.add_argument("--name", help="default: the directory's own name")
     pl = psub.add_parser("list", help="every registered project, local or Work-backed")
+    pl.add_argument("--all", action="store_true",
+                    help="include archived projects, marked")
     pl.set_defaults(path=None, name=None)
     pk = psub.add_parser("link", help="bind a Work project to the checkout it "
                                       "lives in, when Work's path is not one")
@@ -1519,6 +1536,12 @@ def main():
     pf = psub.add_parser("forget", help="drop a locally adopted project")
     pf.add_argument("path", nargs="?", help="default: the current directory")
     pf.set_defaults(name=None)
+    for action, blurb in (("archive", "park a locally adopted project: hide it "
+                                      "and stop unattended dispatch into it"),
+                          ("unarchive", "bring a parked project back")):
+        pp = psub.add_parser(action, help=blurb)
+        pp.add_argument("path", nargs="?", help="default: the current directory")
+        pp.set_defaults(name=None)
 
     s = sub.add_parser("traces", help="run traces: raw-log retention and "
                                       "a run's inbox/outbox (DESIGN §7)")

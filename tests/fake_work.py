@@ -108,13 +108,14 @@ class FakeWork:
     # --- state helpers (tests act as the human via these) -------------------
 
     def add_project(self, work_id, project_id, *, path=None, name=None,
-                    alias_paths=()):
+                    alias_paths=(), archived=False):
         """A Work project as /api/projects serves it: ``id`` is the human
         path-ish key an item's ``projectPath`` carries, ``projectId`` is the
-        immutable UUID Orchestra keys on. ``path`` is workspace-relative."""
+        immutable UUID Orchestra keys on. ``path`` is workspace-relative.
+        ``archived`` is Work's own flag, on every record it serves."""
         entry = {"id": work_id, "projectId": project_id,
                  "name": name or work_id, "path": path or work_id,
-                 "aliasPaths": list(alias_paths)}
+                 "aliasPaths": list(alias_paths), "archived": bool(archived)}
         self.projects.append(entry)
         return entry
 

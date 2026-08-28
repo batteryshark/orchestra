@@ -277,6 +277,24 @@ class RefineLaneTests(SweeperFixture, unittest.TestCase):
         self.assertIn("the owner's riff, kept whole.",
                       task["sections"]["description"])
 
+    def test_a_parked_project_gets_no_refinement_run(self) -> None:
+        """DESIGN §1: shaping is unattended too, so a parked project gets
+        none."""
+        self.tag_item()
+        self.archive_project()
+        self.sweep()
+        self.assertEqual([], self.refine_runs())
+        self.assertIn("refine", self.work.tasks["W-0001"]["tags"],
+                      "the tag is the human's request and stays put")
+        # Unparking revives it: the tag is still there, and the next pass
+        # that reads the item at all dispatches the shaping run. The sweep
+        # cursor is incremental, so that is the item's next edit or the next
+        # full board read — this lane holds no waiting row of its own.
+        self.archive_project(archived=False)
+        self.work.tasks["W-0001"]["updatedAt"] = self.work.now()
+        self.sweep()
+        self.assertEqual(1, len(self.refine_runs()))
+
 
 if __name__ == "__main__":
     unittest.main()

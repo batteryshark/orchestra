@@ -88,6 +88,11 @@ Data-model invariants (DESIGN D4):
   ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
   the card's decision — stamped exactly once, so an answered card never
   retriggers on the next tick. Owned by ``nod.py``; carries no issuer token.
+- ``projects.archived`` (schema v20, DESIGN §1) mirrors Work's own flag: an
+  archived project is PARKED, so the unattended lanes skip its items and the
+  listing surfaces hide it. It hides nothing that already happened — every
+  query over ``runs`` ignores this column, so history, statistics and run
+  lookup are untouched, and a live run is never disturbed by it.
 - ``meta['board_revision']`` (schema v19, DESIGN §3) is the dashboard's
   invalidation counter: three triggers on ``runs`` bump it on every insert,
   update and delete. It exists so the board can be TOLD something changed
@@ -103,7 +108,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "19"
+SCHEMA_VERSION = "20"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files).
@@ -175,6 +180,14 @@ RUNS_V17_COLUMNS = (
     ("spawn_request_id", "INTEGER"),
     ("child_wakeup_run", "INTEGER"),
     ("child_wakeup_message", "INTEGER"),
+)
+
+# Schema v20 (DESIGN §1). Work already marks a project archived and serves
+# the flag; ``remember`` copies it, so parking a project in Work parks it here
+# on the next refresh with no local action. A locally adopted project has no
+# Work behind it and is parked with ``orchestra project archive``.
+PROJECTS_V20_COLUMNS = (
+    ("archived", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
@@ -292,7 +305,8 @@ CREATE TABLE IF NOT EXISTS projects (
   project_id TEXT NOT NULL,
   work_id TEXT,
   name TEXT,
-  refreshed_at TEXT NOT NULL
+  refreshed_at TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_projects_project_id ON projects(project_id);
 CREATE TABLE IF NOT EXISTS messages (
@@ -564,6 +578,11 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in MESSAGES_V9_COLUMNS:
             if name not in have:
                 con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
+    known = {r["name"] for r in con.execute("PRAGMA table_info(projects)")}
+    if known:
+        for name, sql_type in PROJECTS_V20_COLUMNS:
+            if name not in known:
+                con.execute(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
     cards = {r["name"] for r in con.execute("PRAGMA table_info(nod_requests)")}
     if cards:
         for name, sql_type in NOD_REQUESTS_V14_COLUMNS:

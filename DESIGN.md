@@ -43,6 +43,21 @@ A project can enter Orchestra's central registry in two ways:
   ids. A Work mapping takes precedence if Work later names a locally adopted
   directory.
 
+A registered project may be ARCHIVED, which means parked rather than hidden.
+Work already marks its own projects archived and serves the flag; the cached
+refresh copies it, so archiving a project in Work parks it in Orchestra with
+no local action. A locally adopted project, which has no Work behind it, is
+parked with `orchestra project archive` — Orchestra refuses that for a
+Work-backed project the same way it refuses `project forget`, because Work
+owns the flag. A parked project is off `orchestra project list` (`--all` shows
+it, marked) and off the dashboard's project picker, and the three unattended
+lanes — the sweep's claim path, the conductor, and refine — skip its items.
+The sweep says so once per item, through the waiting queue, so a forgotten
+`delegated` tick is not silently dropped. Nothing else changes: manual
+`orchestra dispatch` still runs and only prints a notice, a run already in
+flight is untouched, and statistics, run listings, `orchestra show`, and every
+run the project already owns read exactly as before.
+
 The Work adapter claims delegated items, freezes an item snapshot into the run
 brief, records checklist accounting, and writes outcomes back through Work's
 agent API. Work is the intent and ledger system in that mode. It is not needed
