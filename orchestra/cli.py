@@ -12,7 +12,7 @@ from orchestra import (acp, auth, child_runs, conductor, config, daemon, db,
                          dispatch,
                          harnesses, hooks, http, merge, messaging, nod,
                          observer, paths, proc, profile_edit, profiles, project,
-                         refine, review, runway, service, supervise, sweeper,
+                         review, runway, service, supervise, sweeper,
                          traces, worktree)
 
 
@@ -197,7 +197,7 @@ def cmd_dispatch(args):
                     "pass --path <dir> once; later dispatches remember it")
         else:
             root = project.start_dir()
-    requester = _requester(cfg)
+    requester = getattr(args, "requester", None) or _requester(cfg)
     if proj.archived:
         # DESIGN §1: parking stops the UNATTENDED lanes. A human dispatching
         # by hand outranks that, so this is a notice, never a refusal.
@@ -229,7 +229,7 @@ def cmd_dispatch(args):
         con, profile=args.to, backend=profile["backend"],
         model=profile.get("model"), title=title, requested_by=requester,
         workdir=str(root), project_id=proj.project_id, status=initial_status,
-        commit=not after_ids)
+        ref=getattr(args, "ref", None), commit=not after_ids)
     if run is None:
         con.close()
         if blocked == "paused":
@@ -986,44 +986,6 @@ def cmd_doctor(args):
     con.close()
 
 
-def cmd_refine(args):
-    """Dispatch one refinement run for one tagged item, no sweep needed.
-
-    This is the refine button's transport: Work's hook runs
-    `orchestra refine "$WORK_ITEM"` the moment a human turns the tag on.
-    The tag is still the request and the debounce — a live refine run for
-    the item, or a missing tag, ends the command without dispatching.
-    """
-    cfg = config.load()
-    client = sweeper.client_from_cfg(cfg)
-    if client is None:
-        raise SystemExit(
-            "orchestra: Work is off — set [work] enabled = true and "
-            f"api_url in {paths.global_config_path()}")
-    item_id = args.item
-    item = (client.epic(item_id) if item_id.startswith("E-")
-            else client.task(item_id))
-    if not item:
-        raise SystemExit(f"orchestra refine: {item_id} not found at "
-                         f"{client.api_url}")
-    if refine.TAG not in (item.get("tags") or []):
-        print(f"orchestra refine: {item_id} carries no `{refine.TAG}` tag — "
-              "nothing to do")
-        return
-    con = db.connect()
-    try:
-        actions: list = []
-        ok = refine.dispatch_one(con, cfg, client, item,
-                                 supervise.spawn_supervisor, actions)
-        for a in actions:
-            print(f"refine: {a['action']} {a['item']}"
-                  + (f" ↔ run {a['run']}" if a.get('run') else ""))
-        if ok and not actions:
-            print(f"refine: {item_id} already live or skipped; see above")
-    finally:
-        con.close()
-
-
 def cmd_sweep(args):
     cfg = config.load()  # per-project overrides resolve per swept item
     client = sweeper.client_from_cfg(cfg)
@@ -1445,6 +1407,10 @@ def main():
     s.add_argument("--brief-file", help="read the mission from a file")
     s.add_argument("--context", help="extra context appended to the brief")
     s.add_argument("--title")
+    s.add_argument("--ref", help="opaque tracking token stored on the run and "
+                   "echoed back; the core never parses it (CONTRACT 0.12)")
+    s.add_argument("--requester", help="requested_by recorded on the run "
+                   "(default: [settings] default_requester)")
     isolation = s.add_mutually_exclusive_group()
     isolation.add_argument("--worktree", dest="worktree", action="store_true",
                            default=True,
@@ -1533,11 +1499,6 @@ def main():
     s.add_argument("--mechanical", action="store_true",
                    help="skip the observer turn; liveness and loop shape only")
     s.set_defaults(fn=cmd_check)
-
-    s = sub.add_parser("refine", help="dispatch one refinement run for one "
-                       "refine-tagged Work item (the refine button's hook)")
-    s.add_argument("item", help="Work item id: W-#### or E-####")
-    s.set_defaults(fn=cmd_refine)
 
     s = sub.add_parser("sweep", help="run one optional Work intake pass")
     s.add_argument("--watch", action="store_true", help="keep sweeping")
