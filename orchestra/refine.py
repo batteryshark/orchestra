@@ -71,7 +71,7 @@ Rules that outrank the standard:
 
 Then write back, in this order, and stop. Every call carries your identity:
 
-    curl -sS -X PATCH {api}/api/tasks/{item} \\
+    curl -sS -X PATCH {api}/api/{surface}/{item} \\
       -H 'X-Work-Agent: {agent}' -H 'Content-Type: application/json' -d @BODY.json
 
 1. Sections: one PATCH whose body carries only the sections you changed
@@ -94,8 +94,9 @@ Then write back, in this order, and stop. Every call carries your identity:
 def refine_mission(*, item: str, root: Path, api: str, agent: str,
                    tag: str) -> str:
     """Fill the refine template for one item (W-0309)."""
+    surface = "epics" if item.startswith("E-") else "tasks"
     return REFINE_MISSION.format(item=item, root=root, api=api.rstrip("/"),
-                                 agent=agent, tag=tag,
+                                 agent=agent, tag=tag, surface=surface,
                                  standard=GOAL_STANDARD)
 
 

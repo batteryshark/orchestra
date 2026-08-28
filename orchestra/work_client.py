@@ -84,6 +84,9 @@ class WorkClient:
     def task(self, task_id: str) -> dict | None:
         return self._call("GET", f"/api/tasks/{task_id}")
 
+    def epic(self, epic_id: str) -> dict | None:
+        return self._call("GET", f"/api/epics/{epic_id}")
+
     def issue(self, issue_id: str) -> dict | None:
         return self._call("GET", f"/api/agent/issues/{issue_id}")
 
@@ -144,7 +147,9 @@ class WorkClient:
         return declined
 
     def log_task(self, task_id: str, message: str):
-        return self._call("POST", f"/api/tasks/{task_id}/log", {"message": message})
+        # Epics keep their own log route; W- and I- style ids stay on tasks.
+        surface = "epics" if task_id.startswith("E-") else "tasks"
+        return self._call("POST", f"/api/{surface}/{task_id}/log", {"message": message})
 
     def claim_issue(self, issue_id: str):
         return self._call("POST", f"/api/agent/issues/{issue_id}/claim", {})
