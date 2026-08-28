@@ -30,6 +30,11 @@ Shape:
   /api/project`` writes the enabled set back. It is a route rather than a
   snapshot field because it is read when a project is picked, not every 4
   seconds, and because the picker itself is derived from ``runs``.
+- **The registry** (this wave): ``GET /api/projects`` lists every registered
+  project with its archived flag, and ``POST /api/projects`` parks or unparks
+  one LOCAL project through the same ``project.set_archived`` the CLI calls.
+  Separate from the picker on purpose — the picker is derived from runs, so
+  the project worth parking is the one missing from it.
 - **Action routes** POST only: stop / tell / check a run, force a sweep,
   pause or resume dispatch. Pause lives in ``meta`` so a restart does not
   silently resume it.
@@ -214,6 +219,14 @@ RUNWAY_ROUTE = "/api/runway"
 # statistics. ``POST`` the same path writes the enabled set. Unlisted in
 # auth.ROUTES, so the human's alone, like runway.
 PROJECT_ROUTE = "/api/project"
+# ``GET /api/projects`` is the REGISTRY — every registered project, archived
+# rows included — and ``POST`` the same path parks or unparks ONE local one.
+# A sibling of PROJECT_ROUTE rather than another field on it: that route is
+# keyed on a projectId and carries one project's settings, while this is the
+# whole list and is keyed on PATH, the registry's own key. Unlisted in
+# auth.ROUTES, so the human's alone: DESIGN §1 parks a project, and a run
+# must never park the project it is running in.
+PROJECTS_ROUTE = "/api/projects"
 # ``GET /api/turns?project=<projectId>&layer=<layer>&limit=<n>`` (I-0081) —
 # the control turns themselves, newest first. The snapshot pins one turn per
 # project; this is the series behind it, so the observer's decisions read as a
@@ -952,6 +965,41 @@ def project_scope(project_id: str, con=None) -> dict:
             con.close()
 
 
+def projects_registry(con=None) -> dict:
+    """``GET /api/projects`` — the whole project registry (DESIGN §2).
+
+    NOT the picker. ``_projects`` derives the picker from the runs in the
+    snapshot on purpose (W-0186), so a project with nothing recent is not in
+    it — and a project with nothing recent is exactly the one a human comes
+    here to park. The panel that archives therefore reads the registry.
+
+    ``source_ref`` stays opaque (CONTRACT §7): it is compared against nothing
+    and parsed for nothing, only quoted back inside ``blocked`` — the reason a
+    source-backed row shows in place of an archive control, worded by
+    ``project.source_owned`` so the dashboard, the HTTP refusal and the CLI
+    all say the same sentence.
+    """
+    own = con is None
+    con = db.connect() if own else con
+    try:
+        rows = project.all_projects(con, include_archived=True)
+        return {
+            "projects": [{
+                "project_id": p.project_id,
+                "path": str(p.path),
+                "name": p.name,
+                "source_ref": p.source_ref,
+                "archived": p.archived,
+                "blocked": (project.source_owned(p.path, p.source_ref)
+                            if p.source_ref else None),
+            } for p in rows],
+            "generated_at": db.now(),
+        }
+    finally:
+        if own:
+            con.close()
+
+
 def control_turns(project_id: str = "", layer: str = "",
                   limit: int = RECENT_TURNS, con=None) -> dict:
     """``GET /api/turns`` (I-0081) — the control turns, newest first.
@@ -1593,6 +1641,8 @@ class Handler(BaseHTTPRequestHandler):
             if not project_id:
                 return self._deny(400, "GET /api/project needs ?id=<projectId>")
             return self._json(project_scope(project_id))
+        if path == PROJECTS_ROUTE:
+            return self._json(projects_registry())
         if path == RUNS_ROUTE:
             return self._json(runs_since(
                 (query.get("since") or ["0"])[0].strip(),
@@ -1753,6 +1803,26 @@ class Handler(BaseHTTPRequestHandler):
             names = body.get("enabled_profiles")
             result = profile_edit.set_enabled(project_id, names)
             return self._json(result, 400 if result.get("error") else 200)
+        if path == PROJECTS_ROUTE:
+            # Park or unpark ONE locally adopted project (DESIGN §1). The rule
+            # is NOT restated here: project.set_archived is the same call
+            # `orchestra project archive` makes, so a source-backed row is
+            # refused with the wording the CLI refuses it with, and the lanes
+            # that skip a parked project keep keying off the one column.
+            root = str(body.get("path") or "").strip()
+            if not root:
+                return self._deny(400, "POST /api/projects needs path")
+            want = bool(body.get("archived"))
+            con = db.connect()
+            try:
+                known = project.set_archived(con, Path(root), want)
+            except SystemExit as exc:
+                return self._deny(400, str(exc))
+            finally:
+                con.close()
+            if not known:
+                return self._deny(404, f"{root} is not a registered project")
+            return self._json({"path": root, "archived": want})
         if path in ("/api/dispatch/pause", "/api/dispatch/resume"):
             con = db.connect()
             try:
