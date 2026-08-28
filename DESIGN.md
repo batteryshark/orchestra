@@ -51,13 +51,19 @@ it writes through, and nothing in the core learns a source's entry shape
 (CONTRACT §7 Enforcement).
 
 A registered project may be ARCHIVED, which means parked rather than hidden.
-A source marks its own projects archived and serves the flag; the adapter's
-refresh copies it, so archiving a project there parks it in Orchestra with no
-local action. Core code reads `archived` as a plain boolean and never asks who
-set it. A locally adopted project, which has no source behind it, is parked
-with `orchestra project archive` — Orchestra refuses that for a source-backed
-project the same way it refuses `project forget`, because the source owns the
-flag. A parked project is off `orchestra project list` (`--all` shows
+The source's flag is the DEFAULT, not the owner: a source marks its own
+projects archived and serves the flag, the adapter's refresh copies it into
+`projects.archived`, so archiving a project there parks it in Orchestra with
+no local action. The owner's own answer sits above it in
+`projects.archived_override` — NULL follows the source, 0 or 1 is a decision
+made here and wins. Effective archived is
+`COALESCE(archived_override, archived, 0)`, and core code reads that derived
+boolean and never asks who set it. `orchestra project archive` parks ANY
+project, source-backed or not, because archiving means "hide this from
+Orchestra and stop dispatching for it" — Orchestra's own decision about its
+own surface, which no refresh may overwrite. `project forget` still refuses a
+source-backed project, since the next refresh would put the row back and the
+removal would look broken. A parked project is off `orchestra project list` (`--all` shows
 it, marked) and off the dashboard's project picker, and the three unattended
 lanes — the sweep's claim path, the conductor, and refine — skip its items.
 The sweep says so once per item, through the waiting queue, so a forgotten

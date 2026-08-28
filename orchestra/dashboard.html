@@ -2251,8 +2251,8 @@ $("cfgsave").onclick = async () => {
 // GET /api/projects is the whole registry, read when the panel opens rather
 // than carried on the snapshot: it changes when a human registers or parks a
 // project, not every 4 seconds. Archiving POSTs the same path, and the server
-// calls the same project.set_archived the CLI does — so a source-backed
-// project is refused there, and this only shows the refusal.
+// calls the same project.set_archived the CLI does — which parks ANY project
+// here, source-backed or not, by writing the owner's own override.
 async function loadProjects() {
   $("projbody").replaceChildren(el("p", "dim", "loading…"));
   let rows;
@@ -2276,25 +2276,20 @@ async function loadProjects() {
         {node: quiet(el("span", null, p.name || p.path.split("/").pop()))},
         {node: quiet(el("span", "mono", p.path)), cls: "grow"},
         p.source_ref ? "source" : "local",
+        // A row parked with no override of its own was parked by its source
+        // (archived_override === null). Three words in the state cell, not a
+        // sentence per row: an earlier revision printed the whole paragraph
+        // and buried the one control that worked.
         {node: el("span", p.archived ? "warn" : "dim",
-                 p.archived ? "archived" : "active")},
-        // No dead button on a source-backed row: the source owns the flag,
-        // so the row carries the server's own sentence saying where to go.
-        // Only the CLI's "orchestra: " prefix is dropped — this is not a
-        // terminal, and the wording after it is the refusal verbatim.
-        {node: p.source_ref ? blockedCell(p) : archiveButton(p)},
+                 !p.archived ? "active"
+                 : (p.source_ref && p.archived_override === null)
+                   ? "archived at source" : "archived")},
+        // Every row gets the control: archiving is Orchestra's own decision
+        // about its own surface, so the server takes it for a source-backed
+        // project too (DESIGN §1).
+        {node: archiveButton(p)},
       ];
     })));
-}
-
-// A short label, not the sentence. The server's refusal names the project and
-// its source path, so rendering it on every source-backed row repeated the
-// same paragraph a dozen times and buried the one row that HAS a control.
-// The full sentence stays, on hover, where it is read once and on purpose.
-function blockedCell(p) {
-  const n = el("span", "dim", "archive at the source");
-  n.title = p.blocked;
-  return n;
 }
 
 function archiveButton(p) {

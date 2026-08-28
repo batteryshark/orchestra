@@ -666,9 +666,9 @@ class ProjectRegistryTests(ServerCase):
         self.assertFalse(rows["alpha"]["archived"])
         self.assertTrue(rows["bravo"]["archived"], "a parked row must still list")
         self.assertIsNone(rows["alpha"]["source_ref"])
-        self.assertIsNone(rows["alpha"]["blocked"], "a local row has a control")
+        self.assertIsNone(rows["alpha"]["archived_override"],
+                          "an untouched row still follows its source")
         self.assertEqual(rows["charlie"]["source_ref"], "P-9")
-        self.assertIn("archive it there", rows["charlie"]["blocked"])
 
     def test_archiving_through_the_post_takes_the_project_off_the_picker(self) -> None:
         root = self.register("alpha")
@@ -692,18 +692,26 @@ class ProjectRegistryTests(ServerCase):
         self.assertEqual([p["project_id"] for p in back["projects"]],
                          ["pid-alpha"])
 
-    def test_a_source_backed_project_is_refused_in_the_cli_s_words(self) -> None:
-        """The HTTP layer restates no rule: project.set_archived refuses, and
-        the refusal that reaches the browser is the sentence the CLI prints."""
+    def test_a_source_backed_project_parks_through_the_same_route(self) -> None:
+        """DESIGN §1: the board's control works on every row. The override is
+        what the payload carries back, so the panel can still say WHICH rows
+        are parked by their source rather than by the owner."""
         root = self.register("charlie", source_ref="P-9")
-        status, text = self.request(method="POST", path="/api/projects",
-                                    body={"path": str(root), "archived": True})
-        self.assertEqual(status, 400)
-        self.assertEqual(
-            text.strip(),
-            f"orchestra: {root} comes from the work source that owns "
-            f"'P-9'; archive it there, not here")
-        self.assertFalse(self.rows()["charlie"]["archived"])
+        status, said = self.json_request(method="POST", path="/api/projects",
+                                         body={"path": str(root),
+                                               "archived": True})
+        self.assertEqual(status, 200, said)
+        row = self.rows()["charlie"]
+        self.assertTrue(row["archived"])
+        self.assertEqual(1, row["archived_override"])
+
+    def test_a_row_parked_by_its_source_carries_no_override(self) -> None:
+        """How the panel words "parked at the source": the derived flag is on
+        and nobody decided it here."""
+        self.register("delta", source_ref="P-8", archived=True)
+        row = self.rows()["delta"]
+        self.assertTrue(row["archived"])
+        self.assertIsNone(row["archived_override"])
 
     def test_an_unregistered_path_is_a_404_not_a_silent_success(self) -> None:
         status, text = self.request(method="POST", path="/api/projects",

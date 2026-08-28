@@ -1557,8 +1557,8 @@ def main():
     pf = psub.add_parser("forget", help="drop a locally adopted project")
     pf.add_argument("path", nargs="?", help="default: the current directory")
     pf.set_defaults(name=None)
-    for action, blurb in (("archive", "park a locally adopted project: hide it "
-                                      "and stop unattended dispatch into it"),
+    for action, blurb in (("archive", "park a project here: hide it and stop "
+                                      "unattended dispatch into it"),
                           ("unarchive", "bring a parked project back")):
         pp = psub.add_parser(action, help=blurb)
         pp.add_argument("path", nargs="?", help="default: the current directory")

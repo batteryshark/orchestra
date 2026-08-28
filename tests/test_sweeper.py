@@ -1207,6 +1207,29 @@ class ArchivedProjectTests(SweeperFixture, unittest.TestCase):
         self.sweep()
         self.assertEqual(1, len(self.launched))
 
+    def test_the_lane_skips_a_project_parked_locally_over_the_source(self) -> None:
+        """DESIGN §1: the unattended lanes read the DERIVED flag, so the
+        owner's own override parks the project even while Work calls it
+        active — and unparking it here revives the item the same way."""
+        self.work.add_task("W-0002", "parked here", delegated=True)
+        con = db.connect()
+        try:
+            self.assertTrue(sweeper.refresh_projects(con, self.cfg))
+            proj = project.by_source_ref(con, "demo")
+            self.assertTrue(project.set_archived(con, proj.path, True))
+        finally:
+            con.close()
+        self.assertIn("archived", self.swept_output())
+        self.assertEqual([], self.launched, "the lane dispatched a parked item")
+        con = db.connect()
+        try:
+            project.set_archived(con, project.by_source_ref(con, "demo").path,
+                                 False)
+        finally:
+            con.close()
+        self.sweep()
+        self.assertEqual(1, len(self.launched))
+
     def test_a_live_run_is_untouched_when_its_project_is_archived(self) -> None:
         self.work.add_task("W-0001", "already going", delegated=True)
         self.sweep()

@@ -383,18 +383,60 @@ class AdoptTests(unittest.TestCase):
         project.set_archived(self.con, self.repo, False)
         self.assertEqual([self.repo], [p.path for p in project.all_projects(self.con)])
 
-    def test_archive_refuses_a_work_backed_project(self) -> None:
-        """Work owns the flag, so archiving here would be overwritten by the
-        next refresh — refused the same way ``forget`` refuses."""
+    def test_a_source_backed_project_archives_and_unarchives_here(self) -> None:
+        """DESIGN §1: archiving means "hide this from Orchestra", which is
+        Orchestra's own decision about its own surface. Every project takes
+        it, source-backed or not, and it is never refused."""
         sweeper.remember_projects(self.con, str(self.root),
                          [{"projectId": "w-1", "id": 7, "name": "theirs",
                            "path": "repo"}])
-        with self.assertRaises(SystemExit) as caught:
-            project.set_archived(self.con, self.repo, True)
-        self.assertIn("comes from the work source", str(caught.exception))
-        self.assertIn("'7'", str(caught.exception),
-                      "the refusal names WHERE to go instead")
+        self.assertTrue(project.set_archived(self.con, self.repo, True))
+        self.assertTrue(project.resolve(self.con, {}, str(self.repo)).archived)
+        self.assertEqual([], project.all_projects(self.con))
+        self.assertTrue(project.set_archived(self.con, self.repo, False))
+        self.assertEqual([self.repo],
+                         [p.path for p in project.all_projects(self.con)])
         self.assertFalse(project.set_archived(self.con, self.root / "nowhere", True))
+
+    def test_the_owners_override_survives_a_refresh_that_says_otherwise(self) -> None:
+        """The human decided HERE, so the human wins: the adapter keeps
+        mirroring the source into ``archived`` and the override sits above it,
+        in both directions."""
+        def refresh(**flag):
+            sweeper.remember_projects(self.con, str(self.root),
+                             [{"projectId": "w-1", "id": 7, "name": "theirs",
+                               "path": "repo", **flag}])
+            return project.resolve(self.con, {}, str(self.repo))
+
+        refresh(archived=False)
+        project.set_archived(self.con, self.repo, True)
+        self.assertTrue(refresh(archived=False).archived,
+                        "a refresh undid the owner's parking")
+        # The source's own mirror still tracks the source underneath it.
+        self.assertEqual(0, self.con.execute(
+            "SELECT archived FROM projects WHERE path=?",
+            (str(self.repo),)).fetchone()["archived"])
+        # And the other way: the owner un-parks what the source parked.
+        project.set_archived(self.con, self.repo, False)
+        hit = refresh(archived=True)
+        self.assertFalse(hit.archived, "a refresh re-parked an unparked project")
+        self.assertIs(False, hit.archived_override)
+
+    def test_a_pre_existing_archived_row_still_parks_with_no_override(self) -> None:
+        """The column is a PURE ADD and no migration runs: a row archived
+        before v26 carries a NULL override, so the COALESCE keeps parking it
+        until the owner toggles it."""
+        project.adopt(self.con, self.repo)
+        self.con.execute("UPDATE projects SET archived=1 WHERE path=?",
+                         (str(self.repo),))
+        self.con.commit()
+        hit = project.resolve(self.con, {}, str(self.repo))
+        self.assertTrue(hit.archived)
+        self.assertIsNone(hit.archived_override)
+        self.assertEqual([], project.all_projects(self.con))
+        project.set_archived(self.con, self.repo, False)
+        self.assertEqual([self.repo],
+                         [p.path for p in project.all_projects(self.con)])
 
     def test_forget_drops_a_local_project_but_refuses_one_from_work(self) -> None:
         project.adopt(self.con, self.repo)
