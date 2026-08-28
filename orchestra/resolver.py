@@ -125,14 +125,14 @@ def resolver_profile(cfg: dict) -> tuple[str, dict] | None:
 
 def _insert(con, failed, root, profile_name: str, profile: dict):
     """A run row with lineage: ``parent_run`` is the failed run and
-    ``work_item`` carries over, so the sweeper's writeback and the dashboard's
+    ``ref`` carries over, so the sweeper's writeback and the dashboard's
     lineage rendering keep working."""
     title = f"Resolve the landing of {failed['branch']}"[:80]
     return supervise.create_run(
         con, profile=profile_name, backend=profile["backend"],
         model=profile.get("model"), title=title, requested_by="nod",
         workdir=str(root), project_id=failed["project_id"],
-        work_item=failed["work_item"], parent_run=int(failed["id"]))
+        ref=failed["ref"], parent_run=int(failed["id"]))
 
 
 def dispatch_resolver_result(con, cfg: dict, run_id: int,

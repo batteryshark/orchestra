@@ -88,7 +88,7 @@ class RefineLaneTests(SweeperFixture, unittest.TestCase):
         run = self.refine_runs()[0]
         self.assertEqual(run["profile"], "stub")
         self.assertEqual(run["requested_by"], "refine")
-        self.assertEqual(run["work_item"], "W-0001")
+        self.assertEqual(run["ref"], "W-0001")
         self.assertIsNone(run["branch"])  # shaping edits Work, not the repo
         self.assertEqual(self.launched, [(self.root, run["id"])])
 
@@ -174,7 +174,7 @@ class RefineLaneTests(SweeperFixture, unittest.TestCase):
         run = self.refine_runs()[0]
         self.finish_run(run["id"], "done", "Refined.")
         self.sweep()
-        self.assertIsNotNone(self.db_run(run["id"])["work_reported_at"])
+        self.assertIsNotNone(self.db_mark(run["id"]))
 
     def test_the_worker_lane_still_needs_delegation(self) -> None:
         """The carve-out is scoped to this lane: a tagged item that nobody

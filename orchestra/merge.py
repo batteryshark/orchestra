@@ -606,7 +606,7 @@ def _recovered_landing(root: Path, cfg: dict, run: dict) -> dict | None:
     settings = merge_cfg(cfg)
     base = settings["base"] or _out(["symbolic-ref", "--short", "HEAD"], root)
     subject = f"orchestra: merge {branch}" \
-        + (f" ({run['work_item']})" if run.get("work_item") else "")
+        + (f" ({run['ref']})" if run.get("ref") else "")
     merge_sha = None
     matches = _lines(
         ["log", "--first-parent", "--format=%H%x09%s", "--fixed-strings",
@@ -737,7 +737,7 @@ def _land(con, cfg: dict, run: dict, status: str) -> str | None:
     result = _recovered_landing(root, cfg, run)
     if result is None:
         try:
-            result = merge_run(root, branch, item_id=run.get("work_item"),
+            result = merge_run(root, branch, item_id=run.get("ref"),
                                settings=cfg, mission=run_mission(run))
         except RuntimeError as exc:
             # git itself refused — most importantly the compare-and-swap losing to
@@ -911,7 +911,7 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
     try:
         created = nod.merge_conflict(
             channels, "\n\n".join(detail), con=con, run_id=int(run["id"]),
-            work_item=run.get("work_item"),
+            work_item=run.get("ref"),
             title=f"{result['branch']} did not land on {result['base']}",
             summary=result["escalation"][:200], **staged)
     except (nod.NodError, nod.NodChannelError) as exc:
@@ -921,11 +921,28 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
     return created.get("request_id")
 
 
+def _claim_writeback(con, run_id: int) -> None:
+    """Mark this run's Work writeback as done, so the sweeper's report pass
+    does not append a second one.
+
+    ``work_marks`` is the Work ADAPTER's table (schema v21), and this module is
+    core — a leak, and a known one: everything in ``_report_to_work`` posts
+    Work facts from inside the git landing path, which CONTRACT 0.10 names and
+    a later wave removes whole. The write travels with the function; it is not
+    a new place the core learned about Work.
+    """
+    con.execute("INSERT INTO work_marks(run_id, reported_at) VALUES(?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET "
+                "reported_at=COALESCE(work_marks.reported_at, excluded.reported_at)",
+                (run_id, db.now()))
+    con.commit()
+
+
 def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> bool:
     """Thread comment, then the run's fact: ``landed`` with the sha that
     reverts it, or ``halted`` with the escalation. This is the only place that
     knows the sha, so it is the only fact that can name one."""
-    item = run.get("work_item")
+    item = run.get("ref")
     if not item:
         return True
     client = work_client.from_cfg(cfg)
@@ -980,15 +997,11 @@ def _post_to_work(con, cfg: dict, run: dict, result: dict, report: str) -> bool:
               file=sys.stderr)
         if work_client.retryable(exc):
             return False
-        con.execute("UPDATE runs SET work_reported_at=COALESCE(work_reported_at, ?) "
-                    "WHERE id=?", (db.now(), run["id"]))
-        con.commit()
+        _claim_writeback(con, int(run["id"]))
         return True
     if posted is not None and not result["ok"]:
         # The run itself succeeded, so the sweeper's completion report would
         # append `landed` and bury the escalation. Claim the writeback here:
         # this comment IS the report for that run.
-        con.execute("UPDATE runs SET work_reported_at=? WHERE id=?",
-                    (db.now(), run["id"]))
-        con.commit()
+        _claim_writeback(con, int(run["id"]))
     return posted is not None

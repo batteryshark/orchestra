@@ -113,18 +113,18 @@ class LandingTestCase(unittest.TestCase):
         git(self.root, "add", "-A")
         git(self.root, "commit", "--quiet", "-m", "human work")
 
-    def add_run(self, *, work_item: str | None = "W-0001",
+    def add_run(self, *, ref: str | None = "W-0001",
                 branch: str | None = BRANCH, status: str = "done") -> dict:
         self.con.execute(
             "INSERT INTO runs(id, slug, profile, backend, requested_by, workdir, "
-            "project_id, work_item, branch, status, started_at) "
+            "project_id, ref, branch, status, started_at) "
             "VALUES(1,'brave_otter','stub','opencode','work',?,?,?,?,?,?)",
-            (str(self.root), PROJECT_ID, work_item, branch, status, db.now()))
+            (str(self.root), PROJECT_ID, ref, branch, status, db.now()))
         self.con.commit()
-        if work_item and work_item.startswith("W-"):
+        if ref and ref.startswith("W-"):
             # A swept run claims before it works, and its claim is what makes
             # the facts it reports later count (CONTRACT 0.8).
-            self.work.agent_claim(work_item, run=1)
+            self.work.agent_claim(ref, run=1)
         return dict(self.con.execute("SELECT * FROM runs WHERE id=1").fetchone())
 
     def thread(self) -> str:
@@ -173,7 +173,7 @@ class LandingTestCase(unittest.TestCase):
     def test_replay_recovers_a_landing_that_deleted_its_branch(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
         checkpoint = git(self.root, "rev-parse", BRANCH)
-        self.add_run(work_item=None)
+        self.add_run(ref=None)
         self.con.execute("UPDATE runs SET checkpoint_commit=? WHERE id=1",
                          (checkpoint,))
         self.con.commit()
@@ -198,7 +198,7 @@ class LandingTestCase(unittest.TestCase):
     def test_landing_replay_dedupes_an_existing_success_receipt(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
         checkpoint = git(self.root, "rev-parse", BRANCH)
-        run = self.add_run(work_item=None)
+        run = self.add_run(ref=None)
         self.con.execute("UPDATE runs SET checkpoint_commit=? WHERE id=1",
                          (checkpoint,))
         self.con.commit()
@@ -267,7 +267,7 @@ class LandingTestCase(unittest.TestCase):
 
     def test_a_settled_landing_is_not_consumed_again(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
-        run = self.add_run(work_item=None)
+        run = self.add_run(ref=None)
         merge.at_completion(self.con, self.cfg, run)
         settled = dict(self.con.execute("SELECT * FROM runs WHERE id=1").fetchone())
 
@@ -367,8 +367,8 @@ class LandingTestCase(unittest.TestCase):
         self.assertIn("Merge escalated at rebase", result["summary"])
         # The sweeper must not later move this blocked item to review.
         self.assertIsNotNone(
-            self.con.execute("SELECT work_reported_at FROM runs "
-                             "WHERE id=1").fetchone()["work_reported_at"])
+            self.con.execute("SELECT reported_at FROM work_marks "
+                             "WHERE run_id=1").fetchone()["reported_at"])
 
     def test_failing_check_escalates_and_never_touches_the_base(self) -> None:
         self.global_config.write_text(
@@ -431,7 +431,7 @@ class LandingTestCase(unittest.TestCase):
 
     def test_a_hand_dispatched_run_lands_and_reports_to_its_own_thread(self) -> None:
         self.run_branch({"feature.py": "x = 1\n"})
-        run = self.add_run(work_item=None)
+        run = self.add_run(ref=None)
 
         note = merge.at_completion(self.con, self.cfg, run)
 
@@ -502,7 +502,8 @@ class LandingTestCase(unittest.TestCase):
         result = dict(self.con.execute("SELECT * FROM runs WHERE id=1").fetchone())
         self.assertEqual(result["landing_status"], "failed")
         self.assertIn("Merge escalated at dirty", result["summary"])
-        self.assertIsNone(result["work_reported_at"])
+        self.assertIsNone(self.con.execute(
+            "SELECT reported_at FROM work_marks WHERE run_id=1").fetchone())
 
         recovered = WorkClient(self.work.start(), identity="orchestra")
         settled, action = sweeper.report_result(self.con, recovered, result)

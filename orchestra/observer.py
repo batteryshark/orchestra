@@ -451,7 +451,7 @@ def record_turn(con, layer: str, profile: dict, log_path: str, ok: bool,
 
     The transcript lands in the logs directory and stays there: it ages out
     under the same ``prune_raw_logs`` rule as any terminal run. The row is
-    terminal at birth and carries ``layer`` and no work_item/branch, so every
+    terminal at birth and carries ``layer`` and no ref/branch, so every
     fleet query either skips it by status or never matches it. It DOES carry
     ``project_id``: a decision about one project must not surface while the
     reader is looking at another (W-0214 follow-up).
@@ -772,7 +772,7 @@ def escalate(con, run, *, title: str, detail: str, cfg: dict | None = None,
             return out
         file_card = nod.alert if alert_only else nod.failure
         filed = file_card(target, detail, title=title, con=con, run_id=run_id,
-                          work_item=run["work_item"] if run is not None else None)
+                          work_item=run["ref"] if run is not None else None)
         out["nod"] = filed.get("request_id")
     except Exception as exc:  # a dead Nod must not swallow the reasoning
         out["nod_error"] = f"{exc.__class__.__name__}: {exc}"
@@ -991,11 +991,11 @@ def _streak_started_at(con, run) -> str | None:
     provider that stays full cannot extend its own deadline forever.
     """
     oldest = run["started_at"]
-    if run["work_item"]:
+    if run["ref"]:
         rows = con.execute(
             f"SELECT status, backend, summary, started_at FROM runs "
-            f"WHERE work_item=? AND id<=? AND status IN {db.TERMINAL_SQL} "
-            "ORDER BY id DESC", (run["work_item"], run["id"]))
+            f"WHERE ref=? AND id<=? AND status IN {db.TERMINAL_SQL} "
+            "ORDER BY id DESC", (run["ref"], run["id"]))
         for row in rows:
             if row["status"] not in INFRA_TERMINAL or _automatic_retry_blocker(row):
                 break
@@ -1036,11 +1036,11 @@ def infra_streak(con, run) -> int:
     """Consecutive infrastructure-shaped failures on the same item, this one
     included. The item is the Work item when there is one, else the retry
     lineage — a run dispatched by hand is still 'the same item' to itself."""
-    if run["work_item"]:
+    if run["ref"]:
         rows = con.execute(
-            f"SELECT status, backend, summary FROM runs WHERE work_item=? AND id<=? "
+            f"SELECT status, backend, summary FROM runs WHERE ref=? AND id<=? "
             f"AND status IN {db.TERMINAL_SQL} ORDER BY id DESC",
-            (run["work_item"], run["id"]))
+            (run["ref"], run["id"]))
         streak = 0
         for row in rows:
             if row["status"] not in INFRA_TERMINAL or _automatic_retry_blocker(row):
@@ -1085,12 +1085,12 @@ def _current_retry_owner(con, run, winner: int) -> int:
         except (KeyError, TypeError, ValueError):
             break
         candidate = con.execute(
-            "SELECT id, layer, project_id, work_item, retry_of FROM runs WHERE id=?",
+            "SELECT id, layer, project_id, ref, retry_of FROM runs WHERE id=?",
             (replacement,)).fetchone()
         same_scope = candidate is not None and candidate["layer"] is None \
             and candidate["project_id"] == run["project_id"] \
-            and candidate["work_item"] == run["work_item"]
-        needs_lineage = decision["action"] == "retry" or run["work_item"] is None
+            and candidate["ref"] == run["ref"]
+        needs_lineage = decision["action"] == "retry" or run["ref"] is None
         if not same_scope or replacement <= winner or (needs_lineage and
                 candidate["retry_of"] != winner):
             break
@@ -1115,20 +1115,20 @@ def _retry_row(con, run, root) -> tuple[int | None, str | None]:
         con, profile=run["profile"], backend=run["backend"],
         model=run["model"], title=run["title"],
         requested_by=run["requested_by"], workdir=str(root),
-        project_id=run["project_id"], work_item=run["work_item"],
-        work_seen_ts=run["work_seen_ts"], retry_of=int(run["id"]),
+        project_id=run["project_id"], ref=run["ref"],
+        retry_of=int(run["id"]),
         routed_reason=run["routed_reason"], commit=False)
     if retry is None:
         kind, _, value = (blocked or "").partition(":")
-        if kind in {"work_item", "retry"} and value.isdigit():
+        if kind in {"ref", "retry"} and value.isdigit():
             winner = int(value)
             con.execute("BEGIN IMMEDIATE")
             try:
-                if kind == "work_item":
+                if kind == "ref":
                     still_winning = con.execute(
-                        "SELECT 1 FROM runs WHERE id=? AND work_item=? "
+                        "SELECT 1 FROM runs WHERE id=? AND ref=? "
                         "AND project_id IS ? AND layer IS NULL",
-                        (winner, run["work_item"], run["project_id"])).fetchone()
+                        (winner, run["ref"], run["project_id"])).fetchone()
                 else:
                     still_winning = con.execute(
                         "SELECT 1 FROM runs WHERE id=? AND retry_of=? "
@@ -1137,8 +1137,8 @@ def _retry_row(con, run, root) -> tuple[int | None, str | None]:
                     con.rollback()
                     return None, blocked
                 winner = _current_retry_owner(con, run, winner)
-                reason = (f"run {winner} already owns {run['work_item']}"
-                          if kind == "work_item" else
+                reason = (f"run {winner} already owns {run['ref']}"
+                          if kind == "ref" else
                           f"retry run {winner} already exists")
                 _repoint_dependents(con, int(run["id"]), winner)
                 record(con, int(run["id"]), "retry", "superseded",
@@ -1287,7 +1287,7 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
         result = {"action": "escalate", "reason": reason, "streak": streak}
         result["escalation"] = escalate(
             con, run, title=f"{run['backend']} stayed at capacity for "
-                            f"{run['work_item'] or f'run {run_id}'}",
+                            f"{run['ref'] or f'run {run_id}'}",
             detail=f"Run {run_id} and {streak - 1} attempt(s) before it were "
                    f"all refused by the provider, across "
                    f"{CAPACITY_WINDOW_S // 3600} hours.\n\n"
@@ -1297,13 +1297,13 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
         return result
     if streak >= 2 and not window_open:
         reason = (f"{streak} consecutive infrastructure failures on "
-                  f"{run['work_item'] or f'run {run_id}'} — nothing spends a third")
+                  f"{run['ref'] or f'run {run_id}'} — nothing spends a third")
         record(con, run_id, "retry", "escalate", reason, {"streak": streak})
         con.commit()
         result = {"action": "escalate", "reason": reason, "streak": streak}
         result["escalation"] = escalate(
             con, run, title=f"Two infrastructure failures on "
-                            f"{run['work_item'] or f'run {run_id}'}",
+                            f"{run['ref'] or f'run {run_id}'}",
             detail=f"Run {run_id} ended `{run['status']}` after an automatic "
                    f"retry of the same brief also failed.\n\n"
                    f"{(run['summary'] or '(no summary)')[:1000]}\n\n"

@@ -71,12 +71,12 @@ class ResolverFixture(unittest.TestCase):
         git(self.root, "checkout", "--quiet", "main")
 
     def add_run(self, status: str = "done", branch: str | None = BRANCH,
-                work_item: str | None = None) -> None:
+                ref: str | None = None) -> None:
         self.con.execute(
             "INSERT INTO runs(id, slug, profile, backend, requested_by, workdir, "
-            "work_item, branch, status, started_at) "
+            "ref, branch, status, started_at) "
             "VALUES(1,'brave_otter','stub','opencode','human',?,?,?,?,?)",
-            (str(self.root), work_item, branch, status, db.now()))
+            (str(self.root), ref, branch, status, db.now()))
         self.con.commit()
 
     def db_run(self, run_id: int):
@@ -172,13 +172,13 @@ class DispatchTestCase(ResolverFixture):
 
     def test_the_resolver_run_carries_lineage_and_a_real_brief(self) -> None:
         self.run_branch({"app.py": "print('branch')\n"})
-        self.add_run(work_item="W-0042")
+        self.add_run(ref="W-0042")
         reason = "Stage `rebase`: rebase onto main conflicted; resolve by hand"
         new_id, _ = self.dispatch({"profiles": PROFILES}, reason=reason)
         self.assertIsNotNone(new_id)
         row = self.db_run(new_id)
         self.assertEqual(1, row["parent_run"])
-        self.assertEqual("W-0042", row["work_item"])
+        self.assertEqual("W-0042", row["ref"])
         self.assertEqual("spawning", row["status"])
         # Its OWN fresh worktree off the current base, never the failed branch.
         self.assertEqual(f"orchestra/run-{new_id}", row["branch"])

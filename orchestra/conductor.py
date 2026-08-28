@@ -222,13 +222,13 @@ def _rows(con, sql: str, item_ids: list[str]):
 
 
 def in_flight(con, item_ids: list[str]) -> list:
-    return _rows(con, "SELECT * FROM runs WHERE work_item IN ({marks}) AND "
+    return _rows(con, "SELECT * FROM runs WHERE ref IN ({marks}) AND "
                       f"status NOT IN {db.TERMINAL_SQL} ORDER BY id", item_ids)
 
 
 def settled_runs(con, item_ids: list[str], since_id: int = 0) -> list:
     return [r for r in _rows(
-        con, "SELECT * FROM runs WHERE work_item IN ({marks}) AND status IN "
+        con, "SELECT * FROM runs WHERE ref IN ({marks}) AND status IN "
              f"{db.TERMINAL_SQL} ORDER BY id", item_ids) if r["id"] > since_id]
 
 
@@ -460,7 +460,7 @@ def runway_entries_for(entries: list[dict]) -> list:
 def flight_entries(runs: list) -> list:
     return [_entry("~", f"- run {r['id']} {r['status']} for "
                         f"{_minutes_since(r['started_at'])}m on "
-                        f"{r['work_item']}: {r['title'] or ''}") for r in runs]
+                        f"{r['ref']}: {r['title'] or ''}") for r in runs]
 
 
 # --- one planner turn --------------------------------------------------------
@@ -614,7 +614,7 @@ def _dispatch(con, cfg: dict, client, goal: dict, board: dict, decision: dict,
     if dispatch.paused(con):
         return {"action": "skipped", "item": item_id,
                 "reason": "dispatch is paused"}
-    if con.execute(f"SELECT 1 FROM runs WHERE work_item=? AND status NOT IN "
+    if con.execute(f"SELECT 1 FROM runs WHERE ref=? AND status NOT IN "
                    f"{db.TERMINAL_SQL} LIMIT 1", (item_id,)).fetchone():
         return {"action": "skipped", "item": item_id,
                 "reason": "a run for this item is already in flight"}
@@ -993,10 +993,10 @@ def judgment_turn(con, run_id: int, reason: str, *, detail: str | None = None,
     client = work_client.from_cfg(cfg or {})
     goal = None
     board: dict = {}
-    if run is not None and client is not None and (run["work_item"] or "").startswith("W-"):
+    if run is not None and client is not None and (run["ref"] or "").startswith("W-"):
         tasks = client.tasks() or []
         board = {t["id"]: t for t in tasks}
-        item = board.get(run["work_item"])
+        item = board.get(run["ref"])
         goal = item if item and is_goal(item) else board.get((item or {}).get("parentId") or "")
         if goal is not None and not is_goal(goal):
             goal = None

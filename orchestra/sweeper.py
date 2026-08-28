@@ -40,6 +40,57 @@ SYSTEM_LOG_PREFIXES = (
 )
 
 
+# --- work_marks: this adapter's bookkeeping (schema v21) --------------------
+# CONTRACT §7 Enforcement 1: the run row carries an opaque ``ref`` and nothing
+# else about Work. How far a thread has been read, whether its writeback
+# landed, and when the last heartbeat posted are facts about WORK'S BOARD, so
+# they live in this adapter's own table. Every write goes through here.
+
+def mark(con, run_id: int, column: str, value: str, *,
+         once: bool = False, commit: bool = True) -> None:
+    """Stamp one mark for a run. ``once=True`` keeps the first value — a
+    report is never posted twice, so its receipt is never overwritten."""
+    keep = (f"COALESCE(work_marks.{column}, excluded.{column})" if once
+            else f"excluded.{column}")
+    con.execute(f"INSERT INTO work_marks(run_id, {column}) VALUES(?,?) "
+                f"ON CONFLICT(run_id) DO UPDATE SET {column}={keep}",
+                (run_id, value))
+    if commit:
+        con.commit()
+
+
+def seen_ts(con, run_id: int) -> str | None:
+    """How far this run had read its ref's thread."""
+    row = con.execute("SELECT seen_ts FROM work_marks WHERE run_id=?",
+                      (run_id,)).fetchone()
+    return row["seen_ts"] if row else None
+
+
+def thread_seen_ts(con, ref: str) -> str | None:
+    """How far ANY run has read this ref's thread.
+
+    A watermark belongs to the THREAD, not to one process against it: a retry
+    or a continuation carries on the same conversation under a new run id.
+    Reading the newest mark on the ref is why a fresh run needs nothing copied
+    into it at creation — which is what let ``supervise.create_run`` and
+    ``messaging.queue_tell`` drop their Work-shaped parameters (CONTRACT §7).
+    """
+    row = con.execute(
+        "SELECT MAX(m.seen_ts) AS ts FROM work_marks m "
+        "JOIN runs r ON r.id = m.run_id WHERE r.ref = ?", (ref,)).fetchone()
+    return row["ts"] if row else None
+
+
+def status_rows(con) -> list:
+    """``orchestra work status``: every run carrying a ref, with the writeback
+    receipt. The join lives HERE because ``work_marks`` is this adapter's
+    table and the CLI is not allowed to know it (CONTRACT §7)."""
+    return list(con.execute(
+        "SELECT r.ref, r.id, r.slug, r.status, m.reported_at FROM runs r "
+        "LEFT JOIN work_marks m ON m.run_id = r.id "
+        "WHERE r.ref IS NOT NULL ORDER BY r.id"))
+
+
 def work_cfg(cfg: dict) -> dict:
     """[work] section with defaults applied (config.DEFAULT_CONFIG owns them)."""
     return dict(cfg.get("work", {}))
@@ -139,7 +190,7 @@ def _comments_text(comments: list[dict], item_id: str) -> str:
 
 def _live_run(con, item_id: str):
     return con.execute(
-        f"SELECT * FROM runs WHERE work_item=? AND status NOT IN {db.TERMINAL_SQL} "
+        f"SELECT * FROM runs WHERE ref=? AND status NOT IN {db.TERMINAL_SQL} "
         "ORDER BY id DESC LIMIT 1", (item_id,)).fetchone()
 
 
@@ -155,7 +206,7 @@ def _last_session_run(con, item_id: str):
     behind it is resumed either — the item gets a fresh run.
     """
     for row in con.execute(
-            f"SELECT * FROM runs WHERE work_item=? AND status IN {db.TERMINAL_SQL} "
+            f"SELECT * FROM runs WHERE ref=? AND status IN {db.TERMINAL_SQL} "
             "ORDER BY id DESC", (item_id,)):
         if row["status"] in ("killed", "halted"):
             return None
@@ -165,15 +216,20 @@ def _last_session_run(con, item_id: str):
 
 
 def _insert_run(con, proj, profile_name: str, profile: dict, title: str,
-                item_id: str, seen_ts: str | None,
+                item_id: str, seen: str | None,
                 routed_reason: str | None = None, *, commit: bool = True):
     """Reserve one fresh Work run through the common admission boundary."""
-    return supervise.create_run(
+    run, blocked = supervise.create_run(
         con, profile=profile_name, backend=profile["backend"],
         model=profile.get("model"), title=title, requested_by="work",
         workdir=str(proj.path), project_id=proj.project_id,
-        work_item=item_id, work_seen_ts=seen_ts,
-        routed_reason=routed_reason, commit=commit)
+        ref=item_id, routed_reason=routed_reason, commit=commit)
+    if run is not None and seen is not None:
+        # The seed watermark rides the caller's commit policy: under
+        # ``commit=False`` create_run's transaction is still open, so the mark
+        # is admitted with the row it belongs to.
+        mark(con, int(run["id"]), "seen_ts", seen, commit=commit)
+    return run, blocked
 
 
 # --- seams (W-0099, the conductor) ------------------------------------------
@@ -243,8 +299,8 @@ def _report_ready(con, result) -> bool:
     if completed is None:
         return False
     newer = con.execute(
-        "SELECT 1 FROM runs WHERE work_item=? AND layer IS NULL AND id>? LIMIT 1",
-        (result["work_item"], result["id"])).fetchone()
+        "SELECT 1 FROM runs WHERE ref=? AND layer IS NULL AND id>? LIMIT 1",
+        (result["ref"], result["id"])).fetchone()
     if newer is not None:
         return False
     retry = con.execute(
@@ -265,7 +321,7 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
     ``(True, None)`` means no append is due; ``(True, action)`` is an appended
     report.
     """
-    if not result["work_item"]:
+    if not result["ref"]:
         return True, None
     if result["requested_by"] == refine.REQUESTED_BY:
         # The refine lane reports itself, from inside the run: the sections,
@@ -277,7 +333,7 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
         return True, None
     if not _report_ready(con, result):
         return True, None
-    item_id, kind = result["work_item"], item_kind(result["work_item"])
+    item_id, kind = result["ref"], item_kind(result["ref"])
     success, summary = _completion_outcome(result)
     tag = f"[{client.identity}/{result['slug'] or result['id']}]"
     comment = (f"{tag} run {result['id']} finished: {result['status']}\n\n"
@@ -344,8 +400,9 @@ def report_result(con, client: WorkClient, result) -> tuple[bool, dict | None]:
 def _report(con, client: WorkClient, actions: list) -> bool:
     ok = True
     rows = list(con.execute(
-        f"SELECT * FROM runs WHERE work_item IS NOT NULL AND status IN {db.TERMINAL_SQL} "
-        "AND work_reported_at IS NULL ORDER BY id"))
+        f"SELECT * FROM runs WHERE ref IS NOT NULL AND status IN {db.TERMINAL_SQL} "
+        "AND id NOT IN (SELECT run_id FROM work_marks "
+        "               WHERE reported_at IS NOT NULL) ORDER BY id"))
     for result in rows:
         settled, action = report_result(con, client, result)
         ok &= settled
@@ -356,9 +413,7 @@ def _report(con, client: WorkClient, actions: list) -> bool:
 
 def _mark_reported(con, run) -> None:
     """Once only, however it ended (DESIGN: a report is never posted twice)."""
-    con.execute("UPDATE runs SET work_reported_at=COALESCE(work_reported_at, ?) WHERE id=?",
-                (db.now(), run["id"]))
-    con.commit()
+    mark(con, int(run["id"]), "reported_at", db.now(), once=True)
 
 
 def _dep_lookup(client: WorkClient):
@@ -447,10 +502,9 @@ def _abandon_claim(con, run) -> None:
             "UPDATE runs SET status='killed', "
             "worker_status=COALESCE(worker_status, 'killed'), "
             "work_claim_status='abandoned', "
-            "work_reported_at=COALESCE(work_reported_at, ?), "
             "summary=?, finished_at=COALESCE(finished_at, ?) WHERE id=?",
-            (db.now(), reason, db.now(), current["id"]))
-        con.commit()
+            (reason, db.now(), current["id"]))
+        mark(con, int(current["id"]), "reported_at", db.now(), once=True)
         supervise.fail_launch(
             con, project.root_for(con, current), int(current["id"]),
             reason, prefix="Work claim abandoned")
@@ -477,7 +531,7 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
         if run["brief_path"] is None:
             if prior is not None:
                 news = _new_human_comments(
-                    item, kind, prior["work_seen_ts"], client.identity)
+                    item, kind, seen_ts(con, int(prior["id"])), client.identity)
                 text = _comments_text(news, item["id"]) or \
                     f"Work {kind} {item['id']} was handed back; continue the mission."
                 supervise.prepare_followup(con, root, prior, run, text)
@@ -491,10 +545,7 @@ def _finish_claim(con, client: WorkClient, kind: str, item: dict, run,
                     use_worktree=bool(work_cfg(pcfg).get("worktree", True))
                     and not project.is_workspace(root),
                     work_snapshot=render_snapshot(item, kind))
-        con.execute(
-            "UPDATE runs SET work_seen_ts=? WHERE id=?",
-            (item.get("updatedAt") or db.now(), run_id))
-        con.commit()
+        mark(con, run_id, "seen_ts", item.get("updatedAt") or db.now())
     except (Exception, SystemExit) as exc:
         error = str(exc)[:1000] or exc.__class__.__name__
         if prior is None:
@@ -555,7 +606,7 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
         f"SELECT * FROM runs WHERE work_claim_status='pending' "
         f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id"))
     for run in pending:
-        found = by_id.get(run["work_item"])
+        found = by_id.get(run["ref"])
         if found is None:
             ok = False
             continue
@@ -667,7 +718,7 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
                                         "detail": late_pause.get("note")})
                     continue
                 # The run TITLE is the item's own title. The id lives on the
-                # row (`work_item`) and at the head of the brief, so repeating
+                # row (`ref`) and at the head of the brief, so repeating
                 # "Work issue issue_abc123:" here only eats the width the
                 # board has for saying what the run is about.
                 run, blocked = _insert_run(
@@ -701,23 +752,33 @@ def _claim(con, cfg: dict, client: WorkClient, items: list,
 def _ferry(con, client: WorkClient, items: list, actions: list) -> bool:
     for kind, item in items:
         run = _live_run(con, item["id"])
-        if not run or run["work_seen_ts"] is None:
+        if not run:
+            continue
+        seen = thread_seen_ts(con, item["id"])
+        if seen is None:
             continue
         # A claim still pending confirmation never receives tells: nothing has
         # launched, and _finish_claim folds these same comments into the
         # mission it launches with — ferrying now would deliver them twice.
         if run["work_claim_status"] == "pending":
             continue
-        news = _new_human_comments(item, kind, run["work_seen_ts"], client.identity)
+        news = _new_human_comments(item, kind, seen, client.identity)
         if not news:
             continue
         if not run["session_ref"]:
             continue  # not resumable yet; the next pass retries
         try:
+            # One admission: the ferry cursor and the message it explains
+            # commit together, so a crash can cause neither a duplicate nor a
+            # lost Work comment. ``commit=False`` is what keeps that true
+            # across the core/adapter line (CONTRACT §7).
             messaging.queue_tell(
                 con, run["id"], f"work:{item['id']}",
                 _comments_text(news, item["id"]), run["log_path"],
-                work_seen_ts=max(n["at"] for n in news))
+                commit=False)
+            mark(con, int(run["id"]), "seen_ts",
+                 max(n["at"] for n in news), commit=False)
+            con.commit()
         except messaging.RunClosed:
             continue
         actions.append({"action": "ferry", "item": item["id"], "run": run["id"],
@@ -742,20 +803,20 @@ def _progress(con, cfg: dict, client: WorkClient, actions: list) -> None:
         return
     cutoff = _iso_ago(interval)
     rows = con.execute(
-        f"SELECT * FROM runs WHERE work_item IS NOT NULL AND status NOT IN {db.TERMINAL_SQL} "
-        "AND (work_progress_at IS NULL OR work_progress_at < ?)", (cutoff,))
+        f"SELECT * FROM runs WHERE ref IS NOT NULL AND status NOT IN {db.TERMINAL_SQL} "
+        "AND id NOT IN (SELECT run_id FROM work_marks "
+        "               WHERE progress_at >= ?)", (cutoff,))
     for run in list(rows):
         note = traces.progress(run["log_path"], run["backend"])
         if not note:
             continue
-        item_id, tag = run["work_item"], f"[{client.identity}/{run['slug'] or run['id']}]"
+        item_id, tag = run["ref"], f"[{client.identity}/{run['slug'] or run['id']}]"
         body = f"{tag} still working — {note}"
         posted = (client.log_task(item_id, body) if item_kind(item_id) == "task"
                   else client.reply_issue(item_id, body))
         if posted is None:
             continue
-        con.execute("UPDATE runs SET work_progress_at=? WHERE id=?", (db.now(), run["id"]))
-        con.commit()
+        mark(con, int(run["id"]), "progress_at", db.now())
         actions.append({"action": "progress", "item": item_id, "run": run["id"]})
 
 

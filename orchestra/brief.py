@@ -241,7 +241,7 @@ def compose_child(root: Path, run, profile: dict, mission: str, *,
                    mission=mission, requester=f"run {parent['id']} "
                                               f"({parent['profile']})",
                    root=root, workdir=workdir, extra_context=context,
-                   work_item=parent["work_item"],
+                   work_item=parent["ref"],
                    # A child is at the depth limit already; a brief never
                    # teaches a verb it cannot use.
                    cfg=None)

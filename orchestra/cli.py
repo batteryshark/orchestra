@@ -940,16 +940,15 @@ def cmd_sweep(args):
 
 def cmd_work_status(args):
     con = db.connect()
-    rows = list(con.execute(
-        "SELECT * FROM runs WHERE work_item IS NOT NULL ORDER BY id"))
+    rows = sweeper.status_rows(con)
     con.close()
     if not rows:
         print("(no runs are mapped to Work items)")
         return
     print(f"{'item':<14} {'run':<5} {'slug':<18} {'status':<10} reported")
     for r in rows:
-        print(f"{r['work_item']:<14} {r['id']:<5} {r['slug'] or '-':<18} "
-              f"{r['status']:<10} {r['work_reported_at'] or '-'}")
+        print(f"{r['ref']:<14} {r['id']:<5} {r['slug'] or '-':<18} "
+              f"{r['status']:<10} {r['reported_at'] or '-'}")
 
 
 def cmd_daemon(args):
@@ -1273,7 +1272,7 @@ def cmd_nod(args):
                               (args.request_id,)).fetchone()
             if row:
                 print(f"  local:  kind={row['kind']} run={row['run_id']} "
-                      f"item={row['work_item']}")
+                      f"item={row['ref']}")
         elif args.action == "cancel":
             client = _nod_client_for(channels, con, args)
             client.cancel(args.request_id)

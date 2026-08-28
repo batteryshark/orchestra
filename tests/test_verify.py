@@ -80,7 +80,7 @@ class VerifyTests(SweeperFixture, unittest.TestCase):
                            depends_on=["W-0001"])
         self.sweep()
         first = self.db_run()
-        self.assertEqual(first["work_item"], "W-0001")
+        self.assertEqual(first["ref"], "W-0001")
         self.assertEqual(self.work.tasks["W-0002"]["status"], "ready")
         self.client.check_task_item("W-0001", "acceptance", 0, checked=True)
         self.finish_run(first["id"], "done", "done")

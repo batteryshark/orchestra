@@ -208,7 +208,7 @@ class ProjectResolutionTests(unittest.TestCase):
         self.assertEqual(self.resolve(self.workspace / "renamed").project_id, DEMO_ID)
         self.assertEqual(config.load(row["project_id"])["settings"]["timeout"], 4242)
 
-    def test_work_item_project_path_maps_to_the_project_id(self) -> None:
+    def test_work_ref_project_path_maps_to_the_project_id(self) -> None:
         self.seed()
         self.assertEqual(project.by_work_path(self.con, "demo").project_id, DEMO_ID)
         self.assertEqual(

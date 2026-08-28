@@ -13,10 +13,21 @@ Data-model invariants (DESIGN D4):
   message whose run ended before it was delivered. Marked and surfaced, never
   dropped — and never moved to a later run, which would hand a correction to
   a run that never saw the context it referred to.
-- ``runs.work_item`` (schema v2, the sweeper) is the durable mapping to the
-  Work item (``W-####`` task or ``issue_*``) that a run serves;
-  ``work_seen_ts`` is the ferry watermark for that item's thread, and
-  ``work_reported_at`` marks that the completion writeback happened.
+- ``runs.ref`` (schema v21, CONTRACT §7 Enforcement 1) is the OPAQUE string a
+  caller hands in at dispatch to say what the run is FOR. The core stores it,
+  echoes it back, and never parses it — a Work ``W-####`` task id today, a
+  Linear key or anything else tomorrow, and this table cannot tell the
+  difference. It replaced ``work_item`` (schema v2) and the three ``work_*``
+  timestamps that sat beside it, which were never facts about a run: a
+  watermark over one source's board is that source's own bookkeeping.
+- ``work_marks`` (schema v21, CONTRACT §7) is where those three timestamps
+  went — ``seen_ts`` is the ferry watermark for the ref's thread,
+  ``reported_at`` is the receipt that the completion writeback happened, and
+  ``progress_at`` is the clock the heartbeat pass rate-limits on. One row per
+  run, written on the first mark. Owned by ``sweeper.py``, the Work adapter,
+  exactly as ``conductor_turns`` is owned by ``conductor.py``; nothing in the
+  core reads it, and a second source's adapter brings its own table rather
+  than columns on ``runs``.
 - ``runs.project_id`` (schema v4, the daemon) is Work's immutable
   ``projectId``. Rows key on it, never on a path: one central database now
   holds every project's runs, and renaming a folder must lose nothing.
@@ -66,8 +77,8 @@ Data-model invariants (DESIGN D4):
   merge-judge, observer or conductor model call — recorded as a terminal
   runs row so its transcript normalizes into ``events`` and opens in the
   same detail screen as a run. NULL is a worker run. Fleet queries exclude
-  turns with ``layer IS NULL``; queries keyed on work_item, branch or
-  parent_run never match one, because a turn carries none of them.
+  turns with ``layer IS NULL``; queries keyed on ref, branch or parent_run
+  never match one, because a turn carries none of them.
 - ``runs.landing_status``/``handoff_processed_at`` (schema v16, W-0295) are
   the two durable policy receipts on the terminal result row. NULL means that
   policy has not settled yet; landing records ``ok`` or ``failed``, while
@@ -108,16 +119,12 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "20"
+SCHEMA_VERSION = "21"
 
 # Columns added after v1; applied idempotently so an older database upgrades
-# in place (greenfield policy: extensions, not migration files).
-RUNS_V2_COLUMNS = (
-    ("work_item", "TEXT"),
-    ("work_seen_ts", "TEXT"),
-    ("work_reported_at", "TEXT"),
-    ("work_progress_at", "TEXT"),
-)
+# in place (greenfield policy: extensions, not migration files). ``ref``
+# (schema v2's ``work_item``) is deliberately NOT in this list: v21 either
+# RENAMES the old column or adds the new one, never both — see ``connect``.
 RUNS_V4_COLUMNS = (
     ("project_id", "TEXT"),
 )
@@ -143,7 +150,7 @@ RUNS_V13_COLUMNS = (
 # ingests into the same events table and opens in the same detail screen.
 # NULL is a worker run. Fleet queries (the snapshot, the statistics, the
 # performance review) exclude them with ``layer IS NULL``; queries keyed on
-# work_item / branch / parent_run never match one, because a control turn
+# ref / branch / parent_run never match one, because a control turn
 # carries none of them.
 RUNS_V15_COLUMNS = (
     ("layer", "TEXT"),
@@ -211,7 +218,25 @@ NOD_REQUESTS_V14_COLUMNS = (
     ("acted_at", "TEXT"),
 )
 
-SCHEMA = """
+# Declared apart from SCHEMA because the v21 migration below has to fill it
+# before SCHEMA runs.
+WORK_MARKS_SQL = """
+-- Schema v21 (CONTRACT §7 Enforcement 1). The Work adapter's bookkeeping
+-- about its OWN board, keyed by the run it concerns: how far that ref's
+-- thread has been ferried, whether the completion writeback landed, and when
+-- the heartbeat last posted. These were columns on ``runs`` and were never
+-- facts about a run. Owned by ``sweeper.py`` (with the Work-facing tails of
+-- ``verify.py`` and ``merge.py``); no core module reads this table, the same
+-- arrangement ``conductor_turns`` has with ``conductor.py``.
+CREATE TABLE IF NOT EXISTS work_marks (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(id),
+  seen_ts TEXT,
+  reported_at TEXT,
+  progress_at TEXT
+);
+"""
+
+SCHEMA = WORK_MARKS_SQL + """
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -241,10 +266,7 @@ CREATE TABLE IF NOT EXISTS runs (
   summary TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT,
-  work_item TEXT,
-  work_seen_ts TEXT,
-  work_reported_at TEXT,
-  work_progress_at TEXT,
+  ref TEXT,
   project_id TEXT,
   retry_of INTEGER REFERENCES runs(id),
   tokens_in INTEGER,
@@ -295,7 +317,7 @@ BEGIN
   ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
 END;
 CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run);
-CREATE INDEX IF NOT EXISTS idx_runs_work_item ON runs(work_item);
+CREATE INDEX IF NOT EXISTS idx_runs_ref ON runs(ref);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 -- Cached Work project list, so an offline CLI still resolves a directory to
 -- a project. One row per local path (an aliasPath gets its own row); the
@@ -540,26 +562,53 @@ def connect(db_file=None) -> sqlite3.Connection:
     upgrading_v16 = bool(existing) and any(
         name not in existing for name, _ in RUNS_V16_COLUMNS)
     if existing:  # extend a pre-existing table before SCHEMA's indexes run
-        for name, sql_type in (RUNS_V2_COLUMNS + RUNS_V4_COLUMNS
+        con.executescript(WORK_MARKS_SQL)  # both migrations below fill it
+        for name, sql_type in (RUNS_V4_COLUMNS
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
                                + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS
                                + RUNS_V18_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
+        # Schema v21 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, run here and
+        # never again: the source-specific column becomes the opaque ``ref``,
+        # and the three board timestamps move to the adapter's own table. No
+        # reader below tolerates the old shape — that tolerance is the leak
+        # §6 forbids — so this branch is the only code that ever names them.
+        # It runs BEFORE the v16 backfill: real receipts move first, and the
+        # backfill then fills only what is still missing.
+        if "work_item" in existing:
+            con.execute("ALTER TABLE runs RENAME COLUMN work_item TO ref")
+            con.execute("DROP INDEX IF EXISTS idx_runs_work_item")
+            con.execute(
+                "INSERT OR IGNORE INTO work_marks(run_id, seen_ts, "
+                "reported_at, progress_at) SELECT id, work_seen_ts, "
+                "work_reported_at, work_progress_at FROM runs "
+                "WHERE work_seen_ts IS NOT NULL OR work_reported_at IS NOT NULL "
+                "OR work_progress_at IS NOT NULL")
+            for column in ("work_seen_ts", "work_reported_at", "work_progress_at"):
+                con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+        elif "ref" not in existing:
+            con.execute("ALTER TABLE runs ADD COLUMN ref TEXT")
         if upgrading_v16:
             # A historical completion notice proves the old finalizer reached
             # its durable result boundary. Settle only those rows: replaying
             # years of old side effects is unsafe, but an old terminal row with
             # no completion is ambiguous and must not be labelled complete.
+            settled = (f"status IN {TERMINAL_SQL} AND EXISTS ("
+                       "SELECT 1 FROM messages m WHERE m.run_id=runs.id "
+                       "AND m.kind='completion')")
             con.execute(
                 "UPDATE runs SET landing_status=COALESCE(landing_status, 'ok'), "
                 "handoff_processed_at=COALESCE(handoff_processed_at, "
-                "finished_at, ?), work_reported_at=COALESCE(work_reported_at, "
-                "finished_at, ?) "
-                f"WHERE status IN {TERMINAL_SQL} AND EXISTS ("
-                "SELECT 1 FROM messages m WHERE m.run_id=runs.id "
-                "AND m.kind='completion')", (now(), now()))
+                f"finished_at, ?) WHERE {settled}", (now(),))
+            # The writeback receipt is the Work adapter's since v21.
+            con.execute(
+                "INSERT INTO work_marks(run_id, reported_at) "
+                f"SELECT id, COALESCE(finished_at, ?) FROM runs WHERE {settled} "
+                "ON CONFLICT(run_id) DO UPDATE SET reported_at="
+                "COALESCE(work_marks.reported_at, excluded.reported_at)",
+                (now(),))
         if "project_seq" not in existing:
             # Every run already recorded gets the number it would have had:
             # its project's order, by id. Done once, on the upgrade.

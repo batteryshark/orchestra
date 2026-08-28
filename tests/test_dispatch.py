@@ -81,7 +81,7 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
         self.work.human_move("W-0001", "done")
         actions = self.sweep()
         self.assertEqual([a["action"] for a in actions], ["dispatch"])
-        self.assertEqual(self.db_run()["work_item"], "W-0002")
+        self.assertEqual(self.db_run()["ref"], "W-0002")
         # W-0002's queue row cleared at dispatch; the other still waits.
         self.assertEqual([r["item_id"] for r in self.waiting()], ["W-0004"])
 
@@ -101,7 +101,7 @@ class DependencyOrderTests(SweeperFixture, unittest.TestCase):
         self.work.human_close_issue("I-0001", summary="settled")
         actions = self.sweep()
         self.assertEqual([a["action"] for a in actions], ["dispatch"])
-        self.assertEqual(self.db_run()["work_item"], "W-0001")
+        self.assertEqual(self.db_run()["ref"], "W-0001")
         self.assertEqual(self.waiting(), [])  # queue row cleared at dispatch
 
     def test_board_order_decides_and_dependencies_outrank_it(self) -> None:
