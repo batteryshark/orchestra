@@ -420,6 +420,11 @@ def set_dispatch_paused(con, paused: bool) -> dict:
         dispatch.pause(con)
     else:
         dispatch.resume(con)
+    # DESIGN §3: pause is a meta write, so no runs trigger fires for it. Every
+    # OTHER open client would wait for the next health tick to learn the
+    # switch moved -- the one bump here is what the board push is for.
+    db.bump_board_revision(con)
+    con.commit()
     return pause_state(con)
 
 
