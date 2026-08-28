@@ -155,7 +155,7 @@ def release(con, item_id: str) -> None:
 def prerequisites(item: dict) -> list[str]:
     """Work item ids this item must wait for. ``dependsOn`` is the one edge
     Work serves; the legacy reverse-edge record folds into it on Work's read
-    (work-management, lib/local-workspace.mjs), so the runner never reads a
+    (Work, lib/local-workspace.mjs), so the runner never reads a
     second key. Tolerant of both a bare id list and a list of
     ``{"id": ...}``."""
     found: list[str] = []

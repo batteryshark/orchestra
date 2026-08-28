@@ -1,4 +1,4 @@
-<!-- Vendored copy of work-management/goal-and-epic-craft/skills/craft-goal/
+<!-- Vendored copy of the craft-goal skill in ~/Projects/work/skills/craft-goal/
 STANDARD.md, taken 2026-08-25. The refine lane's brief points every
 refinement run at THIS file (orchestra/refine.py), so the standard ships with
 Orchestra instead of depending on a skill checkout. Re-copy when the source
