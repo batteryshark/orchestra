@@ -262,6 +262,52 @@ and worker are gone. Work reporting waits for completion, landing, handoff, and
 retry policy to settle, so an execution outcome cannot be mistaken for a landed
 result or a failure that is already being retried.
 
+## Load-bearing rules
+
+These invariants hold in the current code. Changing one breaks an assumption
+another subsystem already depends on.
+
+1. Never downgrade an isolated run to the owner's checkout — a failed worktree
+   setup would silently let unattended runs mutate the human's tree; enforced in
+   `supervise.py` (`prepare_launch` raises, `rehome` returns the failure).
+2. Never merge in the owner's checkout — the merge would collide with the
+   uncommitted work a checkout routinely holds; `merge.py` rebases in a
+   throwaway worktree and moves the base with `git update-ref`.
+3. Never write a Work item's status from a run — status has one writer class,
+   the human, and a run that transitions an item overwrites the human's own
+   move (CONTRACT 0.8); runs append `fact:` comments through `work_client.py`,
+   which offers no status call.
+4. Never let the worker report to Work — a worker that files its own findings
+   can forget, self-approve, or hand itself work; `findings.py` parses the
+   final handoff after the run and files the issues and proposals.
+5. Never let a run token act on a sibling run — the shared secret is in every
+   worker's environment, so route authority is the only containment; `auth.py`
+   holds the whole table, and an unlisted route is the human's.
+6. Never store a run token, only its SHA-256 — a stored token outlives the run
+   that held it; `auth.py` writes the hash, and the `revoke_run_token` trigger
+   in `db.py` nulls it at every terminal status.
+7. Never stop a run without recording why — a stop that reached nobody is
+   indistinguishable from a crash; `observer.py` writes the observation and
+   escalates before it signals the process.
+8. Never let a run launch its own children, and never above its own tier — a
+   self-launching worker escapes the depth, per-run, and concurrency bounds,
+   and an upward hand-off is a decomposition the human never approved;
+   `child_runs.py` checks both under one write lock in the parent's supervisor.
+9. Never let a runway adapter raise — capacity telemetry is auxiliary, and a
+   scraper fault must not block dispatch; every adapter in `runway.py` is
+   wrapped by `@soft` and returns `remaining=None` with a reason.
+10. Never touch a worktree a live run holds — the run loses the directory its
+    process is standing in; `worktree.py` checks `live_holders` before `remove`
+    and `prune`.
+11. Never build a second result model — the refreshed run row is the result,
+    and a parallel object would drift from the row that landing, findings,
+    retry, and Work reporting all read; `supervise.py` commits the terminal row
+    and hands back the row itself.
+12. Never treat the normalized event as the record — `events` carries a
+    truncated payload, so a viewer or parser that trusts it loses detail; the
+    raw log is the source of truth and `traces.py` stores the byte offset and
+    length of the line each event came from.
+
 ## Non-goals
 
 - Rebuilding the legacy Operator, immutable contracts, councils, rosters,
