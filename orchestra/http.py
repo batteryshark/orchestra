@@ -16,6 +16,14 @@ Shape:
   control turns, newest first, optionally one project's and one layer's. The
   snapshot pins only the latest per project; reading the observer's reasoning
   over time is a screen you open, not a thing worth carrying on a 4s poll.
+- **The outbound feed** (CONTRACT §7 Enforcement 2): ``GET
+  /api/runs?since=<revision>`` is the cursored read of run outcomes. Every
+  runs row carries ``revision``, the monotonic marker the schema's triggers
+  stamp on it; a consumer keeps its own cursor and asks for what is past it.
+  Orchestra holds no subscriber list, no endpoint and no delivery state, so
+  it cannot learn who is listening — the consumer's cursor IS the delivery
+  guarantee, which is why nothing here retries. Not SSE and not the board:
+  a plain paged GET for programs.
 - **One per-project read** (W-0186, reshaped by W-0187): ``GET
   /api/project?id=<projectId>`` carries that project's ENABLED SET — which
   of the global profiles it may staff — and its own statistics. ``POST
@@ -214,6 +222,14 @@ PROJECT_ROUTE = "/api/project"
 # in auth.ROUTES, so the human's alone.
 TURNS_ROUTE = "/api/turns"
 RECENT_TURNS = 200
+# ``GET /api/runs?since=<revision>&limit=<n>`` (CONTRACT §7 Enforcement 2) —
+# the cursored feed of run outcomes, oldest change first. Unlisted in
+# auth.ROUTES, so the human's alone: it carries every project's refs and
+# summaries, which is wider than the snapshot's window. ``FEED_PAGE`` is both
+# the default and the ceiling, and it is echoed in the payload so a consumer
+# can tell a full page from a final one.
+RUNS_ROUTE = "/api/runs"
+FEED_PAGE = 200
 # ``GET /api/config`` is the file as written; ``POST`` replaces it (W-0190).
 # Unlisted in auth.ROUTES, so the human's alone — the file holds the shared
 # secret and every profile.
@@ -984,6 +1000,91 @@ def control_turns(project_id: str = "", layer: str = "",
             con.close()
 
 
+def _feed_payload(r) -> dict:
+    """One run as a CONSUMER sees it: enough to act on the outcome without a
+    second call.
+
+    The fields are the ones ``sweeper``'s reporting path actually reads off a
+    run row — ``ref`` (which item), ``status``/``summary``/``landing_status``
+    (what happened, and whether the landing settled), ``branch`` and
+    ``handoff_processed_at`` (whether the result is settled at all),
+    ``requested_by`` (which lane reports itself), ``slug`` and ``no`` (the tag
+    and the human number in every comment it posts), ``layer`` (a control
+    turn is not a run) — plus the usage the row carries, so a consumer can
+    price an outcome without reopening the run.
+
+    Deliberately NOT the dashboard's ``_run_payload``: that one runs four
+    subqueries and a message read per row, which is the wrong shape for a
+    walk over every run ever recorded.
+    """
+    return {
+        "id": r["id"],
+        "revision": r["revision"],
+        "ref": r["ref"],
+        "slug": r["slug"],
+        "no": None if r["layer"] else r["project_seq"],
+        "layer": r["layer"],
+        "project_id": r["project_id"],
+        "status": r["status"],
+        # Full, not truncated: a consumer's report carries the summary
+        # onward, and the board comment is where the length limit belongs.
+        "summary": r["summary"],
+        "title": r["title"],
+        "branch": r["branch"],
+        "landing_status": r["landing_status"],
+        "handoff_processed_at": r["handoff_processed_at"],
+        "requested_by": r["requested_by"],
+        "exit_code": r["exit_code"],
+        "started_at": r["started_at"],
+        "finished_at": r["finished_at"],
+        "tokens_in": r["tokens_in"],
+        "tokens_out": r["tokens_out"],
+        "tokens_total": r["tokens_total"],
+        "cost_usd": r["cost_usd"],
+        "usage_source": r["usage_source"],
+    }
+
+
+def runs_since(since=0, limit=FEED_PAGE, con=None) -> dict:
+    """``GET /api/runs?since=<revision>`` — what changed after that cursor.
+
+    A range scan on ``runs.revision``, oldest change first. ``next_cursor``
+    is the last row's own marker, so resuming from it repeats nothing and
+    skips nothing; an empty page hands the cursor straight back. A row that
+    changes again reappears with a higher marker — the feed carries CURRENT
+    state per run, not a history of transitions, which is why it needs no
+    event table behind it. A deleted run simply stops appearing.
+
+    ``limit`` is echoed because a consumer cannot otherwise tell a full page
+    from the end of the feed: ``len(runs) == limit`` means ask again.
+    """
+    own = con is None
+    con = db.connect() if own else con
+    try:
+        try:
+            since = max(0, int(since))
+        except (TypeError, ValueError):
+            since = 0
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = FEED_PAGE
+        limit = max(1, min(limit, FEED_PAGE))
+        rows = list(con.execute(
+            "SELECT * FROM runs WHERE revision > ? ORDER BY revision LIMIT ?",
+            (since, limit)))
+        return {
+            "runs": [_feed_payload(r) for r in rows],
+            "cursor": since,
+            "next_cursor": rows[-1]["revision"] if rows else since,
+            "limit": limit,
+            "generated_at": db.now(),
+        }
+    finally:
+        if own:
+            con.close()
+
+
 def snapshot(con=None) -> dict:
     own = con is None
     con = db.connect() if own else con
@@ -1489,6 +1590,10 @@ class Handler(BaseHTTPRequestHandler):
             if not project_id:
                 return self._deny(400, "GET /api/project needs ?id=<projectId>")
             return self._json(project_scope(project_id))
+        if path == RUNS_ROUTE:
+            return self._json(runs_since(
+                (query.get("since") or ["0"])[0].strip(),
+                (query.get("limit") or [FEED_PAGE])[0]))
         if path == TURNS_ROUTE:
             return self._json(control_turns(
                 (query.get("project") or [""])[0].strip(),
