@@ -32,7 +32,7 @@ Shape:
   seconds, and because the picker itself is derived from ``runs``.
 - **The registry** (this wave): ``GET /api/projects`` lists every registered
   project with its archived flag, and ``POST /api/projects`` parks or unparks
-  one LOCAL project through the same ``project.set_archived`` the CLI calls.
+  ANY project through the same ``project.set_archived`` the CLI calls.
   Separate from the picker on purpose — the picker is derived from runs, so
   the project worth parking is the one missing from it.
 - **Action routes** POST only: stop / tell / check a run, force a sweep,
@@ -698,7 +698,7 @@ def _projects(con, runs: list[dict]) -> list[dict]:
     stranding the view.
     """
     parked = {r["project_id"] for r in con.execute(
-        "SELECT project_id FROM projects WHERE archived=1")}
+        f"SELECT project_id FROM projects WHERE {project.ARCHIVED_SQL}=1")}
     seen: dict[str, dict] = {}
     for r in runs:
         pid = r.get("project_id")
@@ -974,10 +974,10 @@ def projects_registry(con=None) -> dict:
     here to park. The panel that archives therefore reads the registry.
 
     ``source_ref`` stays opaque (CONTRACT §7): it is compared against nothing
-    and parsed for nothing, only quoted back inside ``blocked`` — the reason a
-    source-backed row shows in place of an archive control, worded by
-    ``project.source_owned`` so the dashboard, the HTTP refusal and the CLI
-    all say the same sentence.
+    and parsed for nothing. ``archived`` is already the DERIVED value
+    (DESIGN §1); ``archived_override`` is NULL while the row still follows its
+    source, which is the only way a surface can say "parked by the source"
+    rather than "parked here".
     """
     own = con is None
     con = db.connect() if own else con
@@ -990,8 +990,7 @@ def projects_registry(con=None) -> dict:
                 "name": p.name,
                 "source_ref": p.source_ref,
                 "archived": p.archived,
-                "blocked": (project.source_owned(p.path, p.source_ref)
-                            if p.source_ref else None),
+                "archived_override": p.archived_override,
             } for p in rows],
             "generated_at": db.now(),
         }
@@ -1804,11 +1803,11 @@ class Handler(BaseHTTPRequestHandler):
             result = profile_edit.set_enabled(project_id, names)
             return self._json(result, 400 if result.get("error") else 200)
         if path == PROJECTS_ROUTE:
-            # Park or unpark ONE locally adopted project (DESIGN §1). The rule
-            # is NOT restated here: project.set_archived is the same call
-            # `orchestra project archive` makes, so a source-backed row is
-            # refused with the wording the CLI refuses it with, and the lanes
-            # that skip a parked project keep keying off the one column.
+            # Park or unpark ONE project, source-backed or not (DESIGN §1).
+            # No rule is restated here: project.set_archived is the same call
+            # `orchestra project archive` makes, it writes the owner's
+            # override, and the lanes that skip a parked project keep reading
+            # the one derived value.
             root = str(body.get("path") or "").strip()
             if not root:
                 return self._deny(400, "POST /api/projects needs path")
@@ -1823,8 +1822,6 @@ class Handler(BaseHTTPRequestHandler):
                 if known:
                     db.bump_board_revision(con)
                     con.commit()
-            except SystemExit as exc:
-                return self._deny(400, str(exc))
             finally:
                 con.close()
             if not known:

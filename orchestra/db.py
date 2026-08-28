@@ -112,9 +112,11 @@ Data-model invariants (DESIGN D4):
   ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
   the card's decision — stamped exactly once, so an answered card never
   retriggers on the next tick. Owned by ``nod.py``; carries no issuer token.
-- ``projects.archived`` (schema v20, DESIGN §1) mirrors Work's own flag: an
-  archived project is PARKED, so the unattended lanes skip its items and the
-  listing surfaces hide it. It hides nothing that already happened — every
+- ``projects.archived`` (schema v20, DESIGN §1) mirrors the source's own flag,
+  and ``projects.archived_override`` (schema v26) is the owner's answer on top
+  of it: effective archived is ``COALESCE(archived_override, archived, 0)``,
+  spelled once in ``project.ARCHIVED_SQL``. An archived project is PARKED, so
+  the unattended lanes skip its items and the listing surfaces hide it. It hides nothing that already happened — every
   query over ``runs`` ignores this column, so history, statistics and run
   lookup are untouched, and a live run is never disturbed by it.
 - ``meta['board_revision']`` (schema v19, DESIGN §3) is the dashboard's
@@ -141,7 +143,7 @@ from datetime import datetime, timezone
 
 from orchestra import paths
 
-SCHEMA_VERSION = "25"
+SCHEMA_VERSION = "26"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -232,6 +234,15 @@ RUNS_V17_COLUMNS = (
 # the flag and never asks who set it (CONTRACT §7).
 PROJECTS_V20_COLUMNS = (
     ("archived", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+# Schema v26 (DESIGN §1). The OWNER'S OWN answer, above the source's: NULL
+# follows ``archived``, 0 and 1 override it. A PURE ADD — nothing is renamed,
+# dropped or migrated, so a stale pre-v26 writer that re-adds its own columns
+# leaves this one alone and every old row keeps its effective state through
+# the COALESCE (2026-08-28, why ``_retire_resurrected`` exists).
+PROJECTS_V26_COLUMNS = (
+    ("archived_override", "INTEGER"),
 )
 
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
@@ -392,7 +403,8 @@ CREATE TABLE IF NOT EXISTS projects (
   source_ref TEXT,
   name TEXT,
   refreshed_at TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0
+  archived INTEGER NOT NULL DEFAULT 0,
+  archived_override INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_projects_project_id ON projects(project_id);
 CREATE TABLE IF NOT EXISTS messages (
@@ -753,7 +765,7 @@ def connect(db_file=None) -> sqlite3.Connection:
                 con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
     known = {r["name"] for r in con.execute("PRAGMA table_info(projects)")}
     if known:
-        for name, sql_type in PROJECTS_V20_COLUMNS:
+        for name, sql_type in PROJECTS_V20_COLUMNS + PROJECTS_V26_COLUMNS:
             if name not in known:
                 con.execute(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
         # Schema v24 (CONTRACT §6, §7). ONE SHOT: the column that held a

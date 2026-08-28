@@ -28,19 +28,27 @@ directory and refresh, then retry."""
 class Project:
     """One cached (path -> projectId) mapping. ``path`` is a lookup key only."""
 
-    __slots__ = ("project_id", "path", "source_ref", "name", "archived")
+    __slots__ = ("project_id", "path", "source_ref", "name", "archived",
+                 "archived_override")
 
     def __init__(self, project_id: str, path: Path, source_ref: str | None,
-                 name: str | None, archived: bool = False):
+                 name: str | None, archived: bool = False,
+                 archived_override: bool | None = None):
         self.project_id = project_id
         self.path = path
         # The source's own identifier for this project, or None when the row
         # was adopted locally. Opaque (CONTRACT §7 Enforcement 1).
         self.source_ref = source_ref
         self.name = name
-        # DESIGN §1: parked, not deleted. Read by the unattended lanes and
-        # the listing surfaces; nothing that reads history looks at it.
+        # DESIGN §1: parked, not deleted, and ALREADY DERIVED — this is
+        # COALESCE(archived_override, archived, 0), not the source's mirror.
+        # Read by the unattended lanes and the listing surfaces; nothing that
+        # reads history looks at it.
         self.archived = archived
+        # Who decided. None means "still following the source", which is the
+        # only thing a surface needs the raw columns for: a row parked with
+        # no override was parked by the source, not by the owner.
+        self.archived_override = archived_override
 
     @property
     def slug(self) -> str:
@@ -50,12 +58,26 @@ class Project:
         return f"Project({self.project_id} @ {self.path})"
 
 
+# DESIGN §1: effective archived, spelled ONCE. The owner's override wins over
+# the source's mirror; NULL follows the source, which is what auto-parks a
+# project the source archived. Every SQL filter uses this string;
+# ``_effective`` is the same rule for a row already in hand.
+ARCHIVED_SQL = "COALESCE(archived_override, archived, 0)"
+
+
+def _effective(row) -> bool:
+    over = row["archived_override"]
+    return bool(row["archived"] if over is None else over)
+
+
 def _row(row) -> Project | None:
     if row is None:
         return None
     return Project(row["project_id"], Path(row["path"]), row["source_ref"],
                    row["name"],
-                   bool(row["archived"]))
+                   _effective(row),
+                   None if row["archived_override"] is None
+                   else bool(row["archived_override"]))
 
 
 # --- cache ------------------------------------------------------------------
@@ -76,9 +98,15 @@ def remember_source(con, rows: list) -> int:
     for path, project_id, source_ref, name, archived in rows:
         if not project_id or not source_ref:
             continue  # a row with no source identity is not source-backed
+        # UPSERT, not INSERT OR REPLACE: REPLACE deletes the row first, which
+        # would drop ``archived_override`` — the owner's answer — on every
+        # refresh. The source still writes its own mirror column (DESIGN §1).
         con.execute(
-            "INSERT OR REPLACE INTO projects(path, project_id, source_ref, name, "
-            "refreshed_at, archived) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO projects(path, project_id, source_ref, name, "
+            "refreshed_at, archived) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(path) DO UPDATE SET project_id=excluded.project_id, "
+            "source_ref=excluded.source_ref, name=excluded.name, "
+            "refreshed_at=excluded.refreshed_at, archived=excluded.archived",
             (str(path), project_id, source_ref, name, ts, int(bool(archived))))
         seen.append(str(path))
         count += 1
@@ -132,14 +160,15 @@ def adopt(con, root: Path, name: str | None = None) -> "Project":
         "SELECT * FROM projects WHERE path=?", (str(root),)).fetchone())
 
 
-def source_owned(root, source_ref: str, verb: str = "archive") -> str:
+def source_owned(root, source_ref: str, verb: str = "remove") -> str:
     """Why a source-backed row refuses a local edit — ONE wording.
 
     Named, not described: the human reading this has to know WHERE to go, and
     the identifier the source gave the project is the only address this module
-    has (CONTRACT §7 — it is not parsed, just quoted back). The CLI raises it,
-    the HTTP surface returns it, and the dashboard prints it in the row where
-    a local project would show its archive control.
+    has (CONTRACT §7 — it is not parsed, just quoted back). ``forget`` is the
+    ONE caller: removing a row the next refresh re-creates is genuinely
+    broken. Archiving is not — that is Orchestra's own surface, so it takes
+    an override instead of a refusal (DESIGN §1).
     """
     return (f"orchestra: {root} comes from the work source that owns "
             f"{source_ref!r}; {verb} it there, not here")
@@ -161,24 +190,29 @@ def forget(con, root: Path) -> bool:
 
 
 def set_archived(con, root: Path, archived: bool) -> bool:
-    """Park or unpark a locally adopted project. Refuses one a work source
-    owns, since that source owns the flag: the next refresh would overwrite
-    the local answer and the change would look broken."""
+    """Park or unpark ANY registered project, source-backed or not.
+
+    Archiving means "hide this from Orchestra and stop dispatching for it" —
+    Orchestra's own decision about its own surface. Mirroring the source's
+    flag as the only writer conflated the source's record with the owner's
+    local preference, so this refused a source-backed project and left the
+    owner nothing to park it with. It writes ``archived_override``, never the
+    source's mirror: the human decided here, and the human always wins
+    (DESIGN §1). Unlike ``forget``, no refresh can undo it.
+    """
     root = Path(root).expanduser().resolve()
-    row = con.execute("SELECT source_ref FROM projects WHERE path=?",
+    row = con.execute("SELECT path FROM projects WHERE path=?",
                       (str(root),)).fetchone()
     if row is None:
         return False
-    if row["source_ref"]:
-        raise SystemExit(source_owned(root, row["source_ref"]))
-    con.execute("UPDATE projects SET archived=? WHERE path=?",
+    con.execute("UPDATE projects SET archived_override=? WHERE path=?",
                 (int(archived), str(root)))
     con.commit()
     return True
 
 
 def all_projects(con, include_archived: bool = False) -> list:
-    where = "" if include_archived else " WHERE archived=0"
+    where = "" if include_archived else f" WHERE {ARCHIVED_SQL}=0"
     return [_row(r) for r in con.execute(
         f"SELECT * FROM projects{where} ORDER BY path")]
 
@@ -317,9 +351,10 @@ def workdir_for(con, proj: "Project | None") -> "Project | None":
     found = _discover(con, proj)
     if found is not None:
         return Project(proj.project_id, found, proj.source_ref, proj.name,
-                       proj.archived)
+                       proj.archived, proj.archived_override)
     return Project(proj.project_id, paths.workspace_dir(proj.project_id),
-                   proj.source_ref, proj.name, proj.archived)
+                   proj.source_ref, proj.name, proj.archived,
+                   proj.archived_override)
 
 
 def _discover(con, proj: "Project") -> Path | None:
