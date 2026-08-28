@@ -1816,6 +1816,13 @@ class Handler(BaseHTTPRequestHandler):
             con = db.connect()
             try:
                 known = project.set_archived(con, Path(root), want)
+                # Parking a project changes the picker, and the projects
+                # table has no trigger of its own. Without this bump another
+                # open board keeps the parked project until a RUN happens to
+                # change — the same gap `set_dispatch_paused` closes.
+                if known:
+                    db.bump_board_revision(con)
+                    con.commit()
             except SystemExit as exc:
                 return self._deny(400, str(exc))
             finally:
