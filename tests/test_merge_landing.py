@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from orchestra import (config, db, dispatch, merge, messaging, project,
-                       sweeper)
+                       supervise, sweeper)
 from orchestra.work_client import WorkClient
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
 from tests.fake_work import FakeWork
@@ -582,3 +582,77 @@ class LandingTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LandingSwitchTests(LandingTestCase):
+    """``[merge] enabled = false``: the pure-runner contract. A run ends at
+    its branch and its receipts; whatever lands it is external."""
+
+    def switch_off(self) -> None:
+        self.global_config.write_text(
+            self.global_config.read_text() + "\n[merge]\nenabled = false\n")
+        self.cfg = config.load(PROJECT_ID)
+
+    def test_the_switch_keeps_the_branch_and_stamps_skipped(self) -> None:
+        self.switch_off()
+        self.run_branch({"feature.py": "x = 1\n"})
+        note = merge.at_completion(self.con, self.cfg, self.add_run())
+        self.assertIn("Landing is off", note)
+        row = self.row()
+        self.assertEqual(row["landing_status"], "skipped")
+        self.assertIsNone(row["landing_commit"])
+        # Nothing merged, nothing deleted: main untouched, the branch kept.
+        self.assertNotIn("feature.py",
+                         git(self.root, "ls-tree", "--name-only", "main"))
+        self.assertIn(BRANCH, git(self.root, "branch", "--list", BRANCH))
+
+    def test_the_report_posts_the_comment_but_no_lifecycle_fact(self) -> None:
+        """The fact belongs to whatever lands the branch. The item stays
+        where the human put it, and no criterion is declined on the run's
+        behalf — the later landing accounts for them."""
+        self.switch_off()
+        self.run_branch({"feature.py": "x = 1\n"})
+        merge.at_completion(self.con, self.cfg, self.add_run())
+        self.report()
+        log = "\n".join(e["message"] for e in self.work.tasks["W-0001"]["log"])
+        self.assertIn("finished: done", log)
+        self.assertIn("Landing is off", log)
+        self.assertNotIn("fact: landed", log)
+        self.assertEqual(self.work.tasks["W-0001"]["status"], "in_progress")
+        # Reported once: the next pass appends nothing new.
+        before = len(self.work.tasks["W-0001"]["log"])
+        self.report()
+        self.assertEqual(len(self.work.tasks["W-0001"]["log"]), before)
+
+    def test_an_explicit_retry_lands_anyway(self) -> None:
+        """The switch gates the AUTOMATIC path, never the owner's own hand."""
+        self.switch_off()
+        self.run_branch({"feature.py": "x = 1\n"})
+        merge.at_completion(self.con, self.cfg, self.add_run())
+        note = merge.retry_landing(self.con, self.cfg, self.row())
+        self.assertIn("Merged", note)
+        row = self.row()
+        self.assertEqual(row["landing_status"], "ok")
+        self.assertIn("feature.py",
+                      git(self.root, "ls-tree", "--name-only", "main"))
+
+    def test_a_skipped_landing_still_releases_dependents(self) -> None:
+        self.switch_off()
+        self.run_branch({"feature.py": "x = 1\n"})
+        merge.at_completion(self.con, self.cfg, self.add_run())
+        self.con.execute(
+            "INSERT INTO runs(id, profile, backend, requested_by, workdir, "
+            "project_id, status, started_at) "
+            "VALUES(2,'stub','opencode','human',?,?, 'pending',?)",
+            (str(self.root), PROJECT_ID, db.now()))
+        self.con.execute(
+            "INSERT INTO dispatch_dependencies(run_id, depends_on_run) "
+            "VALUES(2, 1)")
+        self.con.execute(
+            "INSERT INTO deferred_dispatches(run_id, mission, created_at) "
+            "VALUES(2, 'follow-up', ?)", (db.now(),))
+        self.con.commit()
+        req, blocked = supervise.admit_pending(self.con, 2)
+        self.assertIsNone(blocked, "a skipped landing must not block "
+                                   "dependents: landing is external now")
+        self.assertIsNotNone(req)

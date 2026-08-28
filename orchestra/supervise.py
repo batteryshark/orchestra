@@ -157,7 +157,7 @@ def admit_pending(con, run_id: int) -> tuple[sqlite3.Row | None, str | None]:
             "AND NOT EXISTS (SELECT 1 FROM dispatch_dependencies e "
             "JOIN runs p ON p.id=e.depends_on_run WHERE e.run_id=d.run_id "
             "AND NOT (p.status='done' AND "
-            "(p.branch IS NULL OR p.landing_status='ok')))",
+            "(p.branch IS NULL OR p.landing_status IN ('ok','skipped'))))",
             (int(run_id),)).fetchone()
         if req is None:
             con.rollback()
@@ -1031,7 +1031,7 @@ def process_ready(con, launcher) -> list[dict]:
         "  SELECT 1 FROM dispatch_dependencies e "
         "  JOIN runs p ON p.id=e.depends_on_run "
         "  WHERE e.run_id=d.run_id AND NOT (p.status='done' AND "
-        "  (p.branch IS NULL OR p.landing_status='ok'))) "
+        "  (p.branch IS NULL OR p.landing_status IN ('ok','skipped')))) "
         "ORDER BY d.run_id"))
     for req in ready:
         run_id = int(req["run_id"])

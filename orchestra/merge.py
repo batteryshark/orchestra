@@ -17,6 +17,9 @@ global ``~/.config/orchestra/config.toml`` (projects have no state directory
 of their own — DESIGN §2)::
 
     [merge]
+    enabled = true           # false: runs END at their branch + receipts, and
+                             # whatever lands them is external (a human, or an
+                             # agentic lander). Explicit retries still land.
     base = "main"            # default: the branch the project root has checked out
     max_files = 50           # tripwire: files touched by the diff
     max_lines = 2000         # tripwire: insertions + deletions
@@ -72,6 +75,11 @@ SWAP_ATTEMPTS = 3
 MAX_REPLAY_DROPS = 100
 
 DEFAULTS = {
+    # Auto-landing. Off means Orchestra's contract ends at the branch and
+    # the receipts (landing_status 'skipped'); an external lander consumes
+    # them. A human's explicit retry still lands — policy gates the
+    # automatic path, never the owner's own hand.
+    "enabled": True,
     "base": None,
     "checks": {},
     "max_files": 50,
@@ -693,11 +701,12 @@ def _record_landing(con, run: dict, status: str | None,
     con.commit()
 
 
-def _consume_landing(con, cfg: dict, result, status: str) -> str | None:
+def _consume_landing(con, cfg: dict, result, status: str,
+                     forced: bool = False) -> str | None:
     """Run landing policy with an explicit effective execution status."""
     run = dict(result)
     try:
-        return _land(con, cfg, run, status)
+        return _land(con, cfg, run, status, forced=forced)
     except Exception as exc:
         note = f"Merge failed: {exc}"
         print(f"orchestra: run {result['id']} {note}", file=sys.stderr)
@@ -740,16 +749,28 @@ def retry_landing(con, cfg: dict, result) -> str | None:
     """Retry landing for the persisted terminal row, whatever its outcome.
 
     A human explicitly chose to retry the kept branch. That changes landing
-    policy, not the execution result recorded on the row.
+    policy, not the execution result recorded on the row — and it overrides
+    ``[merge] enabled = false``: the switch gates the automatic path, never
+    the owner's own hand.
     """
-    return _consume_landing(con, cfg, result, "done")
+    return _consume_landing(con, cfg, result, "done", forced=True)
 
 
-def _land(con, cfg: dict, run: dict, status: str) -> str | None:
+def _land(con, cfg: dict, run: dict, status: str,
+          forced: bool = False) -> str | None:
     if status != "done" or not run.get("branch"):
         _record_landing(con, run, "ok")
         return None  # only a verified success lands; a shared-tree run has no branch
     branch = run["branch"]
+    if not forced and not merge_cfg(cfg).get("enabled", True):
+        # The pure-runner contract: the run ENDS at its branch and this
+        # receipt. Whatever lands it — a human, an external agentic lander —
+        # reads landing_status 'skipped' and the kept branch, and posts its
+        # own facts. Nothing is merged, nothing is deleted.
+        note = (f"Landing is off ([merge] enabled = false): branch {branch} "
+                "is kept for an external landing")
+        _record_landing(con, run, "skipped", note)
+        return note
     root = project.root_for(con, run)
     result = _recovered_landing(root, cfg, run)
     if result is None:
