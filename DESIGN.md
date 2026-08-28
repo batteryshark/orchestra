@@ -138,6 +138,16 @@ identifier and Keychain service keep their shipped string for upgrade and
 Keychain compatibility; every name in the project and on the phone is
 Orchestra.
 
+Run outcomes leave through a CURSORED READ, not a callback. Every run row
+carries `revision`, a monotonic marker the same triggers stamp that bump the
+board counter, and `GET /api/runs?since=<revision>` pages the rows past a
+caller's cursor. Orchestra holds no subscriber list, no endpoint and no
+delivery state, so it cannot learn who consumes it; the consumer's own cursor
+is the delivery guarantee, which is why no retry queue exists on this side.
+The Work adapter reads it like any other consumer would. A push relay could
+subscribe and POST without Orchestra learning anything (CONTRACT §7
+Enforcement).
+
 The HTTP server can bind to loopback or a discovered Tailscale address. Host
 checks and the shared key still apply on a tailnet.
 
@@ -189,9 +199,9 @@ readable from the CLI with every source down.
 
 The durable write comes FIRST, before any delivery is attempted. The earlier
 shape filed the decision and kept the request only in its return value, so
-every failure path reported that a human was needed while destroying what
-for (2026-08-28: an agent's request reached neither Work nor any local row,
-and the values were unrecoverable).
+every failure path reported that a human was needed while destroying what it
+asked for (2026-08-28: an agent's request reached neither Work nor any local
+row, and the values were unrecoverable).
 
 There is no team, roster, council, squad, or other grouping layer.
 
@@ -345,12 +355,22 @@ another subsystem already depends on.
     and `prune`.
 11. Never build a second result model — the refreshed run row is the result,
     and a parallel object would drift from the row that landing, findings,
-    retry, and Work reporting all read; `supervise.py` commits the terminal row
-    and hands back the row itself.
+    retry, and source reporting all read; `supervise.py` commits the terminal
+    row and hands back the row itself.
 12. Never treat the normalized event as the record — `events` carries a
     truncated payload, so a viewer or parser that trusts it loses detail; the
     raw log is the source of truth and `traces.py` stores the byte offset and
     length of the line each event came from.
+13. Never let the core know a source — only `sweeper`, `conductor`, `verify`,
+    `refine` and `findings` may import a source client, and `runs.ref`,
+    `projects.source_ref` and `nod_requests.ref` are opaque strings the core
+    stores and never parses; the rule is the contract's (§7 Enforcement) and
+    `tests/test_boundary.py` asserts it against the import graph.
+14. Never attempt delivery before the durable write — a record that exists
+    only in a return value dies with the first unreachable server, and the
+    caller is told a human is needed while what they asked for is destroyed;
+    `profile_edit` writes its escalation row first and an adapter files it
+    later.
 
 ## Non-goals
 
