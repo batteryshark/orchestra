@@ -32,7 +32,7 @@ from orchestra import (acp, auth, brief, child_runs, config, db, dispatch,
                        project, runners, traces, worktree)
 from orchestra.proc import (enrich_path, process_identity, raise_file_limit,
                             resolve_cmd,
-                            session_kwargs, terminate_group)
+                            session_kwargs, terminate_group, which)
 
 EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
 POLL_INTERVAL = 0.5
@@ -233,6 +233,20 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
     """Create the workdir, brief, and log for a run row about to launch."""
     run_id = int(run["id"])
     profile = config.profile_cfg(cfg, run["profile"])
+    # DESIGN §4: fail closed BEFORE anything is allocated. A harness whose CLI
+    # is missing used to surface only at exec — after the run row, the frozen
+    # brief, the raw log and an isolated worktree existed — leaving a dead run
+    # and an orphaned worktree instead of a refusal. PRESENCE only: the
+    # binary's PATH lookup is free, while auth is DESIGN §7's after-the-fact
+    # escalation and costs a process per launch to probe. The search uses the
+    # WORKER's PATH, not the daemon's: enrich_path is what lets a launchd job
+    # see the CLIs at all, so looking anywhere else would refuse a run that
+    # would have started.
+    harness = profile["backend"]
+    if which(harness, path=enrich_path(dict(os.environ)).get("PATH")) is None:
+        raise RuntimeError(
+            f"harness '{harness}' is not installed: no '{harness}' binary on "
+            f"PATH; run {run_id} did not start")
     workdir, branch = str(root), None
     base_commit = None
     bp = paths.briefs_dir() / f"run-{run_id}.md"

@@ -17,22 +17,26 @@ _WIN_LAUNCHABLE = (".exe", ".cmd", ".bat", ".com")
 _STILL_ACTIVE = 259
 
 
-def which(name: str) -> str | None:
+def which(name: str, path: str | None = None) -> str | None:
     """A path ``CreateProcess`` / ``exec`` can actually launch.
 
     On Windows ``shutil.which('claude')`` can land on the extensionless npm
     shim, which is a Unix shell script. Prefer ``.cmd`` / ``.exe``.
+
+    ``path`` searches somewhere other than this process's own PATH — a caller
+    that decides for a CHILD must look up the child's PATH, not its own.
     """
     if not IS_WIN:
-        return shutil.which(name)
+        return shutil.which(name, path=path)
     suffix = Path(name).suffix.lower()
     if suffix in _WIN_LAUNCHABLE and Path(name).is_file():
         return name
     for ext in (".cmd", ".exe", ".bat"):
-        found = shutil.which(name if name.lower().endswith(ext) else name + ext)
+        found = shutil.which(name if name.lower().endswith(ext) else name + ext,
+                             path=path)
         if found:
             return found
-    found = shutil.which(name)
+    found = shutil.which(name, path=path)
     if found and Path(found).suffix.lower() in _WIN_LAUNCHABLE:
         return found
     return found
