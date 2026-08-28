@@ -40,12 +40,18 @@ Data-model invariants (DESIGN D4):
   on it, never on a path: one central database now holds every project's
   runs, and renaming a folder must lose nothing.
   ``runs.workdir`` stays a path because it is where a process actually ran.
-- ``projects.slug`` (schema v27) is the project's HUMAN address: lowercase
-  kebab-case, minted once from the project's name and never rewritten by a
-  refresh. Unique across project ids (alias rows of one project share it) —
-  enforced at mint time, not by SQL, exactly because those alias rows share
-  it. ``dispatch --project``, the HTTP dispatch route, and the per-project
-  directory ``~/.orchestra/projects/<slug>/`` all key on it.
+- ``projects`` (schema v29) is IDENTITY ONLY: one row per project — its id,
+  slug, name, whether the owner or an adapter minted it, and the parked
+  flags. NO PATH: Orchestra is a runner, and a checkout is the CALLER's to
+  supply at dispatch (``--path``, the cwd, or "where this project last ran",
+  read from the run history). ``projects.slug`` (v27) is the human address:
+  lowercase kebab-case, minted once, never rewritten by a refresh.
+  ``projects.local`` says who minted the row — 1 the owner, 0 a source
+  adapter's cache — which is provenance, not a source's name.
+- ``checkouts`` (schema v29) is the Work adapter's OWN label-to-folder map,
+  owned by ``sweeper.py`` exactly as ``work_marks`` is: the source's cached
+  project list plus the owner's ``link`` bindings. The core never reads it;
+  an unattended dispatch is the adapter resolving its own labels.
 - ``dispatch_queue`` (schema v8, DESIGN §4) holds Work items that cannot
   start yet, with the reason. It is queue state only: nothing dispatches
   from a row here, and the run row appears at actual dispatch.
@@ -151,7 +157,7 @@ from pathlib import PurePath
 
 from orchestra import paths
 
-SCHEMA_VERSION = "28"
+SCHEMA_VERSION = "29"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -300,6 +306,22 @@ NOD_REQUESTS_V24_COLUMNS = (
     ("body", "TEXT"),
 )
 
+# Declared apart from SCHEMA because the v29 migration below has to fill it
+# before SCHEMA runs.
+CHECKOUTS_SQL = """
+-- Schema v29 (CONTRACT §7 Enforcement 1). The Work adapter's label-to-folder
+-- map: the source's cached project list (``source_ref`` set) plus the
+-- owner's ``link`` bindings (``source_ref`` NULL). Owned by ``sweeper.py``;
+-- the core never reads it. The core's ``projects`` table is identity only.
+CREATE TABLE IF NOT EXISTS checkouts (
+  path TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  source_ref TEXT,
+  refreshed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_checkouts_project ON checkouts(project_id);
+"""
+
 # Declared apart from SCHEMA because the v21 migration below has to fill it
 # before SCHEMA runs.
 WORK_MARKS_SQL = """
@@ -318,7 +340,7 @@ CREATE TABLE IF NOT EXISTS work_marks (
 );
 """
 
-SCHEMA = WORK_MARKS_SQL + """
+SCHEMA = CHECKOUTS_SQL + WORK_MARKS_SQL + """
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -415,24 +437,21 @@ CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run);
 CREATE INDEX IF NOT EXISTS idx_runs_revision ON runs(revision);
 CREATE INDEX IF NOT EXISTS idx_runs_ref ON runs(ref);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
--- Orchestra's project registry, so an offline CLI still resolves a directory
--- to a project. One row per local path (a source's alias path gets its own
--- row); ``project_id`` is what everything else keys on.
--- ``source_ref`` (schema v24, CONTRACT §7) is the SOURCE'S OWN identifier for
--- the project, opaque here exactly like ``runs.ref``: NULL means the row was
--- adopted locally and no source stands behind it. Only a source's adapter
--- mints one or reads meaning into it; the core compares it and nothing more.
+-- Orchestra's project registry: IDENTITY ONLY (schema v29). One row per
+-- project; ``project_id`` is what everything keys on, ``slug`` is the human
+-- address, and ``local`` records who minted the row (1 the owner, 0 an
+-- adapter's cache) — provenance, never a source's name (CONTRACT §7).
+-- Checkouts are the caller's business at dispatch; the adapter's own map
+-- lives in ``checkouts`` above.
 CREATE TABLE IF NOT EXISTS projects (
-  path TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  source_ref TEXT,
+  project_id TEXT PRIMARY KEY,
+  slug TEXT UNIQUE,
   name TEXT,
+  local INTEGER NOT NULL DEFAULT 1,
   refreshed_at TEXT NOT NULL,
   archived INTEGER NOT NULL DEFAULT 0,
-  archived_override INTEGER,
-  slug TEXT
+  archived_override INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_projects_project_id ON projects(project_id);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY,
   run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -723,6 +742,54 @@ def _backfill_project_slugs(con: sqlite3.Connection) -> None:
                     (slug, row["project_id"]))
 
 
+def _rebuild_projects_v29(con: sqlite3.Connection) -> None:
+    """Schema v29, one shot: the path-keyed registry becomes identity only.
+
+    Three moves, in an order that loses nothing:
+    1. ``runs.repo`` is backfilled from the old rows first, so every old
+       run keeps a correct landing target after the paths leave the core.
+    2. Source-backed rows — and the ``link`` rows that share their project
+       id — move to the adapter's ``checkouts`` table verbatim.
+    3. The table is rebuilt one row per project id. A purely local project's
+       path is dropped: the caller supplies checkouts now, and the run
+       history answers "where does this project usually run".
+    """
+    con.executescript(CHECKOUTS_SQL)
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                   "AND name='runs'").fetchone():
+        con.execute(
+            "UPDATE runs SET repo = ("
+            " SELECT p.path FROM projects p WHERE p.project_id = runs.project_id"
+            " ORDER BY p.source_ref IS NULL, LENGTH(p.path) LIMIT 1) "
+            "WHERE repo IS NULL AND project_id IS NOT NULL")
+    con.execute(
+        "INSERT OR IGNORE INTO checkouts(path, project_id, source_ref, "
+        "refreshed_at) SELECT path, project_id, source_ref, refreshed_at "
+        "FROM projects WHERE EXISTS (SELECT 1 FROM projects s "
+        "WHERE s.project_id = projects.project_id "
+        "AND s.source_ref IS NOT NULL)")
+    con.execute(
+        "CREATE TABLE projects_v29 ("
+        " project_id TEXT PRIMARY KEY, slug TEXT UNIQUE, name TEXT,"
+        " local INTEGER NOT NULL DEFAULT 1, refreshed_at TEXT NOT NULL,"
+        " archived INTEGER NOT NULL DEFAULT 0, archived_override INTEGER)")
+    # One row per id: the source row's name wins, any row's park wins, and
+    # MAX skips NULL overrides. ``local`` is provenance: no source row ever
+    # stood behind this id.
+    con.execute(
+        "INSERT INTO projects_v29(project_id, slug, name, local, "
+        "refreshed_at, archived, archived_override) "
+        "SELECT project_id, MAX(slug), "
+        " COALESCE(MAX(CASE WHEN source_ref IS NOT NULL THEN name END), "
+        "          MAX(name)), "
+        " CASE WHEN MAX(source_ref) IS NULL THEN 1 ELSE 0 END, "
+        " MAX(refreshed_at), MAX(archived), MAX(archived_override) "
+        "FROM projects GROUP BY project_id")
+    con.execute("DROP INDEX IF EXISTS idx_projects_project_id")
+    con.execute("DROP TABLE projects")
+    con.execute("ALTER TABLE projects_v29 RENAME TO projects")
+
+
 def connect(db_file=None) -> sqlite3.Connection:
     """The central database (DESIGN §2). ``db_file`` opens another file, for
     tests."""
@@ -813,20 +880,20 @@ def connect(db_file=None) -> sqlite3.Connection:
             if name not in have:
                 con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
     known = {r["name"] for r in con.execute("PRAGMA table_info(projects)")}
-    if known:
-        for name, sql_type in (PROJECTS_V20_COLUMNS + PROJECTS_V26_COLUMNS
-                               + PROJECTS_V27_COLUMNS):
+    if known and "path" in known:
+        # A pre-v29 registry: one row per PATH. Bring it to the last
+        # path-keyed shape first — v24's rename and v27's slugs need the old
+        # columns — then rebuild it as the identity table.
+        if "work_id" in known:
+            con.execute(
+                "ALTER TABLE projects RENAME COLUMN work_id TO source_ref")
+        for name, sql_type in PROJECTS_V20_COLUMNS + PROJECTS_V26_COLUMNS \
+                + PROJECTS_V27_COLUMNS:
             if name not in known:
                 con.execute(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
         if "slug" not in known:
             _backfill_project_slugs(con)
-        # Schema v24 (CONTRACT §6, §7). ONE SHOT: the column that held a
-        # source's own project identifier stops carrying that source's name.
-        # No reader below accepts the old spelling — that tolerance is the
-        # leak §6 forbids — so this line is the only code that ever names it.
-        if "work_id" in known:
-            con.execute(
-                "ALTER TABLE projects RENAME COLUMN work_id TO source_ref")
+        _rebuild_projects_v29(con)
     cards = {r["name"] for r in con.execute("PRAGMA table_info(nod_requests)")}
     if cards:
         for name, sql_type in NOD_REQUESTS_V14_COLUMNS + NOD_REQUESTS_V24_COLUMNS:

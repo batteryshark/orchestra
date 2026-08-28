@@ -19,18 +19,19 @@ This reports installed harnesses, state paths, configuration problems, and
 whether a managed daemon service is installed. Do not send a run to a missing
 harness.
 
-## Register the project
+## Name the project
 
-Orchestra dispatches only into registered directories:
+A project is an identity — slug, settings, run numbering — never a folder:
 
 ```sh
-orchestra project add .
+orchestra project add <name>
 orchestra project list
 ```
 
-`project list` labels each entry as local or Work-backed, and shows each
-project's slug — its stable lowercase kebab-case address. Local registration
-is enough for direct dispatch.
+`project list` labels each entry as local or source-cached and shows its
+slug, the stable lowercase kebab-case address. No path is stored anywhere:
+each dispatch names its checkout, and the run history remembers where a
+project usually runs.
 
 ## Dispatch
 
@@ -39,15 +40,16 @@ orchestra profiles
 orchestra dispatch --to <profile> "<mission>"
 ```
 
-Dispatch resolves the project from the current directory. To target another
-project from anywhere, name it by slug:
+A bare dispatch works in the current directory and resolves the project
+from the run history. To target a project from anywhere, name it by slug:
 
 ```sh
 orchestra dispatch --project <slug> --to <profile> "<mission>"
 ```
 
-A project is not one checkout. Add `--path <dir>` to branch this run from a
-specific checkout (and land back into it); without `--project`, the path
+That uses the checkout the project last ran in. Add `--path <dir>` to
+branch this run from a specific checkout (and land back into it) — required
+once for a project with no run history yet; without `--project`, the path
 names the project the same way the current directory does.
 
 Dispatch is isolated by default. Use `--shared` only for read-only research or

@@ -16,36 +16,34 @@ from orchestra import (acp, auth, child_runs, conductor, config, daemon, db,
                          worktree)
 
 
+def _locate_dir(con, start) -> "project.Project | None":
+    """The project this directory belongs to: the run history first (the
+    runner's own records are the address book), then the Work adapter's
+    cached checkout map for a folder no run has taught the history yet."""
+    return project.for_dir(con, start) or sweeper.project_for_dir(con, start)
+
+
 def _here(con) -> tuple:
     """(project, merged config) for the current directory.
 
-    The project is None outside any registered project: listing runs or profiles
+    The project is None outside any known one: listing runs or profiles
     must still work from an arbitrary directory now that state is central.
     """
-    proj = project.try_resolve(con, config.load(),
-                               refresh=sweeper.refresh_projects)
+    try:
+        proj = _locate_dir(con, project.start_dir())
+    except (OSError, ValueError):
+        proj = None
     return proj, config.load(proj.project_id if proj else None)
 
 
-def _require_project(con, selector: str | None = None):
-    """Same, but a command that has to run somewhere refuses to guess.
-
-    ``selector`` names a project outright — slug, project id, or registered
-    path — so a dispatch does not have to stand in the project's directory.
-    """
-    if selector:
+def _find_project(con, selector: str) -> "project.Project":
+    hit = project.find(con, selector)
+    if hit is None and sweeper.refresh_projects(con, config.load()):
         hit = project.find(con, selector)
-        if hit is None and sweeper.refresh_projects(con, config.load()):
-            hit = project.find(con, selector)
-        if hit is None:
-            raise SystemExit(
-                f"orchestra: no project matches {selector!r} — "
-                "`orchestra project list` names them")
-        proj = project.workdir_for(con, hit)
-        return proj, config.load(proj.project_id)
-    proj = project.resolve(con, config.load(),
-                           refresh=sweeper.refresh_projects)
-    return proj, config.load(proj.project_id)
+    if hit is None:
+        raise SystemExit(f"orchestra: no project matches {selector!r} — "
+                         "`orchestra project list` names them")
+    return hit
 
 
 def _requester(cfg: dict) -> str:
@@ -146,7 +144,7 @@ def cmd_init(args):
     for line in hook_lines:
         print(f"    {line}")
     if proj:
-        print(f"  project:       {proj.name or proj.source_ref} ({proj.project_id})")
+        print(f"  project:       {proj.slug} ({proj.project_id})")
         print(f"  overrides:     [project.\"{proj.project_id}\"] in the global config")
         # Which profiles this project may STAFF (W-0187). Absent is every
         # profile, and saying so beats printing a list nobody wrote.
@@ -157,26 +155,48 @@ def cmd_init(args):
             said = ", ".join(enabled) or "NONE — nothing can be staffed here"
         print(f"  profiles:      {said}")
     else:
-        print(f"  project:       {root} is not registered — run "
-              "`orchestra project add .`, or enable Work, then re-run")
+        print(f"  project:       no run history in {root} yet — dispatch "
+              "with --project <slug> once (mint one with "
+              "`orchestra project add <name>`) and it is remembered")
 
 
 def cmd_dispatch(args):
     con = db.connect()
+    selector = getattr(args, "project", None)
     path_arg = getattr(args, "path", None)
-    if path_arg and not getattr(args, "project", None):
-        # A project is not one checkout: the path names the run's repository,
-        # and it names the project too, the same way the cwd does.
-        proj = project.resolve(con, config.load(), path_arg,
-                               refresh=sweeper.refresh_projects)
-        cfg = config.load(proj.project_id)
+    root = project.guard_run_path(path_arg) if path_arg else None
+    if root is not None and not root.is_dir():
+        raise SystemExit(f"orchestra: --path {root} is not a directory")
+    if selector:
+        proj = _find_project(con, selector)
     else:
-        proj, cfg = _require_project(con, getattr(args, "project", None))
-    root = proj.path
-    if path_arg:
-        root = Path(path_arg).expanduser().resolve()
-        if not root.is_dir():
-            raise SystemExit(f"orchestra: --path {root} is not a directory")
+        # No name given: the checkout names the project — the run history
+        # first, then the adapter's cached map (warmed once on a miss).
+        start = root if root is not None else project.start_dir()
+        proj = _locate_dir(con, start)
+        if proj is None and sweeper.refresh_projects(con, config.load()):
+            proj = _locate_dir(con, start)
+        if proj is None:
+            raise SystemExit(
+                f"orchestra: no project is known to run in {start}.\n"
+                "Name one with --project <slug> (`orchestra project list`), "
+                "or mint one first: `orchestra project add <name>`. The run "
+                "history remembers, so this is a first-time step.")
+    cfg = config.load(proj.project_id)
+    if root is None:
+        if selector:
+            # A NAMED project dispatched from anywhere: the default checkout
+            # is where it last ran — the runner's own records, not a stored
+            # setting — else the adapter's map (a store-only project gets
+            # its workspace here).
+            root = project.last_root(con, proj.project_id) \
+                or sweeper.locate(con, proj)
+            if root is None:
+                raise SystemExit(
+                    f"orchestra: {proj.slug} has no known checkout yet — "
+                    "pass --path <dir> once; later dispatches remember it")
+        else:
+            root = project.start_dir()
     requester = _requester(cfg)
     if proj.archived:
         # DESIGN §1: parking stops the UNATTENDED lanes. A human dispatching
@@ -308,8 +328,7 @@ def cmd_resume(args):
 def cmd_status(args):
     con = db.connect()
     proj, _ = _here(con)
-    here = (f"{proj.name or proj.source_ref} ({proj.path})"
-            if proj else "no registered project")
+    here = proj.slug if proj else "no known project"
     # Central state, so this is the whole workspace, not one project.
     print(f"orchestra @ {paths.home()} — here: {here}\n")
     _print_dispatch(dispatch.state(con))
@@ -1132,17 +1151,18 @@ def cmd_review(args):
 
 def cmd_merge(args):
     con = db.connect()
-    proj = project.resolve(con, config.load(),
-                           refresh=sweeper.refresh_projects)
     # The by-hand retry judges tripwires against the same mission the
-    # automatic landing does — the row is found by its branch name.
+    # automatic landing does — the row is found by its branch name, and the
+    # run's own record says which checkout the branch lives in.
     row = con.execute("SELECT * FROM runs WHERE branch=? ORDER BY id DESC LIMIT 1",
                       (args.branch,)).fetchone()
     mission = merge.run_mission(dict(row)) if row else ""
+    root = project.root_for(con, row) if row else Path.cwd().resolve()
+    settings = config.load(row["project_id"] if row else None)
     con.close()
-    result = merge.merge_run(proj.path, args.branch, mission=mission,
+    result = merge.merge_run(root, args.branch, mission=mission,
                              item_id=args.item,
-                             settings=config.load(proj.project_id))
+                             settings=settings)
     print(json.dumps(result, indent=2))
     if not result["ok"]:
         raise SystemExit(1)
@@ -1176,8 +1196,9 @@ def cmd_prune(args):
 
 
 def cmd_project(args):
-    """Address a directory without Work. DESIGN §2: state is central, so this
-    writes a row in ~/.orchestra, never a marker file in the project."""
+    """Project IDENTITY management (schema v29). A project is a slug and
+    settings, not a folder: checkouts belong to each dispatch, and the run
+    history remembers where a project usually runs."""
     con = db.connect()
     try:
         if args.action == "list":
@@ -1185,42 +1206,49 @@ def cmd_project(args):
             # list until --all asks for it. Its runs are never hidden.
             rows = project.all_projects(con, include_archived=args.all)
             if not rows:
-                print("no projects. `orchestra project add .` registers this one.")
+                print("no projects. `orchestra project add <name>` mints one.")
                 return
-            width = max(len(str(r.path)) for r in rows)
             slugw = max(len(r.slug or "") for r in rows)
             for r in rows:
-                source = "source" if r.source_ref else "local"
+                where = project.last_root(con, r.project_id)
                 mark = "  (archived)" if r.archived else ""
-                print(f"{r.slug or '-':<{slugw}}  {str(r.path):<{width}}  "
-                      f"{source:<6}  {r.project_id}  {r.name or ''}{mark}")
+                print(f"{r.slug or '-':<{slugw}}  "
+                      f"{'local ' if r.local else 'source'}  {r.project_id}"
+                      f"  {r.name or ''}"
+                      + (f"  · runs in {where}" if where else "") + mark)
             return
         if args.action in ("archive", "unarchive"):
-            target = Path(args.path or ".").expanduser().resolve()
             want = args.action == "archive"
-            if not project.set_archived(con, target, want):
-                print(f"orchestra: {target} was not registered")
+            hit = project.set_archived(con, args.selector, want)
+            if hit is None:
+                print(f"orchestra: no project matches {args.selector!r}")
                 return
-            print(f"{'archived' if want else 'unarchived'} {target}")
+            print(f"{'archived' if want else 'unarchived'} {hit.slug}")
             return
         if args.action == "link":
-            linked = project.link(con, args.project, Path(args.path or "."))
-            print(f"{linked.path}\n  project id: {linked.project_id}"
+            linked = sweeper.link(con, args.project, Path(args.path or "."))
+            print(f"{linked.slug}\n  project id: {linked.project_id}"
                   f"\n  name:       {linked.name}")
-            print("\nWork keeps organizing this project; runs go here.")
+            print("\nThe source keeps organizing this project; runs go here.")
             return
         if args.action == "forget":
-            target = Path(args.path or ".").expanduser().resolve()
-            print(f"forgot {target}" if project.forget(con, target)
-                  else f"orchestra: {target} was not registered")
+            print(f"forgot {args.selector}"
+                  if project.forget(con, args.selector)
+                  else f"orchestra: no project matches {args.selector!r}")
             return
-        adopted = project.adopt(con, Path(args.path or "."), args.name)
-        print(f"{adopted.path}\n  project id: {adopted.project_id}"
-              f"\n  slug:       {adopted.slug}"
-              f"\n  name:       {adopted.name}")
-        print("\nDispatch into it with:\n"
-              f"  orchestra dispatch --project {adopted.slug} "
-              "--to <profile> \"<mission>\"")
+        # `add`: mint identity. A directory argument (the old muscle memory,
+        # `project add .`) contributes only its NAME; no path is stored.
+        raw = args.path or "."
+        as_dir = Path(raw).expanduser()
+        name = args.name or (as_dir.resolve().name if as_dir.is_dir() else raw)
+        made = project.create(con, name)
+        print(f"{made.slug}\n  project id: {made.project_id}"
+              f"\n  name:       {made.name}")
+        print("\nNo path is stored: each dispatch names its checkout, and "
+              "the run history remembers.\nDispatch with:\n"
+              f"  orchestra dispatch --project {made.slug} --path <dir> "
+              "--to <profile> \"<mission>\"\n"
+              "or run it from inside the checkout after that first time.")
     finally:
         con.close()
 
@@ -1581,32 +1609,38 @@ def main():
     s.add_argument("--shared-workdir", action="store_true",
                    help="work in the lead's checkout instead of a worktree")
 
-    s = sub.add_parser("project", help="register a local directory Orchestra "
-                                       "may dispatch into")
+    s = sub.add_parser("project", help="project identities: slug, settings, "
+                                       "and the parked flag — no paths")
     s.set_defaults(fn=cmd_project, action="add", path=None, name=None,
-               project=None, all=False)
+               project=None, all=False, selector=None)
     psub = s.add_subparsers(dest="action")
-    pa = psub.add_parser("add", help="adopt a directory as a project")
-    pa.add_argument("path", nargs="?", help="default: the current directory")
-    pa.add_argument("--name", help="default: the directory's own name")
-    pl = psub.add_parser("list", help="every registered project, local or Work-backed")
+    pa = psub.add_parser("add", help="mint a project identity; a directory "
+                                     "argument contributes only its name")
+    pa.add_argument("path", nargs="?",
+                    help="a name, or a directory whose name to use "
+                         "(default: the current directory's)")
+    pa.add_argument("--name", help="explicit name")
+    pl = psub.add_parser("list", help="every project, owner-minted or "
+                                      "source-cached")
     pl.add_argument("--all", action="store_true",
                     help="include archived projects, marked")
     pl.set_defaults(path=None, name=None)
-    pk = psub.add_parser("link", help="bind a Work project to the checkout it "
-                                      "lives in, when Work's path is not one")
-    pk.add_argument("project", help="the Work project path or project id")
+    pk = psub.add_parser("link", help="bind a source-cached project to the "
+                                      "checkout it lives in, when the "
+                                      "source's label is not a folder")
+    pk.add_argument("project", help="the source's project label, a slug, "
+                                    "or a project id")
     pk.add_argument("path", nargs="?", help="default: the current directory")
     pk.set_defaults(name=None)
-    pf = psub.add_parser("forget", help="drop a locally adopted project")
-    pf.add_argument("path", nargs="?", help="default: the current directory")
-    pf.set_defaults(name=None)
-    for action, blurb in (("archive", "park a project here: hide it and stop "
+    pf = psub.add_parser("forget", help="drop an owner-minted project")
+    pf.add_argument("selector", help="slug or project id")
+    pf.set_defaults(name=None, path=None)
+    for action, blurb in (("archive", "park a project: hide it and stop "
                                       "unattended dispatch into it"),
                           ("unarchive", "bring a parked project back")):
         pp = psub.add_parser(action, help=blurb)
-        pp.add_argument("path", nargs="?", help="default: the current directory")
-        pp.set_defaults(name=None)
+        pp.add_argument("selector", help="slug or project id")
+        pp.set_defaults(name=None, path=None)
 
     s = sub.add_parser("traces", help="run traces: raw-log retention and "
                                       "a run's inbox/outbox (DESIGN §7)")

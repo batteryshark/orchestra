@@ -483,18 +483,25 @@ class NamedProjectDispatchTests(SweeperFixture, unittest.TestCase):
         from orchestra import http
         self._warm_registry()
         launched = []
-        result = http.dispatch_run(
+        first = http.dispatch_run(
             {"project": "demo", "profile": "stub", "mission": "do the thing",
+             "worktree": False, "path": str(self.root)},
+            launcher=lambda root, run_id: launched.append((root, run_id)))
+        self.assertNotIn("error", first)
+        self.assertEqual(first["project"], "demo")
+        # The next dispatch needs no path: the run history remembers.
+        again = http.dispatch_run(
+            {"project": "demo", "profile": "stub", "mission": "more",
              "worktree": False},
             launcher=lambda root, run_id: launched.append((root, run_id)))
-        self.assertNotIn("error", result)
-        self.assertEqual(result["project"], "demo")
+        self.assertNotIn("error", again)
         con = db.connect()
         run = con.execute("SELECT * FROM runs WHERE id=?",
-                          (result["run"],)).fetchone()
+                          (again["run"],)).fetchone()
         con.close()
         self.assertEqual(run["project_id"], PROJECT_ID)
-        self.assertEqual(launched, [(self.root, result["run"])])
+        self.assertEqual(run["repo"], str(self.root))
+        self.assertEqual(launched[-1], (self.root, again["run"]))
 
     def test_http_dispatch_refusals_are_payloads(self) -> None:
         from orchestra import http
@@ -506,29 +513,31 @@ class NamedProjectDispatchTests(SweeperFixture, unittest.TestCase):
                       http.dispatch_run({"project": "nope", "profile": "stub",
                                          "mission": "m"},
                                         launcher=noop)["error"])
+        # No history and no path: the route says what the first call needs.
+        self.assertIn("no run history",
+                      http.dispatch_run({"project": "demo", "profile": "stub",
+                                         "mission": "m"},
+                                        launcher=noop)["error"])
         con = db.connect()
         dispatch.pause(con, "hold")
         con.close()
         try:
-            result = http.dispatch_run({"project": "demo", "profile": "stub",
-                                        "mission": "m"}, launcher=noop)
+            result = http.dispatch_run(
+                {"project": "demo", "profile": "stub", "mission": "m",
+                 "path": str(self.root)}, launcher=noop)
             self.assertIn("paused", result["error"])
         finally:
             con = db.connect()
             dispatch.resume(con)
             con.close()
 
-    def test_http_add_project_registers_and_repeats(self) -> None:
+    def test_http_add_project_mints_identity_and_repeats(self) -> None:
         from orchestra import http
-        fresh = self.workspace / "brand new"
-        fresh.mkdir()
-        made = http.add_project(str(fresh))
+        made = http.add_project("Brand New")
         self.assertEqual(made["slug"], "brand-new")
-        again = http.add_project(str(fresh))
+        again = http.add_project("Brand New")
         self.assertEqual(again["project_id"], made["project_id"])
         self.assertIn("error", http.add_project(""))
-        self.assertIn("error",
-                      http.add_project(str(self.workspace / "missing")))
 
 
 class RunPathTests(SweeperFixture, unittest.TestCase):
@@ -595,3 +604,32 @@ class RunPathTests(SweeperFixture, unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             cli.cmd_dispatch(self._args(path=str(self.tmp_path / "nope")))
         self.assertIn("is not a directory", str(caught.exception))
+
+
+class StateDirGuardTests(SweeperFixture, unittest.TestCase):
+    """A caller-named path inside ~/.orchestra is refused: a worktree of the
+    run database is never what anyone meant. A project's own workspace is
+    the one legitimate in-home place a run stands."""
+
+    def test_the_state_directory_is_refused_on_both_surfaces(self) -> None:
+        from argparse import Namespace
+        from orchestra import http, project
+        home = Path(os.environ["ORCHESTRA_HOME"])
+        (home / "logs").mkdir(parents=True, exist_ok=True)
+        args = Namespace(mission=["m"], to="stub", after=None, brief_file=None,
+                         context=None, title=None, worktree=False, sync=False,
+                         project="demo", path=str(home / "logs"))
+        with self.assertRaisesRegex(SystemExit, "own state directory"):
+            cli.cmd_dispatch(args)
+        from orchestra import sweeper
+        con = db.connect()
+        sweeper.refresh_projects(con, self.cfg)
+        con.close()
+        said = http.dispatch_run(
+            {"project": "demo", "profile": "stub", "mission": "m",
+             "path": str(home)}, launcher=lambda root, run_id: None)
+        self.assertIn("own state directory", said["error"])
+        # The exception: a project's ephemeral workspace passes the guard.
+        from orchestra import paths as mpaths
+        ws = mpaths.workspace_dir("demo")
+        self.assertEqual(project.guard_run_path(ws), ws.resolve())

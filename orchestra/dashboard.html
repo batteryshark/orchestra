@@ -508,11 +508,11 @@
       <h2>projects <span class="dim" style="text-transform:none;letter-spacing:0"
             >· the registry, archived rows included</span></h2>
       <!-- flex:0 overrides `.card > .pad { flex: 1 }`: this is one input
-           row, and the registry table below is the card's grower. -->
+           row, and the registry table below is the card's grower. A project
+           is IDENTITY (schema v29): a name mints a slug, no path is asked
+           for — each dispatch names its checkout. -->
       <div class="pad" id="projadd" style="display:flex;gap:.5rem;flex:0 0 auto">
-        <input id="projpath" class="mono" style="flex:1"
-               placeholder="path to the repository Orchestra works on">
-        <input id="projname" placeholder="name (optional)">
+        <input id="projname" style="flex:1" placeholder="project name">
         <button id="projaddbtn">add project</button>
       </div>
       <div class="pad" id="projbody"></div>
@@ -2271,27 +2271,29 @@ async function loadProjects() {
   }
   if (!rows.length) {
     return $("projbody").replaceChildren(el("p", "dim",
-      "no projects registered — `orchestra project add .` registers one"));
+      "no projects — mint one above, or `orchestra project add <name>`"));
   }
   // Useful rows first: parked ones sink, and read dim once they are down there.
   rows.sort((a, b) => (a.archived - b.archived) ||
-    (a.name || a.path).toLowerCase().localeCompare((b.name || b.path).toLowerCase()));
+    (a.slug || a.name || "").toLowerCase().localeCompare(
+      (b.slug || b.name || "").toLowerCase()));
   $("projbody").replaceChildren(table(
-    ["slug", "project", "path", "origin", "state", ""],
+    ["slug", "project", "runs in", "origin", "state", ""],
     rows.map((p) => {
       const quiet = (n) => { if (p.archived) n.classList.add("dim"); return n; };
       return [
         {node: quiet(el("span", "mono", p.slug || "-"))},
-        {node: quiet(el("span", null, p.name || p.path.split("/").pop()))},
-        {node: quiet(el("span", "mono", p.path)), cls: "grow"},
-        p.source_ref ? "source" : "local",
+        {node: quiet(el("span", null, p.name || ""))},
+        // Where it LAST ran — the run history's answer, not a stored path.
+        {node: quiet(el("span", "mono", p.last_root || "—")), cls: "grow"},
+        p.local ? "local" : "source",
         // A row parked with no override of its own was parked by its source
         // (archived_override === null). Three words in the state cell, not a
         // sentence per row: an earlier revision printed the whole paragraph
         // and buried the one control that worked.
         {node: el("span", p.archived ? "warn" : "dim",
                  !p.archived ? "active"
-                 : (p.source_ref && p.archived_override === null)
+                 : (!p.local && p.archived_override === null)
                    ? "archived at source" : "archived")},
         // Every row gets the control: archiving is Orchestra's own decision
         // about its own surface, so the server takes it for a source-backed
@@ -2301,17 +2303,17 @@ async function loadProjects() {
     })));
 }
 
-// Registering was CLI-only; the panel can now do what `orchestra project
-// add` does. The server answers idempotently for a path already registered.
+// A project is identity: a name mints a slug, and the server answers
+// idempotently for the same name. No path — dispatches carry checkouts.
 $("projaddbtn").onclick = async () => {
-  const path = $("projpath").value.trim();
-  if (!path) return;
+  const name = $("projname").value.trim();
+  if (!name) return;
   const b = $("projaddbtn");
   b.disabled = true;
   try {
-    await api("/api/projects/add", {method: "POST", body: JSON.stringify(
-      {path, name: $("projname").value.trim() || null})});
-    $("projpath").value = ""; $("projname").value = "";
+    await api("/api/projects/add", {method: "POST",
+                                    body: JSON.stringify({name})});
+    $("projname").value = "";
     await loadProjects();
   } catch (e) { fail(e); }
   b.disabled = false;
@@ -2324,7 +2326,7 @@ function archiveButton(p) {
     b.disabled = true;
     try {
       await api("/api/projects", {method: "POST", body: JSON.stringify(
-        {path: p.path, archived: !p.archived})});
+        {project: p.project_id, archived: !p.archived})});
       await loadProjects();
       await refresh();   // the picker drops a project that just left it
     } catch (e) { fail(e); b.disabled = false; }
