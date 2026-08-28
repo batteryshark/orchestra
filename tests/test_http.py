@@ -1349,3 +1349,30 @@ class BindTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TailnetAuthTests(unittest.TestCase):
+    """DESIGN §3: a device on the owner's tailnet is the owner — the phone
+    needs no key. Loopback and this machine's own tailscale address never
+    count, because workers run on this machine."""
+
+    def test_a_tailnet_peer_is_the_human_with_exclusions(self) -> None:
+        cfg = {"http": {"key": "k"}}
+        lookup = {"100.64.0.7": "me@github"}.get
+        with mock.patch.object(mhttp, "tailscale_address",
+                               return_value="100.64.0.1"):
+            self.assertEqual(
+                mhttp.tailnet_login_for("100.64.0.7", cfg, lookup),
+                "me@github")
+            self.assertIsNone(mhttp.tailnet_login_for("127.0.0.1", cfg, lookup))
+            self.assertIsNone(mhttp.tailnet_login_for("100.64.0.1", cfg, lookup))
+            self.assertIsNone(mhttp.tailnet_login_for("10.0.0.9", cfg, lookup))
+            off = {"http": {"tailnet_auth": False}}
+            self.assertIsNone(mhttp.tailnet_login_for("100.64.0.7", off, lookup))
+            narrowed = {"http": {"tailnet_logins": ["other@x"]}}
+            self.assertIsNone(
+                mhttp.tailnet_login_for("100.64.0.7", narrowed, lookup))
+            listed = {"http": {"tailnet_logins": ["me@github"]}}
+            self.assertEqual(
+                mhttp.tailnet_login_for("100.64.0.7", listed, lookup),
+                "me@github")

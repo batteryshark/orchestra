@@ -115,8 +115,6 @@ def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
         return env
     plugin = paths.opencode_plugin_path()
     deny_delegation = not profile.get("opencode_native_subagents")
-    if not deny_delegation and not plugin.exists():
-        return env
 
     raw = env.get("OPENCODE_CONFIG_CONTENT", "")
     try:
@@ -135,6 +133,15 @@ def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
             **permissions,
             **{name: "deny" for name in _OPENCODE_DELEGATION_PERMISSIONS},
         }
+    if not profile.get("opencode_snapshots"):
+        # OpenCode snapshots the WHOLE working directory into its own undo
+        # store, once per session. An Orchestra worktree is transient and
+        # already has git plus the checkpoint commit as its record, so every
+        # supervised run's snapshot is a full dead copy — 495GB of them by
+        # 2026-08-28. Off for Orchestra's runs; a profile sets
+        # ``opencode_snapshots = true`` to restore them, and the human's own
+        # interactive sessions are untouched either way.
+        content.setdefault("snapshot", False)
     # ponytail: referenced by absolute path, because OPENCODE_CONFIG_CONTENT is
     # inline JSON with no directory to resolve a relative path against. Only
     # added when the file is really there, so a run never dies on a missing

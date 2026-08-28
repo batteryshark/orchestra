@@ -329,6 +329,12 @@ port = {port}
 bind = "auto"
 # Extra Host header values to accept, e.g. a MagicDNS name.
 hosts = []
+# A device on YOUR tailnet is the human: `tailscale whois` names the peer,
+# so the phone needs no key. On by default — the tailnet is the boundary.
+# This machine's own tailscale address never counts (workers live here).
+# tailnet_auth = true
+# Narrow it to specific tailscale logins; absent means any resolved login.
+# tailnet_logins = ["you@example.com"]
 """
 
 
@@ -397,6 +403,54 @@ def _tailscale_dns() -> str | None:
         return None
     name = str((data.get("Self") or {}).get("DNSName") or "").strip().rstrip(".")
     return name or None
+
+
+def _tailscale_whois(peer: str) -> str | None:
+    """The tailscale login that owns the peer device, or None.
+
+    A tagged node, a peer outside the tailnet, and any whois failure all
+    read as None — no login, no trust. Cached per peer for the process
+    lifetime: an IP's owner changes only when the device leaves the tailnet,
+    at which point it cannot reach this socket anyway.
+    """
+    try:
+        out = subprocess.run([_tailscale_exe(), "whois", "--json", peer],
+                             capture_output=True, text=True, timeout=3)
+        data = json.loads(out.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    login = str((data.get("UserProfile") or {}).get("LoginName") or "").strip()
+    return login or None
+
+
+_tailscale_whois = functools.cache(_tailscale_whois)
+
+
+def tailnet_login_for(peer: str, cfg: dict | None = None,
+                      lookup=None) -> str | None:
+    """The login a tailnet peer is trusted as, or None (DESIGN §3).
+
+    The tailnet is the boundary: a device on the owner's tailnet IS the
+    owner, so the phone needs no key. Three exclusions keep that honest:
+    ``tailnet_auth = false`` turns the whole path off; loopback and this
+    machine's OWN tailscale address never count, because workers run on this
+    machine and could reach either (the same hole ``trust_local`` documents);
+    and ``tailnet_logins`` narrows trust to listed logins — absent means any
+    login whois resolves, which is the single-user tailnet's honest default.
+    """
+    table = http_cfg(cfg)
+    if not table.get("tailnet_auth", True):
+        return None
+    if peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "") \
+            or peer == tailscale_address():
+        return None
+    login = (lookup or _tailscale_whois)(peer)
+    if not login:
+        return None
+    allowed = table.get("tailnet_logins")
+    if allowed and login not in allowed:
+        return None
+    return login
 
 
 _tailscale_ip = functools.cache(_tailscale_ip)
@@ -1696,6 +1750,13 @@ class Handler(BaseHTTPRequestHandler):
             # request is the human at the keyboard — but only when the owner
             # has said so, because a worker can reach loopback too.
             if self._loopback_human():
+                return auth.Identity(auth.HUMAN), None
+            # A device on the owner's tailnet is the owner: `tailscale
+            # whois` names the peer, so the phone needs no key. This
+            # machine's own tailscale address never counts — workers live
+            # here (see tailnet_login_for).
+            peer = (self.client_address or ("",))[0]
+            if tailnet_login_for(peer, config.load()):
                 return auth.Identity(auth.HUMAN), None
             return None, (f"missing {HEADER}" if header_only
                           else f"missing {HEADER} (or ?key= on a first visit)")

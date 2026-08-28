@@ -106,10 +106,12 @@ class BackendEnvTests(unittest.TestCase):
         self.assertEqual(permissions["task"], "deny")
         self.assertEqual(permissions["team_spawn"], "deny")
         self.assertEqual(out["KEEP"], "1")
-        self.assertIs(
-            runners.apply_backend_env(
-                {"backend": "opencode", "opencode_native_subagents": True}, env),
-            env)
+        opted = runners.apply_backend_env(
+            {"backend": "opencode", "opencode_native_subagents": True}, env)
+        # Native delegation restored — but the snapshot policy still rides
+        # the config, so the env is rebuilt rather than returned as-is.
+        self.assertNotIn("permission",
+                         json.loads(opted["OPENCODE_CONFIG_CONTENT"]))
 
     def test_quota_lane_strips_credentials_without_mutating_input(self) -> None:
         env = {"ANTHROPIC_API_KEY": "key", "ANTHROPIC_AUTH_TOKEN": "token",
@@ -259,3 +261,23 @@ class QuotaLaneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpencodeSnapshotTests(unittest.TestCase):
+    def test_supervised_runs_disable_the_snapshot_store(self) -> None:
+        """OpenCode clones the whole workdir into its undo store per session;
+        an Orchestra worktree is transient, so that is a dead full copy
+        (495GB of them by 2026-08-28)."""
+        env = runners.apply_backend_env({"backend": "opencode"}, {})
+        content = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+        self.assertIs(content["snapshot"], False)
+        # The escape hatch, and the caller's own explicit value, both win.
+        kept = runners.apply_backend_env(
+            {"backend": "opencode", "opencode_snapshots": True}, {})
+        self.assertNotIn("snapshot",
+                         json.loads(kept.get("OPENCODE_CONFIG_CONTENT", "{}")))
+        explicit = runners.apply_backend_env(
+            {"backend": "opencode"},
+            {"OPENCODE_CONFIG_CONTENT": '{"snapshot": true}'})
+        self.assertIs(json.loads(
+            explicit["OPENCODE_CONFIG_CONTENT"])["snapshot"], True)
