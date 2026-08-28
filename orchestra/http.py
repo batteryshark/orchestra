@@ -1060,6 +1060,13 @@ def dispatch_run(body: dict, launcher=None, con=None) -> dict:
             return {"error": f"no project matches {selector!r} — "
                              "GET /api/projects names them"}
         proj = project.workdir_for(con, hit)
+        root = proj.path
+        if body.get("path"):
+            # A project is not one checkout: the caller may name the
+            # repository this run branches from and lands into.
+            root = Path(str(body["path"])).expanduser().resolve()
+            if not root.is_dir():
+                return {"error": f"path {root} is not a directory"}
         pcfg = config.load(proj.project_id)
         try:
             profile = config.staff_profile(pcfg, profile_name)
@@ -1072,22 +1079,22 @@ def dispatch_run(body: dict, launcher=None, con=None) -> dict:
             model=profile.get("model"), title=title,
             requested_by=pcfg.get("settings", {}).get("default_requester",
                                                       "human"),
-            workdir=str(proj.path), project_id=proj.project_id)
+            workdir=str(root), project_id=proj.project_id)
         if run is None:
             return {"error": f"run not admitted ({blocked})"}
         run_id = int(run["id"])
         isolate = bool(body.get("worktree", True)) \
-            and not project.is_workspace(proj.path)
+            and not project.is_workspace(root)
         context = body.get("context")
         try:
             supervise.prepare_launch(
-                con, proj.path, pcfg, run, mission=mission,
+                con, root, pcfg, run, mission=mission,
                 context=str(context) if context else None,
                 use_worktree=isolate)
             con.commit()
-            launcher(proj.path, run_id)
+            launcher(root, run_id)
         except BaseException as exc:
-            supervise.fail_launch(con, proj.path, run_id, exc)
+            supervise.fail_launch(con, root, run_id, exc)
             return {"error": str(exc)[:1000] or exc.__class__.__name__}
         return {"run": run_id, "slug": run["slug"], "project": proj.slug,
                 "project_id": proj.project_id,

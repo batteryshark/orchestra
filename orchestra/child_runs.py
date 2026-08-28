@@ -187,8 +187,9 @@ def create(con, root: Path, cfg: dict, parent, targets: list[str],
             bp.write_text(text)
             lp.touch()
             con.execute(
-                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=? "
-                "WHERE id=?", (str(bp), str(lp), workdir, branch, run_id))
+                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
+                "repo=? WHERE id=?",
+                (str(bp), str(lp), workdir, branch, str(root), run_id))
             con.commit()
     except BaseException as exc:
         con.execute(

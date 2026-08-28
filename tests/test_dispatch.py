@@ -443,7 +443,7 @@ class NamedProjectDispatchTests(SweeperFixture, unittest.TestCase):
         from argparse import Namespace
         base = dict(mission=["do the thing"], to="stub", after=None,
                     brief_file=None, context=None, title=None, worktree=False,
-                    sync=False, project="demo")
+                    sync=False, project="demo", path=None)
         base.update(over)
         return Namespace(**base)
 
@@ -529,3 +529,69 @@ class NamedProjectDispatchTests(SweeperFixture, unittest.TestCase):
         self.assertIn("error", http.add_project(""))
         self.assertIn("error",
                       http.add_project(str(self.workspace / "missing")))
+
+
+class RunPathTests(SweeperFixture, unittest.TestCase):
+    """A project is not one checkout: --path names the repository ONE run
+    branches from and lands into, while its artifacts still file under the
+    project's slug."""
+
+    def _repo(self, name: str) -> Path:
+        repo = self.tmp_path / name
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "a.txt").write_text("a\n")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                        "-c", "user.name=t", "commit", "-qm", "init"],
+                       check=True)
+        return repo
+
+    def _args(self, **over):
+        from argparse import Namespace
+        base = dict(mission=["do the thing"], to="stub", after=None,
+                    brief_file=None, context=None, title=None, worktree=False,
+                    sync=False, project="demo", path=None)
+        base.update(over)
+        return Namespace(**base)
+
+    def _last_run(self):
+        con = db.connect()
+        run = con.execute("SELECT * FROM runs ORDER BY id DESC").fetchone()
+        con.close()
+        return run
+
+    def test_a_run_branches_from_the_named_checkout(self) -> None:
+        other = self._repo("second-checkout")
+        with mock.patch.object(supervise, "spawn_supervisor"):
+            cli.cmd_dispatch(self._args(path=str(other), worktree=True))
+        run = self._last_run()
+        self.assertEqual(run["repo"], str(other))
+        self.assertEqual(run["project_id"], PROJECT_ID)
+        # The branch lives in the NAMED repo; the worktree files under the
+        # project's slug like any other.
+        branches = subprocess.run(
+            ["git", "-C", str(other), "branch", "--list", run["branch"]],
+            capture_output=True, text=True, check=True).stdout
+        self.assertIn(run["branch"], branches)
+        home = Path(os.environ["ORCHESTRA_HOME"])
+        self.assertTrue(Path(run["workdir"]).is_relative_to(
+            home / "projects" / "demo" / "worktrees"))
+        # Landing must return to the same checkout.
+        from orchestra import project
+        con = db.connect()
+        self.assertEqual(project.root_for(con, run), other)
+        con.close()
+
+    def test_a_bare_path_names_the_project_too(self) -> None:
+        with mock.patch.object(supervise, "spawn_supervisor"):
+            cli.cmd_dispatch(self._args(project=None, path=str(self.root)))
+        run = self._last_run()
+        self.assertEqual(run["project_id"], PROJECT_ID)
+        self.assertEqual(run["workdir"], str(self.root))
+        self.assertEqual(run["repo"], str(self.root))
+
+    def test_a_missing_path_is_refused_by_name(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            cli.cmd_dispatch(self._args(path=str(self.tmp_path / "nope")))
+        self.assertIn("is not a directory", str(caught.exception))

@@ -163,8 +163,20 @@ def cmd_init(args):
 
 def cmd_dispatch(args):
     con = db.connect()
-    proj, cfg = _require_project(con, getattr(args, "project", None))
+    path_arg = getattr(args, "path", None)
+    if path_arg and not getattr(args, "project", None):
+        # A project is not one checkout: the path names the run's repository,
+        # and it names the project too, the same way the cwd does.
+        proj = project.resolve(con, config.load(), path_arg,
+                               refresh=sweeper.refresh_projects)
+        cfg = config.load(proj.project_id)
+    else:
+        proj, cfg = _require_project(con, getattr(args, "project", None))
     root = proj.path
+    if path_arg:
+        root = Path(path_arg).expanduser().resolve()
+        if not root.is_dir():
+            raise SystemExit(f"orchestra: --path {root} is not a directory")
     requester = _requester(cfg)
     if proj.archived:
         # DESIGN §1: parking stops the UNATTENDED lanes. A human dispatching
@@ -1358,6 +1370,10 @@ def main():
     s.add_argument("--project", metavar="SLUG",
                    help="target project by slug, id, or registered path "
                         "(default: the current directory's project)")
+    s.add_argument("--path", metavar="DIR",
+                   help="the checkout this run branches from and lands into "
+                        "(default: the project's registered path); with no "
+                        "--project, the path names the project too")
     s.add_argument("--after", type=int, action="append", metavar="RUN",
                    help="launch only after this run succeeds (repeatable)")
     s.add_argument("--brief-file", help="read the mission from a file")

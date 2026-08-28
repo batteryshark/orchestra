@@ -506,8 +506,16 @@ def link(con, project_path: str, root: Path) -> "Project":
 
 
 def root_for(con, run) -> Path:
-    """A run's project checkout. Falls back to its recorded workdir so a run
-    whose project left the source is still supervisable."""
+    """The checkout this run branched from and lands into.
+
+    The run's own ``repo`` (schema v28) wins: a project is not one checkout,
+    so the registry's default path cannot say where THIS run's branch lives.
+    A pre-v28 row falls back to the registry, then to its recorded workdir,
+    so a run whose project left the source is still supervisable.
+    """
+    repo = run["repo"] if "repo" in run.keys() else None
+    if repo and Path(repo).is_dir():
+        return Path(repo)
     hit = workdir_for(con, by_id(con, run["project_id"]))
     return hit.path if hit else Path(run["workdir"])
 
