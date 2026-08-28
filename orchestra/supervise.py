@@ -279,8 +279,9 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
         lp.touch()
         prepared = con.execute(
             "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=?, started_at=? WHERE id=? AND status='spawning'",
-            (str(bp), str(lp), workdir, branch, base_commit, db.now(), run_id),
+            "base_commit=?, repo=?, started_at=? WHERE id=? AND status='spawning'",
+            (str(bp), str(lp), workdir, branch, base_commit, str(root),
+             db.now(), run_id),
         )
         if prepared.rowcount != 1:
             raise RuntimeError("run admission expired during launch preparation")
@@ -414,8 +415,9 @@ def prepare_followup(con, root: Path, parent, run, text: str) -> int:
         lp.touch()
         prepared = con.execute(
             "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=?, started_at=? WHERE id=? AND status='spawning'",
-            (str(bp), str(lp), workdir, branch, base_commit, db.now(), run_id))
+            "base_commit=?, repo=?, started_at=? WHERE id=? AND status='spawning'",
+            (str(bp), str(lp), workdir, branch, base_commit, str(root),
+             db.now(), run_id))
         if prepared.rowcount != 1:
             raise RuntimeError("run admission expired during continuation setup")
         con.commit()

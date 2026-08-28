@@ -46,6 +46,10 @@ project from anywhere, name it by slug:
 orchestra dispatch --project <slug> --to <profile> "<mission>"
 ```
 
+A project is not one checkout. Add `--path <dir>` to branch this run from a
+specific checkout (and land back into it); without `--project`, the path
+names the project the same way the current directory does.
+
 Dispatch is isolated by default. Use `--shared` only for read-only research or
 another case where using the registered checkout is explicitly safe.
 

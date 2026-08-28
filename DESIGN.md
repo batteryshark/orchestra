@@ -195,6 +195,15 @@ choice for read-only work or another case where the caller accepts use of the
 registered checkout. Concurrent mutation is safe only when each run has an
 isolated checkout.
 
+A project is not one checkout. The registered path is only the DEFAULT:
+`dispatch --path` (and `path` on `POST /api/dispatch`) names the repository
+one run branches from and lands into, for a project with several checkouts
+or work inside a shared component. The run row records it as `runs.repo`
+(schema v28), and `project.root_for` prefers that over the registry, so
+landing returns to the checkout the run actually came from. With no
+`--project`, the path also names the project, exactly as the cwd does. The
+worktree and artifacts still file under `~/.orchestra/projects/<slug>/`.
+
 An isolated run uses a branch named `orchestra/run-N`. The Work sweeper and
 conductor also request isolation by default. If worktree setup or rehoming
 fails, launch fails closed; unattended execution never changes to the owner's

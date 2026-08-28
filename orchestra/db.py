@@ -151,7 +151,7 @@ from pathlib import PurePath
 
 from orchestra import paths
 
-SCHEMA_VERSION = "27"
+SCHEMA_VERSION = "28"
 
 # Columns added after v1; applied idempotently so an older database upgrades
 # in place (greenfield policy: extensions, not migration files). ``ref``
@@ -259,6 +259,16 @@ PROJECTS_V27_COLUMNS = (
     ("slug", "TEXT"),
 )
 
+# Schema v28. ``repo`` is the CHECKOUT this run branched from and lands into.
+# A project is not one checkout: a dispatch may name any path (``--path``),
+# so the registry's default cannot answer "where does this run's branch
+# live" — and landing into the wrong repository is not a small mistake.
+# Stamped at launch preparation; NULL on older rows, where ``root_for``
+# falls back to the registry as before.
+RUNS_V28_COLUMNS = (
+    ("repo", "TEXT"),
+)
+
 # Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
 # of EVERY window the provider reported in that poll — Claude's 5-hour and
 # weekly limits are two facts. The scalar columns stay the tightest live one.
@@ -360,7 +370,8 @@ CREATE TABLE IF NOT EXISTS runs (
   child_wakeup_message INTEGER,
   project_seq INTEGER,
   revision INTEGER,
-  landing_commit TEXT
+  landing_commit TEXT,
+  repo TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
@@ -729,7 +740,7 @@ def connect(db_file=None) -> sqlite3.Connection:
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
                                + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS
                                + RUNS_V18_COLUMNS + RUNS_V22_COLUMNS
-                               + RUNS_V23_COLUMNS):
+                               + RUNS_V23_COLUMNS + RUNS_V28_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
         # Schema v21 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, run here and
