@@ -543,7 +543,7 @@
       <div class="pad" style="overflow:visible">
         <div id="daemon"></div>
         <div class="row" style="margin-top:.7rem">
-          <button id="sweep">sweep now</button>
+          <button id="sweep">tick now</button>
           <button id="pause" class="pause">pause dispatch</button>
           <button id="restart" title="Picks up code changes. In-flight runs keep running — a supervisor is its own process.">restart service</button>
         </div>
@@ -2344,6 +2344,7 @@ $("statsclose").onclick = () => $("statsdlg").close();
 // is deliberately no handler here — an earlier revision bound one to
 // `projbtn`, which is the PICKER's button, so the picker stopped opening its
 // own menu and the new control did nothing.
+// "tick now": wakes the daemon's own maintenance pass.
 $("sweep").onclick = () => act("/api/sweep", {method: "POST"});
 $("pause").onclick = () => act("/api/dispatch/" + (paused ? "resume" : "pause"),
                                {method: "POST"});

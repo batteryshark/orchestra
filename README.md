@@ -34,11 +34,11 @@ Landing does not review the diff against acceptance criteria. Without declared
 checks, it relies on tripwires and their optional mission-alignment judge, so
 configure a real test, lint, or build command before trusting automatic landing.
 
-When Work automation is enabled, its sweeper claims delegated items and requests
-isolated runs by default. An isolation failure records a failed launch and sends
-the item back for human attention; unattended execution never falls back to the
-owner's checkout. A project can explicitly set `worktree = false` under `[work]`
-for shared execution.
+Work automation lives in the sibling **work-bridge** project — a consumer
+that knows both sides so that neither knows the other. Its sweeper claims
+delegated items and requests isolated runs by default; an isolation failure
+records a failed launch and sends the item back for human attention, and
+unattended execution never falls back to the owner's checkout.
 
 ## What it looks like
 
@@ -122,9 +122,8 @@ uv run orchestra check 7
 uv run orchestra kill 7
 ```
 
-Pausing prevents new runs from being admitted. Running workers, completion and
-Work reporting, completion-only Nod actions, and health maintenance continue.
-The conductor waits without consuming its next planning trigger.
+Pausing prevents new runs from being admitted. Running workers, completion
+reporting, completion-only Nod actions, and health maintenance continue.
 
 ## Install it as a command
 

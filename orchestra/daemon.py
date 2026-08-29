@@ -1,15 +1,14 @@
 """The one long-lived process (DESIGN §2).
 
 Foreground loop, launchd-supervised: each tick recovers abandoned admissions,
-resumes held policy work, releases dependency-ready runs, and then runs the
-adapter passes. It SCHEDULES a work source without knowing one exists: the
-passes take ``cfg`` and answer empty when none is configured, so every tick
-here is complete on a machine with no source at all (CONTRACT §7 Enforcement).
-SIGTERM/SIGINT stop it between ticks, so launchd's stop signal never lands
-mid-pass.
+resumes held policy work, releases dependency-ready runs, polls runway, and
+acts on answered human-loop cards. The RUNNER's own maintenance and nothing
+else: any external automation (a work source's bridge, a cron script) is its
+own process against the same database and API. SIGTERM/SIGINT stop it
+between ticks, so launchd's stop signal never lands mid-pass.
 
 The HTTP surface and dashboard (§3) attach at ``serve_http`` below: one
-process, one port, the same database. The dashboard's "sweep now" button
+process, one port, the same database. The dashboard's "tick now" button
 sets ``wake``, so a tick starts at once instead of waiting out the interval.
 """
 import os
@@ -21,8 +20,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import (conductor, config, db, findings, http, merge, nod, observer,
-                         proc, project, supervise, runway, sweeper,
+from orchestra import (config, db, handoff, http, merge, nod, observer,
+                         proc, project, supervise, runway,
                          worktree)
 
 DEFAULT_INTERVAL = 60
@@ -341,7 +340,7 @@ def _resume_result_policies(con) -> list[int]:
                 run = dict(con.execute("SELECT * FROM runs WHERE id=?",
                                        (run_id,)).fetchone())
             if run.get("handoff_processed_at") is None:
-                findings.at_completion(con, cfg, run)
+                handoff.at_completion(con, run)
             resumed.append(run_id)
         except Exception as exc:
             print(f"orchestra daemon: run {run_id} policy recovery failed: {exc}",
@@ -396,19 +395,12 @@ def _act_on_nod_answers(con, cfg: dict) -> list[dict]:
 
 
 def tick() -> dict:
-    """One pass. Returns a small report; never raises for a source-side fault.
-
-    This is the SCHEDULER and nothing else. It decides when each job runs and
-    in what order; it does not know a work source exists, cannot name one, and
-    builds no client for one. The adapter passes below take ``cfg`` and answer
-    with an empty list when no source is configured, so a tick is complete and
-    reports every job on a machine with Work switched off entirely
-    (CONTRACT §7 Enforcement 3).
-    """
+    """One maintenance pass. Returns a small report; never raises for a
+    provider-side fault. The runner's own upkeep and nothing else."""
     cfg = config.load()
-    report = {"swept": [], "conducted": [], "released": [], "reaped": [],
+    report = {"released": [], "reaped": [],
               "recovered_results": [], "resumed_results": [],
-              "resumed_retries": [], "resumed_judgments": [],
+              "resumed_retries": [],
               "paused": False, "runway": 0, "nod_answers": []}
     con = db.connect()
     try:
@@ -420,8 +412,6 @@ def tick() -> dict:
         if not report["paused"]:
             report["resumed_retries"] = observer.resume_deferred_retries(
                 con, launcher=supervise.spawn_supervisor)
-            report["resumed_judgments"] = conductor.resume_deferred_judgments(
-                con, launcher=supervise.spawn_supervisor)
         # Retry reservations repoint dependency edges before settlement. This
         # ordering prevents a paused-then-resumed retry from losing its waiting
         # dependents to the failed original run.
@@ -429,25 +419,16 @@ def tick() -> dict:
             con, supervise.spawn_supervisor)
         report["runway"] = _poll_runway(con)
         report["nod_answers"] = _act_on_nod_answers(con, cfg)
-        # ponytail: one project-list fetch per tick keeps the cache warm at the
-        # cost of an HTTP round trip a minute; drive it off a Work event when
-        # phase 3's hooks land.
-        sweeper.refresh_projects(con, cfg)
     finally:
         con.close()
-    report["swept"] = sweeper.sweep(cfg)
-    # The conductor rides the same tick (DESIGN §10). It reads the board
-    # and costs ZERO tokens unless a goal has an event worth judging.
-    # ponytail: that is a second whole-board GET per tick; share the
-    # sweeper's fetch once one of the two passes owns it.
-    report["conducted"] = conductor.pass_once(cfg)
     return report
 
 
 def run(interval: int | None = None, once: bool = False) -> int:
     cfg = config.load()
     if interval is None:
-        interval = int(cfg.get("work", {}).get("poll_interval", DEFAULT_INTERVAL) or
+        interval = int(cfg.get("settings", {}).get("daemon_interval",
+                                                   DEFAULT_INTERVAL) or
                        DEFAULT_INTERVAL)
     # Everything this daemon spawns inherits its descriptor limit, and
     # launchd's 256 is below what a harness needs (proc.raise_file_limit).

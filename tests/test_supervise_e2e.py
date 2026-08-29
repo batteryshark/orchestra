@@ -17,7 +17,7 @@ from unittest import mock
 
 import subprocess
 
-from orchestra import (cli, db, merge, messaging, project, supervise, sweeper,
+from orchestra import (cli, db, merge, messaging, project, supervise,
                          traces, worktree)
 
 
@@ -120,9 +120,9 @@ class E2ETestCase(unittest.TestCase):
         # Work is not running here: seed the project cache directly, which is
         # exactly the offline path the CLI depends on (DESIGN §2).
         con = db.connect()
-        sweeper.remember_projects(con, str(self.tmp_path / "workspace"),
-                         [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
-                           "path": "demo"}])
+        from tests.util import seed_project
+
+        seed_project(con, PROJECT_ID, self.root)
         con.close()
 
     def tearDown(self) -> None:

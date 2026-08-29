@@ -8,19 +8,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import (acp, auth, child_runs, conductor, config, daemon, db,
+from orchestra import (acp, auth, child_runs, config, daemon, db,
                          dispatch,
                          harnesses, hooks, http, merge, messaging, nod,
                          observer, paths, proc, profile_edit, profiles, project,
-                         review, runway, service, supervise, sweeper,
+                         review, runway, service, supervise,
                          traces, worktree)
 
 
 def _locate_dir(con, start) -> "project.Project | None":
-    """The project this directory belongs to: the run history first (the
-    runner's own records are the address book), then the Work adapter's
-    cached checkout map for a folder no run has taught the history yet."""
-    return project.for_dir(con, start) or sweeper.project_for_dir(con, start)
+    """The project this directory belongs to: the run history — the
+    runner's own records are the address book."""
+    return project.for_dir(con, start)
 
 
 def _here(con) -> tuple:
@@ -38,8 +37,6 @@ def _here(con) -> tuple:
 
 def _find_project(con, selector: str) -> "project.Project":
     hit = project.find(con, selector)
-    if hit is None and sweeper.refresh_projects(con, config.load()):
-        hit = project.find(con, selector)
     if hit is None:
         raise SystemExit(f"orchestra: no project matches {selector!r} — "
                          "`orchestra project list` names them")
@@ -170,12 +167,10 @@ def cmd_dispatch(args):
     if selector:
         proj = _find_project(con, selector)
     else:
-        # No name given: the checkout names the project — the run history
-        # first, then the adapter's cached map (warmed once on a miss).
+        # No name given: the checkout names the project through the run
+        # history — the runner's own records are the address book.
         start = root if root is not None else project.start_dir()
         proj = _locate_dir(con, start)
-        if proj is None and sweeper.refresh_projects(con, config.load()):
-            proj = _locate_dir(con, start)
         if proj is None:
             raise SystemExit(
                 f"orchestra: no project is known to run in {start}.\n"
@@ -187,10 +182,8 @@ def cmd_dispatch(args):
         if selector:
             # A NAMED project dispatched from anywhere: the default checkout
             # is where it last ran — the runner's own records, not a stored
-            # setting — else the adapter's map (a store-only project gets
-            # its workspace here).
-            root = project.last_root(con, proj.project_id) \
-                or sweeper.locate(con, proj)
+            # setting.
+            root = project.last_root(con, proj.project_id)
             if root is None:
                 raise SystemExit(
                     f"orchestra: {proj.slug} has no known checkout yet — "
@@ -209,8 +202,7 @@ def cmd_dispatch(args):
     if not mission.strip():
         raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
     # An ephemeral workspace has no repository to branch from and never had
-    # one (W-0312) — the same skip the sweeper applies, now that --project
-    # can aim a dispatch at a store-only project from anywhere.
+    # one (W-0312) — isolation is skipped there, never demanded.
     isolate = args.worktree and not project.is_workspace(root)
     # A staffing moment (W-0187): the project's enabled set gates it, and a
     # profile it has not enabled is refused by name rather than swapped.
@@ -986,41 +978,6 @@ def cmd_doctor(args):
     con.close()
 
 
-def cmd_sweep(args):
-    cfg = config.load()  # per-project overrides resolve per swept item
-    client = sweeper.client_from_cfg(cfg)
-    if client is None:
-        raise SystemExit(
-            "orchestra: the sweeper is off — set [work] enabled = true and "
-            f"api_url in {paths.global_config_path()}")
-    if args.watch:
-        interval = args.interval or int(sweeper.work_cfg(cfg).get("poll_interval", 60))
-        print(f"orchestra sweep: watching {client.api_url} as "
-              f"'{client.identity}' every {interval}s")
-        sweeper.watch(cfg, client, interval)
-        return
-    actions = sweeper.sweep(cfg, client)
-    if not actions:
-        print("sweep: nothing to do")
-    for a in actions:
-        detail = {k: v for k, v in a.items() if k not in ("action", "item", "run")}
-        print(f"sweep: {a['action']} {a['item']} ↔ run {a['run']}"
-              + (f" {detail}" if detail else ""))
-
-
-def cmd_work_status(args):
-    con = db.connect()
-    rows = sweeper.status_rows(con)
-    con.close()
-    if not rows:
-        print("(no runs are mapped to Work items)")
-        return
-    print(f"{'item':<14} {'run':<5} {'slug':<18} {'status':<10} reported")
-    for r in rows:
-        print(f"{r['ref']:<14} {r['id']:<5} {r['slug'] or '-':<18} "
-              f"{r['status']:<10} {r['reported_at'] or '-'}")
-
-
 def cmd_daemon(args):
     sys.exit(daemon.run(interval=args.interval, once=args.once))
 
@@ -1225,12 +1182,6 @@ def cmd_project(args):
                 return
             print(f"{'archived' if want else 'unarchived'} {hit.slug}")
             return
-        if args.action == "link":
-            linked = sweeper.link(con, args.project, Path(args.path or "."))
-            print(f"{linked.slug}\n  project id: {linked.project_id}"
-                  f"\n  name:       {linked.name}")
-            print("\nThe source keeps organizing this project; runs go here.")
-            return
         if args.action == "forget":
             print(f"forgot {args.selector}"
                   if project.forget(con, args.selector)
@@ -1371,9 +1322,6 @@ def cmd_nod(args):
 
 
 def cmd_supervise(args):
-    # W-0099: this process is where a completion files proposals and where a
-    # judgment failure is noticed, so it is where both planner seams attach.
-    conductor.attach()
     sys.exit(supervise.supervise(Path(args.root), args.run_id))
 
 
@@ -1500,15 +1448,6 @@ def main():
                    help="skip the observer turn; liveness and loop shape only")
     s.set_defaults(fn=cmd_check)
 
-    s = sub.add_parser("sweep", help="run one optional Work intake pass")
-    s.add_argument("--watch", action="store_true", help="keep sweeping")
-    s.add_argument("--interval", type=int,
-                   help="watch heartbeat in seconds (fallback signal only)")
-    s.set_defaults(fn=cmd_sweep)
-
-    s = sub.add_parser("work-status", help="Work item ↔ run mapping")
-    s.set_defaults(fn=cmd_work_status)
-
     s = sub.add_parser("profiles",
                        help="list, add, edit and remove launch profiles; "
                             "discover models; set notes")
@@ -1629,13 +1568,6 @@ def main():
     pl.add_argument("--all", action="store_true",
                     help="include archived projects, marked")
     pl.set_defaults(path=None, name=None)
-    pk = psub.add_parser("link", help="bind a source-cached project to the "
-                                      "checkout it lives in, when the "
-                                      "source's label is not a folder")
-    pk.add_argument("project", help="the source's project label, a slug, "
-                                    "or a project id")
-    pk.add_argument("path", nargs="?", help="default: the current directory")
-    pk.set_defaults(name=None)
     pf = psub.add_parser("forget", help="drop an owner-minted project")
     pf.add_argument("selector", help="slug or project id")
     pf.set_defaults(name=None, path=None)

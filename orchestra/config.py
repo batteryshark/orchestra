@@ -123,62 +123,9 @@ raw_log_retention_days = 0
 # row, and how many consecutive edits to one file, count as spinning.
 # loop_repeats = 6
 # loop_file_repeats = 8
-# Optional Work conductor policy. A goal is a Work task tagged `goal` and ticked
-# delegated; planner_profile picks the mid-tier model that takes its planner
-# turns. With none set, the one profile marked tier = 2 (generalist) is used,
-# and with neither the conductor says exactly what to add and takes no turn.
-# Set it per project in a [project."<projectId>".settings] table to give
-# that project's goals their own planner.
-# planner_profile = "planner"
-
 # Non-secret environment values applied to every worker process.
 # {{root}} expands to the project root.
 [worker_env]
-
-# --- Optional Work intent/ledger adapter ----------------------------------
-# Off unless enabled. agent_identity is the X-Work-Agent name Orchestra posts
-# as. A human hands an item to automation by ticking its `delegated` flag
-# (CONTRACT v0.2 §2). profile picks the launch template used for swept
-# items. poll_interval is the fallback heartbeat for `orchestra sweep
-# --watch`, in seconds.
-[work]
-enabled = false
-api_url = "http://127.0.0.1:43170"
-agent_identity = "orchestra"
-profile = "claude"
-poll_interval = 60
-# The staffing turn (W-0183). `router` names a CHEAP profile that, on claim,
-# reads the item and picks which of THIS PROJECT'S ENABLED profiles runs it,
-# from their tier/priority/role/note/runway. Leave it out and there is no
-# routing: every swept item is staffed with `profile` above, as before. Work
-# never learns about models (CONTRACT §6), so this decision cannot live on the
-# item — it lives here. It never blocks a dispatch: any failure falls back to
-# `profile` and records why on the run row and in the item's thread. The call
-# is skipped entirely when the project enables only one profile.
-# router = "cheap"
-# Heartbeat posted to a live item's thread, derived from the worker's log
-# rather than asked of the worker (D7). Seconds; 0 disables.
-progress_interval = 900
-# Swept runs get an isolated git worktree: nobody is watching a swept
-# dispatch, so it must not share a checkout with a working human.
-worktree = true
-
-# --- Sign-off (W-0269, W-0299) --------------------------------------------
-# A verifier run follows every landing: when the sweeper's landed fact moves
-# an item to review, a verification run executes each acceptance criterion's
-# stated method against landed main. ON by default — no human asks. profile
-# names the launch template; unset, the one enabled profile marked tier = 1
-# (workhorse) takes the run — a cheaper model than the worker's, and never
-# the worker's own profile. Zero or several tier-1 profiles: the pass says
-# so and skips. Legacy [work] verify / verify_profile keys are still read.
-[verify]
-# enabled = true
-# profile = "judge"
-# A second voice makes needs-judgment criteria judgeable (W-0307): unset,
-# the dialogue is off. Caps are enforced in code, not hoped for.
-# second_opinion = "judge2"
-# dialogue_messages = 4
-# dialogue_budget = 8000
 
 # --- Optional Nod notification adapter -----------------------------------
 # Escalations are delivered as Nod request cards. Off unless enabled.
@@ -213,8 +160,7 @@ expires_after = 86400
 # tier:    1 workhorse (well-defined bounded tasks) | 2 generalist |
 #          3 heavy (frontier model, hardest thinking). Routing metadata a
 #          planner reads. tier = 1 also volunteers a profile as the spin
-#          observer when settings.observer_profile is unset, and tier = 2 as
-#          the conductor's planner when settings.planner_profile is unset.
+#          observer when settings.observer_profile is unset.
 # priority: 0-99, like a linux process `nice` value — LOWER is more preferred.
 #          Orders profiles of the SAME tier against each other. Default 50.
 # transport: "exec" (default, all supported harnesses) or "acp" — one persistent
@@ -335,17 +281,12 @@ def load(project_id: str | None = None) -> dict:
     cfg["enabled_profiles"] = _enabled_list(path, project_id, per_project)
     for overlay in (top, per_project):
         cfg.setdefault("settings", {}).update(overlay.get("settings", {}))
-        cfg.setdefault("work", {}).update(overlay.get("work", {}))
         cfg.setdefault("nod", {}).update(overlay.get("nod", {}))
         # [merge] is the verification gate (DESIGN §9): base branch, declared
         # checks, tripwire limits. Without this line merge_cfg only ever saw
         # its defaults, so a configured `test` check never ran — for the
         # supervisor OR for `orchestra merge`.
         cfg.setdefault("merge", {}).update(overlay.get("merge", {}))
-        # [verify] is the sign-off pass (W-0299). Every table has to be
-        # listed here to survive the load — the same omission once meant a
-        # configured [merge] check never ran.
-        cfg.setdefault("verify", {}).update(overlay.get("verify", {}))
         # [http] trust_local = true makes an unauthenticated request FROM THIS MACHINE
 # the human, so a browser on localhost never pastes the key. Off by default:
 # workers run on this machine too, and loopback cannot tell them apart, so

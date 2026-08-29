@@ -1,10 +1,9 @@
 """The identity registry (schema v29) and the paths module.
 
 A project is a slug and settings, never a folder: checkouts belong to each
-dispatch, the run history answers "where does this project run", and the
-Work adapter keeps its own label-to-folder map (tests/test_sweeper.py covers
-that map's dispatch flow end to end; the classes here cover it directly).
-"""
+dispatch and the run history answers "where does this project run". A
+source's label-to-folder map lives in the work-bridge project, with its
+tests."""
 import os
 import sqlite3
 import stat
@@ -13,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import db, paths, project, sweeper
+from orchestra import db, paths, project
 
 DEMO_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 INNER_ID = "b993cc1f-857d-450c-96ec-c8864f754bef"
@@ -115,10 +114,9 @@ class RegistryFixture(unittest.TestCase):
         self.tmp.cleanup()
 
     def seed(self, entries=None):
-        return sweeper.remember_projects(self.con, str(self.workspace),
-                                         entries or [
-            {"projectId": DEMO_ID, "id": "demo", "name": "Demo",
-             "path": "demo"}])
+        return project.remember_identity(self.con, [
+            (e.get("projectId"), e.get("name"), e.get("archived") is True)
+            for e in (entries or [{"projectId": DEMO_ID, "name": "Demo"}])])
 
     def run_in(self, project_id: str, repo: Path) -> int:
         cur = self.con.execute(
@@ -259,108 +257,6 @@ class HistoryResolutionTests(RegistryFixture):
         self.assertEqual(project.root_for(self.con, run), repo)
 
 
-class AdapterMapTests(RegistryFixture):
-    """The Work adapter's checkouts table: label -> folder, its resolution
-    order, and the corrections a human makes locally (W-0312)."""
-
-    def test_a_cached_directory_resolves_directly(self) -> None:
-        repo = self.workspace / "demo"
-        repo.mkdir()
-        self.seed()
-        sited = sweeper.by_source_ref(self.con, "demo")
-        self.assertEqual(sited.path, repo)
-        self.assertEqual(sited.project_id, DEMO_ID)
-        self.assertEqual(sited.slug, "demo")
-
-    def test_the_folder_is_found_without_anyone_naming_it(self) -> None:
-        """Grouping is the source's business; the folder keeps its own name:
-        "Group/orchestra" finds the workspace's orchestra folder itself."""
-        (self.workspace / "orchestra").mkdir()
-        self.seed([{"projectId": DEMO_ID, "id": "Group/orchestra",
-                    "name": "Orchestra", "path": "Group/orchestra"}])
-        sited = sweeper.by_source_ref(self.con, "Group/orchestra")
-        self.assertEqual(sited.path, self.workspace / "orchestra")
-
-    def test_a_folder_another_project_claims_is_not_borrowed(self) -> None:
-        (self.workspace / "docs").mkdir()
-        self.seed([{"projectId": DEMO_ID, "id": "Group/docs", "name": "Ours",
-                    "path": "Group/docs"},
-                   {"projectId": INNER_ID, "id": "docs", "name": "Theirs",
-                    "path": "docs"}])
-        found = sweeper.by_source_ref(self.con, "Group/docs")
-        self.assertEqual(paths.workspace_dir("ours"), found.path)
-        self.assertEqual(sweeper.by_source_ref(self.con, "docs").path,
-                         self.workspace / "docs")
-
-    def test_a_store_only_project_gets_its_workspace(self) -> None:
-        self.seed([{"projectId": DEMO_ID, "id": "errands", "name": "Errands",
-                    "path": "errands"}])
-        sited = sweeper.by_source_ref(self.con, "errands")
-        self.assertEqual(paths.workspace_dir("errands"), sited.path)
-        self.assertTrue(project.is_workspace(sited.path))
-
-    def test_a_link_wins_even_when_its_directory_is_gone(self) -> None:
-        """A claimed checkout on an unmounted volume must fail where a human
-        sees it, never be replaced by an empty workspace an agent fills."""
-        self.seed([{"projectId": DEMO_ID, "id": "Group/demo", "name": "Demo",
-                    "path": "Group/demo"}])
-        checkout = self.workspace / "elsewhere"
-        checkout.mkdir()
-        linked = sweeper.link(self.con, "Group/demo", checkout)
-        self.assertEqual(linked.project_id, DEMO_ID)
-        self.assertEqual(sweeper.by_source_ref(self.con, "Group/demo").path,
-                         checkout)
-        checkout.rmdir()
-        self.assertEqual(sweeper.by_source_ref(self.con, "Group/demo").path,
-                         checkout)
-
-    def test_link_refuses_a_project_it_cannot_find(self) -> None:
-        target = self.workspace / "somewhere"
-        target.mkdir()
-        with self.assertRaisesRegex(SystemExit, "no project matches"):
-            sweeper.link(self.con, "no/such/project", target)
-
-    def test_a_stale_source_path_is_pruned_and_a_link_survives(self) -> None:
-        self.seed([{"projectId": DEMO_ID, "id": "demo", "name": "Demo",
-                    "path": "demo/inner"}])
-        bound = self.workspace / "bound"
-        bound.mkdir()
-        sweeper.link(self.con, "demo", bound)
-        self.seed([{"projectId": DEMO_ID, "id": "demo", "name": "Demo",
-                    "path": "demo"}])
-        cached = [r["path"] for r in self.con.execute(
-            "SELECT path FROM checkouts ORDER BY path")]
-        self.assertIn(str(self.workspace / "demo"), cached)
-        self.assertNotIn(str(self.workspace / "demo" / "inner"), cached)
-        self.assertIn(str(bound), cached)  # the owner's binding survives
-
-    def test_alias_paths_resolve_to_the_same_project(self) -> None:
-        alias = self.tmp_path / "elsewhere"
-        alias.mkdir()
-        self.seed([{"projectId": DEMO_ID, "id": "demo", "name": "Demo",
-                    "path": "demo", "aliasPaths": [str(alias)]}])
-        self.assertEqual(
-            sweeper.project_for_dir(self.con, alias).project_id, DEMO_ID)
-
-    def test_project_for_dir_answers_before_any_run_exists(self) -> None:
-        repo = self.workspace / "demo"
-        (repo / "src").mkdir(parents=True)
-        self.seed()
-        self.assertEqual(
-            sweeper.project_for_dir(self.con, repo / "src").project_id,
-            DEMO_ID)
-        self.assertIsNone(sweeper.project_for_dir(self.con, self.tmp_path))
-
-    def test_locate_prefers_the_source_checkout(self) -> None:
-        repo = self.workspace / "demo"
-        repo.mkdir()
-        self.seed()
-        proj = project.by_slug(self.con, "demo")
-        self.assertEqual(sweeper.locate(self.con, proj), repo)
-        self.assertIsNone(
-            sweeper.locate(self.con, project.create(self.con, "solo")))
-
-
 class ArtifactPathTests(RegistryFixture):
     def test_run_artifacts_file_under_the_project_by_board_number(self) -> None:
         made = project.create(self.con, "demo")
@@ -454,7 +350,7 @@ class MigrationV29Tests(unittest.TestCase):
         old = sqlite3.connect(db_file)
         old.executescript(f"""
             DROP TABLE projects;
-            DROP TABLE checkouts;
+            DROP TABLE IF EXISTS checkouts;
             CREATE TABLE projects (
               path TEXT PRIMARY KEY, project_id TEXT NOT NULL,
               source_ref TEXT, name TEXT, refreshed_at TEXT NOT NULL,

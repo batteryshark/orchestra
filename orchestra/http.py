@@ -268,12 +268,11 @@ SEATS_ROUTE = "/api/seats"
 # the same comment-preserving surgery every managed config edit uses. An
 # empty router seat turns routing OFF; the other seats then derive from
 # profile tiers.
+# The RUNNER's own judgment seats. A caller-side policy (a work source's
+# planner, router, or sign-off) configures itself in its own process and
+# never appears here.
 SEATS = {
     "observer": ("[settings]", "observer_profile"),
-    "planner": ("[settings]", "planner_profile"),
-    "router": ("[work]", "router"),
-    "verify": ("[verify]", "profile"),
-    "second_opinion": ("[verify]", "second_opinion"),
     "resolver": ("[merge]", "resolver_profile"),
 }
 
@@ -281,10 +280,6 @@ SEATS = {
 def seats_payload() -> dict:
     cfg = config.load()
     tables = {"observer": cfg.get("settings") or {},
-              "planner": cfg.get("settings") or {},
-              "router": cfg.get("work") or {},
-              "verify": cfg.get("verify") or {},
-              "second_opinion": cfg.get("verify") or {},
               "resolver": cfg.get("merge") or {}}
     return {
         "seats": {seat: str(tables[seat].get(key) or "") or None

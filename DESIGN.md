@@ -34,7 +34,17 @@ The twelve sections retain the old DESIGN section numbers because source
 comments use them as architectural signposts. Their content now describes
 current behavior rather than the original build plan.
 
-## 1. Optional Work integration
+## 1. External automation and the registry
+
+Orchestra hosts NO source integration. The Work automation — the sweep, the
+conductor, the verify lane, the findings filer, the router — lives in the
+sibling **work-bridge** project: a consumer that knows both sides so that
+neither knows the other. The bridge drives Orchestra through its library
+and API, keeps its own tables in its own ATTACHed database file, and runs
+as its own process (`workbridge sweep --watch`). Any other source (Linear,
+a cron script) integrates the same way: dispatch with a path, a brief, an
+opaque `ref` and `requester`; read the cursored results feed and the
+receipts.
 
 Orchestra's registry holds project IDENTITIES and nothing else (schema v29):
 one row per project — slug, name, provenance, parked flags. NO PATHS.
@@ -45,16 +55,14 @@ registry two ways:
 
 - `orchestra project add <name>` mints an owner-local identity (a directory
   argument contributes only its name).
-- With Work enabled, the adapter caches Work's project identities through
-  the one core seam, `project.remember_identity`. Cached identities the
-  source stops naming are pruned unless runs or an owner's override hold
-  them; owner-minted rows are never a source's to delete.
+- An external caller (the work-bridge) caches its source's project
+  identities through the one core seam, `project.remember_identity`. Cached
+  identities the source stops naming are pruned unless runs or an owner's
+  override hold them; owner-minted rows are never a caller's to delete.
 
-The label-to-folder map is the ADAPTER's own table, `checkouts` — the
-source's cached paths and aliases plus the owner's `link` bindings — owned
-by `sweeper.py` exactly as `work_marks` is (CONTRACT §7 Enforcement). An
-unattended dispatch is the adapter resolving its own labels; the core never
-reads that table.
+The label-to-folder map is the BRIDGE's own `checkouts` table, in the
+bridge's own database file. An unattended dispatch is the bridge resolving
+its own labels; nothing in this repository reads that table.
 
 Every project carries a SLUG (v27): lowercase kebab-case, minted once from
 the name, unique, never rewritten by a refresh or rename. The slug is the
@@ -79,36 +87,16 @@ Orchestra and stop dispatching for it" — Orchestra's own decision about its
 own surface, which no refresh may overwrite. `project forget` still refuses a
 source-cached identity, since the next refresh would put the row back and the
 removal would look broken. A parked project is off `orchestra project list` (`--all` shows
-it, marked) and off the dashboard's project picker, and the three unattended
-lanes — the sweep's claim path, the conductor, and refine — skip its items.
-The sweep says so once per item, through the waiting queue, so a forgotten
-`delegated` tick is not silently dropped. Nothing else changes: manual
+it, marked) and off the dashboard's project picker, and the bridge's
+unattended lanes skip its items. Nothing else changes: manual
 `orchestra dispatch` still runs and only prints a notice, a run already in
 flight is untouched, and statistics, run listings, `orchestra show`, and every
 run the project already owns read exactly as before.
 
-The Work adapter claims delegated items, freezes an item snapshot into the run
-brief, records checklist accounting, and writes outcomes back through Work's
-agent API. Work is the intent and ledger system in that mode. It is not needed
-for local project registration or direct dispatch.
-
-Work sign-off is separate and on by default (W-0299): the sweep that posts a
-landed fact dispatches a verification run in the same pass, under `[verify]
-profile` — defaulting to the one enabled workhorse-tier profile, a cheaper
-model than the worker's. It executes each acceptance criterion's stated
-method against landed main and writes the result to Work; `[verify] enabled
-= false` turns it off. A criterion with no mechanical method may get a
-capped two-seat dialogue under `[verify] second_opinion`; unset, that path is off.
-
-The refine lane sits on the other side of execution (W-0309): a human tags an
-item `refine` and the next sweep dispatches one shaping run under `[work]
-refine_profile`, whatever the item's status and whether or not it is
-delegated — refinement comes before execution, so it waits for neither
-signal. The run rewrites the item's six sections to `docs/GOAL-STANDARD.md`
-around the owner's own words, leaves every undecidable point as a `Q:` line,
-appends `fact: refined`, and drops the tag that asked for it. It claims
-nothing, ticks nothing, and lands nothing. The tag is the receipt: a tag
-still present with no refine run live dispatches the pass again.
+What the bridge does with Work — claiming, ferrying, reporting, sign-off,
+the conductor's planner turns — is the bridge's own documentation, tested
+in its own repository. Orchestra needs none of it for registration or
+direct dispatch.
 
 ## 2. Daemon and central state
 
@@ -138,7 +126,7 @@ analysis. Pruning is opt-in — a positive day count, plus a human running
 A direct run follows this path:
 
 ```text
-human or program                         Work adapter (optional)
+human or program                         work-bridge (optional)
        \                                      /
                     mission + profile
                             |
@@ -154,11 +142,11 @@ human or program                         Work adapter (optional)
                             |
                  terminal status and summary
                             |
-          optional landing and Work/Nod writeback
+          optional landing; receipts for any consumer
 ```
 
-Manual CLI dispatch, Work sweeping, conductor dispatch, retries, and resolver
-runs create run rows through several paths. They converge on `prepare_launch`
+Manual CLI dispatch, the bridge's sweeping and conducting, retries, and
+resolver runs create run rows through several paths. They converge on `prepare_launch`
 and the same supervisor. W-0293 tracks the missing single
 `RunRequest -> Run` admission seam.
 
@@ -220,8 +208,8 @@ artifacts still file under `~/.orchestra/projects/<slug>/`, and a
 caller-named path inside `~/.orchestra` itself is refused (the workspace
 excepted) — a worktree of the run database is never what anyone meant.
 
-An isolated run uses a branch named `orchestra/run-N`. The Work sweeper and
-conductor also request isolation by default. If worktree setup or rehoming
+An isolated run uses a branch named `orchestra/run-N`. The bridge's
+unattended dispatches request isolation by default too. If worktree setup or rehoming
 fails, launch fails closed; unattended execution never changes to the owner's
 checkout. A project's `[work] worktree = false` is the explicit shared mode.
 
@@ -343,15 +331,12 @@ Every successful run's final handoff is parsed. Findings and proposals are filed
 only when Work is configured and the run has Work context. They have no local
 durable collection, so the dashboard and iOS client do not present one.
 
-## 10. Optional Work conductor
+## 10. The conductor (moved out)
 
-The conductor takes episodic planning turns inside a human-delegated Work goal.
-It can dispatch existing tasks, propose children, ask the human, wait, or finish
-the goal. Direct dispatch does not use it.
-
-This policy is deliberately smaller than the retired Operator. It does not
-introduce immutable contracts, councils, rosters, capacity budgets, or a
-persistent orchestrator identity.
+The conductor lives in the work-bridge project with the rest of the Work
+automation. Its planner turns still record as `layer` rows in `runs`
+(through the library), so the dashboard shows them like any control turn —
+but no conductor code exists in this repository.
 
 ## 11. Statistics and runway
 
@@ -400,11 +385,11 @@ another subsystem already depends on.
    throwaway worktree and moves the base with `git update-ref`.
 3. Never write a Work item's status from a run — status has one writer class,
    the human, and a run that transitions an item overwrites the human's own
-   move (CONTRACT 0.8); runs append `fact:` comments through `work_client.py`,
-   which offers no status call.
-4. Never let the worker report to Work — a worker that files its own findings
-   can forget, self-approve, or hand itself work; `findings.py` parses the
-   final handoff after the run and files the issues and proposals.
+   move (CONTRACT 0.8); the bridge's client offers no status call.
+4. Never let the worker report to a source — a worker that files its own
+   findings can forget, self-approve, or hand itself work; `handoff.py`
+   parses and enforces the protocol after the run, and the bridge files the
+   entries from the stamped receipt.
 5. Never let a run token act on a sibling run — the shared secret is in every
    worker's environment, so route authority is the only containment; `auth.py`
    holds the whole table, and an unlisted route is the human's.
@@ -432,15 +417,15 @@ another subsystem already depends on.
     truncated payload, so a viewer or parser that trusts it loses detail; the
     raw log is the source of truth and `traces.py` stores the byte offset and
     length of the line each event came from.
-13. Never let the core know a source — only `sweeper`, `conductor`, `verify`,
-    `refine` and `findings` may import a source client, and `runs.ref`,
-    `checkouts.source_ref` and `nod_requests.ref` are opaque strings the core
-    stores and never parses; the rule is the contract's (§7 Enforcement) and
-    `tests/test_boundary.py` asserts it against the import graph.
+13. Never let the core know a source — the adapter LEFT the repository
+    (the work-bridge project), so the rule is absolute: no module imports a
+    source client, none is named for one, none reads a `[work]` table, and
+    `runs.ref` / `nod_requests.ref` are opaque strings the core stores and
+    never parses; `tests/test_boundary.py` asserts all of it.
 14. Never attempt delivery before the durable write — a record that exists
     only in a return value dies with the first unreachable server, and the
     caller is told a human is needed while what they asked for is destroyed;
-    `profile_edit` writes its escalation row first and an adapter files it
+    `profile_edit` writes its escalation row first and the bridge files it
     later.
 
 ## Non-goals
