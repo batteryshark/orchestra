@@ -965,6 +965,25 @@ def finalize_run(con, run, status: str, exit_code: int | None, *,
     return dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
 
 
+def notify_run_finished(cfg: dict, run) -> None:
+    """[settings] on_run_finished: one shell command fired after a run's
+    result and handoff are durable. A callback, not a policy — Orchestra
+    learns nothing about who listens, and a listener that misses one is
+    expected to have its own fallback poll."""
+    cmd = ((cfg.get("settings") or {}).get("on_run_finished") or "").strip()
+    if not cmd:
+        return
+    env = dict(os.environ, ORCHESTRA_RUN_ID=str(run["id"]),
+               ORCHESTRA_RUN_STATUS=str(run["status"]))
+    try:
+        subprocess.Popen(cmd, shell=True, env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as exc:
+        print(f"orchestra: on_run_finished could not start: {exc}",
+              file=sys.stderr)
+
+
 def finalize_if_unowned(con, run_id: int, *, worker_gone: bool = False) -> bool:
     """Finish a terminal row that has no process left to own finalization.
 
@@ -1255,6 +1274,7 @@ def supervise(root: Path, run_id: int) -> int:
         print(f"orchestra: run {run_id} child wakeup failed: {exc}",
               file=sys.stderr)
     process_ready(con, spawn_supervisor)  # dependency release (D3)
+    notify_run_finished(cfg, result)
     con.close()
     if wake_id:
         spawn_supervisor(root, wake_id)

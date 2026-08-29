@@ -341,6 +341,7 @@ def _resume_result_policies(con) -> list[int]:
                                        (run_id,)).fetchone())
             if run.get("handoff_processed_at") is None:
                 handoff.at_completion(con, run)
+                supervise.notify_run_finished(cfg, run)
             resumed.append(run_id)
         except Exception as exc:
             print(f"orchestra daemon: run {run_id} policy recovery failed: {exc}",

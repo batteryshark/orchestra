@@ -109,6 +109,12 @@ default_requester = "human"
 # age out TERMINAL runs' logs after that many days. Normalized trace events
 # are kept indefinitely either way; pruning only loses expand-in-place detail.
 raw_log_retention_days = 0
+# One shell command fired after a run finishes — its result, landing, and
+# handoff are durable first. A callback for external listeners; Orchestra
+# does not care who. ORCHESTRA_RUN_ID and ORCHESTRA_RUN_STATUS are set in
+# its environment. A missed callback must be covered by the listener's own
+# fallback poll.
+# on_run_finished = "/path/to/notify-listener"
 # Optional observer policy. There are no budgets and no run ceilings: a
 # long run is a good run, and this is what catches a feral one instead.
 # observer_profile picks the model that judges transcripts out of band;
