@@ -926,8 +926,11 @@ def defer_retry(con, run_id: int) -> bool:
     return True
 
 
-def _automatic_retry_blocker(run) -> str | None:
-    """A failed precondition that another identical attempt cannot change.
+def _automatic_retry_blocker(run) -> tuple[str, str] | None:
+    """A failed precondition that another identical attempt cannot change,
+    as ``(kind, reason)`` — the kind decides the escalation's shape, because
+    a checkout problem announced as an auth outage sends the operator to
+    reauthenticate a backend that works (run 641, 2026-08-29).
 
     Keep this deliberately narrow. The Claude event that produced live runs
     7 and 8 carries ``error=authentication_failed`` and this durable summary;
@@ -935,8 +938,8 @@ def _automatic_retry_blocker(run) -> str | None:
     """
     summary = str(run["summary"] or "").strip().casefold()
     if run["backend"] == "claude" and summary.startswith("failed to authenticate:"):
-        return "Claude authentication failed; reauthenticate Claude before " \
-               "dispatching the work again"
+        return ("auth", "Claude authentication failed; reauthenticate Claude "
+                        "before dispatching the work again")
     # The worker finished; the CHECKOUT would not be read. Repeating a run
     # that already succeeded cannot change what git objects to — PREX3 runs
     # 93, 94, and 99 each did fourteen minutes of good work and were thrown
@@ -944,9 +947,9 @@ def _automatic_retry_blocker(run) -> str | None:
     # hand (2026-08-26).
     if "checkpoint error:" in summary:
         detail = summary.split("checkpoint error:", 1)[1].strip()
-        return ("the run finished but its checkout could not be "
-                f"checkpointed: {detail[:200]}. Fix the checkout; another "
-                "identical run cannot")
+        return ("checkout", "the run finished but its checkout could not be "
+                            f"checkpointed: {detail[:200]}. Fix the checkout; "
+                            "another identical run cannot")
     return None
 
 
@@ -1238,24 +1241,38 @@ def after_terminal(con, run_id: int, *, cfg: dict | None = None,
     cfg = config.load(run["project_id"]) if cfg is None else cfg
     blocker = _automatic_retry_blocker(run)
     if blocker:
-        record(con, run_id, "retry", "escalate", blocker,
-               {"precondition": "reauthenticate", "backend": run["backend"]})
-        # The worker-run half of the same outage flag the turn runner sets:
-        # a Nod alert on a disabled Nod reaches nobody, the banner always
-        # reaches the operator.
-        note_auth_outage(con, run["backend"], run["summary"])
+        kind, reason = blocker
+        precondition = "reauthenticate" if kind == "auth" else "fix the checkout"
+        record(con, run_id, "retry", "escalate", reason,
+               {"precondition": precondition, "backend": run["backend"]})
+        if kind == "auth":
+            # The worker-run half of the same outage flag the turn runner
+            # sets: a Nod alert on a disabled Nod reaches nobody, the banner
+            # always reaches the operator. ONLY for auth — a checkout
+            # problem under this flag told the operator to reauthenticate
+            # an opencode that worked (run 641).
+            note_auth_outage(con, run["backend"], run["summary"])
         con.commit()
-        result = {"action": "escalate", "reason": blocker,
-                  "precondition": "reauthenticate"}
+        result = {"action": "escalate", "reason": reason,
+                  "precondition": precondition}
+        if kind == "auth":
+            title = f"Run {run_id} needs Claude authentication"
+            detail = (f"Run {run_id} failed because its Claude authentication "
+                      "could not be refreshed.\n\n"
+                      f"{(run['summary'] or '(no summary)')[:1000]}\n\n"
+                      "Orchestra did not repeat the same brief with the same "
+                      "expired credential. Reauthenticate Claude, then "
+                      "dispatch the work again.")
+        else:
+            title = f"Run {run_id} finished but its checkout failed"
+            detail = (f"Run {run_id}'s work is done, but its checkout could "
+                      "not be checkpointed.\n\n"
+                      f"{(run['summary'] or '(no summary)')[:1000]}\n\n"
+                      "Orchestra did not repeat the run: the work exists and "
+                      "an identical attempt cannot fix the checkout. Fix the "
+                      "checkout, then recover the result by hand.")
         result["escalation"] = escalate(
-            con, run, title=f"Run {run_id} needs Claude authentication",
-            detail=f"Run {run_id} failed because its Claude authentication "
-                   "could not be refreshed.\n\n"
-                   f"{(run['summary'] or '(no summary)')[:1000]}\n\n"
-                   "Orchestra did not repeat the same brief with the same "
-                   "expired credential. Reauthenticate Claude, then dispatch "
-                   "the work again.",
-            cfg=cfg, alert_only=True)
+            con, run, title=title, detail=detail, cfg=cfg, alert_only=True)
         return result
     streak = infra_streak(con, run)
     # A provider's busy hour is not two failures' worth of evidence about the

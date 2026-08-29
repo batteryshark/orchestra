@@ -656,6 +656,11 @@ class RetryTests(ObserverCase):
         self.assertIn("could not be checkpointed", result["reason"])
         self.assertIn("symbolic link", result["reason"])
         self.assertEqual(self.retries_of(run_id), 0)
+        # A checkout problem is NOT an auth outage: run 641's checkpoint
+        # failure raised the "opencode cannot authenticate" banner and sent
+        # the operator to reauthenticate a backend that worked (2026-08-29).
+        self.assertEqual(result["precondition"], "fix the checkout")
+        self.assertFalse(db.meta_get(self.con, "auth_outage:opencode"))
 
     def test_non_infrastructure_outcomes_are_never_retried(self) -> None:
         for status in ("done", "killed", "halted"):
