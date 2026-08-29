@@ -559,8 +559,10 @@ def _make_handler(state: FakeWork):
                                         project_path=body.get("projectPath"))
                 return self._send(201, issue)
             if path == "/api/tasks":
-                # Contract verb 5 + its gate (W-0158): an agent-created task
-                # must be a child of a task the human delegated.
+                # Contract verb 5 + its gate (W-0158, amended 0.13): a child
+                # of a delegated task stays direct; a TOP-LEVEL ask files an
+                # adopt proposal decision — the human's approve click is the
+                # create.
                 body = self._body()
                 if self._agent():
                     if body.get("delegated"):
@@ -568,9 +570,19 @@ def _make_handler(state: FakeWork):
                                            "Agents cannot set delegated.")
                     parent = state.tasks.get(body.get("parentId") or "")
                     if not body.get("parentId"):
-                        return self._error(403, "agent_task_parent_required",
-                                           "Agent-created tasks must be parented "
-                                           "to a delegated goal.")
+                        state._tick += 1
+                        decision_id = f"decision_{state._tick}"
+                        decision = {
+                            "id": decision_id,
+                            "title": f"Adopt task proposal from "
+                                     f"{self._agent()}: "
+                                     f"{body.get('title') or ''}"[:500],
+                            "status": "open",
+                            "options": ["Create the task", "Decline"],
+                        }
+                        state.decisions[decision_id] = decision
+                        return self._send(200, {"proposed": True,
+                                                "decision": decision})
                     if not parent or not parent.get("delegated"):
                         return self._error(403, "agent_task_parent_not_delegated",
                                            "The parent must be a delegated goal.")

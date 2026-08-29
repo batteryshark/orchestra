@@ -310,10 +310,18 @@ class WorkContract(unittest.TestCase):
     # --- verb 5 and its gate --------------------------------------------------
 
     def test_agent_task_creation_gate(self):
+        # CONTRACT 0.13: a top-level ask is not refused — it FILES an adopt
+        # proposal decision, and the human's approve click is the create.
         status, body = self.agent_raw("POST", "/api/tasks",
                                       {"title": "unparented"})
-        self.assertEqual((status, body["error"]["code"]),
-                         (403, "agent_task_parent_required"))
+        self.assertIn(status, (200, 201), body)
+        self.assertIs(body.get("proposed"), True, body)
+        filed = body["decision"]
+        self.assertIn("unparented", filed["title"])
+        self.assertIn(filed["id"], [d["id"] for d in self.client.decisions()])
+        # Nothing was created: the proposal is the whole effect.
+        self.assertNotIn("unparented",
+                         [t["title"] for t in self.client.tasks()])
 
         plain = self.new_task("Plain human task")
         with self.assertRaises(WorkError) as caught:

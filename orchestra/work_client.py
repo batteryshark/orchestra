@@ -178,7 +178,10 @@ class WorkClient:
 
         Always parented, never top-level. ``delegated`` is deliberately not
         sent: Work rejects the flag from any agent identity, and its default
-        is false, which is exactly the required value.
+        is false, which is exactly the required value. A TOP-LEVEL ask would
+        come back as ``{"proposed": true, "decision": …}`` instead of a task
+        (CONTRACT 0.13) — this client never sends one, so callers may read
+        the created task directly.
         """
         payload = {"title": title, "parentId": parent_id}
         if project_path is not None:
