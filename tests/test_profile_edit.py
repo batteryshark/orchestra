@@ -154,7 +154,7 @@ class AuthorityTests(EditCase):
     """DESIGN §5's split, and where a refused change goes.
 
     ``profile_edit`` writes ONE durable record and knows nothing about a
-    record system (CONTRACT §7 Enforcement). The record is what survives; a
+    record system (source boundary). The record is what survives; a
     source adapter files the decision off it later.
     """
 

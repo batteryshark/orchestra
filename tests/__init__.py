@@ -19,7 +19,7 @@ import tempfile
 #              often executed BY a supervised run, which exports these into
 #              its own shell, and cli._authority() reads ORCHESTRA_RUN_ID to
 #              decide whether a caller is an agent -- so `orchestra profiles
-#              set` inside a test suddenly needed a Work decision, and four
+#              set` inside a test suddenly needed a filed decision, and four
 #              tests failed for nobody's fault but the shell they were
 #              launched from (I-0008, I-0009).
 #   ORCHESTRA_NOD_* / ORCHESTRA_KEY  are LIVE CREDENTIALS. nod.load_secrets lets

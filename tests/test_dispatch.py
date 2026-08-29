@@ -1,8 +1,8 @@
 """Dispatch policy, core half: the pause switch, isolation defaults, and
 how a dispatch names its project and checkout (schema v29).
 
-The claim/order/dependency flow against a work source lives with the
-work-bridge project and its tests.
+The claim/order/dependency flow against a source lives with the
+bridge project and its tests.
 """
 import os
 import subprocess
@@ -81,7 +81,7 @@ class PauseSwitchTests(unittest.TestCase):
 
 
 class CoreDispatchFixture(unittest.TestCase):
-    """A registered identity, a real checkout, and NO work source anywhere."""
+    """A registered identity, a real checkout, and NO source anywhere."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

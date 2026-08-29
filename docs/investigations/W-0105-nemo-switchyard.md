@@ -9,7 +9,7 @@ Switchyard snapshot: `2bef154970d23cacf9c83b4fe9c1cd90212623e8`
 Do not make Switchyard a Orchestra dependency or replace Orchestra's profile/run
 routing with it. The two systems route at different levels:
 
-- **Orchestra routes work to an agent harness process.** It owns Work intake,
+- **Orchestra routes work to an agent harness process.** It owns item intake,
   profiles, worktrees, supervision, budgets, approvals, messages, resumes, and
   durable run state.
 - **Switchyard routes LLM API calls made by that process.** It is a proxy and
@@ -119,9 +119,9 @@ requirements directly.
 
 | Concern | Orchestra | Switchyard | Conclusion |
 |---|---|---|---|
-| Unit routed | Work item / complete agent run | One model API request or conversation turn | Complementary layers |
+| Unit routed | Source item / complete agent run | One model API request or conversation turn | Complementary layers |
 | Destinations | Codex, Claude Code, OpenCode, Reasonix profiles | Model/provider targets behind a compatible API | Does not replace `runners.py` |
-| Durable intent/state | Work + SQLite + briefs/logs | Process-local routing state; optional routing log | Orchestra remains owner |
+| Durable intent/state | Source tracker + SQLite + briefs/logs | Process-local routing state; optional routing log | Orchestra remains owner |
 | Safety/control | Approval, budget, timeout, stall, worktree | Target policy, fallback, context fit | Neither subsumes the other |
 | Cost control | Run/provider grants (planned D2) | Per-call tier selection and accounting | Switchyard can operate inside a Orchestra grant |
 | Protocol | CLI exec/JSONL or ACP | OpenAI/Anthropic HTTP APIs | HTTP proxy is the correct seam |
@@ -148,7 +148,7 @@ Codex/Claude process and its JSONL output, and it makes proxy failure explicit.
    model, then run about 20 stratified tasks on the efficient model, following
    Switchyard's own minimum-data guidance. Include easy/clean, easy/tricky,
    hard/structural, and hard/localized tasks.
-3. Replay the same frozen Work snapshots through the routed profile. Compare
+3. Replay the same frozen item snapshots through the routed profile. Compare
    verified completion, human acceptance, total provider cost, wall time,
    retries, cancellations, context overflow, and stuck/loop incidence. Include
    judge calls in both cost and latency.

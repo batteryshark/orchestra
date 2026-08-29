@@ -67,7 +67,7 @@ MCP wiring. Two reasons dominate: layer mismatch and maturity.
 
 | Concern | Orchestra | yeschef | Conclusion |
 |---|---|---|---|
-| Unit routed | Work item / whole run | Ticket inside a live session | Different layers |
+| Unit routed | Source item / whole run | Ticket inside a live session | Different layers |
 | Destination | Codex / Claude / OpenCode / Reasonix profiles | MCP tools into a running session | No new harness to add |
 | Durable state | SQLite runs + board | Hub SQLite tickets | Orchestra already durable at run level |
 | Cost control | Router tiers + runway + seats | Free local cooks for grunt work | Same goal, different unit |

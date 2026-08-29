@@ -2,7 +2,7 @@
 
 The iOS app is a small mirror of Orchestra's run list and normalized trace
 stream. It can stop a live run or send it a `tell`; push notifications,
-decisions, and Work record editing deliberately remain outside the app.
+decisions, and source record editing deliberately remain outside the app.
 
 Open `Orchestra.xcodeproj` in Xcode and run the `Orchestra` scheme. In
 Settings, enter the daemon URL (including its port) and the shared

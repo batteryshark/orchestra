@@ -64,7 +64,7 @@ class NodError(Exception):
 
     Carries the status and the server's message only. No token is ever
     interpolated into this — an escalation failure often ends up in a log
-    or a Work comment.
+    or a source's comment thread.
     """
 
     def __init__(self, status: int, message: str):
@@ -432,9 +432,9 @@ def file_escalation(target: "Nod | NodClient", *, kind: str, title: str, options
 
 
 def links_for(work_url: str | None = None, run_url: str | None = None) -> list[dict]:
-    """DESIGN §8: cards carry "open the Work item" and "open the run trace"."""
+    """DESIGN §8: cards carry "open the source item" and "open the run trace"."""
     return [link for link in (
-        {"label": "Work item", "url": work_url} if work_url else None,
+        {"label": "Source item", "url": work_url} if work_url else None,
         {"label": "Run trace", "url": run_url} if run_url else None,
     ) if link]
 
@@ -460,8 +460,8 @@ def _rfc3339(when) -> str:
 # escalations depend on — the refusal used to survive while the thing being
 # refused did not.
 # It also remembers which run and which ``ref`` a Nod request id belongs to.
-# ``ref`` is the same OPAQUE string ``runs.ref`` carries (schema v25, CONTRACT
-# §7 Enforcement 1): a caller hands it in, this module stores it and never
+# ``ref`` is the same OPAQUE string ``runs.ref`` carries (schema v25, source
+# boundary): a caller hands it in, this module stores it and never
 # parses it, and the source adapter that reads these rows is the only code
 # that knows what it spells.
 # `channel` is what makes a later read possible at all: the token is scoped
@@ -477,7 +477,7 @@ def record(con: sqlite3.Connection, request_id: str, *, kind: str, channel: str,
     The row keeps WHAT WAS SAID, not just where it was sent: a reader that
     carries the same escalation onward — a source adapter filing a decision —
     reads it here rather than asking Nod, and the module that filed it never
-    learns who reads it (CONTRACT §7 Enforcement 2).
+    learns who reads it (source boundary).
     """
     # Same request id means Nod deduped onto the card already filed, so the
     # two once-only stamps SURVIVE the re-record: a retried ask must not
@@ -517,7 +517,7 @@ def record_escalation(con: sqlite3.Connection, *, kind: str, title: str,
     THE DURABLE WRITE COMES FIRST. An escalation that attempts delivery
     before it records itself loses its own content the moment delivery fails
     — the caller is still told a human is needed, and nobody can say what for
-    (2026-08-28: an agent's profile request reached neither Work nor any local
+    (2026-08-28: an agent's profile request reached neither the source nor any local
     row, and the values are unrecoverable). Whoever delivers it reads the row
     afterwards and may retry as long as it likes; nothing here waits on them.
 
@@ -548,7 +548,7 @@ def save_decision(con: sqlite3.Connection, request_id: str, view: dict) -> None:
 
 
 def mark_mirrored(con: sqlite3.Connection, request_id: str) -> None:
-    """The decision reached the Work thread; stop re-mirroring it."""
+    """The decision reached the source's thread; stop re-mirroring it."""
     con.execute("UPDATE nod_requests SET mirrored_at=? WHERE request_id=?",
                 (_now(), request_id))
     con.commit()
@@ -592,7 +592,7 @@ def act_on_answers(con: sqlite3.Connection, cfg: dict) -> list[dict]:
     body), act, and stamp ``acted_at`` — the once-and-only-once guard, so an
     answered card never retriggers on a later tick.
 
-    Coherence with the Work mirror: ``mirrored_at`` is not touched here, so
+    Coherence with the source mirror: ``mirrored_at`` is not touched here, so
     ``unmirrored`` still lists an acted card for mirroring. And a card whose
     decision another reader already saved (status flipped, ``acted_at``
     still NULL) is acted on from the stored columns, with no network call.

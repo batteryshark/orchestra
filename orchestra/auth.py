@@ -80,8 +80,8 @@ ROUTES: dict[str, str] = {
     "POST /api/restart":           ONLY_HUMAN,
     "POST /api/dispatch/pause":    ONLY_HUMAN,
     "POST /api/dispatch/resume":   ONLY_HUMAN,
-    # note/effort-down for a run; everything dearer files a Work
-    # decision — the split itself is in profile_edit.save.
+    # note/effort-down for a run; everything dearer files a decision
+    # with the record system — the split itself is in profile_edit.save.
     "POST /api/profiles/{name}":   SPLIT,
 }
 DEFAULT_LEVEL = ONLY_HUMAN

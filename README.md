@@ -3,17 +3,17 @@
 ## What this is
 
 Orchestra is a local execution plane for agent work. It accepts a mission from
-a person, an agent, or Work, runs it through a configured agent CLI, and keeps
+a person, an agent, or an external source, runs it through a configured agent CLI, and keeps
 a durable record of the run, its trace, controls, and outcome.
 
 The current release supports four harnesses: Codex, Claude Code, OpenCode, and
 Reasonix. Orchestra gives their runs a common operating surface. The harnesses'
 own tools, permissions, configuration, and model catalogs remain different.
 
-Direct dispatch works without Work. Work automation and sign-off, isolated git
+Direct dispatch works without any source. Source automation and sign-off, isolated git
 landing, routing and conducting, model-based observation, Nod, runway, and the
 iOS client sit around the execution core. None is required for a direct run.
-Work's automated sign-off verifier is disabled by default.
+The bridge's automated sign-off verifier is disabled by default.
 
 **Orchestra — one dispatcher, many runners, one problem.**
 
@@ -34,7 +34,7 @@ Landing does not review the diff against acceptance criteria. Without declared
 checks, it relies on tripwires and their optional mission-alignment judge, so
 configure a real test, lint, or build command before trusting automatic landing.
 
-Work automation lives in the sibling **work-bridge** project — a consumer
+Source automation lives in the sibling **work-bridge** project — a consumer
 that knows both sides so that neither knows the other. Its sweeper claims
 delegated items and requests isolated runs by default; an isolation failure
 records a failed launch and sends the item back for human attention, and
@@ -55,8 +55,9 @@ Captions and the full set: [`docs/screenshots/`](docs/screenshots/README.md).
 - Git and a repository to work in.
 - At least one signed-in agent CLI: `codex`, `claude`, `opencode`, or
   `reasonix`. Orchestra uses the CLI's existing authentication.
-- Work only if you want delegated-item intake, project discovery, planning, or
-  writeback. Standalone projects use `orchestra project add <name>`.
+- A source (through the bridge) only if you want delegated-item intake, project
+  discovery, planning, or writeback. Standalone projects use
+  `orchestra project add <name>`.
 
 `orchestra service` installs a launchd agent on macOS or a per-user Scheduled
 Task on Windows. The daemon can also run in the foreground.
@@ -78,7 +79,7 @@ uv run orchestra init
 uv run orchestra doctor
 ```
 
-Mint a project identity if it does not come from Work (no path is stored —
+Mint a project identity if it does not come from a source (no path is stored —
 each dispatch names its checkout, and the run history remembers):
 
 ```sh
@@ -159,7 +160,7 @@ ln -sfn "$PWD/skills/orchestra" ~/.claude/skills/orchestra
 | Config | `~/.config/orchestra/config.toml` |
 | Isolated run branches | `orchestra/run-N` |
 | Environment overrides | `ORCHESTRA_*` |
-| Work agent identity | `orchestra` |
+| Agent identity at the source | `orchestra` |
 
 On POSIX systems, the state root and its managed container directories are
 owner-only (`0700`) traversal boundaries.

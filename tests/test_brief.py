@@ -48,7 +48,7 @@ class BriefContentTests(unittest.TestCase):
         self.assertNotIn("s" * (brief.SNAPSHOT_MAX_CHARS + 1), text)
 
     def test_snapshot_protocol_is_injected_verbatim(self) -> None:
-        # The checklist card is the ADAPTER's rendering (CONTRACT §7); the
+        # The checklist card is the ADAPTER's rendering (source boundary); the
         # core injects it beside the snapshot and knows nothing about it.
         text = _compose(mission="m", snapshot="W-1 · t [ready]",
                         snapshot_protocol="account for every criterion")

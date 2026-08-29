@@ -82,8 +82,8 @@ DEFAULT_CONFIG = f"""\
 # Orchestra profiles + settings. The only file: ~/.config/orchestra/config.toml
 #
 # Per-project overrides go in a [project."<projectId>"] table in THIS file.
-# Use the id shown by `orchestra project list`; Work-backed projects retain
-# Work's immutable projectId. Settings tables have the same shape as the top
+# Use the id shown by `orchestra project list`; source-backed projects retain
+# the source's immutable projectId. Settings tables have the same shape as the top
 # level and merge over it:
 #
 #   [project."53efe3c3-6def-4797-8560-3dce073d7d63".settings]

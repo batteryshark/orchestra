@@ -25,8 +25,7 @@ dict write:
 
   The escalation is one row in ``nod_requests``, the escalation record
   (DESIGN §8), written before anything can fail and carrying the requested
-  VALUES. Editing config must not know a record system exists (CONTRACT §7
-  Enforcement), so this module records and stops; a source adapter reads the
+  VALUES. Editing config must not know a record system exists (source boundary), so this module records and stops; a source adapter reads the
   record and files the decision the human answers, and `orchestra profiles`
   prints it meanwhile. It is the shape 44c8335 established — the core writes
   the durable thing, the adapter does the source-facing half — with the
@@ -548,14 +547,15 @@ def _decide(cfg: dict, name: str, changes: dict, keys: set[str],
 
     ONE DURABLE WRITE, AND NO DELIVERY. The record carries the profile, the
     keys and their VALUES, and it is written before anything could fail —
-    that ordering is the whole point. The old shape filed a Work decision
-    first and kept the request only in its own return value, so every failure
-    path (Work down, Work refusing, ``[work]`` off) reported "a human is
+    that ordering is the whole point. The old shape filed a decision with the
+    record system first and kept the request only in its own return value, so
+    every failure path (the source down, the source refusing, its config table
+    off) reported "a human is
     needed" while destroying what for (2026-08-28; the values were
     unrecoverable and the owner could not approve a change nobody could name).
 
     Delivery is somebody else's later, retryable step: a source adapter reads
-    the record and files the decision (CONTRACT §7 Enforcement — config
+    the record and files the decision (source boundary — config
     editing knows no record system), and `orchestra profiles` prints it
     meanwhile, so with every source down a human can still read exactly what
     was asked for.

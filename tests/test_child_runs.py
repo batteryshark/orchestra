@@ -152,7 +152,7 @@ class CreateTests(ChildRunCase):
             "SELECT brief_path FROM runs WHERE id=?",
             (ids[0],)).fetchone()["brief_path"]).read_text()
         self.assertIn("You are a child run", text)
-        self.assertIn("Do not merge, land, or report to Work", text)
+        self.assertIn("Do not merge, land, or report to the source", text)
         self.assertIn(f"run {self.lead['id']} decides", text)
 
     def test_the_lifetime_and_active_caps_are_separate(self) -> None:

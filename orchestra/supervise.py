@@ -267,7 +267,7 @@ def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
         # at resume (the immutability is load-bearing — Orchestra learned it
         # the hard way). The protocol beside it is the source adapter's own
         # rendering: whether this run's ref carries a checklist is the
-        # source's schema, which this module may not read (CONTRACT §7).
+        # source's schema, which this module may not read (source boundary).
         text = brief.compose(
             run_id=run_id, slug=run["slug"], profile=profile,
             mission=mission, requester=run["requested_by"], root=root,
@@ -388,7 +388,7 @@ def rehome(con, root: Path, previous, run_id: int) \
 
 def reserve_followup(con, root: Path, parent, requester: str,
                      title: str | None = None, *, commit: bool = True):
-    """Reserve a continuation before any Work claim or filesystem setup."""
+    """Reserve a continuation before any source claim or filesystem setup."""
     return create_run(
         con, profile=parent["profile"], backend=parent["backend"],
         model=parent["model"],

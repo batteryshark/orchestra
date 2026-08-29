@@ -59,12 +59,12 @@ class MergeTestCase(unittest.TestCase):
 
     def test_a_run_cannot_land_a_file_the_base_branch_stopped_tracking(self):
         """The drop rule, in the real shape of the recurring escalation:
-        `.work/` held a live Work database, git tracked it, and every run
+        `.work/` held a live service's database, git tracked it, and every run
         committed whatever snapshot happened to be on disk. Two runs branched
         while it was still tracked — one edited the snapshot alongside real
         work (as an agent with a file editor will when the file is sitting in
         its worktree), one touched ONLY the snapshot. Then the base untracked
-        it while Work kept writing the real copy. Both runs still land; only
+        it while the service kept writing the real copy. Both runs still land; only
         their stale snapshots are dropped."""
         (self.root / ".work").mkdir()
         self.write(".work/W-0171.md", "status: backlog\n")
@@ -74,7 +74,7 @@ class MergeTestCase(unittest.TestCase):
                          "docs.md": "the actual work\n"})
         self.run_branch({".work/W-0171.md": "status: done\n"},
                         branch="orchestra/run-2")
-        # Meanwhile the base untracked it and Work kept writing the real copy.
+        # Meanwhile the base untracked it and the service kept writing the real copy.
         git(self.root, "rm", "-r", "--quiet", "--cached", ".work")
         self.write(".gitignore", ".work/\n")
         git(self.root, "add", ".gitignore")

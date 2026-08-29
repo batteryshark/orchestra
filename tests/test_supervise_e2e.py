@@ -117,7 +117,7 @@ class E2ETestCase(unittest.TestCase):
             "STUB_SESSION_GONE": "",
         })
         self.env.start()
-        # Work is not running here: seed the project cache directly, which is
+        # No source is running here: seed the project cache directly, which is
         # exactly the offline path the CLI depends on (DESIGN §2).
         con = db.connect()
         from tests.util import seed_project

@@ -330,7 +330,7 @@ class DaemonTests(unittest.TestCase):
     def test_tick_report_contract(self) -> None:
         """The tick is the RUNNER's own maintenance and nothing else: it
         completes and reports every job with no external automation anywhere
-        — a work source's bridge is its own process, never a tick job.
+        — a source's bridge is its own process, never a tick job.
         """
         report = daemon.tick()
         self.assertEqual(set(report), {

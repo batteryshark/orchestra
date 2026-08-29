@@ -160,7 +160,7 @@ class IdentityTests(RegistryFixture):
         self.seed()
         self.assertTrue(project.forget(self.con, "mine"))
         self.assertIsNone(project.by_slug(self.con, "mine"))
-        with self.assertRaisesRegex(SystemExit, "cached from a work source"):
+        with self.assertRaisesRegex(SystemExit, "cached from a source"):
             project.forget(self.con, "demo")
 
     def test_archive_hides_from_the_default_list(self) -> None:

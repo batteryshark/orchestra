@@ -120,12 +120,12 @@ class DbTests(unittest.TestCase):
 
     def test_v24_source_named_columns_are_renamed_once_and_keep_their_values(
             self) -> None:
-        """Schema v25 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, both tables.
+        """Schema v25 (one-shot rename; source boundary). ONE SHOT, both tables.
 
         ``runs.work_claim_status`` becomes ``claim_status`` and
         ``nod_requests.work_item`` becomes ``ref``: same values, same index
-        coverage, and the old spelling is gone rather than tolerated. §6
-        forbids a reader that accepts two shapes, so the old names must not
+        coverage, and the old spelling is gone rather than tolerated. The
+        one-shot rule forbids a reader that accepts two shapes, so the old names must not
         survive the upgrade.
         """
         v24 = (db.SCHEMA

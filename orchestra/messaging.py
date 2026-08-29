@@ -15,8 +15,7 @@ its own judgement rather than being left hanging.
 Both sides of an ``ask`` belong in the source item's thread, because a
 decision that only exists on a phone is not a record. This module does not
 put them there: it records the question and the answer as ``ask``/``answer``
-rows on the run, and the source's ADAPTER carries them (CONTRACT §7
-Enforcement). Neither row is deleted when it is carried, so the mirror is a
+rows on the run, and the source's ADAPTER carries them (source boundary). Neither row is deleted when it is carried, so the mirror is a
 read, not a queue.
 
 Undeliverable is a state, not a deletion. A message whose run ended before
@@ -65,7 +64,7 @@ def queue_tell(con: sqlite3.Connection, run_id: int, sender: str, body: str,
 
     ``commit=False`` leaves this function's transaction open so a caller can
     attach its own row to the same admission — the pattern ``create_run``
-    already uses. The Work adapter's ferry needs it: its thread watermark and
+    already uses. The source adapter's ferry needs it: its thread watermark and
     the message that explains it must land together or not at all, and after
     schema v21 that watermark is the adapter's row to write, not this one's.
     """
@@ -201,7 +200,7 @@ def file_question(con: sqlite3.Connection, cfg: dict, run, question: str,
         "INSERT INTO messages(run_id, sender, body, kind, created_at, delivered_at) "
         "VALUES(?,?,?,?,?,?)",
         (run_id, f"run {run_id}", question, ASK_KIND, db.now(), db.now()))
-    con.commit()   # the adapter reads this row and mirrors it (CONTRACT §7)
+    con.commit()   # the adapter reads this row and mirrors it (source boundary)
     callbacks.fire(cfg, "on_run_blocked",
                    {"ORCHESTRA_RUN_ID": str(run_id),
                     "ORCHESTRA_BLOCK_KIND": "ask"})

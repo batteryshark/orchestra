@@ -1114,7 +1114,7 @@ const PANES = {
     if (!thread.length)
       box.append(el("p", "dim",
         "nothing was told to this run and it asked nothing"));
-    // A Work-backed run's completion writeback already carries the summary
+    // A source-backed run's completion writeback already carries the summary
     // into the thread; a second handoff card under it would say it twice.
     if (r.summary && !thread.some((m) => m.kind === "completion"))
       box.append(handoffItem(r.summary));
@@ -1507,7 +1507,7 @@ function turnItem(t) {
 // One dropdown per judgment layer, over /api/seats. Empty derives the seat
 // from profile tiers — except the router, where empty is routing off.
 const SEAT_ROWS = [
-  ["router", "router", "picks each swept run's profile; (off) keeps the [work] profile"],
+  ["router", "router", "picks each swept run's profile; (off) keeps the caller's default profile"],
   ["observer", "observer", "judges live runs out of band"],
   ["planner", "planner", "takes the conductor's turns"],
   ["verify", "verifier", "reviews every landing"],

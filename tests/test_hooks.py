@@ -259,7 +259,7 @@ class HookRuntimeTests(HookFixture):
     def test_forced_compaction_reinjects_the_bounded_run_brief(self) -> None:
         text = brief.compose(
             run_id=1, slug="brave_otter", profile={"name": "stub"},
-            mission="Work task W-0001: demo item", requester="human",
+            mission="Source task W-0001: demo item", requester="human",
             root=self.tmp_path, workdir=str(self.tmp_path),
             recent_commits=["secret landed detail"],
             extra_context="secret additional context",

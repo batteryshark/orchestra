@@ -1,4 +1,4 @@
-"""The outbound feed: a cursored read, not a callback (CONTRACT §7, 0.10).
+"""The outbound feed: a cursored read, not a callback (source boundary).
 
 Orchestra publishes run rows with a monotonic marker and holds nothing about
 who reads them — no subscriber list, no endpoint, no delivery state. So the

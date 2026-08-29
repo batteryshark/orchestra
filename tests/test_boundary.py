@@ -1,6 +1,6 @@
-"""CONTRACT §7 became structure: the adapter LEFT the repository.
+"""The source boundary became structure: the adapter LEFT the repository.
 
-The old enforcement allowed five adapter modules to know the Work source.
+The old rule allowed five adapter modules to know the one source.
 The eviction moved them to the sibling work-bridge project — a consumer of
 Orchestra's library and API — so the rule is now absolute: nothing in
 ``orchestra/`` names a source, imports a source client, or reads a
@@ -44,7 +44,7 @@ class BoundaryTests(unittest.TestCase):
     def test_the_evicted_modules_stay_evicted(self):
         present = {p.stem for p in CORE.glob("*.py")} & EVICTED
         self.assertEqual(present, set(),
-                         f"{sorted(present)} came back: the Work automation "
+                         f"{sorted(present)} came back: the source automation "
                          "lives in work-bridge, not here")
 
     def test_nothing_imports_an_evicted_name(self):

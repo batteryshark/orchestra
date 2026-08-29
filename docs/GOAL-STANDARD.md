@@ -1,5 +1,4 @@
-<!-- Vendored copy of the craft-goal skill in ~/Projects/work/skills/craft-goal/
-STANDARD.md, taken 2026-08-25. The refine lane's brief points every
+<!-- Vendored copy of the craft-goal skill's STANDARD.md, taken 2026-08-25. The refine lane's brief points every
 refinement run at THIS file (orchestra/refine.py), so the standard ships with
 Orchestra instead of depending on a skill checkout. Re-copy when the source
 changes; never edit this copy. -->
@@ -9,7 +8,7 @@ changes; never edit this copy. -->
 What a goal or epic must contain before an executor — human or agent — can
 run with it and not guess. `craft-goal` builds to this standard, `grade-goal`
 scores against it, `split-goal` refuses input that fails it. The standard is
-tool-neutral: it describes a markdown document. Mapping onto the Work system
+tool-neutral: it describes a markdown document. Mapping onto a tracker
 is a thin layer at the end.
 
 ## Vocabulary
@@ -127,15 +126,15 @@ layer ("the DB part"). Children carry a one-line pointer to the parent's
 purpose so the executor can break ties without asking. Slices are candidates;
 execution may reshape them.
 
-## Work mapping
+## Tracker mapping
 
-When the item lives in the Work system, the document above maps 1:1 onto a
-Work task — the sections keep their names and order; Work adds `Progress Log`
+When the item lives in a tracker, the document above maps 1:1 onto a
+tracker task — the sections keep their names and order; the tracker adds `Progress Log`
 and `Completion Summary`, which this standard leaves alone.
 
 - A goal is a top-level task (`parentId: null`); an epic's children are tasks
   with `parentId` set to it. One level only.
-- The checkbox economics are enforced: Work refuses `review` and `blocked`
+- The checkbox economics are enforced: the tracker refuses `review` and `blocked`
   while any checkbox is neither ticked nor declined-with-a-reason.
 - A goal enters execution only when a human ticks `delegated` and moves it
   `backlog → ready`. No skill does either.

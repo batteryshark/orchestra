@@ -144,7 +144,7 @@ def profile_name(cfg: dict) -> str:
 
     Per-goal configurable: settings merge per project, so a
     ``[project."<id>".settings]`` table picks a different observer for that
-    project's goals. ponytail: per-Work-item granularity has nowhere to live
+    project's goals. ponytail: per-item granularity has nowhere to live
     yet — add it when an item carries its own settings.
 
     There are no default profiles (DESIGN §5), so an unconfigured install is
@@ -1034,7 +1034,7 @@ def _capacity_window_left(con, run) -> float | None:
 
 def infra_streak(con, run) -> int:
     """Consecutive infrastructure-shaped failures on the same item, this one
-    included. The item is the Work item when there is one, else the retry
+    included. The item is the caller's ref when there is one, else the retry
     lineage — a run dispatched by hand is still 'the same item' to itself."""
     if run["ref"]:
         rows = con.execute(

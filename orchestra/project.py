@@ -5,7 +5,7 @@ else. Orchestra is a runner: the checkout a run works in is the CALLER's to
 supply at dispatch, and the durable answer to "where does this project run"
 is the run history itself (``runs.repo``), not a stored path. A source
 adapter caches its own label-to-folder map in its own table (``checkouts``,
-owned by ``sweeper.py``); the core never reads it (CONTRACT §7 Enforcement).
+owned by ``sweeper.py``); the core never reads it (source boundary).
 
 Settings, run numbering, and the per-project state directory all key on
 ``project_id``; humans address a project by ``slug``.
@@ -109,7 +109,7 @@ def create(con, name: str) -> "Project":
 
 
 def remember_identity(con, entries: list, prune: bool = True) -> int:
-    """The ONE seam an adapter writes identities through (CONTRACT §7).
+    """The ONE seam an adapter writes identities through (source boundary).
 
     ``entries`` is a list of ``(project_id, name, archived)``; the adapter
     keeps its label-to-folder map in its own table. The upsert never touches
@@ -151,7 +151,7 @@ def forget(con, selector: str) -> bool:
         return False
     if not hit.local:
         raise SystemExit(
-            f"orchestra: {hit.slug} is cached from a work source; archive it "
+            f"orchestra: {hit.slug} is cached from a source; archive it "
             "here, or remove it at the source")
     con.execute("DELETE FROM projects WHERE project_id=?", (hit.project_id,))
     con.commit()
@@ -286,7 +286,7 @@ def is_workspace(root: Path) -> bool:
 
     The one place isolation is skipped rather than demanded: a workspace has
     no repository to branch from and never had one. A REAL checkout that is
-    not a git repository still fails closed when [work] worktree is on — a
+    not a git repository still fails closed when worktree isolation is on — a
     run that quietly shares a checkout it was told to isolate from is the
     thing that guard exists to prevent.
     """

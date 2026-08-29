@@ -81,7 +81,7 @@ def postcompact_context(text: str) -> str:
     """The frozen parts of a run brief that must survive compaction."""
     # The snapshot's first line is ``<id> · <title> [<state>]``. The id is an
     # opaque ref — the shape of the line, not a source's id format, is what
-    # is matched here (CONTRACT §7 Enforcement 1).
+    # is matched here (source boundary).
     item = re.search(r"(?m)^([A-Za-z0-9_.:-]+)\s*·\s*(.*?)\s*\[[^\n]*\]$", text)
     identity = (f"Item: {item.group(1)}\nTitle: {item.group(2)}" if item else
                 _section(text, "Mission").split("\n\n", 1)[0])
@@ -123,7 +123,7 @@ Project: `{root}` · Working directory: `{workdir}`.
 {mission}
 """]
     if recent_commits:
-        # Frozen at dispatch like the Work snapshot, and for the same reason:
+        # Frozen at dispatch like the item snapshot, and for the same reason:
         # a run reads its brief again on resume, and a brief that changed
         # underneath it describes a project it never worked on.
         listed = "\n".join(f"- {line}" for line in recent_commits)
@@ -136,7 +136,7 @@ Project: `{root}` · Working directory: `{workdir}`.
         # Phase-2 seam: the source adapter freezes the item snapshot at
         # dispatch and passes it here, capped at 2,000 chars (D6). The
         # protocol beside it — the source's own checklist verbs — is rendered
-        # by the adapter too; this file knows no source (CONTRACT §7).
+        # by the adapter too; this file knows no source (source boundary).
         parts.append(f"## Item snapshot\n\n{snapshot[:SNAPSHOT_MAX_CHARS]}\n")
         if snapshot_protocol:
             parts.append(snapshot_protocol)
@@ -172,7 +172,7 @@ Run {parent['id']} is leading this work and asked you for one bounded piece:
 the mission above, and nothing beyond it.
 
 - Do the piece. Do not widen it, and do not take over the lead's mission.
-- Do not merge, land, or report to Work. Your branch is your answer, and
+- Do not merge, land, or report to the source. Your branch is your answer, and
   run {parent['id']} decides what of it survives.
 - Finish with a summary that says what you did and what you did not, plainly.
   It is read by the lead, not by a human.
