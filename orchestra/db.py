@@ -652,6 +652,7 @@ def _retire_resurrected(con: sqlite3.Connection) -> None:
                          ("work_progress_at", "progress_at")):
         if column not in names:
             continue
+        con.executescript(WORK_MARKS_SQL)
         # The adapter's own table is the home. A mark already there WINS: it
         # was written by code that understood the new shape, where the twin
         # may hold a value an old backfill re-derived.
@@ -751,7 +752,6 @@ def connect(db_file=None) -> sqlite3.Connection:
     upgrading_v16 = bool(existing) and any(
         name not in existing for name, _ in RUNS_V16_COLUMNS)
     if existing:  # extend a pre-existing table before SCHEMA's indexes run
-        con.executescript(WORK_MARKS_SQL)  # both migrations below fill it
         for name, sql_type in (RUNS_V4_COLUMNS
                                + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
                                + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
@@ -768,6 +768,7 @@ def connect(db_file=None) -> sqlite3.Connection:
         # It runs BEFORE the v16 backfill: real receipts move first, and the
         # backfill then fills only what is still missing.
         if "work_item" in existing and "ref" not in existing:
+            con.executescript(WORK_MARKS_SQL)  # this migration fills it
             con.execute("ALTER TABLE runs RENAME COLUMN work_item TO ref")
             con.execute("DROP INDEX IF EXISTS idx_runs_work_item")
             con.execute(
@@ -804,7 +805,10 @@ def connect(db_file=None) -> sqlite3.Connection:
                 "UPDATE runs SET landing_status=COALESCE(landing_status, 'ok'), "
                 "handoff_processed_at=COALESCE(handoff_processed_at, "
                 f"finished_at, ?) WHERE {settled}", (now(),))
-            # The writeback receipt is the Work adapter's since v21.
+            # The writeback receipt is the consumer's since v21; the table
+            # exists here only so this one-shot backfill has somewhere to
+            # write, and its owner lifts it out on first contact.
+            con.executescript(WORK_MARKS_SQL)
             con.execute(
                 "INSERT INTO work_marks(run_id, reported_at) "
                 f"SELECT id, COALESCE(finished_at, ?) FROM runs WHERE {settled} "
