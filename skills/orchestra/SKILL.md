@@ -6,8 +6,9 @@ description: Use Orchestra to dispatch and supervise an already-formed coding or
 # Orchestra
 
 Orchestra runs missions through Codex, Claude Code, OpenCode, or Reasonix behind
-one lifecycle, trace, control, and result surface. Work is an optional intent
-and ledger adapter. A locally registered project needs no Work server.
+one lifecycle, trace, control, and result surface. A source tracker is an
+optional intent and ledger adapter. A locally registered project needs no
+source server.
 
 Check the installation before dispatching:
 

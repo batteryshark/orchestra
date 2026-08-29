@@ -58,7 +58,7 @@ when a run reaches ``done``. It lands the branch, files a Nod card when a
 human must choose, writes the report into the run's own thread, and stamps
 the landing receipt — ``landing_status`` plus ``landing_commit`` — on the run
 row. It reports to no source: rebasing a branch and moving a ref must not
-know a record system exists (CONTRACT §7 Enforcement). Whoever reports a run
+know a record system exists (source boundary). Whoever reports a run
 to its source reads the receipt. Nothing in here may break finalization.
 """
 import inspect
@@ -300,8 +300,8 @@ def rebase_dropping_ignored(root: Path, scratch: Path, base: str) -> tuple[bool,
     """Rebase the run branch, dropping anything the base does not track.
 
     The host checkpoints with `git add -A`, so it sweeps up whatever sits in
-    its worktree — including a service's live record store. Work rewrites those
-    files continuously while the run holds its branch, so both sides edit the
+    its worktree — including a live service's own record store. That service
+    rewrites those files continuously while the run holds its branch, so both sides edit the
     same append-only log and the rebase conflicts EVERY time. Nothing raced:
     two processes own one file, and retrying cannot help. That was the
     recurring "did not land on main" card, and it was never a decision worth
@@ -677,8 +677,7 @@ def _record_landing(con, run: dict, status: str | None,
                     note: str | None = None, commit: str | None = None) -> None:
     """Stamp the landing receipt and keep its human reason on the result row.
 
-    The receipt is the WHOLE outbound interface of this module (CONTRACT §7
-    Enforcement): verdict, merge commit, and the human line, all on the run
+    The receipt is the WHOLE outbound interface of this module (source boundary): verdict, merge commit, and the human line, all on the run
     row. Whoever reports a run to its source reads them there — this module
     knows git and nothing about a board.
 
@@ -826,7 +825,7 @@ def _land(con, cfg: dict, run: dict, status: str,
     note = _note(run, result, request_id)
     # The verdict is deliberate and final either way, so the receipt closes
     # here and nothing waits on a remote system being reachable. Delivery is
-    # the consumer's cursor, not this path's retry (CONTRACT §7 Enforcement 2).
+    # the consumer's cursor, not this path's retry (source boundary).
     _record_landing(con, run, "ok" if result["ok"] else "failed", note,
                     commit=result["commit"])
     return note
@@ -840,7 +839,7 @@ def _is_resolver(run: dict) -> bool:
 
 def _thread(con, run_id: int, body: str) -> None:
     """The run's own thread. This is the whole report for a hand-dispatched
-    run, which has no Work item to post to."""
+    run, which has no source item to post to."""
     existing = [row["body"] for row in con.execute(
         "SELECT body FROM messages WHERE run_id=? AND kind='merge'", (run_id,))]
     success = body.startswith(f"run {run_id} landed `") or (
@@ -866,7 +865,7 @@ def _checks_line(result: dict) -> str:
 
 
 def _report_text(run: dict, result: dict, request_id: str | None) -> str:
-    """The comment that goes in the Work thread and the run thread.
+    """The comment that goes in the source's thread and the run thread.
 
     DESIGN §9 names its contents: merge commit, files changed, check results,
     and the revert command.
@@ -929,7 +928,7 @@ def _file_card(con, cfg: dict, run: dict, result: dict) -> str | None:
     """
     channels = nod.from_cfg(cfg)
     if channels is None:
-        return None  # the human loop is off; the Work item still carries it
+        return None  # the human loop is off; the source item still carries it
     detail = [f"`{result['branch']}` did not land on `{result['base']}`.",
               f"Stage `{result['stage']}`: {result['escalation']}"]
     if result["conflicts"]:

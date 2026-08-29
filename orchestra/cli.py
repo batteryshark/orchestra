@@ -1356,7 +1356,7 @@ def main():
     s.add_argument("--context", help="extra context appended to the brief")
     s.add_argument("--title")
     s.add_argument("--ref", help="opaque tracking token stored on the run and "
-                   "echoed back; the core never parses it (CONTRACT 0.12)")
+                   "echoed back; the core never parses it")
     s.add_argument("--requester", help="requested_by recorded on the run "
                    "(default: [settings] default_requester)")
     isolation = s.add_mutually_exclusive_group()
@@ -1499,7 +1499,7 @@ def main():
     s = sub.add_parser("merge", help="run declared checks and tripwires, then "
                                     "land a run branch on the base")
     s.add_argument("branch", help="run branch, e.g. orchestra/run-7")
-    s.add_argument("--item", help="Work item id, for the merge commit message")
+    s.add_argument("--item", help="source item id, for the merge commit message")
     s.set_defaults(fn=cmd_merge)
 
     s = sub.add_parser("prune", help="remove run worktrees nobody owns and the "

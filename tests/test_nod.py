@@ -59,7 +59,7 @@ class CreateTests(NodTestCase):
         card = self.nod.requests[got["request_id"]]
         self.assertEqual(card["title"], "Deploy?")
         self.assertEqual(card["channel_id"], DECISIONS_CHANNEL)
-        self.assertEqual(card["links"][0]["label"], "Work item")
+        self.assertEqual(card["links"][0]["label"], "Source item")
         self.assertEqual(card["links"][1]["url"], "http://run/7")
         # The server's create body is deny_unknown_fields and has no
         # `priority`, so sending it would 422 the whole escalation.

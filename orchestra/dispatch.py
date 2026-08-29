@@ -19,7 +19,7 @@ functions rather than reimplementing them:
   claims something is running while it waits stops being trusted.
 - **Order** lives in the ADAPTER (``sweeper.plan``), not here: which item
   blocks which, and what a board's lane order means, is the source's own
-  schema (CONTRACT §7). This module only records who waits and why, with
+  schema (source boundary). This module only records who waits and why, with
   ``item_id`` as an opaque string.
 """
 import json
@@ -120,7 +120,7 @@ def hold(con, item_id: str, kind: str, lane_index: int | None,
          reason: str, detail: str | None) -> bool:
     """Record that ``item_id`` waits, and why. Returns True when this is new
     or the reason changed, so a caller logs the transition once instead of
-    every pass. The Work item gets NO claim fact — that happens at actual
+    every pass. The source item gets NO claim fact — that happens at actual
     dispatch and nowhere else, so a waiting item never reads in_progress."""
     now = db.now()
     row = con.execute("SELECT reason, detail FROM dispatch_queue WHERE item_id=?",

@@ -3,7 +3,7 @@
 Foreground loop, launchd-supervised: each tick recovers abandoned admissions,
 resumes held policy work, releases dependency-ready runs, polls runway, and
 acts on answered human-loop cards. The RUNNER's own maintenance and nothing
-else: any external automation (a work source's bridge, a cron script) is its
+else: any external automation (a source's bridge, a cron script) is its
 own process against the same database and API. SIGTERM/SIGINT stop it
 between ticks, so launchd's stop signal never lands mid-pass.
 

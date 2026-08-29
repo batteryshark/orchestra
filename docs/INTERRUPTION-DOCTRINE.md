@@ -35,6 +35,6 @@ Each offense dies by a structural rule, not a policy note.
 | Noise drowning signal | Signal has a named layer. Filter in SQL, not on the client. | `GET /api/turns?layer=` |
 | Notification scoped wrong | Pin or notify only the project named on the event. No project → pin nowhere. | `http._pinned_turns` requires `project_id` |
 | "New build — restart" pill | The class has no host. `/api/service/update` does not exist. | absent route |
-| Stale report overwrites the present | A run appends facts and never writes status; a human move dismisses every earlier run's narrative (CONTRACT 0.8) | derivation in Work; runs 234/238/240/242/249's ghosts were the offense record |
+| Stale report overwrites the present | A run appends facts and never writes status; a human move dismisses every earlier run's narrative (the source's status rule) | derivation at the source; runs 234/238/240/242/249's ghosts were the offense record |
 
 Phone rule: ring only on **interrupt**. Alerts that report (dismiss-only) stay on the alerts channel and do not use the decisions channel. Run start and run finish never buzz.

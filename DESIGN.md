@@ -6,7 +6,7 @@ optional policy and calls out incomplete paths.
 ## Mission
 
 Orchestra is a local execution plane for agent work. It accepts a mission from
-a person, an agent, or Work, starts the selected harness, and keeps a durable
+a person, an agent, or an external source, starts the selected harness, and keeps a durable
 record of its lifecycle, trace, controls, and outcome.
 
 Codex, Claude Code, OpenCode, and Reasonix are the supported harnesses today.
@@ -14,14 +14,14 @@ Orchestra normalizes how their runs are launched, observed, controlled, and
 reported. Harness-native tools, permissions, configuration, and model catalogs
 remain harness-specific.
 
-Work automation, git landing, routing, conducting, human escalation, provider
+Source automation, git landing, routing, conducting, human escalation, provider
 runway, and the iOS client are policies or integrations. Direct dispatch does
 not require them.
 
 ## Product boundary
 
 Orchestra owns execution after it receives a mission. The caller owns intent. A
-Work-backed conductor may decompose a human-delegated goal, but that is an
+source-backed conductor may decompose a human-delegated goal, but that is an
 optional policy rather than the definition of a run.
 
 Each run has a durable numeric id. A profile selects its harness, model, effort,
@@ -36,7 +36,7 @@ current behavior rather than the original build plan.
 
 ## 1. External automation and the registry
 
-Orchestra hosts NO source integration. The Work automation — the sweep, the
+Orchestra hosts NO source integration. The source automation — the sweep, the
 conductor, the verify lane, the findings filer, the router — lives in the
 sibling **work-bridge** project: a consumer that knows both sides so that
 neither knows the other. The bridge drives Orchestra through its library
@@ -93,7 +93,7 @@ unattended lanes skip its items. Nothing else changes: manual
 flight is untouched, and statistics, run listings, `orchestra show`, and every
 run the project already owns read exactly as before.
 
-What the bridge does with Work — claiming, ferrying, reporting, sign-off,
+What the bridge does with its source — claiming, ferrying, reporting, sign-off,
 the conductor's planner turns — is the bridge's own documentation, tested
 in its own repository. Orchestra needs none of it for registration or
 direct dispatch.
@@ -174,9 +174,8 @@ board counter, and `GET /api/runs?since=<revision>` pages the rows past a
 caller's cursor. Orchestra holds no subscriber list, no endpoint and no
 delivery state, so it cannot learn who consumes it; the consumer's own cursor
 is the delivery guarantee, which is why no retry queue exists on this side.
-The Work adapter reads it like any other consumer would. A push relay could
-subscribe and POST without Orchestra learning anything (CONTRACT §7
-Enforcement).
+The source adapter reads it like any other consumer would. A push relay could
+subscribe and POST without Orchestra learning anything (source boundary).
 
 The HTTP server can bind to loopback or a discovered Tailscale address. Host
 checks still apply on a tailnet — but the shared key does not have to: a
@@ -211,13 +210,13 @@ excepted) — a worktree of the run database is never what anyone meant.
 An isolated run uses a branch named `orchestra/run-N`. The bridge's
 unattended dispatches request isolation by default too. If worktree setup or rehoming
 fails, launch fails closed; unattended execution never changes to the owner's
-checkout. A project's `[work] worktree = false` is the explicit shared mode.
+checkout. A project's `worktree = false` in the source's own config table is the explicit shared mode.
 
 Orchestra has no global, per-project, or per-profile concurrency cap. The
 visible live count and pause switch are the admission controls. Pause stops
 manual and policy-driven admission, including continuations and ready dependency
 launches. Live work, automatic landing, completion reporting, failed dependency
-settlement, completion-only Nod actions, runway and project refresh, Work message
+settlement, completion-only Nod actions, runway and project refresh, source message
 ferrying, and health maintenance continue. Ordinary conductor events,
 infrastructure retries, resolver answers, and completion judgments are retained
 for resume. A paused judgment does not spend its planner turn.
@@ -250,14 +249,14 @@ readable from the CLI with every source down.
 The durable write comes FIRST, before any delivery is attempted. The earlier
 shape filed the decision and kept the request only in its return value, so
 every failure path reported that a human was needed while destroying what it
-asked for (2026-08-28: an agent's request reached neither Work nor any local
+asked for (2026-08-28: an agent's request reached neither the source nor any local
 row, and the values were unrecoverable).
 
 There is no team, roster, council, squad, or other grouping layer.
 
 ## 6. Execution and messaging
 
-`prepare_launch` freezes the brief and Work snapshot, creates the raw log, and
+`prepare_launch` freezes the brief and item snapshot, creates the raw log, and
 optionally prepares an isolated worktree. The detached supervisor mints a
 per-run control token, builds the harness command, starts it, and records its
 terminal status and handoff.
@@ -292,8 +291,8 @@ dispatched afresh.
 ## 8. Optional human loop
 
 Nod can deliver blocking decisions and alerts outside the worker session. It is
-disabled by default. Run summaries remain local, and Work-backed runs also keep
-their comments in Work.
+disabled by default. Run summaries remain local, and source-backed runs also keep
+their comments at the source.
 
 The CLI retains direct `ask`, `show`, and `cancel` operations for this
 adapter. Nod is not part of the minimum execution path.
@@ -316,7 +315,7 @@ actually ran.
 Landing reports to no source. It stamps `landing_status` and `landing_commit`
 on the run row and writes its report into the run's own thread. A source
 adapter reads that receipt and posts the fact, because rebasing a branch and
-moving a ref must not know a record system exists (CONTRACT §7 Enforcement).
+moving a ref must not know a record system exists (source boundary).
 
 Landing is a POLICY, and `[merge] enabled = false` turns the automatic path
 off: the run then ends at its branch and a `landing_status` of `skipped`,
@@ -328,12 +327,12 @@ An explicit retry (`retry_landing`) still lands: the switch gates the
 automatic path, never the owner's own hand.
 
 Every successful run's final handoff is parsed. Findings and proposals are filed
-only when Work is configured and the run has Work context. They have no local
+only when a source is configured and the run has source context. They have no local
 durable collection, so the dashboard and iOS client do not present one.
 
 ## 10. The conductor (moved out)
 
-The conductor lives in the work-bridge project with the rest of the Work
+The conductor lives in the work-bridge project with the rest of the source
 automation. Its planner turns still record as `layer` rows in `runs`
 (through the library), so the dashboard shows them like any control turn —
 but no conductor code exists in this repository.
@@ -365,10 +364,10 @@ last trace, checkpoints isolated changes, and atomically records the terminal
 row, usage, message delivery state, completion notice, and any retry hold. That
 commit precedes worktree release. The refreshed row is the result.
 
-Landing, findings, retry handling, dependency release, and Work reporting then
+Landing, findings, retry handling, dependency release, and source reporting then
 consume it. Landing and handoff completion leave structured receipts on the same
 row; the daemon replays any missing consumer after proving the old supervisor
-and worker are gone. Work reporting waits for completion, landing, handoff, and
+and worker are gone. Source reporting waits for completion, landing, handoff, and
 retry policy to settle, so an execution outcome cannot be mistaken for a landed
 result or a failure that is already being retried.
 
@@ -383,9 +382,9 @@ another subsystem already depends on.
 2. Never merge in the owner's checkout — the merge would collide with the
    uncommitted work a checkout routinely holds; `merge.py` rebases in a
    throwaway worktree and moves the base with `git update-ref`.
-3. Never write a Work item's status from a run — status has one writer class,
+3. Never write a source item's status from a run — status has one writer class,
    the human, and a run that transitions an item overwrites the human's own
-   move (CONTRACT 0.8); the bridge's client offers no status call.
+   move (the source's status rule); the bridge's client offers no status call.
 4. Never let the worker report to a source — a worker that files its own
    findings can forget, self-approve, or hand itself work; `handoff.py`
    parses and enforces the protocol after the run, and the bridge files the
@@ -419,7 +418,7 @@ another subsystem already depends on.
     length of the line each event came from.
 13. Never let the core know a source — the adapter LEFT the repository
     (the work-bridge project), so the rule is absolute: no module imports a
-    source client, none is named for one, none reads a `[work]` table, and
+    source client, none is named for one, none reads a source's config table, and
     `runs.ref` / `nod_requests.ref` are opaque strings the core stores and
     never parses; `tests/test_boundary.py` asserts all of it.
 14. Never attempt delivery before the durable write — a record that exists
@@ -435,5 +434,5 @@ another subsystem already depends on.
 - Making harness-native tools look identical.
 - A dynamic harness plug-in system before another real adapter needs it.
 - Process-level containment or distributed multi-machine scheduling.
-- Making Work mandatory for direct execution.
+- Making any source mandatory for direct execution.
 - Linux service-manager integration in the current release.

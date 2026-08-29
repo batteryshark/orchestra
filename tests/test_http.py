@@ -1283,7 +1283,7 @@ class SeatsAndOutageTests(ServerCase):
                          self.config_path.read_text())
 
     def test_a_seat_refuses_what_the_config_does_not_hold(self) -> None:
-        # `verify` was a seat until the Work automation left for the
+        # `verify` was a seat until the source automation left for the
         # bridge; an evicted seat refuses like any unknown one.
         for body in ({"seat": "conductor", "profile": "probe"},
                      {"seat": "verify", "profile": "probe"},

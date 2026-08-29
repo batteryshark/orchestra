@@ -16,7 +16,7 @@ Shape:
   control turns, newest first, optionally one project's and one layer's. The
   snapshot pins only the latest per project; reading the observer's reasoning
   over time is a screen you open, not a thing worth carrying on a 4s poll.
-- **The outbound feed** (CONTRACT §7 Enforcement 2): ``GET
+- **The outbound feed** (source boundary): ``GET
   /api/runs?since=<revision>`` is the cursored read of run outcomes. Every
   runs row carries ``revision``, the monotonic marker the schema's triggers
   stamp on it; a consumer keeps its own cursor and asks for what is past it.
@@ -246,7 +246,7 @@ DISPATCH_ROUTE = "/api/dispatch"
 # in auth.ROUTES, so the human's alone.
 TURNS_ROUTE = "/api/turns"
 RECENT_TURNS = 200
-# ``GET /api/runs?since=<revision>&limit=<n>`` (CONTRACT §7 Enforcement 2) —
+# ``GET /api/runs?since=<revision>&limit=<n>`` (source boundary) —
 # the cursored feed of run outcomes, oldest change first. Unlisted in
 # auth.ROUTES, so the human's alone: it carries every project's refs and
 # summaries, which is wider than the snapshot's window. ``FEED_PAGE`` is both
@@ -268,7 +268,7 @@ SEATS_ROUTE = "/api/seats"
 # the same comment-preserving surgery every managed config edit uses. An
 # empty router seat turns routing OFF; the other seats then derive from
 # profile tiers.
-# The RUNNER's own judgment seats. A caller-side policy (a work source's
+# The RUNNER's own judgment seats. A caller-side policy (a source's
 # planner, router, or sign-off) configures itself in its own process and
 # never appears here.
 SEATS = {
@@ -365,7 +365,7 @@ def _tailscale_exe() -> str:
 
 
 def tailscale_address() -> str | None:
-    """Bind to the tailnet like Work does, so the phone reaches it and the
+    """Bind to the tailnet, so the phone reaches it and the
     coffee-shop wifi does not.
 
     ponytail: shells out to `tailscale ip -4`; scanning interfaces for the
@@ -743,12 +743,12 @@ def _messages(con, run_id: int) -> list[dict]:
 def _projects(con, runs: list[dict]) -> list[dict]:
     """The projects the dashboard's picker offers (W-0186).
 
-    DERIVED FROM THE RUNS IN THIS SNAPSHOT, never from Work's project list:
+    DERIVED FROM THE RUNS IN THIS SNAPSHOT, never from a source's project list:
     the picker is for switching between the projects you have actually
     kicked something off from, so a project with no run in the window is not
     in it — offering one would filter the board to nothing.
 
-    ``name`` is whatever the run row already resolved (the project's Work id,
+    ``name`` is whatever the run row already resolved (the project's source id,
     else its name); a run with no ``project_id`` belongs to no project and
     contributes nothing.
 

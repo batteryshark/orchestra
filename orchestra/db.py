@@ -13,16 +13,16 @@ Data-model invariants (DESIGN D4):
   message whose run ended before it was delivered. Marked and surfaced, never
   dropped — and never moved to a later run, which would hand a correction to
   a run that never saw the context it referred to.
-- ``runs.ref`` (schema v21, CONTRACT §7 Enforcement 1) is the OPAQUE string a
+- ``runs.ref`` (schema v21, source boundary) is the OPAQUE string a
   caller hands in at dispatch to say what the run is FOR. The core stores it,
-  echoes it back, and never parses it — a Work ``W-####`` task id today, a
-  Linear key or anything else tomorrow, and this table cannot tell the
+  echoes it back, and never parses it — one tracker's task id today, another
+  tracker's key or anything else tomorrow, and this table cannot tell the
   difference. It replaced ``work_item`` (schema v2) and the three ``work_*``
   timestamps that sat beside it, which were never facts about a run: a
   watermark over one source's board is that source's own bookkeeping.
 - A consumer's OWN bookkeeping about runs — which outcome it reported
   where, how far it read a thread — lives in that consumer's own database
-  (the work-bridge ATTACHes one beside this file), never in this schema.
+  (the bridge ATTACHes one beside this file), never in this schema.
   This schema holds facts about runs and projects, nothing else.
 - ``runs.claim_status`` (schema v16 as ``work_claim_status``, renamed in v25)
   is the ADMISSION GATE, and it stayed on ``runs`` when the watermarks left
@@ -30,7 +30,7 @@ Data-model invariants (DESIGN D4):
   a run parked in ``spawning`` while its dispatch is still being confirmed
   somewhere else. ``pending`` / ``claimed`` / ``abandoned`` describe the run's
   own lifecycle; the core never learns what the claim was made against, so the
-  name stopped saying Work (CONTRACT §7 Enforcement 1).
+  name stopped naming a source (source boundary).
 - ``runs.project_id`` (schema v4, the daemon) is the registry's stable
   project id — a local UUID, or whatever id a source adapter cached. Rows key
   on it, never on a path: one central database now holds every project's
@@ -90,7 +90,7 @@ Data-model invariants (DESIGN D4):
   handoff processing records its completion timestamp. ``landing_commit``
   (schema v23) is the merge commit that verdict produced, NULL when the
   landing made none. It is the whole receipt a reporting consumer needs: the
-  landing path writes it and posts nothing (CONTRACT §7 Enforcement). ``pid_identity`` is
+  landing path writes it and posts nothing (source boundary). ``pid_identity`` is
   the worker process's kernel creation token; orphan recovery matches it before
   signaling the stored PID, which may otherwise have been reused.
   ``supervisor_pid_identity`` applies the same reuse check to the process that
@@ -103,8 +103,8 @@ Data-model invariants (DESIGN D4):
   run and the ``ref`` it escalated, so a source adapter can carry the answer
   onward. That column was ``work_item`` until schema v25 and is now the same
   OPAQUE string ``runs.ref`` is: the caller supplies it, the core stores and
-  echoes it, and only an adapter knows it spells a Work id today (CONTRACT §7
-  Enforcement 1). ``channel`` is stored because a Nod issuer token is scoped to
+  echoes it, and only an adapter knows it spells a tracker id today (source
+  boundary). ``channel`` is stored because a Nod issuer token is scoped to
   exactly one channel: a later decision/wait/cancel read has to pick the
   credential for the channel the card was filed to, never guess.
   ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
@@ -126,7 +126,7 @@ Data-model invariants (DESIGN D4):
   trigger: every path that touches a run must bump it. ``runs`` alone —
   everything else the snapshot reads (pause state, runway, health) rides the
   explicit bump ``http.record_health`` makes once per sweeper tick.
-- ``runs.revision`` (schema v22, CONTRACT §7 Enforcement 2) is that same
+- ``runs.revision`` (schema v22, source boundary) is that same
   counter STAMPED ON THE ROW: the monotonic marker of when this run last
   changed. The global number says only THAT something changed; the column
   says WHICH run, so a consumer keeps a cursor and reads the rows past it
@@ -163,7 +163,7 @@ RUNS_V11_COLUMNS = (
     ("run_token_hash", "TEXT"),
 )
 # Schema v13 (W-0183). The staffing turn's one line: which profile it chose
-# and why, or why it fell back to the [work] profile. NULL means routing was
+# and why, or why it fell back to the caller's default profile. NULL means routing was
 # off for that dispatch — there was no decision to explain.
 RUNS_V13_COLUMNS = (
     ("routed_reason", "TEXT"),
@@ -206,15 +206,15 @@ RUNS_V16_COLUMNS = (
 RUNS_V18_COLUMNS = (
     ("project_seq", "INTEGER"),
 )
-# Schema v22 (CONTRACT §7 Enforcement 2). The change marker the cursored read
+# Schema v22 (source boundary). The change marker the cursored read
 # scans. Written only by the triggers below; NULL only between the ALTER and
 # the one-shot backfill in ``connect``.
 RUNS_V22_COLUMNS = (
     ("revision", "INTEGER"),
 )
-# Schema v23 (CONTRACT §7 Enforcement). The merge commit a landing produced,
+# Schema v23 (source boundary). The merge commit a landing produced,
 # beside the ``ok``/``failed`` verdict that already sits there. The landing
-# path used to keep this fact to itself and post it to Work directly; now it
+# path used to keep this fact to itself and post it to the source directly; now it
 # writes the receipt and a consumer reads it.
 RUNS_V23_COLUMNS = (
     ("landing_commit", "TEXT"),
@@ -230,7 +230,7 @@ RUNS_V17_COLUMNS = (
 # source-backed row gets it from the source's adapter on every refresh, so
 # parking a project there parks it here with no local action; a locally
 # adopted row is parked with ``orchestra project archive``. Core code reads
-# the flag and never asks who set it (CONTRACT §7).
+# the flag and never asks who set it (source boundary).
 PROJECTS_V20_COLUMNS = (
     ("archived", "INTEGER NOT NULL DEFAULT 0"),
 )
@@ -281,7 +281,7 @@ NOD_REQUESTS_V14_COLUMNS = (
     ("acted_at", "TEXT"),
 )
 
-# Schema v24 (CONTRACT §7 Enforcement). What the card SAID. An escalation
+# Schema v24 (source boundary). What the card SAID. An escalation
 # record that keeps only a pointer to the push device is not durable: a
 # consumer that carries the same escalation somewhere else — a source
 # adapter filing a decision — has to be able to read it back without asking
@@ -294,7 +294,7 @@ NOD_REQUESTS_V24_COLUMNS = (
 # Declared apart from SCHEMA because the v29 migration below has to fill it
 # before SCHEMA runs.
 CHECKOUTS_SQL = """
--- Schema v29 (CONTRACT §7 Enforcement 1). The Work adapter's label-to-folder
+-- Schema v29 (source boundary). The source adapter's label-to-folder
 -- map: the source's cached project list (``source_ref`` set) plus the
 -- owner's ``link`` bindings (``source_ref`` NULL). Owned by ``sweeper.py``;
 -- the core never reads it. The core's ``projects`` table is identity only.
@@ -310,11 +310,11 @@ CREATE INDEX IF NOT EXISTS idx_checkouts_project ON checkouts(project_id);
 # Declared apart from SCHEMA because the v21 migration below has to fill it
 # before SCHEMA runs.
 WORK_MARKS_SQL = """
--- Schema v21 (CONTRACT §7 Enforcement 1). The Work adapter's bookkeeping
+-- Schema v21 (source boundary). The source adapter's bookkeeping
 -- about its OWN board, keyed by the run it concerns: how far that ref's
 -- thread has been ferried, whether the completion writeback landed, and when
 -- the heartbeat last posted. These were columns on ``runs`` and were never
--- facts about a run. Owned by ``sweeper.py`` (with the Work-facing tails of
+-- facts about a run. Owned by ``sweeper.py`` (with the source-facing tails of
 -- ``verify.py`` and ``merge.py``); no core module reads this table, the same
 -- arrangement ``conductor_turns`` has with ``conductor.py``.
 CREATE TABLE IF NOT EXISTS work_marks (
@@ -391,7 +391,7 @@ BEGIN
   UPDATE runs SET run_token_hash=NULL WHERE id=NEW.id;
 END;
 -- The board's invalidation counter (DESIGN §3) and, since v22, the run's own
--- change marker (CONTRACT §7 Enforcement 2): every write to runs bumps the
+-- change marker (source boundary): every write to runs bumps the
 -- counter AND stamps the new value on the row that changed. The SSE seam
 -- tails the counter; a cursored consumer range-scans the column. Triggers,
 -- not a call per writer: runs is written from a dozen modules.
@@ -425,7 +425,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 -- Orchestra's project registry: IDENTITY ONLY (schema v29). One row per
 -- project; ``project_id`` is what everything keys on, ``slug`` is the human
 -- address, and ``local`` records who minted the row (1 the owner, 0 an
--- adapter's cache) — provenance, never a source's name (CONTRACT §7).
+-- adapter's cache) — provenance, never a source's name (source boundary).
 -- Checkouts are the caller's business at dispatch; the adapter's own map
 -- lives in ``checkouts`` above.
 CREATE TABLE IF NOT EXISTS projects (
@@ -469,7 +469,7 @@ CREATE TABLE IF NOT EXISTS deferred_dispatches (
   created_at TEXT NOT NULL,
   processed_at TEXT
 );
--- Honest queue state (schema v6, DESIGN §4): a Work item that cannot start
+-- Honest queue state (schema v6, DESIGN §4): a caller's item that cannot start
 -- yet waits HERE, with the reason it waits, instead of being moved to
 -- in_progress on entering a queue. One row per item; ``id`` is the FIFO
 -- tiebreak and ``lane_index`` the ready-lane board position it last had.
@@ -621,7 +621,7 @@ def _retire_resurrected(con: sqlite3.Connection) -> None:
     """Fold away an old column name a stale process put back (2026-08-28).
 
     v21 and v25 rename in ONE SHOT and no reader tolerates the old spelling
-    (CONTRACT §6). That holds for readers; it did not survive a WRITER left
+    (the one-shot rule). That holds for readers; it did not survive a WRITER left
     running across the upgrade. A supervisor started before the upgrade keeps
     pre-v21 code in memory, and its own ``connect`` re-adds every column it
     expects. All five came back on the owner's database, and one of them,
@@ -629,8 +629,8 @@ def _retire_resurrected(con: sqlite3.Connection) -> None:
     columns also re-triggered the v16 backfill.
 
     So "both spellings exist" is a REAL state, and crashing on it took the
-    daemon down. This stays a migration rather than the read-path shim §6
-    forbids: it FOLDS the twin into the live column and DROPS it, so the old
+    daemon down. This stays a migration rather than the read-path shim the
+    one-shot rule forbids: it FOLDS the twin into the live column and DROPS it, so the old
     shape is gone by the time this returns. Folding instead of dropping means
     it never matters which side happened to hold the value.
     """
@@ -760,11 +760,11 @@ def connect(db_file=None) -> sqlite3.Connection:
                                + RUNS_V23_COLUMNS + RUNS_V28_COLUMNS):
             if name not in existing:
                 con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
-        # Schema v21 (CONTRACT §6, §7 Enforcement 1). ONE SHOT, run here and
+        # Schema v21 (one-shot rename; source boundary). ONE SHOT, run here and
         # never again: the source-specific column becomes the opaque ``ref``,
         # and the three board timestamps move to the adapter's own table. No
         # reader below tolerates the old shape — that tolerance is the leak
-        # §6 forbids — so this branch is the only code that ever names them.
+        # the one-shot rule forbids — so this branch is the only code that ever names them.
         # It runs BEFORE the v16 backfill: real receipts move first, and the
         # backfill then fills only what is still missing.
         if "work_item" in existing and "ref" not in existing:
@@ -781,7 +781,7 @@ def connect(db_file=None) -> sqlite3.Connection:
                 con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
         elif "ref" not in existing:
             con.execute("ALTER TABLE runs ADD COLUMN ref TEXT")
-        # Schema v25 (CONTRACT §6, §7 Enforcement 1). ONE SHOT: the admission
+        # Schema v25 (one-shot rename; source boundary). ONE SHOT: the admission
         # gate keeps its place on ``runs`` — the reaper reads it — and stops
         # naming the one source that happens to confirm the claim. Same rule
         # as v21: rename OR add, never a reader that accepts both spellings.
@@ -853,7 +853,7 @@ def connect(db_file=None) -> sqlite3.Connection:
         for name, sql_type in NOD_REQUESTS_V14_COLUMNS + NOD_REQUESTS_V24_COLUMNS:
             if name not in cards:
                 con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
-        # Schema v25 (CONTRACT §6, §7 Enforcement 1). ONE SHOT: an escalation
+        # Schema v25 (one-shot rename; source boundary). ONE SHOT: an escalation
         # carries the same OPAQUE ref a run does, so the column stops spelling
         # one source's name. The index is recreated under its new name by
         # SCHEMA below; no reader accepts the old spelling.

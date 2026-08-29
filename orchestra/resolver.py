@@ -8,7 +8,7 @@ with the reason on stderr.
 
 The retry is ``merge.at_completion`` again — the SAME pipeline an automatic
 landing takes (dirty-base guard, ignored-path dropping, tripwire judge,
-checks, compare-and-swap), the same Work report, and a fresh card if it
+checks, compare-and-swap), the same source report, and a fresh card if it
 escalates again.
 
 The resolver dispatch is a synchronous ``sweeper._claim``-shaped launch:
@@ -79,7 +79,7 @@ def retry_landing(con, cfg: dict, run_id: int) -> str:
         root = project.root_for(con, run)
         if not _branch_exists(root, branch):
             return f"branch {branch} is gone from {root}; nothing to retry"
-        # The shared landing path: same guards, same report to the Work
+        # The shared landing path: same guards, same report to the source's
         # thread, a fresh card if it escalates again, the stale-card
         # withdrawal if it lands. at_completion never raises.
         return merge.retry_landing(con, cfg, dict(run)) \
