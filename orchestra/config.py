@@ -115,6 +115,10 @@ raw_log_retention_days = 0
 # its environment. A missed callback must be covered by the listener's own
 # fallback poll.
 # on_run_finished = "/path/to/notify-listener"
+# Same shape, fired when a run raises an ask or an agent request needs a
+# human decision. ORCHESTRA_RUN_ID (may be empty) and ORCHESTRA_BLOCK_KIND
+# ("ask" or "profile_change") are set in its environment.
+# on_run_blocked = "/path/to/notify-listener"
 # Optional observer policy. There are no budgets and no run ceilings: a
 # long run is a good run, and this is what catches a feral one instead.
 # observer_profile picks the model that judges transcripts out of band;

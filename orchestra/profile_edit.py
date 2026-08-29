@@ -44,7 +44,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import config, db, harnesses, nod, paths, profiles
+from orchestra import callbacks, config, db, harnesses, nod, paths, profiles
 from orchestra.proc import chmod
 
 # The harnesses. The config KEY is still `backend`; "harness" is the word
@@ -580,6 +580,9 @@ def _decide(cfg: dict, name: str, changes: dict, keys: set[str],
     finally:
         if own:
             con.close()
+    callbacks.fire(cfg, "on_run_blocked",
+                   {"ORCHESTRA_RUN_ID": "",
+                    "ORCHESTRA_BLOCK_KIND": nod.PROFILE_CHANGE})
     return {"applied": False, "authority": "agent", "profile": name,
             "needs": sorted(keys), "detail": detail, "title": title,
             "escalation": request_id, "filed": True}

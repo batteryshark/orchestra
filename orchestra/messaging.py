@@ -32,7 +32,7 @@ human only.
 import os
 import sqlite3
 
-from orchestra import db, nod, traces
+from orchestra import callbacks, db, nod, traces
 
 DELIVERY_KIND = "interrupt"   # a tell, delivered by exec boundary or live ACP
 ASK_KIND = "ask"              # the run's question (outbound)
@@ -202,6 +202,9 @@ def file_question(con: sqlite3.Connection, cfg: dict, run, question: str,
         "VALUES(?,?,?,?,?,?)",
         (run_id, f"run {run_id}", question, ASK_KIND, db.now(), db.now()))
     con.commit()   # the adapter reads this row and mirrors it (CONTRACT §7)
+    callbacks.fire(cfg, "on_run_blocked",
+                   {"ORCHESTRA_RUN_ID": str(run_id),
+                    "ORCHESTRA_BLOCK_KIND": "ask"})
     return created["request_id"], seconds
 
 

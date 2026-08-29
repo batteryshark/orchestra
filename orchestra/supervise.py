@@ -27,9 +27,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestra import (acp, auth, brief, child_runs, config, db, dispatch,
-                       handoff, merge, messaging, names, observer, paths,
-                       project, runners, traces, worktree)
+from orchestra import (acp, auth, brief, callbacks, child_runs, config, db,
+                       dispatch, handoff, merge, messaging, names, observer,
+                       paths, project, runners, traces, worktree)
 from orchestra.proc import (enrich_path, process_identity, raise_file_limit,
                             resolve_cmd,
                             session_kwargs, terminate_group, which)
@@ -970,18 +970,9 @@ def notify_run_finished(cfg: dict, run) -> None:
     result and handoff are durable. A callback, not a policy — Orchestra
     learns nothing about who listens, and a listener that misses one is
     expected to have its own fallback poll."""
-    cmd = ((cfg.get("settings") or {}).get("on_run_finished") or "").strip()
-    if not cmd:
-        return
-    env = dict(os.environ, ORCHESTRA_RUN_ID=str(run["id"]),
-               ORCHESTRA_RUN_STATUS=str(run["status"]))
-    try:
-        subprocess.Popen(cmd, shell=True, env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-    except OSError as exc:
-        print(f"orchestra: on_run_finished could not start: {exc}",
-              file=sys.stderr)
+    callbacks.fire(cfg, "on_run_finished",
+                   {"ORCHESTRA_RUN_ID": str(run["id"]),
+                    "ORCHESTRA_RUN_STATUS": str(run["status"])})
 
 
 def finalize_if_unowned(con, run_id: int, *, worker_gone: bool = False) -> bool:
