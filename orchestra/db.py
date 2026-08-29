@@ -20,14 +20,10 @@ Data-model invariants (DESIGN D4):
   difference. It replaced ``work_item`` (schema v2) and the three ``work_*``
   timestamps that sat beside it, which were never facts about a run: a
   watermark over one source's board is that source's own bookkeeping.
-- ``work_marks`` (schema v21, CONTRACT §7) is where those three timestamps
-  went — ``seen_ts`` is the ferry watermark for the ref's thread,
-  ``reported_at`` is the receipt that the completion writeback happened, and
-  ``progress_at`` is the clock the heartbeat pass rate-limits on. One row per
-  run, written on the first mark. Owned by ``sweeper.py``, the Work adapter,
-  exactly as ``conductor_turns`` is owned by ``conductor.py``; nothing in the
-  core reads it, and a second source's adapter brings its own table rather
-  than columns on ``runs``.
+- A consumer's OWN bookkeeping about runs — which outcome it reported
+  where, how far it read a thread — lives in that consumer's own database
+  (the work-bridge ATTACHes one beside this file), never in this schema.
+  This schema holds facts about runs and projects, nothing else.
 - ``runs.claim_status`` (schema v16 as ``work_claim_status``, renamed in v25)
   is the ADMISSION GATE, and it stayed on ``runs`` when the watermarks left
   because the core genuinely reads it: ``daemon._reap_orphans`` must not reap
@@ -48,13 +44,10 @@ Data-model invariants (DESIGN D4):
   lowercase kebab-case, minted once, never rewritten by a refresh.
   ``projects.local`` says who minted the row — 1 the owner, 0 a source
   adapter's cache — which is provenance, not a source's name.
-- ``checkouts`` (schema v29) is the Work adapter's OWN label-to-folder map,
-  owned by ``sweeper.py`` exactly as ``work_marks`` is: the source's cached
-  project list plus the owner's ``link`` bindings. The core never reads it;
-  an unattended dispatch is the adapter resolving its own labels.
-- ``dispatch_queue`` (schema v8, DESIGN §4) holds Work items that cannot
-  start yet, with the reason. It is queue state only: nothing dispatches
-  from a row here, and the run row appears at actual dispatch.
+- ``dispatch_queue`` (schema v8, DESIGN §4) holds caller items that cannot
+  start yet, with the reason — ``item_id`` is opaque here. It is queue state
+  only: nothing dispatches from a row here, and the run row appears at
+  actual dispatch.
 - ``runway_polls`` (schema v5, DESIGN §11) is a self-contained append-only
   log of provider runway polls — one row per adapter per poll, unknowns
   included. It references nothing and nothing references it. ``windows``
@@ -66,10 +59,6 @@ Data-model invariants (DESIGN D4):
   plus the byte offset/length of the line it came from, so a viewer expands
   in place. ``trace_cursors`` is the per-run tail watermark (and the record
   that a terminal run's raw log was pruned).
-- ``finding_fingerprints`` (schema v9, DESIGN §9) is the dedup ledger for
-  filed findings: one row per ``(project, where, normalized claim)``, so a
-  repeat increments ``occurrences`` and comments on ``issue_id`` instead of
-  filing a duplicate Work issue. Owned by ``findings.py``.
 - ``observations`` (schema v9, DESIGN §7) is the spin observer's record: one
   row per judgement, from any of its three layers, with the reasoning that
   produced it. It exists because the observer may never silently kill a run
@@ -82,10 +71,6 @@ Data-model invariants (DESIGN D4):
   statistics are a query and never a re-parse. All NULL when the backend
   reported nothing recognizable — ``usage_source`` names the parser that
   produced the numbers, and NULL there means "not captured", never "zero".
-- ``conductor_turns`` (schema v10, DESIGN §10) is the conductor's log AND its
-  only state: one row per planner turn, carrying the trigger and the key that
-  makes that trigger fire exactly once. Owned by ``conductor.py``; references
-  Work item ids rather than run ids, because a planner turn is not a run.
 - ``runs.run_token_hash`` (schema v11, DESIGN §3/§5, W-0176) is the SHA-256 of
   the per-run token minted at dispatch into the worker's environment. Only the
   hash is ever stored — the raw token lives in the worker's environment and
@@ -340,7 +325,7 @@ CREATE TABLE IF NOT EXISTS work_marks (
 );
 """
 
-SCHEMA = CHECKOUTS_SQL + WORK_MARKS_SQL + """
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -601,48 +586,6 @@ CREATE TABLE IF NOT EXISTS nod_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_nod_requests_run ON nod_requests(run_id);
 CREATE INDEX IF NOT EXISTS idx_nod_requests_ref ON nod_requests(ref);
--- Schema v9 (DESIGN §9). ``fingerprint`` is the hash of (project, where,
--- normalized claim); ``issue_id`` is the Work issue the first occurrence
--- filed, which every repeat comments on instead of duplicating.
-CREATE TABLE IF NOT EXISTS finding_fingerprints (
-  fingerprint TEXT PRIMARY KEY,
-  project_id TEXT,
-  location TEXT NOT NULL,
-  claim TEXT NOT NULL,
-  issue_id TEXT,
-  occurrences INTEGER NOT NULL DEFAULT 1,
-  first_run INTEGER,
-  last_run INTEGER,
-  first_seen_at TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_finding_fingerprints_project
-  ON finding_fingerprints(project_id);
--- Schema v10 (DESIGN §10, the conductor). One row per planner turn, and the
--- conductor's whole memory: the ~2-minute floor, the wait gate, the
--- once-per-event guard and the delta watermark are all queries against it.
--- ``trigger_kind`` + ``trigger_key`` is what makes a trigger fire once and
--- only once — the key is the batch that settled, the run that blocked, the
--- comment's timestamp. ``wait_event`` is the event a `wait` turn named, and
--- until it arrives nothing else wakes that goal. A `wait` turn lives ONLY
--- here: it never reaches the goal's Work thread.
-CREATE TABLE IF NOT EXISTS conductor_turns (
-  id INTEGER PRIMARY KEY,
-  goal_id TEXT NOT NULL,
-  trigger_kind TEXT NOT NULL,
-  trigger_key TEXT NOT NULL DEFAULT '',
-  slug TEXT,
-  profile TEXT,
-  action TEXT NOT NULL,
-  rationale TEXT NOT NULL DEFAULT '',
-  wait_event TEXT,
-  comment_ts TEXT,
-  packet_tokens INTEGER,
-  detail TEXT,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_conductor_turns_goal
-  ON conductor_turns(goal_id, id);
 """
 
 RUN_TERMINAL = ("done", "failed", "timeout", "killed", "halted")

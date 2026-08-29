@@ -2,8 +2,7 @@
 
 Nothing here spawns a real harness, files a real Nod card, or writes into
 the developer's ~/.claude, ~/.codex, ~/.reasonix or ~/.orchestra: every home
-is redirected at a throwaway directory, Nod is tests/fake_nod.py and Work is
-tests/fake_work.py.
+is redirected at a throwaway directory and Nod is tests/fake_nod.py.
 """
 import json
 import os
@@ -13,10 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from orchestra import (brief, config, db, hooks, messaging, runners,
-                       sweeper, traces)
+                       traces)
 from tests.fake_nod import DECISIONS_CHANNEL, DECISIONS_TOKEN, FakeNod
-from orchestra.work_client import WorkClient
-from tests.fake_work import FakeWork
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -33,29 +30,21 @@ expires_after = 2
 # Never the default path: that one is the developer's real Nod credentials.
 secrets_file = "{secrets}"
 
-[work]
-enabled = true
-agent_identity = "orchestra"
-profile = "stub"
 """
 
 
 class HookFixture(unittest.TestCase):
-    """A run row, a fake Nod, a fake Work, and every home redirected."""
+    """A run row, a fake Nod, and every home redirected."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp.name).resolve()
         self.nod = FakeNod()
         self.nod_url = self.nod.start()
-        self.work = FakeWork(workspace_root=self.tmp_path / "workspace")
-        self.work.add_task("W-0001", "demo item")
-        self.work_url = self.work.start()
         self.global_config = self.tmp_path / "global.toml"
         secrets = (self.tmp_path / "nod-secrets.env").as_posix()
-        self.global_config.write_text(
-            CONFIG.format(secrets=secrets) + f'api_url = "{self.work_url}"\n',
-            encoding="utf-8")
+        self.global_config.write_text(CONFIG.format(secrets=secrets),
+                                      encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
             "ORCHESTRA_CONFIG": str(self.global_config),
             "ORCHESTRA_HOME": str(self.tmp_path / "home"),
@@ -82,21 +71,11 @@ class HookFixture(unittest.TestCase):
     def tearDown(self) -> None:
         self.con.close()
         self.env.stop()
-        self.work.stop()
         self.nod.stop()
         self.tmp.cleanup()
 
     def run_row(self):
         return self.con.execute("SELECT * FROM runs WHERE id=1").fetchone()
-
-    def mirror(self) -> list:
-        """The ADAPTER's mirror pass. ``messaging`` records an ask and its
-        answer on the run and posts nothing (CONTRACT §7 Enforcement); the
-        thread only sees them once the sweeper carries them."""
-        actions: list = []
-        sweeper._mirror(self.con, WorkClient(self.work_url, identity="orchestra"),
-                        actions)
-        return actions
 
     def as_run(self, run_id=1):
         return mock.patch.dict(os.environ, {"ORCHESTRA_RUN_ID": str(run_id)})
@@ -316,67 +295,6 @@ class HookRuntimeTests(HookFixture):
                          {"decision": "block", "reason": "go on"})
         self.assertEqual(hooks.render("claude", None), "{}")
         self.assertEqual(hooks.render("opencode", None), "")
-
-
-# --- ask ------------------------------------------------------------------------
-
-class AskTests(HookFixture):
-    def file_one(self, question="which database?"):
-        return messaging.file_question(self.con, self.cfg, self.run_row(), question)
-
-    def test_question_is_filed_and_mirrored_into_the_work_thread(self) -> None:
-        request_id, seconds = self.file_one()
-        self.assertEqual([], self.work.tasks["W-0001"]["log"],
-                         "the ask verb posts nothing itself (CONTRACT §7)")
-        self.assertEqual(1, len(self.mirror()))
-        self.assertEqual([], self.mirror())   # the thread is the watermark
-        self.assertLessEqual(seconds, messaging.MAX_ASK_SECONDS)
-        card = self.nod.requests[request_id]
-        self.assertEqual(card["channel_id"], DECISIONS_CHANNEL)
-        self.assertIn("which database?", card["body_markdown"])
-        self.assertTrue(card["expires_at"])          # the declared fallback
-        row = self.con.execute("SELECT * FROM nod_requests WHERE request_id=?",
-                               (request_id,)).fetchone()
-        self.assertEqual(row["kind"], "blocked")
-        self.assertEqual(row["ref"], "W-0001")
-        self.assertIn("which database?",
-                      self.work.tasks["W-0001"]["log"][-1]["message"])
-
-    def test_the_stop_hook_holds_the_session_and_injects_the_answer(self) -> None:
-        request_id, _ = self.file_one()
-        self.nod.resolve(request_id, text="postgres, not sqlite")  # the device
-        with self.as_run():
-            text = hooks.run_hook("claude", {"hook_event_name": "Stop"})
-        self.assertIn("postgres, not sqlite", text)
-        row = self.con.execute("SELECT * FROM nod_requests WHERE request_id=?",
-                               (request_id,)).fetchone()
-        self.assertEqual(row["status"], "resolved")
-        self.assertIsNone(row["mirrored_at"])   # nothing posted from the core
-        self.assertEqual(2, len(self.mirror()))
-        self.assertIsNotNone(
-            self.con.execute("SELECT mirrored_at FROM nod_requests WHERE "
-                             "request_id=?", (request_id,)).fetchone()["mirrored_at"])
-        kinds = [m["kind"] for m in traces.run_messages(self.con, 1)]
-        self.assertEqual(kinds, ["ask", "answer"])
-        # Both sides reached the Work thread.
-        thread = " ".join(e["message"] for e in self.work.tasks["W-0001"]["log"])
-        self.assertIn("which database?", thread)
-        self.assertIn("postgres, not sqlite", thread)
-
-    def test_expiry_is_the_declared_fallback_not_a_hang(self) -> None:
-        self.file_one()
-        self.nod.resolve_after = None     # nobody ever answers
-        with self.as_run():
-            text = hooks.run_hook("claude", {"hook_event_name": "Stop"})
-        self.assertIn("No answer arrived", text)
-        self.assertIn("own best judgement", text)
-
-    def test_ask_refuses_when_the_human_loop_is_off(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("ORCHESTRA_NOD_BASE_URL")
-            with self.assertRaises(SystemExit):
-                messaging.file_question(self.con, config.load(PROJECT_ID),
-                                        self.run_row(), "anyone there?")
 
 
 # --- undeliverable ----------------------------------------------------------------

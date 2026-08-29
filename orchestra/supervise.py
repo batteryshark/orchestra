@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from orchestra import (acp, auth, brief, child_runs, config, db, dispatch,
-                       findings, merge, messaging, names, observer, paths,
+                       handoff, merge, messaging, names, observer, paths,
                        project, runners, traces, worktree)
 from orchestra.proc import (enrich_path, process_identity, raise_file_limit,
                             resolve_cmd,
@@ -870,7 +870,7 @@ def finalize_run(con, run, status: str, exit_code: int | None, *,
         authoritative = True
 
     summary = (last_text or "").strip()[:2000] or None
-    reason = findings.halt_reason(last_text)
+    reason = handoff.halt_reason(last_text)
     if reason and not already_terminal and status != "killed":
         status = "halted"
         summary = reason
@@ -1235,7 +1235,7 @@ def supervise(root: Path, run_id: int) -> int:
         con.commit()
         result = dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
     try:  # DESIGN §9: code files the handoff, never the agent
-        findings.at_completion(con, cfg, result)
+        handoff.at_completion(con, result)
     except Exception as exc:  # filing must never break finalization
         print(f"orchestra: run {run_id} handoff filing failed: {exc}", file=sys.stderr)
 

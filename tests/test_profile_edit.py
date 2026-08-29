@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, nod, profile_edit, sweeper, work_client
+from orchestra import config, db, nod, profile_edit
 
 
 FOUND = {
@@ -211,58 +211,11 @@ class AuthorityTests(EditCase):
                            authority="agent")
         self.assertTrue(result["filed"])
 
-        class Refusing:
-            def create_decision(self, **kwargs):
-                raise work_client.WorkError(503, "unavailable", "try again")
-
-        con = db.connect()
-        try:
-            sweeper._escalations(con, Refusing(), [])
-            row = con.execute("SELECT * FROM nod_requests WHERE request_id=?",
-                              (result["escalation"],)).fetchone()
-        finally:
-            con.close()
-        self.assertIsNone(row["mirrored_at"], "an unfiled record was consumed")
-        self.assertIn("thinker", row["title"])
-        self.assertIn("'gpt-5.6-luna'", row["body"])
-        self.assertIn("tier = 3", row["body"])
-
         # And a human reads it back from the CLI with no source at all.
         printed = CliContractTests.run_cli(["profiles"])
         self.assertIn("waiting on you", printed)
         self.assertIn("'gpt-5.6-luna'", printed)
         self.assertIn("tier = 3", printed)
-
-    def test_the_adapter_turns_the_record_into_a_decision_once(self) -> None:
-        """The other half (CONTRACT §7 Enforcement): the source adapter reads
-        the record and files the decision the human answers."""
-        result = self.save("thinker", {"model": "gpt-5.6-luna"},
-                           authority="agent")
-
-        class Client:
-            def __init__(self) -> None:
-                self.filed = []
-
-            def create_decision(self, **kwargs) -> dict:
-                self.filed.append(kwargs)
-                return {"id": "W-9001"}
-
-        client, actions = Client(), []
-        con = db.connect()
-        try:
-            sweeper._escalations(con, client, actions)
-            sweeper._escalations(con, client, actions)  # watermark holds
-        finally:
-            con.close()
-        self.assertEqual(len(client.filed), 1)
-        self.assertIn("thinker", client.filed[0]["title"])
-        self.assertIn("'gpt-5.6-luna'", client.filed[0]["detail"])
-        self.assertTrue(client.filed[0]["recommendation_reason"])
-        self.assertEqual(actions, [{"action": "decide",
-                                    "escalation": result["escalation"],
-                                    "decision": "W-9001"}])
-        # Filed, so it stops printing as waiting on the human.
-        self.assertNotIn("waiting on you", CliContractTests.run_cli(["profiles"]))
 
 
 class EnabledSetTests(EditCase):

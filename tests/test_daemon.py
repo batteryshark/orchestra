@@ -328,19 +328,14 @@ class DaemonTests(unittest.TestCase):
         self.assertIn("identity changed", diagnostics.getvalue())
 
     def test_tick_report_contract(self) -> None:
-        """With NO source configured the tick still completes and reports
-        every job; the nod answers land in it, and a raising nod pass never
-        ends the tick.
-
-        The empty ``swept``/``conducted`` come from the adapter passes
-        themselves: the daemon builds no client and cannot tell whether a
-        source exists (CONTRACT §7 Enforcement 3).
+        """The tick is the RUNNER's own maintenance and nothing else: it
+        completes and reports every job with no external automation anywhere
+        — a work source's bridge is its own process, never a tick job.
         """
         report = daemon.tick()
-        self.assertEqual((report["swept"], report["conducted"]), ([], []))
         self.assertEqual(set(report), {
-            "swept", "conducted", "released", "reaped", "recovered_results",
-            "resumed_results", "resumed_retries", "resumed_judgments",
+            "released", "reaped", "recovered_results",
+            "resumed_results", "resumed_retries",
             "paused", "runway", "nod_answers"})
         acted = [{"request_id": "req_1", "action": "retry", "outcome": "landed"}]
         cases = {
@@ -363,29 +358,15 @@ class DaemonTests(unittest.TestCase):
         with mock.patch.object(daemon.supervise, "process_ready") as ready, \
                 mock.patch.object(daemon, "_poll_runway", return_value=2) as runway_, \
                 mock.patch.object(daemon, "_act_on_nod_answers",
-                                  return_value=[{"answer": 1}]) as nod_, \
-                mock.patch.object(daemon.sweeper, "refresh_projects",
-                                  return_value=True) as refresh, \
-                mock.patch.object(daemon.sweeper, "sweep",
-                                  return_value=[{"action": "report"}]) as swept, \
-                mock.patch.object(daemon.conductor, "pass_once",
-                                  return_value=[{"action": "wait"}]) as conducted:
+                                  return_value=[{"answer": 1}]) as nod_:
             report = daemon.tick()
         self.assertTrue(report["paused"])
         self.assertEqual(report["reaped"], [dead])
         self.assertEqual(report["runway"], 2)
         self.assertEqual(report["nod_answers"], [{"answer": 1}])
-        self.assertEqual(report["swept"], [{"action": "report"}])
-        self.assertEqual(report["conducted"], [{"action": "wait"}])
         ready.assert_called_once()
         runway_.assert_called_once()
         nod_.assert_called_once()
-        refresh.assert_called_once()
-        # CONTRACT §7 Enforcement 3: the scheduler hands over cfg and
-        # nothing else — no client, no source name.
-        for called in (swept, conducted):
-            called.assert_called_once()
-            self.assertEqual(called.call_args, mock.call(mock.ANY))
 
     def test_once_runs_a_single_tick_even_a_failing_one_and_returns_zero(self) -> None:
         cases = {"a clean tick": {"return_value": {}},

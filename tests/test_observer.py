@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestra import config, db, observer, supervise, sweeper
+from orchestra import config, db, observer, supervise
 
 PROJECT_ID = "53efe3c3-6def-4797-8560-3dce073d7d63"
 
@@ -837,9 +837,9 @@ class RetryTests(ObserverCase):
                        capture_output=True)
         subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "init"],
                        check=True, capture_output=True)
-        sweeper.remember_projects(self.con, str(self.tmp_path / "workspace"),
-                         [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
-                           "path": "demo"}])
+        from tests.util import seed_project
+
+        seed_project(self.con, PROJECT_ID, checkout)
 
         released = checkout / "worktrees" / "run-1"  # given back at finalization
         run_id = self.make_run(status="failed", ref="W-0028",
@@ -1089,9 +1089,9 @@ class SupervisedRunTests(unittest.TestCase):
             "STUB_EXIT": "0"})
         self.env.start()
         con = db.connect()
-        sweeper.remember_projects(con, str(self.tmp_path / "workspace"),
-                         [{"projectId": PROJECT_ID, "id": "demo", "name": "Demo",
-                           "path": "demo"}])
+        from tests.util import seed_project
+
+        seed_project(con, PROJECT_ID, self.tmp_path / "workspace" / "demo")
         con.close()
 
     def tearDown(self) -> None:
