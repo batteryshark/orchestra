@@ -1,318 +1,501 @@
 import SwiftUI
 
-/// The machine's own state: the daemon, the observer that watches it, the
-/// dispatch gate, and where its files are.
-struct HealthView: View {
-    @EnvironmentObject private var state: AppState
-    @State private var configPath: String?
-    @State private var confirmingRestart = false
-    @State private var busy = false
-    @State private var error: String?
-    @State private var lastAction: String?
+private enum InboxMode: String, CaseIterable, Identifiable {
+    case attention = "Attention"
+    case messages = "Inbox / Outbox"
+    var id: String { rawValue }
+}
 
-    private var daemon: Daemon { state.snapshot?.daemon ?? Daemon() }
-    private var dispatch: Dispatch { state.snapshot?.dispatch ?? Dispatch(paused: false, since: nil) }
+struct InboxView: View {
+    @EnvironmentObject private var state: AppState
+    @State private var kind: String?
+    @State private var responding: AttentionItem?
+    @State private var mode: InboxMode = .attention
+    @State private var selectedRun: Run?
+
+    private var visible: [AttentionItem] {
+        guard let kind else { return state.inbox }
+        return state.inbox.filter { $0.kind == kind }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Picker("Inbox view", selection: $mode) {
+                    ForEach(InboxMode.allCases) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented)
+            }
+            if mode == .attention {
+                Section {
+                    Picker("Kind", selection: $kind) {
+                        Text("All").tag(String?.none)
+                        ForEach(Array(Set(state.inbox.map(\.kind))).sorted(), id: \.self) {
+                            Text($0.replacingOccurrences(of: "_", with: " ").capitalized)
+                                .tag(String?.some($0))
+                        }
+                    }.pickerStyle(.menu)
+                }
+                if visible.isEmpty {
+                    Section {
+                        ContentUnavailableView("Inbox zero", systemImage: "tray",
+                            description: Text("No questions, profile proposals, or alerts need attention."))
+                    }
+                } else {
+                    ForEach(visible) { item in
+                        AttentionRow(item: item) { responding = item }
+                    }
+                    if state.inboxCursor != nil {
+                        Button("Load more") { Task { await state.loadMoreInbox() } }
+                    }
+                }
+            } else {
+                Section { messageMetrics.listRowInsets(.init()) }
+                Section("Filters") {
+                    Picker("Direction", selection: $state.messageFilters.direction) {
+                        Text("All directions").tag(String?.none)
+                        Text("Operator → run").tag(String?.some("inbound"))
+                        Text("Run → operator").tag(String?.some("outbound"))
+                        Text("System").tag(String?.some("system"))
+                    }
+                    Picker("Delivery", selection: $state.messageFilters.status) {
+                        Text("Every receipt").tag(String?.none)
+                        ForEach(["pending", "delivered", "undeliverable"], id: \.self) {
+                            Text($0.capitalized).tag(String?.some($0))
+                        }
+                    }
+                }
+                Section("Durable message ledger") {
+                    if state.messages.isEmpty {
+                        ContentUnavailableView("No matching messages", systemImage: "tray.2",
+                            description: Text("Inbound, outbound, and system messages appear here with delivery receipts."))
+                    }
+                    ForEach(state.messages) { message in messageRow(message) }
+                    if state.messageCursor != nil {
+                        Button("Load more messages") { Task { await state.loadMoreMessages() } }
+                    }
+                }
+            }
+        }
+        .listStyle(.inset)
+        .navigationTitle("Inbox")
+        .toolbar { ServerToolbarMenu() }
+        .sheet(item: $responding) { AttentionResponseView(item: $0) }
+        .navigationDestination(item: $selectedRun) { RunDetailView(run: $0) }
+        .refreshable { await state.refresh() }
+        .task(id: state.messageFilters) { await state.refreshMessages() }
+    }
+
+    private var messageMetrics: some View {
+        let counts = state.snapshot?.messages ?? .init()
+        return LazyVGrid(columns: [GridItem(.adaptive(minimum: 110))], spacing: 8) {
+            MetricCard(value: counts.total.formatted(), label: "messages")
+            MetricCard(value: counts.pending.formatted(), label: "pending")
+            MetricCard(value: counts.undeliverable.formatted(), label: "undeliverable")
+            MetricCard(value: counts.outbound.formatted(), label: "outbound")
+        }.padding(.vertical, 8)
+    }
+
+    @ViewBuilder private func messageRow(_ message: RunMessage) -> some View {
+        if let run = state.runs.first(where: { $0.id == message.runID }) {
+            NavigationLink { RunDetailView(run: run) } label: {
+                VStack(alignment: .leading, spacing: 5) {
+                Text(message.display ?? run.display ?? "Run \(run.id)").font(.caption.bold())
+                    MessageReceiptRow(message: message)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(message.display ?? "Run \(message.runID)").font(.caption.bold())
+                    Spacer()
+                    Button("Open run") { openRun(message.runID) }
+                }
+                MessageReceiptRow(message: message)
+            }
+        }
+    }
+
+    private func openRun(_ id: Int) {
+        Task {
+            do { selectedRun = try await state.api().run(id).value }
+            catch { state.report(error) }
+        }
+    }
+}
+
+private struct AttentionRow: View {
+    @EnvironmentObject private var state: AppState
+    let item: AttentionItem
+    let respond: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                StatusChip(status: item.kind)
+                if item.blocking { Label("Blocking", systemImage: "pause.circle").foregroundStyle(.orange) }
+                Spacer()
+                Text(item.openedAt.relativeAge).font(.caption).foregroundStyle(.secondary)
+            }
+            Text(item.prompt ?? item.message ?? "Attention")
+                .font(.headline)
+            if let detail = item.detail { Text(detail).foregroundStyle(.secondary) }
+            HStack {
+                if let runID = item.runID {
+                    Text("Run \(runID)").font(.caption.monospaced()).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if item.kind == "profile_proposal" {
+                    Button("Reject") { decide(false) }
+                    Button("Approve") { decide(true) }.buttonStyle(.borderedProminent)
+                } else if item.kind == "alert" {
+                    Button("Acknowledge") { acknowledge() }
+                } else {
+                    Button("Answer", action: respond).buttonStyle(.borderedProminent)
+                }
+            }
+        }.padding(.vertical, 5)
+    }
+
+    private func decide(_ approve: Bool) {
+        Task {
+            do {
+                _ = try await state.api().decideProposal(item.id, approve: approve)
+                await state.succeeded(approve ? "Proposal approved" : "Proposal rejected")
+            } catch { state.report(error) }
+        }
+    }
+
+    private func acknowledge() {
+        Task {
+            do {
+                _ = try await state.api().acknowledge(item.id)
+                await state.succeeded("Alert acknowledged")
+            } catch { state.report(error) }
+        }
+    }
+}
+
+private struct AttentionResponseView: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    let item: AttentionItem
+    @State private var answer = ""
+    @State private var selectedChoice: String?
+    @State private var sending = false
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    ConnectionBanner()
-                    if let error {
-                        Banner(text: error, icon: "exclamationmark.triangle.fill", tint: .red)
-                    } else if let lastAction {
-                        Banner(text: lastAction, icon: "checkmark.circle.fill", tint: .green)
-                    }
-                    daemonCard
-                    observerCard
-                    dispatchCard
-                    locationsCard
+            Form {
+                Section {
+                    Text(item.prompt ?? item.message ?? "Question").font(.headline)
+                    if let detail = item.detail { Text(detail).foregroundStyle(.secondary) }
                 }
-                .padding()
-            }
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("Health")
-            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
-            .refreshable { await state.refresh() }
-            .task { await loadConfigPath() }
-            .confirmationDialog(
-                "Restart the daemon?",
-                isPresented: $confirmingRestart,
-                titleVisibility: .visible
-            ) {
-                Button("Restart daemon", role: .destructive) { Task { await restart() } }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Running work keeps going; the daemon re-reads its config and resumes sweeping.")
-            }
-        }
-    }
-
-    // --- daemon -----------------------------------------------------------
-
-    private var daemonCard: some View {
-        Card("Daemon", icon: "gearshape.2") {
-            if let pid = daemon.pid {
-                Row("Running", value: "pid \(pid)", tint: .green)
-            } else {
-                Row("Not running", value: "no pid", tint: .red)
-            }
-            if let started = daemon.startedAt {
-                Row("Started", value: Self.stamp(started))
-            }
-            if let sweep = daemon.lastSweepAt {
-                Row("Last sweep", value: Self.stamp(sweep))
-            }
-            if let outcome = daemon.outcome {
-                Row("Outcome", value: outcome, tint: outcome == "ok" ? .green : .orange)
-            }
-
-            HStack(spacing: 12) {
-                MetricCard(title: "Actions", value: "\(daemon.actions ?? 0)",
-                           systemImage: "bolt")
-                MetricCard(title: "Released", value: "\(daemon.released ?? 0)",
-                           systemImage: "lock.open", tint: .teal)
-                MetricCard(title: "Reaped", value: "\(daemon.reaped ?? 0)",
-                           systemImage: "trash", tint: .orange)
-            }
-            .padding(.top, 4)
-
-            if let problem = daemon.error, !problem.isEmpty {
-                Banner(text: problem, icon: "exclamationmark.octagon.fill", tint: .red)
-            }
-            // History, not current state: last_error sticks until the next
-            // failure, so a fixed crash from days ago used to sit here in
-            // alarm orange next to a healthy daemon. Collapsed by default —
-            // the daemon log holds the traceback worth acting on.
-            if let last = daemon.lastError, !last.isEmpty {
-                DisclosureGroup {
-                    WrappedText(text: last, font: .caption, color: .secondary)
-                        .padding(.top, 2)
-                } label: {
-                    Text(daemon.lastErrorAt.map { "Last error · \(Self.stamp($0))" } ?? "Last error")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-                .tint(.secondary)
-                .padding(.top, 4)
-            }
-
-            HStack(spacing: 12) {
-                Button {
-                    Task { await act("Sweep queued.") { try await $0.sweep() } }
-                } label: {
-                    Label("Sweep now", systemImage: "arrow.triangle.2.circlepath")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-
-                Button(role: .destructive) {
-                    confirmingRestart = true
-                } label: {
-                    Label("Restart", systemImage: "power")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-            }
-            .disabled(busy)
-            .padding(.top, 8)
-        }
-    }
-
-    // --- observer ---------------------------------------------------------
-
-    private var observerCard: some View {
-        Card("Observer", icon: "eye") {
-            if let observer = daemon.observer {
-                if let problem = observer.problem, !problem.isEmpty {
-                    // The observer saying it cannot run is the whole point of
-                    // this card, so it goes above the settings it cannot use.
-                    Banner(text: problem, icon: "eye.slash.fill", tint: .red)
-                }
-                Row(observer.enabled ? "Watching" : "Off",
-                    value: observer.profile ?? "no profile set",
-                    tint: observer.enabled ? .green : .secondary)
-                Row("First look", value: Self.minutes(observer.firstLook))
-                Row("Then every", value: Self.minutes(observer.interval))
-            } else {
-                Text("The daemon reports no observer.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    // --- dispatch ---------------------------------------------------------
-
-    private var dispatchCard: some View {
-        Card("Dispatch", icon: "arrow.triangle.branch") {
-            Row(dispatch.paused ? "Paused" : "Running",
-                value: dispatch.since.map(Self.stamp) ?? "—",
-                tint: dispatch.paused ? .orange : .green)
-            Text(dispatch.paused
-                 ? "Nothing new launches while dispatch is paused. Running work is untouched."
-                 : "New work launches as the queue allows.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Button {
-                let pause = !dispatch.paused
-                Task {
-                    await act(pause ? "Dispatch paused." : "Dispatch resumed.") {
-                        try await $0.pauseDispatch(pause)
+                if !item.choices.isEmpty {
+                    Section("Choices") {
+                        Picker("Choice", selection: $selectedChoice) {
+                            Text("Choose…").tag(String?.none)
+                            ForEach(item.choices) { Text($0.label).tag(String?.some($0.id)) }
+                        }.pickerStyle(.inline)
                     }
                 }
-            } label: {
-                Label(dispatch.paused ? "Resume dispatch" : "Pause dispatch",
-                      systemImage: dispatch.paused ? "play.fill" : "pause.fill")
-                    .frame(maxWidth: .infinity)
+                Section("Answer") { TextEditor(text: $answer).frame(minHeight: 120) }
+                if let deadline = item.deadline { Section { LabeledContent("Deadline", value: deadline) } }
+                if let fallback = item.fallback {
+                    Section { LabeledContent("Fallback", value: fallback.description) }
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .tint(dispatch.paused ? .green : .orange)
-            .disabled(busy)
-            .padding(.top, 4)
-        }
-    }
-
-    // --- where things live ------------------------------------------------
-
-    private var locationsCard: some View {
-        Card("Where things live", icon: "folder") {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Home").font(.caption).foregroundStyle(.secondary)
-                WrappedText(text: state.snapshot?.home ?? "unknown", font: .footnote.monospaced())
+            .navigationTitle("Answer")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") { send() }
+                        .disabled(sending || (answer.trimmed.isEmpty && selectedChoice == nil))
+                }
             }
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Config").font(.caption).foregroundStyle(.secondary)
-                WrappedText(text: configPath ?? "unknown", font: .footnote.monospaced())
-            }
-            .padding(.top, 4)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Server").font(.caption).foregroundStyle(.secondary)
-                WrappedText(text: state.serverURL, font: .footnote.monospaced())
-            }
-            .padding(.top, 4)
-        }
+            .disabled(sending)
+        }.frame(minWidth: 380, minHeight: 420)
     }
 
-    // --- actions ----------------------------------------------------------
-
-    private func act(_ done: String, _ body: @escaping (OrchestraAPI) async throws -> Void) async {
-        busy = true
-        defer { busy = false }
-        if let problem = await state.perform(body) {
-            error = problem
-            lastAction = nil
-        } else {
-            error = nil
-            lastAction = done
-        }
-    }
-
-    /// The reply to a restart may never arrive — the process answering is the
-    /// one going away — and the client already treats that transport failure
-    /// as success, so nothing here turns it back into an error.
-    private func restart() async {
-        await act("Daemon restarting.") { try await $0.restart() }
-    }
-
-    private func loadConfigPath() async {
-        configPath = try? await state.api().config().path
-    }
-
-    // --- formatting -------------------------------------------------------
-
-    /// Seconds as the minutes the owner set them in.
-    private static func minutes(_ seconds: Int?) -> String {
-        guard let seconds else { return "—" }
-        let m = Double(seconds) / 60
-        return m < 1
-            ? "\(seconds)s"
-            : (m == m.rounded() ? "\(Int(m)) min" : String(format: "%.1f min", m))
-    }
-
-    private static let iso: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
-    private static let relative: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .full
-        return f
-    }()
-
-    /// "2 minutes ago" beats a UTC stamp for everything on this screen — but
-    /// an unparseable one is shown as it came, never dropped.
-    private static func stamp(_ text: String) -> String {
-        guard let date = iso.date(from: text) else { return text }
-        return relative.localizedString(for: date, relativeTo: Date())
-    }
-}
-
-// --- small pieces this screen builds from -----------------------------------
-
-private struct Card<Content: View>: View {
-    let title: String
-    let icon: String
-    @ViewBuilder let content: Content
-
-    init(_ title: String, icon: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.icon = icon
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(title, systemImage: icon)
-                .font(.headline)
-                .foregroundStyle(.primary)
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(Color(.secondarySystemGroupedBackground),
-                    in: RoundedRectangle(cornerRadius: 16))
-    }
-}
-
-private struct Row: View {
-    let label: String
-    let value: String
-    var tint: Color = .primary
-
-    init(_ label: String, value: String, tint: Color = .primary) {
-        self.label = label
-        self.value = value
-        self.tint = tint
-    }
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label).font(.subheadline.weight(.medium)).foregroundStyle(tint)
-            Spacer(minLength: 12)
-            Text(value)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.trailing)
-                .textSelection(.enabled)
+    private func send() {
+        sending = true
+        let choice = item.choices.first { $0.id == selectedChoice }
+        let response = answer.trimmed.isEmpty ? choice?.label ?? "" : answer.trimmed
+        Task {
+            defer { sending = false }
+            do {
+                _ = try await state.api().answer(attentionID: item.id, answer: response,
+                                                 choice: selectedChoice)
+                await state.succeeded("Answer recorded")
+                dismiss()
+            } catch { state.report(error) }
         }
     }
 }
 
-private struct Banner: View {
-    let text: String
-    let icon: String
-    let tint: Color
+struct FleetView: View {
+    @EnvironmentObject private var state: AppState
+    @State private var editingRuntime: RuntimeConfig?
+    @State private var creatingRuntime = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: icon).foregroundStyle(tint)
-            WrappedText(text: text, font: .footnote)
+        List {
+            Section { metrics.listRowInsets(.init()) }
+            Section("Scheduler") {
+                LabeledContent("Admission", value: state.snapshot?.scheduler.paused == true ? "Paused" : "FIFO")
+                LabeledContent("Active", value: state.snapshot?.scheduler.active.formatted() ?? "0")
+                LabeledContent("Queued", value: state.snapshot?.scheduler.queued.formatted() ?? "0")
+                LabeledContent("Global capacity", value: state.snapshot?.scheduler.maxActive.formatted() ?? "—")
+                Button(state.snapshot?.scheduler.paused == true ? "Resume starts" : "Pause new starts") {
+                    setPaused(state.snapshot?.scheduler.paused != true)
+                }
+            }
+            Section("Message delivery") {
+                let messages = state.snapshot?.messages ?? .init()
+                LabeledContent("Total", value: messages.total.formatted())
+                LabeledContent("Pending", value: messages.pending.formatted())
+                LabeledContent("Delivered", value: messages.delivered.formatted())
+                LabeledContent("Undeliverable", value: messages.undeliverable.formatted())
+                    .foregroundStyle(messages.undeliverable > 0 ? .red : .primary)
+            }
+            Section("Fleet settings") {
+                NavigationLink("Capacity and delegation") { FleetSettingsView() }
+                Text("Global admission and child-run bounds are fleet policy.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Runtimes") {
+                ForEach(state.runtimes) { runtime in
+                    Button { editingRuntime = runtime } label: {
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(runtime.name).foregroundStyle(.primary)
+                                Text("\(runtime.kind) · \(runtime.argv.joined(separator: " "))")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                if let configured = runtime.configConfigured {
+                                    Text("Host config \(configured ? "configured" : "unset")")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            StatusChip(status: runtime.enabled ? "enabled" : "disabled")
+                        }
+                    }.buttonStyle(.plain)
+                }
+                Button("Add exec / ACP runtime", systemImage: "plus") { creatingRuntime = true }
+            }
+            Section("Daemon") {
+                LabeledContent("Status", value: state.snapshot?.daemon.status ?? "unknown")
+                LabeledContent("Last tick", value: state.snapshot?.daemon.lastTickAt.relativeAge ?? "—")
+                LabeledContent("Instance", value: state.selectedServer?.instanceID ?? "—")
+            }
         }
-        .padding(10)
-        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .navigationTitle("Fleet")
+        .toolbar { ServerToolbarMenu() }
+        .sheet(item: $editingRuntime) { RuntimeEditor(runtime: $0, creating: false) }
+        .sheet(isPresented: $creatingRuntime) {
+            RuntimeEditor(runtime: .init(id: "", name: "", kind: "exec", argv: [],
+                                         enabled: true, supportsSteering: nil,
+                                         supportsInterrupt: nil), creating: true)
+        }
+        .refreshable { await state.refresh() }
+    }
+
+    private var metrics: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 120))], spacing: 8) {
+            MetricCard(value: state.snapshot?.scheduler.active.formatted() ?? "—", label: "active")
+            MetricCard(value: state.snapshot?.scheduler.queued.formatted() ?? "—", label: "queued")
+            MetricCard(value: state.snapshot?.scheduler.maxActive.formatted() ?? "—", label: "capacity")
+            MetricCard(value: state.runtimes.filter(\.enabled).count.formatted(), label: "runtimes")
+        }.padding(.vertical, 8)
+    }
+
+    private func setPaused(_ paused: Bool) {
+        Task {
+            do {
+                _ = try await state.api().scheduler(paused: paused)
+                await state.succeeded(paused ? "New starts paused" : "Scheduler resumed")
+            } catch { state.report(error) }
+        }
+    }
+}
+
+private struct FleetSettingsView: View {
+    @EnvironmentObject private var state: AppState
+    @State private var instanceName = "Orchestra"
+    @State private var maxActive = 8
+    @State private var maxDepth = 2
+    @State private var maxChildren = 3
+    @State private var maxActiveChildren = 3
+    @State private var seeded = false
+    @State private var saving = false
+
+    var body: some View {
+        Form {
+            Section("Identity") {
+                TextField("Instance name", text: $instanceName)
+                    .onChange(of: instanceName) { _, value in
+                        if value.count > 100 { instanceName = String(value.prefix(100)) }
+                    }
+            }
+            Section("Admission") {
+                Stepper("Maximum active runs: \(maxActive)", value: $maxActive, in: 1...256)
+            }
+            Section {
+                Stepper("Maximum depth: \(maxDepth)", value: $maxDepth, in: 0...10)
+                Stepper("Children per run: \(maxChildren)", value: $maxChildren, in: 1...100)
+                Stepper("Active children per run: \(maxActiveChildren)",
+                        value: $maxActiveChildren, in: 1...100)
+            } header: {
+                Text("Delegation")
+            } footer: {
+                Text("These bounds apply to new child admissions. They do not route work or change profile tiers.")
+            }
+        }
+        .navigationTitle("Fleet settings")
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") { save() }
+                    .disabled(saving || instanceName.trimmed.isEmpty || instanceName.count > 100)
+            }
+        }
+        .disabled(saving)
+        .task { seed() }
+    }
+
+    private func seed() {
+        guard !seeded else { return }
+        instanceName = string("instance_name", fallback: state.snapshot?.instance.name ?? "Orchestra")
+        maxActive = integer("max_active_runs", fallback: state.snapshot?.scheduler.maxActive ?? 8)
+        maxDepth = integer("delegation_max_depth", fallback: 2)
+        maxChildren = integer("delegation_max_children", fallback: 3)
+        maxActiveChildren = integer("delegation_max_active_children", fallback: 3)
+        seeded = true
+    }
+
+    private func setting(_ key: String) -> FleetSetting? {
+        state.settings.first { $0.key == key }
+    }
+
+    private func integer(_ key: String, fallback: Int) -> Int {
+        guard case let .number(value) = setting(key)?.value else { return fallback }
+        return Int(value)
+    }
+
+    private func string(_ key: String, fallback: String) -> String {
+        guard case let .string(value) = setting(key)?.value else { return fallback }
+        return value
+    }
+
+    private func save() {
+        saving = true
+        Task {
+            defer { saving = false }
+            do {
+                let desired: [(String, JSONValue)] = [
+                    ("instance_name", .string(instanceName.trimmed)),
+                    ("max_active_runs", .number(Double(maxActive))),
+                    ("delegation_max_depth", .number(Double(maxDepth))),
+                    ("delegation_max_children", .number(Double(maxChildren))),
+                    ("delegation_max_active_children", .number(Double(maxActiveChildren))),
+                ]
+                let client = try state.api()
+                for (key, value) in desired {
+                    guard let current = setting(key), current.value != value else { continue }
+                    _ = try await client.updateSetting(current, value: value)
+                }
+                await state.succeeded("Fleet settings saved")
+            } catch { state.report(error) }
+        }
+    }
+}
+
+private struct RuntimeEditor: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: RuntimeConfig
+    @State private var argv: String
+    @State private var config = ""
+    private let originalArgv: String
+    let creating: Bool
+
+    init(runtime: RuntimeConfig, creating: Bool) {
+        _draft = State(initialValue: runtime)
+        _argv = State(initialValue: runtime.argv.joined(separator: "\n"))
+        originalArgv = runtime.argv.joined(separator: "\n")
+        self.creating = creating
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Runtime") {
+                    TextField("Name", text: $draft.name)
+                    Picker("Protocol", selection: $draft.kind) {
+                        Text("Command (JSON events)").tag("exec")
+                        Text("ACP").tag("acp")
+                        if !["exec", "acp"].contains(draft.kind) { Text(draft.kind).tag(draft.kind) }
+                    }.disabled(!creating && !["exec", "acp"].contains(draft.kind))
+                    Toggle("Enabled", isOn: $draft.enabled)
+                }
+                if ["exec", "acp"].contains(draft.kind) {
+                    Section("Argument vector") {
+                        TextEditor(text: $argv).font(.body.monospaced()).frame(minHeight: 150)
+                        Text("One argument per line. Orchestra invokes an argv directly; this is not a shell hook.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if !creating {
+                            Text("Credential-shaped values may be redacted. Leave the vector unchanged to preserve the host configuration.")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                } else {
+                    Section {
+                        Text("This built-in runtime is launched directly by Orchestra and has no custom argv.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                }
+                Section("Configuration") {
+                    TextEditor(text: $config).font(.body.monospaced()).frame(minHeight: 110)
+                        .accessibilityLabel("Replacement runtime configuration JSON")
+                    Text(creating
+                         ? "Optional JSON object. Credential-shaped fields are rejected."
+                         : "Blank preserves the private host value; {} clears it. Existing values are never returned or prefilled.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if !creating {
+                        LabeledContent("Host configuration",
+                                       value: draft.configConfigured.map { $0 ? "Configured" : "Not configured" } ?? "Unknown")
+                    }
+                }
+            }
+            .navigationTitle(creating ? "New runtime" : draft.name)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }
+                        .disabled(draft.name.trimmed.isEmpty ||
+                                  (["exec", "acp"].contains(draft.kind) && argv.trimmed.isEmpty))
+                }
+            }
+        }.frame(minWidth: 400, minHeight: 420)
+    }
+
+    private func save() {
+        let commandRuntime = ["exec", "acp"].contains(draft.kind)
+        if commandRuntime {
+            draft.argv = argv.split(whereSeparator: \.isNewline).map(String.init)
+        }
+        Task {
+            do {
+                let configValue = try replacementObject(config, label: "Configuration")
+                if creating {
+                    _ = try await state.api().createRuntime(draft, config: configValue)
+                }
+                else {
+                    _ = try await state.api().updateRuntime(
+                        draft, updateArgv: commandRuntime && argv != originalArgv,
+                        config: configValue)
+                }
+                await state.succeeded("Runtime saved")
+                dismiss()
+            } catch { state.report(error) }
+        }
     }
 }

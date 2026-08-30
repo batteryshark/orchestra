@@ -1,886 +1,959 @@
-"""Single owner of Orchestra's SQLite schema (clean v1 — a greenfield has no
-legacy, so there are no migrations; future subsystems join THIS schema and
-bump meta.schema_version when they extend it).
+"""Orchestra v2's SQLite schema and small shared database helpers.
 
-Data-model invariants (DESIGN D4):
-- ``runs.id`` is the only address for a run. ``runs.slug`` is a memorable
-  display alias (UNIQUE so concurrent dispatchers cannot double-mint one).
-- ``runs.profile`` records which launch template started the run — pure
-  provenance/display. Nothing keys on it.
-- ``messages`` address run ids. There is deliberately no recipient-name
-  column: a profile is a launch template, never a worker identity.
-  ``undeliverable_at``/``undeliverable_reason`` (schema v9, DESIGN §6) mark a
-  message whose run ended before it was delivered. Marked and surfaced, never
-  dropped — and never moved to a later run, which would hand a correction to
-  a run that never saw the context it referred to.
-- ``runs.ref`` (schema v21, source boundary) is the OPAQUE string a
-  caller hands in at dispatch to say what the run is FOR. The core stores it,
-  echoes it back, and never parses it — one tracker's task id today, another
-  tracker's key or anything else tomorrow, and this table cannot tell the
-  difference. It replaced ``work_item`` (schema v2) and the three ``work_*``
-  timestamps that sat beside it, which were never facts about a run: a
-  watermark over one source's board is that source's own bookkeeping.
-- A consumer's OWN bookkeeping about runs — which outcome it reported
-  where, how far it read a thread — lives in that consumer's own database
-  (the bridge ATTACHes one beside this file), never in this schema.
-  This schema holds facts about runs and projects, nothing else.
-- ``runs.claim_status`` (schema v16 as ``work_claim_status``, renamed in v25)
-  is the ADMISSION GATE, and it stayed on ``runs`` when the watermarks left
-  because the core genuinely reads it: ``daemon._reap_orphans`` must not reap
-  a run parked in ``spawning`` while its dispatch is still being confirmed
-  somewhere else. ``pending`` / ``claimed`` / ``abandoned`` describe the run's
-  own lifecycle; the core never learns what the claim was made against, so the
-  name stopped naming a source (source boundary).
-- ``runs.project_id`` (schema v4, the daemon) is the registry's stable
-  project id — a local UUID, or whatever id a source adapter cached. Rows key
-  on it, never on a path: one central database now holds every project's
-  runs, and renaming a folder must lose nothing.
-  ``runs.workdir`` stays a path because it is where a process actually ran.
-- ``projects`` (schema v29) is IDENTITY ONLY: one row per project — its id,
-  slug, name, whether the owner or an adapter minted it, and the parked
-  flags. NO PATH: Orchestra is a runner, and a checkout is the CALLER's to
-  supply at dispatch (``--path``, the cwd, or "where this project last ran",
-  read from the run history). ``projects.slug`` (v27) is the human address:
-  lowercase kebab-case, minted once, never rewritten by a refresh.
-  ``projects.local`` says who minted the row — 1 the owner, 0 a source
-  adapter's cache — which is provenance, not a source's name.
-- ``dispatch_queue`` (schema v8, DESIGN §4) holds caller items that cannot
-  start yet, with the reason — ``item_id`` is opaque here. It is queue state
-  only: nothing dispatches from a row here, and the run row appears at
-  actual dispatch.
-- ``runway_polls`` (schema v5, DESIGN §11) is a self-contained append-only
-  log of provider runway polls — one row per adapter per poll, unknowns
-  included. It references nothing and nothing references it. ``windows``
-  (v12, W-0179) is every window that poll reported; the scalar columns are
-  the tightest live one, which is what dispatch and the trend read.
-- ``events`` (schema v6, DESIGN §7) is the ONE normalized trace table: every
-  backend's JSONL is mapped into the same seven kinds at ingest. The raw
-  file stays the source of truth — each row carries a truncated payload
-  plus the byte offset/length of the line it came from, so a viewer expands
-  in place. ``trace_cursors`` is the per-run tail watermark (and the record
-  that a terminal run's raw log was pruned).
-- ``observations`` (schema v9, DESIGN §7) is the spin observer's record: one
-  row per judgement, from any of its three layers, with the reasoning that
-  produced it. It exists because the observer may never silently kill a run
-  — a stop has to leave its reasoning somewhere durable — and because the
-  hourly cadence anchors on the last row for a run. ``runs.retry_of`` (also
-  v9) is the retry lineage: which run this one is the single automatic
-  retry of, so a second consecutive infrastructure failure is countable.
-- ``runs.tokens_*``/``cost_usd``/``usage_source`` (schema v9, DESIGN §11) are
-  the backend's own usage totals, stamped on the row at completion so
-  statistics are a query and never a re-parse. All NULL when the backend
-  reported nothing recognizable — ``usage_source`` names the parser that
-  produced the numbers, and NULL there means "not captured", never "zero".
-- ``runs.run_token_hash`` (schema v11, DESIGN §3/§5, W-0176) is the SHA-256 of
-  the per-run token minted at dispatch into the worker's environment. Only the
-  hash is ever stored — the raw token lives in the worker's environment and
-  nowhere else, the same discipline the config applies to provider keys.
-  Revocation is the ``revoke_run_token`` trigger below rather than a call
-  every finalizer has to remember: reaching a terminal status nulls the hash,
-  whichever code path got the run there. Owned by ``auth.py``.
-- ``runs.layer`` (schema v15, W-0214) marks a CONTROL TURN — a router,
-  merge-judge, observer or conductor model call — recorded as a terminal
-  runs row so its transcript normalizes into ``events`` and opens in the
-  same detail screen as a run. NULL is a worker run. Fleet queries exclude
-  turns with ``layer IS NULL``; queries keyed on ref, branch or parent_run
-  never match one, because a turn carries none of them.
-- ``runs.landing_status``/``handoff_processed_at`` (schema v16, W-0295) are
-  the two durable policy receipts on the terminal result row. NULL means that
-  policy has not settled yet; landing records ``ok`` or ``failed``, while
-  handoff processing records its completion timestamp. ``landing_commit``
-  (schema v23) is the merge commit that verdict produced, NULL when the
-  landing made none. It is the whole receipt a reporting consumer needs: the
-  landing path writes it and posts nothing (source boundary). ``pid_identity`` is
-  the worker process's kernel creation token; orphan recovery matches it before
-  signaling the stored PID, which may otherwise have been reused.
-  ``supervisor_pid_identity`` applies the same reuse check to the process that
-  owns finalization, though it is never signaled. ``worker_status``/
-  ``worker_exit_code`` preserve a supervised process outcome before slower
-  result enrichment begins. Worker finalization and explicit stop/reaper paths
-  write them; synthetic terminal rows do not become replay candidates merely
-  because their status changed. Historical rows remain NULL.
-- ``nod_requests`` (schema v7, the human loop) maps a Nod request id to the
-  run and the ``ref`` it escalated, so a source adapter can carry the answer
-  onward. That column was ``work_item`` until schema v25 and is now the same
-  OPAQUE string ``runs.ref`` is: the caller supplies it, the core stores and
-  echoes it, and only an adapter knows it spells a tracker id today (source
-  boundary). ``channel`` is stored because a Nod issuer token is scoped to
-  exactly one channel: a later decision/wait/cancel read has to pick the
-  credential for the channel the card was filed to, never guess.
-  ``acted_at`` (schema v14) marks that the daemon's answers pass acted on
-  the card's decision — stamped exactly once, so an answered card never
-  retriggers on the next tick. Owned by ``nod.py``; carries no issuer token.
-- ``projects.archived`` (schema v20, DESIGN §1) mirrors the source's own flag,
-  and ``projects.archived_override`` (schema v26) is the owner's answer on top
-  of it: effective archived is ``COALESCE(archived_override, archived, 0)``,
-  spelled once in ``project.ARCHIVED_SQL``. An archived project is PARKED, so
-  the unattended lanes skip its items and the listing surfaces hide it. It hides nothing that already happened — every
-  query over ``runs`` ignores this column, so history, statistics and run
-  lookup are untouched, and a live run is never disturbed by it.
-- ``meta['board_revision']`` (schema v19, DESIGN §3) is the dashboard's
-  invalidation counter: three triggers on ``runs`` bump it on every insert,
-  update and delete. It exists so the board can be TOLD something changed
-  instead of asking every four seconds; the number itself is the SSE event id
-  on ``/api/board/stream``, so a reconnect resumes on it. Triggers rather
-  than a call in each writer, for the same reason ``revoke_run_token`` is a
-  trigger: every path that touches a run must bump it. ``runs`` alone —
-  everything else the snapshot reads (pause state, runway, health) rides the
-  explicit bump ``http.record_health`` makes once per sweeper tick.
-- ``runs.revision`` (schema v22, source boundary) is that same
-  counter STAMPED ON THE ROW: the monotonic marker of when this run last
-  changed. The global number says only THAT something changed; the column
-  says WHICH run, so a consumer keeps a cursor and reads the rows past it
-  (``http.runs_since``, ``GET /api/runs?since=``). It is the whole outbound
-  feed — Orchestra keeps no subscriber list, no endpoint and no delivery
-  state, because the consumer's cursor is the delivery guarantee. Indexed,
-  since every read of it is a range scan. Stamped by the same triggers, for
-  the same reason: every path that touches a run must mark it.
+This is a clean-break schema. A database without the exact v2 marker is
+refused; archived databases are never upgraded in place.
 """
+
+import json
 import sqlite3
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path, PurePath
+from pathlib import Path
 
 from orchestra import paths
 
-SCHEMA_VERSION = "29"
+SCHEMA_VERSION = "v2"
+GENERAL_GROUP_ID = "general"
+GENERAL_GROUP_SLUG = "general"
 
-# Columns added after v1; applied idempotently so an older database upgrades
-# in place (greenfield policy: extensions, not migration files). ``ref``
-# (schema v2's ``work_item``) is deliberately NOT in this list: v21 either
-# RENAMES the old column or adds the new one, never both — see ``connect``.
-RUNS_V4_COLUMNS = (
-    ("project_id", "TEXT"),
-)
-RUNS_V9_COLUMNS = (
-    ("retry_of", "INTEGER"),
-    ("tokens_in", "INTEGER"),
-    ("tokens_out", "INTEGER"),
-    ("tokens_total", "INTEGER"),
-    ("cost_usd", "REAL"),
-    ("usage_source", "TEXT"),
-)
-RUNS_V11_COLUMNS = (
-    ("run_token_hash", "TEXT"),
-)
-# Schema v13 (W-0183). The staffing turn's one line: which profile it chose
-# and why, or why it fell back to the caller's default profile. NULL means routing was
-# off for that dispatch — there was no decision to explain.
-RUNS_V13_COLUMNS = (
-    ("routed_reason", "TEXT"),
-)
-# Schema v15 (W-0214). ``layer`` marks a CONTROL TURN — router / merge /
-# observer / conductor — recorded as a terminal runs row so its transcript
-# ingests into the same events table and opens in the same detail screen.
-# NULL is a worker run. Fleet queries (the snapshot, the statistics, the
-# performance review) exclude them with ``layer IS NULL``; queries keyed on
-# ref / branch / parent_run never match one, because a control turn
-# carries none of them.
-RUNS_V15_COLUMNS = (
-    ("layer", "TEXT"),
-)
-# Schema v16 (W-0295). Landing, handoff, worker recovery, and claim handoff
-# all stamp the plain run row; no result object or replay table is needed.
-# ``claim_status`` (v16's ``work_claim_status``) is deliberately NOT in this
-# list: v25 either RENAMES the old column or adds the new one, never both —
-# see ``connect``.
-RUNS_V16_COLUMNS = (
-    ("landing_status", "TEXT"),
-    ("handoff_processed_at", "TEXT"),
-    ("pid_identity", "TEXT"),
-    ("supervisor_pid_identity", "TEXT"),
-    ("worker_status", "TEXT"),
-    ("worker_exit_code", "INTEGER"),
-)
-# Schema v17. A run may ask for HELP: a weaker profile to take a bounded
-# piece while it keeps the mission. ``parent_run`` already says who spawned
-# it; these say how deep the tree goes, which request produced this child,
-# and how its lead was told the batch had settled — once, whether the lead
-# was still running (a message) or already finished (a continuation run).
-# Schema v18. THE number a human reads: this project's own count, dense and
-# starting at 1. ``id`` stays the internal key every foreign key points at,
-# and stops being shown. A single global sequence was read as a per-project
-# run count and could not be: control turns took 146 of the first 300
-# numbers, and five projects shared the rest, so PREX3's 105 runs were
-# spread across ids 1 to 299 (2026-08-27). A control turn is not a run and
-# gets no number.
-RUNS_V18_COLUMNS = (
-    ("project_seq", "INTEGER"),
-)
-# Schema v22 (source boundary). The change marker the cursored read
-# scans. Written only by the triggers below; NULL only between the ALTER and
-# the one-shot backfill in ``connect``.
-RUNS_V22_COLUMNS = (
-    ("revision", "INTEGER"),
-)
-# Schema v23 (source boundary). The merge commit a landing produced,
-# beside the ``ok``/``failed`` verdict that already sits there. The landing
-# path used to keep this fact to itself and post it to the source directly; now it
-# writes the receipt and a consumer reads it.
-RUNS_V23_COLUMNS = (
-    ("landing_commit", "TEXT"),
-)
-RUNS_V17_COLUMNS = (
-    ("child_depth", "INTEGER"),
-    ("spawn_request_id", "INTEGER"),
-    ("child_wakeup_run", "INTEGER"),
-    ("child_wakeup_message", "INTEGER"),
-)
+RUN_ACTIVE = ("queued", "starting", "running", "waiting")
+RUN_TERMINAL = ("completed", "failed", "timed_out", "stopped", "skipped")
+TERMINAL_SQL = "(" + ",".join(f"'{status}'" for status in RUN_TERMINAL) + ")"
 
-# Schema v20 (DESIGN §1). A plain boolean: this project is parked. A
-# source-backed row gets it from the source's adapter on every refresh, so
-# parking a project there parks it here with no local action; a locally
-# adopted row is parked with ``orchestra project archive``. Core code reads
-# the flag and never asks who set it (source boundary).
-PROJECTS_V20_COLUMNS = (
-    ("archived", "INTEGER NOT NULL DEFAULT 0"),
-)
 
-# Schema v26 (DESIGN §1). The OWNER'S OWN answer, above the source's: NULL
-# follows ``archived``, 0 and 1 override it. A PURE ADD — nothing is renamed,
-# dropped or migrated, so a stale pre-v26 writer that re-adds its own columns
-# leaves this one alone and every old row keeps its effective state through
-# the COALESCE (2026-08-28, why ``_retire_resurrected`` exists).
-PROJECTS_V26_COLUMNS = (
-    ("archived_override", "INTEGER"),
-)
+class _Connection(sqlite3.Connection):
+    """SQLite connection with one private API transaction mode.
 
-# Schema v27. The human address (see the data-model note above). Backfilled
-# once by ``_backfill_project_slugs``; new rows are minted in ``project.py``.
-PROJECTS_V27_COLUMNS = (
-    ("slug", "TEXT"),
-)
+    Domain helpers historically own their small transactions.  An HTTP
+    mutation must additionally commit its replay receipt with those writes.
+    While ``api_mutation`` is active, helper commits and successful ``with
+    con`` exits become logical boundaries; the outer API transaction performs
+    the only real commit.  Rollback is intentionally never deferred.
+    """
 
-# Schema v28. ``repo`` is the CHECKOUT this run branched from and lands into.
-# A project is not one checkout: a dispatch may name any path (``--path``),
-# so the registry's default cannot answer "where does this run's branch
-# live" — and landing into the wrong repository is not a small mistake.
-# Stamped at launch preparation; NULL on older rows, where ``root_for``
-# falls back to the registry as before.
-RUNS_V28_COLUMNS = (
-    ("repo", "TEXT"),
-)
+    _api_mutation_active = False
+    _api_mutation_broken = False
+    _api_context_depth = 0
 
-# Schema v12 (DESIGN §11, W-0179). ``runway_polls.windows`` is the JSON list
-# of EVERY window the provider reported in that poll — Claude's 5-hour and
-# weekly limits are two facts. The scalar columns stay the tightest live one.
-RUNWAY_V12_COLUMNS = (
-    ("windows", "TEXT"),
-)
+    @contextmanager
+    def api_mutation(self):
+        if self._api_mutation_active or \
+                sqlite3.Connection.in_transaction.__get__(self):
+            raise RuntimeError("API mutation requires a clean transaction")
+        sqlite3.Connection.execute(self, "BEGIN IMMEDIATE")
+        self._api_mutation_active = True
+        self._api_mutation_broken = False
+        try:
+            yield self
+        except BaseException:
+            sqlite3.Connection.rollback(self)
+            raise
+        else:
+            if self._api_mutation_broken:
+                sqlite3.Connection.rollback(self)
+                raise RuntimeError(
+                    "API mutation was rolled back before completion")
+            sqlite3.Connection.commit(self)
+        finally:
+            self._api_mutation_active = False
+            self._api_mutation_broken = False
+            self._api_context_depth = 0
 
-# Schema v9 (DESIGN §6, messaging). A message that never reached its run is
-# MARKED, never dropped and never re-aimed at a later run.
-MESSAGES_V9_COLUMNS = (
-    ("undeliverable_at", "TEXT"),
-    ("undeliverable_reason", "TEXT"),
-)
+    def commit(self) -> None:
+        if not self._api_mutation_active:
+            sqlite3.Connection.commit(self)
 
-# Schema v14 (the human loop, acting half). ``acted_at`` is the answers
-# pass's once-and-only-once stamp: NULL means the decision has not been
-# acted on yet, anything else means it must never trigger an action again.
-NOD_REQUESTS_V14_COLUMNS = (
-    ("acted_at", "TEXT"),
-)
+    def rollback(self) -> None:
+        if self._api_mutation_active:
+            self._api_mutation_broken = True
+        sqlite3.Connection.rollback(self)
 
-# Schema v24 (source boundary). What the card SAID. An escalation
-# record that keeps only a pointer to the push device is not durable: a
-# consumer that carries the same escalation somewhere else — a source
-# adapter filing a decision — has to be able to read it back without asking
-# Nod, and without the filing module knowing who reads it.
-NOD_REQUESTS_V24_COLUMNS = (
-    ("title", "TEXT"),
-    ("body", "TEXT"),
-)
+    def __enter__(self):
+        if not self._api_mutation_active:
+            return sqlite3.Connection.__enter__(self)
+        self._api_context_depth += 1
+        return self
 
-# Declared apart from SCHEMA because the v29 migration below has to fill it
-# before SCHEMA runs.
-CHECKOUTS_SQL = """
--- Schema v29 (source boundary). The source adapter's label-to-folder
--- map: the source's cached project list (``source_ref`` set) plus the
--- owner's ``link`` bindings (``source_ref`` NULL). Owned by ``sweeper.py``;
--- the core never reads it. The core's ``projects`` table is identity only.
-CREATE TABLE IF NOT EXISTS checkouts (
-  path TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  source_ref TEXT,
-  refreshed_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_checkouts_project ON checkouts(project_id);
-"""
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self._api_mutation_active:
+            return sqlite3.Connection.__exit__(
+                self, exc_type, exc_value, traceback)
+        try:
+            if exc_type is not None:
+                self.rollback()
+            return False
+        finally:
+            self._api_context_depth = max(0, self._api_context_depth - 1)
 
-# Declared apart from SCHEMA because the v21 migration below has to fill it
-# before SCHEMA runs.
-WORK_MARKS_SQL = """
--- Schema v21 (source boundary). The source adapter's bookkeeping
--- about its OWN board, keyed by the run it concerns: how far that ref's
--- thread has been ferried, whether the completion writeback landed, and when
--- the heartbeat last posted. These were columns on ``runs`` and were never
--- facts about a run. Owned by ``sweeper.py`` (with the source-facing tails of
--- ``verify.py`` and ``merge.py``); no core module reads this table, the same
--- arrangement ``conductor_turns`` has with ``conductor.py``.
-CREATE TABLE IF NOT EXISTS work_marks (
-  run_id INTEGER PRIMARY KEY REFERENCES runs(id),
-  seen_ts TEXT,
-  reported_at TEXT,
-  progress_at TEXT
-);
-"""
+
+def api_mutation(con: sqlite3.Connection):
+    """Return the private transaction context used only by the HTTP service."""
+    if not isinstance(con, _Connection):
+        raise TypeError("API mutations require a connection from db.connect()")
+    return con.api_mutation()
+
+
+def in_api_mutation(con: sqlite3.Connection) -> bool:
+    return isinstance(con, _Connection) and con._api_mutation_active
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
+CREATE TABLE meta (
   key TEXT PRIMARY KEY,
-  value TEXT
+  value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS runs (
-  id INTEGER PRIMARY KEY,
-  slug TEXT UNIQUE,
-  profile TEXT NOT NULL,
-  backend TEXT NOT NULL,
+
+CREATE TABLE run_groups (
+  group_id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(slug)) > 0),
+  name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+  default_cwd TEXT,
+  archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+  last_run_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_run_seq >= 0),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TRIGGER protect_general_group_delete BEFORE DELETE ON run_groups
+WHEN OLD.group_id='general'
+BEGIN
+  SELECT RAISE(ABORT, 'the General group is permanent');
+END;
+
+CREATE TRIGGER protect_general_group_identity
+BEFORE UPDATE OF slug, name, archived ON run_groups
+WHEN OLD.group_id='general' AND
+     (NEW.slug IS NOT OLD.slug OR NEW.name IS NOT OLD.name OR NEW.archived <> 0)
+BEGIN
+  SELECT RAISE(ABORT, 'the General group is permanent');
+END;
+
+CREATE TABLE runtimes (
+  runtime_id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(slug)) > 0),
+  name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+  adapter TEXT NOT NULL CHECK(length(trim(adapter)) > 0),
+  command_json TEXT NOT NULL DEFAULT '[]',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE runway_sources (
+  source_id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(slug)) > 0),
+  name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+  provider TEXT NOT NULL CHECK(length(trim(provider)) > 0),
+  account TEXT NOT NULL DEFAULT '',
+  lane TEXT NOT NULL DEFAULT '',
+  adapter TEXT NOT NULL CHECK(length(trim(adapter)) > 0),
+  command_json TEXT NOT NULL DEFAULT '[]',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(provider, account, lane)
+);
+
+CREATE TABLE profiles (
+  profile_id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(slug)) > 0),
+  name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+  runtime_id TEXT NOT NULL REFERENCES runtimes(runtime_id),
   model TEXT,
+  effort TEXT,
+  tier INTEGER NOT NULL CHECK(tier BETWEEN 1 AND 3),
+  priority INTEGER NOT NULL DEFAULT 0,
+  sandbox TEXT,
+  timeout_seconds INTEGER CHECK(timeout_seconds IS NULL OR timeout_seconds > 0),
+  max_concurrency INTEGER CHECK(max_concurrency IS NULL OR max_concurrency > 0),
+  runway_source_id TEXT REFERENCES runway_sources(source_id),
+  env_json TEXT NOT NULL DEFAULT '{}',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  note TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+  archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_profiles_runtime ON profiles(runtime_id);
+CREATE INDEX idx_profiles_runway_source ON profiles(runway_source_id);
+
+CREATE TABLE fleet_settings (
+  key TEXT PRIMARY KEY CHECK(length(trim(key)) > 0),
+  value_json TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  updated_by TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE observer_settings (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+  profile_id TEXT REFERENCES profiles(profile_id),
+  max_concurrency INTEGER NOT NULL DEFAULT 1
+    CHECK(max_concurrency BETWEEN 1 AND 8),
+  first_look_seconds INTEGER NOT NULL DEFAULT 300 CHECK(first_look_seconds > 0),
+  minimum_events INTEGER NOT NULL DEFAULT 5 CHECK(minimum_events > 0),
+  interval_seconds INTEGER NOT NULL DEFAULT 1800 CHECK(interval_seconds > 0),
+  authority TEXT NOT NULL DEFAULT 'correct_then_stop'
+    CHECK(authority IN ('advisory', 'tell_only', 'correct_then_stop')),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  updated_by TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK(enabled=0 OR profile_id IS NOT NULL)
+);
+
+CREATE TABLE devices (
+  device_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+  token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash) >= 32),
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE TABLE service_tokens (
+  token_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+  token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash) >= 32),
+  authorities_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  revoked_at TEXT
+);
+
+CREATE TABLE pairing_codes (
+  pairing_id TEXT PRIMARY KEY,
+  code_hash TEXT NOT NULL UNIQUE CHECK(length(code_hash) >= 32),
+  created_by_device_id TEXT REFERENCES devices(device_id),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
+);
+CREATE INDEX idx_pairing_codes_expiry ON pairing_codes(expires_at, used_at);
+
+CREATE TABLE runs (
+  id INTEGER PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(8)))),
+  request_id TEXT NOT NULL UNIQUE,
+  group_id TEXT NOT NULL DEFAULT 'general' REFERENCES run_groups(group_id),
+  group_seq INTEGER,
+  profile_id TEXT NOT NULL REFERENCES profiles(profile_id),
+  runtime_id TEXT NOT NULL REFERENCES runtimes(runtime_id),
+  runway_source_id TEXT REFERENCES runway_sources(source_id),
+  root_run_id INTEGER REFERENCES runs(id),
+  parent_run_id INTEGER REFERENCES runs(id),
+  retry_of_run_id INTEGER REFERENCES runs(id),
+  continuation_of_run_id INTEGER REFERENCES runs(id),
+  attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt > 0),
   title TEXT,
+  mission TEXT NOT NULL CHECK(length(trim(mission)) > 0),
+  context TEXT,
   requested_by TEXT NOT NULL,
-  brief_path TEXT,
-  log_path TEXT,
+  ref TEXT,
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK(status IN ('queued','starting','running','waiting','completed',
+                     'failed','timed_out','stopped','skipped')),
+  hold_reason TEXT,
+  not_before TEXT,
+  waiting_kind TEXT CHECK(waiting_kind IS NULL OR waiting_kind IN ('input','children')),
+  summary TEXT,
+  exit_code INTEGER,
+  queued_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  cwd TEXT NOT NULL,
+  cwd_source TEXT NOT NULL
+    CHECK(cwd_source IN ('run','group','managed','inherited')),
   workdir TEXT NOT NULL,
+  isolation TEXT NOT NULL DEFAULT 'auto'
+    CHECK(isolation IN ('auto','worktree','shared')),
+  repo TEXT,
   branch TEXT,
   base_commit TEXT,
+  head_commit TEXT,
   checkpoint_commit TEXT,
-  parent_run INTEGER REFERENCES runs(id),
+  diff_path TEXT,
+  brief_path TEXT,
+  log_path TEXT,
   pid INTEGER,
   pid_identity TEXT,
   supervisor_pid INTEGER,
   supervisor_pid_identity TEXT,
   session_ref TEXT,
-  status TEXT NOT NULL DEFAULT 'spawning',
-  exit_code INTEGER,
-  summary TEXT,
-  started_at TEXT NOT NULL,
-  finished_at TEXT,
-  ref TEXT,
-  project_id TEXT,
-  retry_of INTEGER REFERENCES runs(id),
-  tokens_in INTEGER,
-  tokens_out INTEGER,
-  tokens_total INTEGER,
-  cost_usd REAL,
-  usage_source TEXT,
-  run_token_hash TEXT,
-  routed_reason TEXT,
-  layer TEXT,
-  landing_status TEXT,
-  handoff_processed_at TEXT,
   worker_status TEXT,
   worker_exit_code INTEGER,
-  claim_status TEXT,
-  child_depth INTEGER,
-  spawn_request_id INTEGER,
-  child_wakeup_run INTEGER,
-  child_wakeup_message INTEGER,
-  project_seq INTEGER,
-  revision INTEGER,
-  landing_commit TEXT,
-  repo TEXT
+  tokens_in INTEGER CHECK(tokens_in IS NULL OR tokens_in >= 0),
+  tokens_out INTEGER CHECK(tokens_out IS NULL OR tokens_out >= 0),
+  tokens_total INTEGER CHECK(tokens_total IS NULL OR tokens_total >= 0),
+  tokens_cache_read INTEGER CHECK(tokens_cache_read IS NULL OR tokens_cache_read >= 0),
+  tokens_cache_write INTEGER CHECK(tokens_cache_write IS NULL OR tokens_cache_write >= 0),
+  cost_usd REAL CHECK(cost_usd IS NULL OR cost_usd >= 0),
+  usage_source TEXT,
+  run_token_hash TEXT UNIQUE,
+  profile_snapshot TEXT NOT NULL,
+  runtime_snapshot TEXT NOT NULL,
+  request_snapshot TEXT NOT NULL,
+  revision INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_token ON runs(run_token_hash);
--- A per-run token dies with its run. This is a trigger and not a call in each
--- finalizer because every terminal writer must revoke the credential.
-CREATE TRIGGER IF NOT EXISTS revoke_run_token AFTER UPDATE OF status ON runs
-WHEN NEW.status IN ('done','failed','timeout','killed','halted')
+CREATE UNIQUE INDEX idx_runs_group_sequence ON runs(group_id, group_seq);
+CREATE INDEX idx_runs_status ON runs(status, id);
+CREATE INDEX idx_runs_scheduled ON runs(status, not_before, id);
+CREATE INDEX idx_runs_revision ON runs(revision, id);
+CREATE INDEX idx_runs_profile ON runs(profile_id, id);
+CREATE INDEX idx_runs_parent ON runs(parent_run_id, id);
+CREATE INDEX idx_runs_root ON runs(root_run_id, id);
+CREATE INDEX idx_runs_ref ON runs(ref, id);
+
+CREATE TRIGGER reject_explicit_group_sequence BEFORE INSERT ON runs
+WHEN NEW.group_seq IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'group sequence is allocated by Orchestra');
+END;
+
+CREATE TRIGGER reject_archived_group_root BEFORE INSERT ON runs
+WHEN NEW.parent_run_id IS NULL AND NEW.retry_of_run_id IS NULL
+     AND NEW.continuation_of_run_id IS NULL
+     AND (SELECT archived FROM run_groups WHERE group_id=NEW.group_id)=1
+BEGIN
+  SELECT RAISE(ABORT, 'archived group does not accept root runs');
+END;
+
+CREATE TRIGGER initialize_run AFTER INSERT ON runs
+BEGIN
+  UPDATE run_groups SET last_run_seq=last_run_seq+1 WHERE group_id=NEW.group_id;
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+  UPDATE runs SET
+    group_seq=(SELECT last_run_seq FROM run_groups WHERE group_id=NEW.group_id),
+    root_run_id=COALESCE(
+      NEW.root_run_id,
+      (SELECT root_run_id FROM runs WHERE id=COALESCE(
+        NEW.parent_run_id, NEW.retry_of_run_id, NEW.continuation_of_run_id)),
+      NEW.id
+    ),
+    revision=(SELECT CAST(value AS INTEGER) FROM meta WHERE key='board_revision')
+  WHERE id=NEW.id;
+END;
+
+CREATE TRIGGER bump_board_revision_update AFTER UPDATE ON runs
+WHEN NEW.revision IS OLD.revision
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+  UPDATE runs SET revision=(SELECT CAST(value AS INTEGER) FROM meta
+                            WHERE key='board_revision') WHERE id=NEW.id;
+END;
+
+CREATE TRIGGER bump_board_revision_delete AFTER DELETE ON runs
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+END;
+
+CREATE TRIGGER revoke_run_token AFTER UPDATE OF status ON runs
+WHEN NEW.status IN ('completed','failed','timed_out','stopped','skipped')
      AND NEW.run_token_hash IS NOT NULL
 BEGIN
   UPDATE runs SET run_token_hash=NULL WHERE id=NEW.id;
 END;
--- The board's invalidation counter (DESIGN §3) and, since v22, the run's own
--- change marker (source boundary): every write to runs bumps the
--- counter AND stamps the new value on the row that changed. The SSE seam
--- tails the counter; a cursored consumer range-scans the column. Triggers,
--- not a call per writer: runs is written from a dozen modules.
---
--- The INSERT trigger only TOUCHES the new row; the UPDATE trigger below does
--- the bump and the stamp for both. SQLite stops a trigger re-entering ITSELF
--- (recursive_triggers is off by default and ``connect`` never turns it on),
--- not from firing a SIBLING — so an insert that bumped here as well would
--- advance the counter twice, once here and once through this touch.
-CREATE TRIGGER IF NOT EXISTS bump_board_revision_insert AFTER INSERT ON runs
-BEGIN
-  UPDATE runs SET revision=revision WHERE id=NEW.id;
-END;
-CREATE TRIGGER IF NOT EXISTS bump_board_revision_update AFTER UPDATE ON runs
-BEGIN
-  INSERT INTO meta(key, value) VALUES('board_revision', 1)
-  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
-  UPDATE runs SET revision=(SELECT CAST(value AS INTEGER) FROM meta
-                            WHERE key='board_revision') WHERE id=NEW.id;
-END;
-CREATE TRIGGER IF NOT EXISTS bump_board_revision_delete AFTER DELETE ON runs
-BEGIN
-  INSERT INTO meta(key, value) VALUES('board_revision', 1)
-  ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
-END;
-CREATE INDEX IF NOT EXISTS idx_runs_parent_run ON runs(parent_run);
--- The cursored read is one range scan on this and nothing else.
-CREATE INDEX IF NOT EXISTS idx_runs_revision ON runs(revision);
-CREATE INDEX IF NOT EXISTS idx_runs_ref ON runs(ref);
-CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
--- Orchestra's project registry: IDENTITY ONLY (schema v29). One row per
--- project; ``project_id`` is what everything keys on, ``slug`` is the human
--- address, and ``local`` records who minted the row (1 the owner, 0 an
--- adapter's cache) — provenance, never a source's name (source boundary).
--- Checkouts are the caller's business at dispatch; the adapter's own map
--- lives in ``checkouts`` above.
-CREATE TABLE IF NOT EXISTS projects (
-  project_id TEXT PRIMARY KEY,
-  slug TEXT UNIQUE,
-  name TEXT,
-  local INTEGER NOT NULL DEFAULT 1,
-  refreshed_at TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0,
-  archived_override INTEGER
+
+CREATE TABLE run_dependencies (
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  depends_on_run_id INTEGER NOT NULL REFERENCES runs(id),
+  condition TEXT NOT NULL DEFAULT 'success'
+    CHECK(condition IN ('success', 'terminal')),
+  PRIMARY KEY(run_id, depends_on_run_id),
+  CHECK(run_id <> depends_on_run_id)
 );
-CREATE TABLE IF NOT EXISTS messages (
+CREATE INDEX idx_run_dependencies_prerequisite
+  ON run_dependencies(depends_on_run_id, run_id);
+
+CREATE TABLE child_requests (
   id INTEGER PRIMARY KEY,
-  run_id INTEGER NOT NULL REFERENCES runs(id),
+  request_id TEXT NOT NULL UNIQUE,
+  parent_run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  requested_by TEXT NOT NULL,
+  targets_json TEXT NOT NULL,
+  mission TEXT NOT NULL,
+  title TEXT,
+  context TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','processing','settled','failed','cancelled')),
+  child_run_ids_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  processed_at TEXT
+);
+CREATE INDEX idx_child_requests_parent ON child_requests(parent_run_id, status, id);
+
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound', 'system')),
   sender TEXT NOT NULL,
   body TEXT NOT NULL,
-  kind TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'message',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','delivered','undeliverable')),
+  correlation_id TEXT,
+  reply_to INTEGER REFERENCES messages(id),
   created_at TEXT NOT NULL,
   delivery_offset INTEGER,
   delivered_at TEXT,
   undeliverable_at TEXT,
   undeliverable_reason TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id);
-CREATE TABLE IF NOT EXISTS dispatch_dependencies (
-  run_id INTEGER NOT NULL REFERENCES runs(id),
-  depends_on_run INTEGER NOT NULL REFERENCES runs(id),
-  kind TEXT NOT NULL DEFAULT 'requires_success'
-    CHECK(kind IN ('requires_success', 'wait_for')),
-  PRIMARY KEY(run_id, depends_on_run)
-);
-CREATE INDEX IF NOT EXISTS idx_dispatch_dependencies_prerequisite
-  ON dispatch_dependencies(depends_on_run);
-CREATE TABLE IF NOT EXISTS deferred_dispatches (
-  run_id INTEGER PRIMARY KEY REFERENCES runs(id),
-  mission TEXT NOT NULL,
-  context TEXT,
-  use_worktree INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'pending',
-  error TEXT,
+CREATE INDEX idx_messages_run ON messages(run_id, id);
+CREATE INDEX idx_messages_delivery ON messages(status, id);
+CREATE UNIQUE INDEX idx_messages_correlation
+  ON messages(run_id, kind, correlation_id) WHERE correlation_id IS NOT NULL;
+
+CREATE TABLE attention_requests (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL
+    CHECK(kind IN ('question','decision','alert','profile_proposal')),
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK(status IN ('open','resolved','cancelled')),
+  blocking INTEGER NOT NULL DEFAULT 0 CHECK(blocking IN (0, 1)),
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  choices_json TEXT,
+  fallback_json TEXT,
+  proposal_json TEXT,
+  correlation_id TEXT NOT NULL UNIQUE,
+  deadline TEXT,
+  created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  processed_at TEXT
+  resolved_at TEXT,
+  resolution_json TEXT,
+  resolved_by TEXT,
+  revision INTEGER
 );
--- Honest queue state (schema v6, DESIGN §4): a caller's item that cannot start
--- yet waits HERE, with the reason it waits, instead of being moved to
--- in_progress on entering a queue. One row per item; ``id`` is the FIFO
--- tiebreak and ``lane_index`` the ready-lane board position it last had.
--- Schema v17. A worker asks for help by WRITING here; it never launches a
--- process from inside its own sandbox. The parent's supervisor claims each
--- request, enforces the bounds, creates the batch, and starts it. The
--- broker is the enforcement point, never the model's judgment.
-CREATE TABLE IF NOT EXISTS spawn_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  lead_run INTEGER NOT NULL REFERENCES runs(id),
-  requested_by TEXT NOT NULL,
-  targets_json TEXT NOT NULL,
-  mission TEXT NOT NULL,
-  title TEXT,
-  context TEXT,
-  shared_workdir INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'pending',
-  error TEXT,
-  child_run_ids_json TEXT,
-  wakeup_run INTEGER,
-  wakeup_message INTEGER,
-  notified_at TEXT,
-  created_at TEXT NOT NULL,
-  processed_at TEXT
-);
-CREATE INDEX IF NOT EXISTS spawn_requests_lead
-  ON spawn_requests(lead_run, status);
-CREATE TABLE IF NOT EXISTS dispatch_queue (
+CREATE INDEX idx_attention_open ON attention_requests(status, created_at, id);
+CREATE INDEX idx_attention_run ON attention_requests(run_id, id);
+CREATE INDEX idx_attention_revision ON attention_requests(revision, id);
+
+CREATE TRIGGER initialize_attention AFTER INSERT ON attention_requests
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+  UPDATE attention_requests SET revision=(
+    SELECT CAST(value AS INTEGER) FROM meta WHERE key='board_revision'
+  ) WHERE id=NEW.id;
+END;
+
+CREATE TRIGGER bump_attention_revision AFTER UPDATE ON attention_requests
+WHEN NEW.revision IS OLD.revision
+BEGIN
+  INSERT INTO meta(key, value) VALUES('board_revision', 1)
+  ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+  UPDATE attention_requests SET revision=(
+    SELECT CAST(value AS INTEGER) FROM meta WHERE key='board_revision'
+  ) WHERE id=NEW.id;
+END;
+
+CREATE TABLE attention_responses (
   id INTEGER PRIMARY KEY,
-  item_id TEXT NOT NULL UNIQUE,
-  kind TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  detail TEXT,
-  lane_index INTEGER,
-  enqueued_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  attention_id INTEGER NOT NULL REFERENCES attention_requests(id) ON DELETE CASCADE,
+  actor TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  accepted INTEGER NOT NULL DEFAULT 0 CHECK(accepted IN (0, 1)),
+  created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS runway_polls (
+CREATE UNIQUE INDEX idx_attention_one_accepted
+  ON attention_responses(attention_id) WHERE accepted=1;
+CREATE INDEX idx_attention_responses_request ON attention_responses(attention_id, id);
+
+CREATE TABLE events (
   id INTEGER PRIMARY KEY,
-  provider TEXT NOT NULL,
-  remaining REAL,
-  limit_value REAL,
-  unit TEXT,
-  resets_at TEXT,
-  as_of TEXT,
-  reason TEXT,
-  raw TEXT,
-  windows TEXT,
-  polled_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_runway_polls_provider
-  ON runway_polls(provider, polled_at);
--- Schema v6 (DESIGN §7). One normalized trace row per interesting JSONL
--- line, for every backend. `payload` is truncated to ~2KB; `payload_len` is
--- the untruncated length; `byte_offset`/`byte_length` locate the raw line so
--- a viewer expands from the file itself. `byte_offset = -1` marks an event
--- with no raw backing (a human injection Orchestra recorded directly).
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY,
-  run_id INTEGER NOT NULL REFERENCES runs(id),
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   seq INTEGER NOT NULL,
   kind TEXT NOT NULL,
   name TEXT,
   payload TEXT NOT NULL DEFAULT '',
   payload_len INTEGER NOT NULL DEFAULT 0,
-  truncated INTEGER NOT NULL DEFAULT 0,
+  truncated INTEGER NOT NULL DEFAULT 0 CHECK(truncated IN (0, 1)),
   byte_offset INTEGER NOT NULL DEFAULT -1,
   byte_length INTEGER NOT NULL DEFAULT 0,
   ts TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(run_id, seq)
 );
-CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
-CREATE TABLE IF NOT EXISTS trace_cursors (
-  run_id INTEGER PRIMARY KEY REFERENCES runs(id),
+CREATE INDEX idx_events_run ON events(run_id, seq);
+
+CREATE TABLE trace_cursors (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
   byte_offset INTEGER NOT NULL DEFAULT 0,
   seq INTEGER NOT NULL DEFAULT 0,
   skipped INTEGER NOT NULL DEFAULT 0,
   raw_pruned_at TEXT,
   updated_at TEXT NOT NULL
 );
--- Schema v9 (DESIGN §7, the spin observer). One row per judgement: which
--- layer produced it (stall / mechanical / observer / retry / planner), what
--- it did (ok / tell / stop / retry / escalate / deferred), and WHY. The why
--- is the point: a stop must never be silent, and the hourly observer cadence
--- measures from the last row for the run.
-CREATE TABLE IF NOT EXISTS observations (
+
+CREATE TABLE supervision_events (
   id INTEGER PRIMARY KEY,
-  run_id INTEGER NOT NULL REFERENCES runs(id),
-  layer TEXT NOT NULL,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  detector TEXT NOT NULL,
   action TEXT NOT NULL,
-  reason TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL,
+  detail_json TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_supervision_events_run ON supervision_events(run_id, id);
+
+CREATE TABLE observer_checks (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  profile_id TEXT REFERENCES profiles(profile_id),
+  profile_snapshot TEXT NOT NULL,
+  runtime_snapshot TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  authority TEXT NOT NULL DEFAULT 'correct_then_stop'
+    CHECK(authority IN ('advisory', 'tell_only', 'correct_then_stop')),
+  verdict TEXT,
+  action TEXT,
+  reason TEXT,
+  detail_json TEXT,
+  delivery_status TEXT NOT NULL DEFAULT 'not_required'
+    CHECK(delivery_status IN ('not_required','pending','delivered','skipped')),
+  delivery_error TEXT,
+  control_audit_id INTEGER REFERENCES control_events(id),
+  event_seq_start INTEGER,
+  event_seq_end INTEGER,
+  event_count INTEGER NOT NULL DEFAULT 0 CHECK(event_count >= 0),
+  tokens_in INTEGER CHECK(tokens_in IS NULL OR tokens_in >= 0),
+  tokens_out INTEGER CHECK(tokens_out IS NULL OR tokens_out >= 0),
+  tokens_total INTEGER CHECK(tokens_total IS NULL OR tokens_total >= 0),
+  cost_usd REAL CHECK(cost_usd IS NULL OR cost_usd >= 0),
+  supervisor_pid INTEGER CHECK(supervisor_pid IS NULL OR supervisor_pid > 0),
+  supervisor_pid_identity TEXT,
+  worker_pid INTEGER CHECK(worker_pid IS NULL OR worker_pid > 0),
+  worker_pid_identity TEXT,
+  log_path TEXT,
+  log_pruned_at TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  error TEXT
+);
+CREATE INDEX idx_observer_checks_run ON observer_checks(run_id, id);
+CREATE INDEX idx_observer_checks_profile ON observer_checks(profile_id, id);
+CREATE UNIQUE INDEX idx_observer_active_run
+  ON observer_checks(run_id) WHERE finished_at IS NULL;
+
+CREATE TABLE runway_readings (
+  id INTEGER PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES runway_sources(source_id),
+  remaining REAL,
+  limit_value REAL,
+  unit TEXT,
+  resets_at TEXT,
+  as_of TEXT,
+  fresh_until TEXT,
+  definitive INTEGER NOT NULL DEFAULT 0 CHECK(definitive IN (0, 1)),
+  reason TEXT,
+  windows_json TEXT,
+  raw_json TEXT,
+  polled_at TEXT NOT NULL
+);
+CREATE INDEX idx_runway_readings_source ON runway_readings(source_id, polled_at, id);
+
+CREATE TABLE artifacts (
+  artifact_id TEXT PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  stored_path TEXT NOT NULL,
+  source_path TEXT,
+  mime_type TEXT,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+  sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+  created_at TEXT NOT NULL,
+  pruned_at TEXT,
+  UNIQUE(run_id, relative_path)
+);
+CREATE INDEX idx_artifacts_run ON artifacts(run_id, created_at, artifact_id);
+
+CREATE TABLE evidence_pins (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  reason TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE prune_plans (
+  plan_id TEXT PRIMARY KEY,
+  criteria_json TEXT NOT NULL,
+  items_json TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  applied_by TEXT,
+  applied_at TEXT,
+  result_json TEXT
+);
+CREATE INDEX idx_prune_plans_created ON prune_plans(created_at, plan_id);
+
+CREATE TABLE control_events (
+  id INTEGER PRIMARY KEY,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target_type TEXT,
+  target_id TEXT,
+  request_id TEXT,
   detail TEXT,
+  outcome TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_observations_run ON observations(run_id, id);
-CREATE TABLE IF NOT EXISTS nod_requests (
+CREATE INDEX idx_control_events_created ON control_events(created_at, id);
+CREATE INDEX idx_control_events_target ON control_events(target_type, target_id, id);
+
+CREATE TABLE request_replays (
   request_id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  channel TEXT NOT NULL,
-  run_id INTEGER REFERENCES runs(id),
-  ref TEXT,
-  dedupe_key TEXT,
-  title TEXT,
-  body TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',
-  option_id TEXT,
-  option_kind TEXT,
-  decision_text TEXT,
-  decided_at TEXT,
-  mirrored_at TEXT,
-  acted_at TEXT,
-  created_at TEXT NOT NULL
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  body_hash TEXT NOT NULL,
+  response_json TEXT,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_nod_requests_run ON nod_requests(run_id);
-CREATE INDEX IF NOT EXISTS idx_nod_requests_ref ON nod_requests(ref);
 """
 
-RUN_TERMINAL = ("done", "failed", "timeout", "killed", "halted")
-TERMINAL_SQL = "(" + ",".join(f"'{s}'" for s in RUN_TERMINAL) + ")"
 
-
-# The next number for a project, as a scalar subquery: the caller passes the
-# project_id one more time where this lands. Written inline so the number is
-# taken inside the same write lock that reserves the row — two dispatches
-# racing must not both read the same maximum.
-NEXT_PROJECT_SEQ = ("(SELECT COALESCE(MAX(project_seq), 0) + 1 FROM runs "
-                    " WHERE layer IS NULL AND project_id IS ?)")
-
-
-def run_no(run) -> str:
-    """How a run is named to a human: its project's own count (schema v18).
-
-    Falls back to the row id for a row that has no number — a control turn,
-    or a run recorded before the column existed. Never invents one.
-    """
-    try:
-        number = run["project_seq"]
-    except (IndexError, KeyError, TypeError):
-        number = None
-    return f"run {number}" if number else f"run {run['id']}"
+DEFAULT_FLEET_SETTINGS = {
+    "instance_name": "Orchestra",
+    "max_active_runs": 8,
+    "paused": False,
+    "delegation_max_depth": 2,
+    "delegation_max_children": 3,
+    "delegation_max_active_children": 3,
+}
 
 
 def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _retire_resurrected(con: sqlite3.Connection) -> None:
-    """Fold away an old column name a stale process put back (2026-08-28).
+def run_no(run) -> str:
+    """Return the group-local human run number, with the row id as fallback."""
+    try:
+        number = run["group_seq"]
+    except (IndexError, KeyError, TypeError):
+        number = None
+    if number:
+        try:
+            name = run["group_name"]
+        except (IndexError, KeyError, TypeError):
+            name = None
+        return f"{name} #{number}" if name else f"run {number}"
+    return f"run {run['id']}"
 
-    v21 and v25 rename in ONE SHOT and no reader tolerates the old spelling
-    (the one-shot rule). That holds for readers; it did not survive a WRITER left
-    running across the upgrade. A supervisor started before the upgrade keeps
-    pre-v21 code in memory, and its own ``connect`` re-adds every column it
-    expects. All five came back on the owner's database, and one of them,
-    ``work_reported_at``, came back carrying 276 rows, because the missing
-    columns also re-triggered the v16 backfill.
 
-    So "both spellings exist" is a REAL state, and crashing on it took the
-    daemon down. This stays a migration rather than the read-path shim the
-    one-shot rule forbids: it FOLDS the twin into the live column and DROPS it, so the old
-    shape is gone by the time this returns. Folding instead of dropping means
-    it never matters which side happened to hold the value.
+def _has_tables(con: sqlite3.Connection) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+    ).fetchone() is not None
+
+
+def _schema_version(con: sqlite3.Connection) -> str | None:
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+    ).fetchone():
+        return None
+    row = con.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def _execute_schema(con: sqlite3.Connection) -> None:
+    statement = ""
+    for line in SCHEMA.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            con.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise RuntimeError("orchestra: incomplete v2 schema statement")
+
+
+def _columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def _ensure_run_identity_triggers(con: sqlite3.Connection) -> None:
+    """Install run invariants after both clean creation and live-v2 migration."""
+    con.execute("""
+        CREATE TRIGGER IF NOT EXISTS validate_run_lineage BEFORE INSERT ON runs
+        WHEN
+          ((NEW.parent_run_id IS NOT NULL) + (NEW.retry_of_run_id IS NOT NULL) +
+           (NEW.continuation_of_run_id IS NOT NULL)) > 1
+          OR (
+            NEW.parent_run_id IS NULL AND NEW.retry_of_run_id IS NULL AND
+            NEW.continuation_of_run_id IS NULL AND NEW.root_run_id IS NOT NULL
+          )
+          OR (
+            COALESCE(NEW.parent_run_id, NEW.retry_of_run_id,
+                     NEW.continuation_of_run_id) IS NOT NULL AND (
+              NEW.group_id IS NOT (SELECT group_id FROM runs WHERE id=COALESCE(
+                NEW.parent_run_id, NEW.retry_of_run_id,
+                NEW.continuation_of_run_id)) OR
+              NEW.cwd IS NOT (SELECT cwd FROM runs WHERE id=COALESCE(
+                NEW.parent_run_id, NEW.retry_of_run_id,
+                NEW.continuation_of_run_id)) OR
+              (NEW.root_run_id IS NOT NULL AND NEW.root_run_id IS NOT
+                (SELECT root_run_id FROM runs WHERE id=COALESCE(
+                  NEW.parent_run_id, NEW.retry_of_run_id,
+                  NEW.continuation_of_run_id)))
+            )
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid run lineage');
+        END
+    """)
+    con.execute("""
+        CREATE TRIGGER IF NOT EXISTS immutable_run_identity
+        BEFORE UPDATE OF request_id, group_id, group_seq, profile_id,
+          runtime_id, runway_source_id, root_run_id, parent_run_id,
+          retry_of_run_id, continuation_of_run_id, attempt, mission, context,
+          requested_by, cwd, cwd_source, isolation, profile_snapshot,
+          runtime_snapshot, request_snapshot ON runs
+        WHEN OLD.group_seq IS NOT NULL AND (
+          NEW.request_id IS NOT OLD.request_id OR
+          NEW.group_id IS NOT OLD.group_id OR
+          NEW.group_seq IS NOT OLD.group_seq OR
+          NEW.profile_id IS NOT OLD.profile_id OR
+          NEW.runtime_id IS NOT OLD.runtime_id OR
+          NEW.runway_source_id IS NOT OLD.runway_source_id OR
+          NEW.root_run_id IS NOT OLD.root_run_id OR
+          NEW.parent_run_id IS NOT OLD.parent_run_id OR
+          NEW.retry_of_run_id IS NOT OLD.retry_of_run_id OR
+          NEW.continuation_of_run_id IS NOT OLD.continuation_of_run_id OR
+          NEW.attempt IS NOT OLD.attempt OR NEW.mission IS NOT OLD.mission OR
+          NEW.context IS NOT OLD.context OR
+          NEW.requested_by IS NOT OLD.requested_by OR
+          NEW.cwd IS NOT OLD.cwd OR NEW.cwd_source IS NOT OLD.cwd_source OR
+          NEW.isolation IS NOT OLD.isolation OR
+          NEW.profile_snapshot IS NOT OLD.profile_snapshot OR
+          NEW.runtime_snapshot IS NOT OLD.runtime_snapshot OR
+          NEW.request_snapshot IS NOT OLD.request_snapshot
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'run identity and snapshots are immutable');
+        END
+    """)
+
+
+def _migrate_scope_model(con: sqlite3.Connection) -> None:
+    """Collapse live v2 scopes into group defaults without retaining an alias.
+
+    Historical runs already froze their owner directory in ``repo/workdir``.
+    A group inherits a default only when all its historical scope bindings
+    agree; ambiguous groups stay unbound and require an explicit future CWD.
     """
-    names = {r["name"] for r in con.execute("PRAGMA table_info(runs)")}
-    if "work_item" in names and "ref" in names:
-        con.execute("UPDATE runs SET ref = COALESCE(ref, work_item) "
-                    "WHERE work_item IS NOT NULL")
-        # The stale writer's SCHEMA rebuilt the old index too, and SQLite
-        # refuses to drop a column an index still names.
-        con.execute("DROP INDEX IF EXISTS idx_runs_work_item")
-        con.execute("ALTER TABLE runs DROP COLUMN work_item")
-    if "work_claim_status" in names and "claim_status" in names:
-        con.execute("UPDATE runs SET claim_status = "
-                    "COALESCE(claim_status, work_claim_status) "
-                    "WHERE work_claim_status IS NOT NULL")
-        con.execute("ALTER TABLE runs DROP COLUMN work_claim_status")
-    for column, mark in (("work_seen_ts", "seen_ts"),
-                         ("work_reported_at", "reported_at"),
-                         ("work_progress_at", "progress_at")):
-        if column not in names:
+    group_columns = _columns(con, "run_groups")
+    if "default_cwd" not in group_columns:
+        con.execute("ALTER TABLE run_groups ADD COLUMN default_cwd TEXT")
+
+    run_columns = _columns(con, "runs")
+    legacy_scope = "scope_id" in run_columns
+    needs_backfill = legacy_scope or "cwd" not in run_columns or \
+        "cwd_source" not in run_columns
+    if "cwd" not in run_columns:
+        con.execute("ALTER TABLE runs ADD COLUMN cwd TEXT")
+    if "cwd_source" not in run_columns:
+        con.execute(
+            "ALTER TABLE runs ADD COLUMN cwd_source TEXT NOT NULL "
+            "DEFAULT 'managed' CHECK(cwd_source IN "
+            "('run','group','managed','inherited'))")
+
+    has_scopes = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scopes'"
+    ).fetchone() is not None
+    if legacy_scope and has_scopes:
+        con.execute("""
+            WITH agreed AS (
+              SELECT r.group_id,MIN(s.root) AS root
+              FROM runs r JOIN scopes s ON s.scope_id=r.scope_id
+              GROUP BY r.group_id HAVING COUNT(DISTINCT s.root)=1
+            )
+            UPDATE run_groups SET default_cwd=(
+              SELECT agreed.root FROM agreed
+              WHERE agreed.group_id=run_groups.group_id
+            )
+            WHERE default_cwd IS NULL AND group_id IN (
+              SELECT group_id FROM agreed
+            )
+        """)
+
+    if needs_backfill:
+        con.execute(
+            "UPDATE runs SET cwd=COALESCE(NULLIF(repo,''),NULLIF(workdir,'')) "
+            "WHERE cwd IS NULL OR trim(cwd)=''"
+        )
+        missing = con.execute(
+            "SELECT id FROM runs WHERE cwd IS NULL OR trim(cwd)='' LIMIT 1"
+        ).fetchone()
+        if missing is not None:
+            raise RuntimeError(
+                f"orchestra: cannot migrate run {missing['id']} without a frozen CWD")
+        con.execute("""
+            UPDATE runs SET cwd_source=CASE
+              WHEN cwd=(SELECT default_cwd FROM run_groups
+                        WHERE group_id=runs.group_id) THEN 'group'
+              ELSE 'run' END
+        """)
+
+    if legacy_scope:
+        con.execute("DROP TRIGGER IF EXISTS validate_run_lineage")
+        con.execute("DROP TRIGGER IF EXISTS immutable_run_identity")
+        con.execute("DROP INDEX IF EXISTS idx_runs_scope")
+        con.execute("ALTER TABLE runs DROP COLUMN scope_id")
+    con.execute("DROP TABLE IF EXISTS scope_profiles")
+    con.execute("DROP TABLE IF EXISTS scopes")
+    _ensure_run_identity_triggers(con)
+
+
+def _migrate_usage_breakdown(con: sqlite3.Connection) -> None:
+    """Add the cache-token split to databases created before it existed."""
+    columns = _columns(con, "runs")
+    for name in ("tokens_cache_read", "tokens_cache_write"):
+        if name not in columns:
+            con.execute(
+                f"ALTER TABLE runs ADD COLUMN {name} INTEGER "
+                f"CHECK({name} IS NULL OR {name} >= 0)")
+
+
+def _ensure_message_revision_triggers(con: sqlite3.Connection) -> None:
+    """Install additive v2 triggers on both new and already-created v2 stores."""
+    con.execute("""
+        CREATE TRIGGER IF NOT EXISTS bump_board_revision_message_insert
+        AFTER INSERT ON messages
+        BEGIN
+          INSERT INTO meta(key, value) VALUES('board_revision', 1)
+          ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+        END
+    """)
+    con.execute("""
+        CREATE TRIGGER IF NOT EXISTS bump_board_revision_message_delivery
+        AFTER UPDATE OF status, delivered_at, undeliverable_at,
+          undeliverable_reason ON messages
+        WHEN NEW.status IS NOT OLD.status OR
+             NEW.delivered_at IS NOT OLD.delivered_at OR
+             NEW.undeliverable_at IS NOT OLD.undeliverable_at OR
+             NEW.undeliverable_reason IS NOT OLD.undeliverable_reason
+        BEGIN
+          INSERT INTO meta(key, value) VALUES('board_revision', 1)
+          ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+        END
+    """)
+
+
+def _ensure_v2_defaults(con: sqlite3.Connection) -> None:
+    con.execute(
+        "INSERT OR IGNORE INTO fleet_settings("
+        "key,value_json,updated_by,updated_at) VALUES('instance_name',?,'system',?)",
+        (json.dumps("Orchestra"), now()),
+    )
+
+
+def _clear_subscription_costs(con: sqlite3.Connection) -> None:
+    """A provider-reported token-plan estimate is not metered USD spend."""
+    def plan(profile_raw, runtime_raw) -> bool:
+        try:
+            profile = json.loads(profile_raw or "{}")
+            runtime = json.loads(runtime_raw or "{}")
+        except (TypeError, ValueError):
+            return False
+        adapter = str(runtime.get("adapter") or runtime.get("kind") or "").lower()
+        if adapter in {"claude", "codex"}:
+            return True
+        provider = str(profile.get("model") or "").split("/", 1)[0].lower()
+        return provider.startswith(("xai", "grok", "kimi", "moonshot", "minimax"))
+
+    for table in ("runs", "observer_checks"):
+        if not _columns(con, table) or "cost_usd" not in _columns(con, table):
             continue
-        con.executescript(WORK_MARKS_SQL)
-        # The adapter's own table is the home. A mark already there WINS: it
-        # was written by code that understood the new shape, where the twin
-        # may hold a value an old backfill re-derived.
-        con.execute(f"INSERT INTO work_marks(run_id, {mark}) "
-                    f"SELECT id, {column} FROM runs WHERE {column} IS NOT NULL "
-                    f"ON CONFLICT(run_id) DO UPDATE SET "
-                    f"{mark} = COALESCE(work_marks.{mark}, excluded.{mark})")
-        con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+        rows = con.execute(
+            f"SELECT id,profile_snapshot,runtime_snapshot FROM {table} "
+            "WHERE cost_usd IS NOT NULL"
+        ).fetchall()
+        ids = [(int(row["id"]),) for row in rows
+               if plan(row["profile_snapshot"], row["runtime_snapshot"])]
+        if ids:
+            con.executemany(f"UPDATE {table} SET cost_usd=NULL WHERE id=?", ids)
 
 
-def _backfill_project_slugs(con: sqlite3.Connection) -> None:
-    """Schema v27, one shot: every registered project gets its human address.
-
-    One slug per project id — alias and link rows of one project share it —
-    minted from the project's name (else its folder name) and deduplicated
-    with a numeric suffix. Never re-run: a slug keys the project's own
-    directory under ``~/.orchestra/projects/``, so rewriting one strands it.
-    """
-    taken = {r["slug"] for r in con.execute(
-        "SELECT DISTINCT slug FROM projects WHERE slug IS NOT NULL")}
-    rows = con.execute(
-        "SELECT project_id, MIN(name) AS name, MIN(path) AS path FROM projects "
-        "WHERE slug IS NULL GROUP BY project_id ORDER BY MIN(path)").fetchall()
-    for row in rows:
-        base = paths.kebab(row["name"] or PurePath(row["path"]).name)
-        slug, n = base, 2
-        while slug in taken:
-            slug, n = f"{base}-{n}", n + 1
-        taken.add(slug)
-        con.execute("UPDATE projects SET slug=? WHERE project_id=?",
-                    (slug, row["project_id"]))
-
-
-def _rebuild_projects_v29(con: sqlite3.Connection) -> None:
-    """Schema v29, one shot: the path-keyed registry becomes identity only.
-
-    Three moves, in an order that loses nothing:
-    1. ``runs.repo`` is backfilled from the old rows first, so every old
-       run keeps a correct landing target after the paths leave the core.
-    2. Source-backed rows — and the ``link`` rows that share their project
-       id — move to the adapter's ``checkouts`` table verbatim.
-    3. The table is rebuilt one row per project id. A purely local project's
-       path is dropped: the caller supplies checkouts now, and the run
-       history answers "where does this project usually run".
-    """
-    con.executescript(CHECKOUTS_SQL)
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                   "AND name='runs'").fetchone():
-        # Only a path that IS a directory backfills: a source's cached path
-        # is often an organizational label ("Group/thing") that never
-        # existed on disk, and stamping that would aim root_for at nothing.
-        # A project with no real path leaves repo NULL, where root_for's
-        # history-then-workdir fallback still answers.
-        for row in con.execute(
-                "SELECT project_id, path FROM projects "
-                "ORDER BY source_ref IS NULL, LENGTH(path)").fetchall():
-            if not Path(row["path"]).is_dir():
-                continue
-            con.execute("UPDATE runs SET repo=? WHERE repo IS NULL "
-                        "AND project_id=?", (row["path"], row["project_id"]))
+def _initialize(con: sqlite3.Connection) -> None:
+    timestamp = now()
+    _execute_schema(con)
+    con.executemany(
+        "INSERT INTO meta(key, value) VALUES(?,?)",
+        (("schema_version", SCHEMA_VERSION),
+         ("instance_id", str(uuid.uuid4())),
+         ("board_revision", "0")),
+    )
     con.execute(
-        "INSERT OR IGNORE INTO checkouts(path, project_id, source_ref, "
-        "refreshed_at) SELECT path, project_id, source_ref, refreshed_at "
-        "FROM projects WHERE EXISTS (SELECT 1 FROM projects s "
-        "WHERE s.project_id = projects.project_id "
-        "AND s.source_ref IS NOT NULL)")
+        "INSERT INTO run_groups(group_id, slug, name, created_at, updated_at) "
+        "VALUES(?,?,?,?,?)",
+        (GENERAL_GROUP_ID, GENERAL_GROUP_SLUG, "General", timestamp, timestamp),
+    )
+    con.executemany(
+        "INSERT INTO fleet_settings(key, value_json, updated_by, updated_at) "
+        "VALUES(?,?,?,?)",
+        ((key, json.dumps(value), "system", timestamp)
+         for key, value in DEFAULT_FLEET_SETTINGS.items()),
+    )
     con.execute(
-        "CREATE TABLE projects_v29 ("
-        " project_id TEXT PRIMARY KEY, slug TEXT UNIQUE, name TEXT,"
-        " local INTEGER NOT NULL DEFAULT 1, refreshed_at TEXT NOT NULL,"
-        " archived INTEGER NOT NULL DEFAULT 0, archived_override INTEGER)")
-    # One row per id: the source row's name wins, any row's park wins, and
-    # MAX skips NULL overrides. ``local`` is provenance: no source row ever
-    # stood behind this id.
-    con.execute(
-        "INSERT INTO projects_v29(project_id, slug, name, local, "
-        "refreshed_at, archived, archived_override) "
-        "SELECT project_id, MAX(slug), "
-        " COALESCE(MAX(CASE WHEN source_ref IS NOT NULL THEN name END), "
-        "          MAX(name)), "
-        " CASE WHEN MAX(source_ref) IS NULL THEN 1 ELSE 0 END, "
-        " MAX(refreshed_at), MAX(archived), MAX(archived_override) "
-        "FROM projects GROUP BY project_id")
-    con.execute("DROP INDEX IF EXISTS idx_projects_project_id")
-    con.execute("DROP TABLE projects")
-    con.execute("ALTER TABLE projects_v29 RENAME TO projects")
+        "INSERT INTO observer_settings(singleton, updated_by, updated_at) "
+        "VALUES(1,'system',?)",
+        (timestamp,),
+    )
 
 
 def connect(db_file=None) -> sqlite3.Connection:
-    """The central database (DESIGN §2). ``db_file`` opens another file, for
-    tests."""
-    con = sqlite3.connect(db_file or paths.db_path(), timeout=15)
+    """Open the authoritative v2 database, refusing every other schema."""
+    target = Path(db_file) if db_file is not None else paths.db_path()
+    if str(target) != ":memory:":
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    con = sqlite3.connect(str(target), timeout=15, factory=_Connection)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=10000")
-    existing = {r["name"] for r in con.execute("PRAGMA table_info(runs)")}
-    upgrading_v16 = bool(existing) and any(
-        name not in existing for name, _ in RUNS_V16_COLUMNS)
-    if existing:  # extend a pre-existing table before SCHEMA's indexes run
-        for name, sql_type in (RUNS_V4_COLUMNS
-                               + RUNS_V9_COLUMNS + RUNS_V11_COLUMNS
-                               + RUNS_V13_COLUMNS + RUNS_V15_COLUMNS
-                               + RUNS_V16_COLUMNS + RUNS_V17_COLUMNS
-                               + RUNS_V18_COLUMNS + RUNS_V22_COLUMNS
-                               + RUNS_V23_COLUMNS + RUNS_V28_COLUMNS):
-            if name not in existing:
-                con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
-        # Schema v21 (one-shot rename; source boundary). ONE SHOT, run here and
-        # never again: the source-specific column becomes the opaque ``ref``,
-        # and the three board timestamps move to the adapter's own table. No
-        # reader below tolerates the old shape — that tolerance is the leak
-        # the one-shot rule forbids — so this branch is the only code that ever names them.
-        # It runs BEFORE the v16 backfill: real receipts move first, and the
-        # backfill then fills only what is still missing.
-        if "work_item" in existing and "ref" not in existing:
-            con.executescript(WORK_MARKS_SQL)  # this migration fills it
-            con.execute("ALTER TABLE runs RENAME COLUMN work_item TO ref")
-            con.execute("DROP INDEX IF EXISTS idx_runs_work_item")
-            con.execute(
-                "INSERT OR IGNORE INTO work_marks(run_id, seen_ts, "
-                "reported_at, progress_at) SELECT id, work_seen_ts, "
-                "work_reported_at, work_progress_at FROM runs "
-                "WHERE work_seen_ts IS NOT NULL OR work_reported_at IS NOT NULL "
-                "OR work_progress_at IS NOT NULL")
-            for column in ("work_seen_ts", "work_reported_at", "work_progress_at"):
-                con.execute(f"ALTER TABLE runs DROP COLUMN {column}")
-        elif "ref" not in existing:
-            con.execute("ALTER TABLE runs ADD COLUMN ref TEXT")
-        # Schema v25 (one-shot rename; source boundary). ONE SHOT: the admission
-        # gate keeps its place on ``runs`` — the reaper reads it — and stops
-        # naming the one source that happens to confirm the claim. Same rule
-        # as v21: rename OR add, never a reader that accepts both spellings.
-        if "work_claim_status" in existing and "claim_status" not in existing:
-            con.execute(
-                "ALTER TABLE runs RENAME COLUMN work_claim_status TO claim_status")
-        elif "claim_status" not in existing:
-            con.execute("ALTER TABLE runs ADD COLUMN claim_status TEXT")
-        # Both spellings can coexist when a pre-upgrade WRITER re-adds the old
-        # one. Fold the twin away before anything below reads either.
-        _retire_resurrected(con)
-        if upgrading_v16:
-            # A historical completion notice proves the old finalizer reached
-            # its durable result boundary. Settle only those rows: replaying
-            # years of old side effects is unsafe, but an old terminal row with
-            # no completion is ambiguous and must not be labelled complete.
-            settled = (f"status IN {TERMINAL_SQL} AND EXISTS ("
-                       "SELECT 1 FROM messages m WHERE m.run_id=runs.id "
-                       "AND m.kind='completion')")
-            con.execute(
-                "UPDATE runs SET landing_status=COALESCE(landing_status, 'ok'), "
-                "handoff_processed_at=COALESCE(handoff_processed_at, "
-                f"finished_at, ?) WHERE {settled}", (now(),))
-            # The writeback receipt is the consumer's since v21; the table
-            # exists here only so this one-shot backfill has somewhere to
-            # write, and its owner lifts it out on first contact.
-            con.executescript(WORK_MARKS_SQL)
-            con.execute(
-                "INSERT INTO work_marks(run_id, reported_at) "
-                f"SELECT id, COALESCE(finished_at, ?) FROM runs WHERE {settled} "
-                "ON CONFLICT(run_id) DO UPDATE SET reported_at="
-                "COALESCE(work_marks.reported_at, excluded.reported_at)",
-                (now(),))
-        if "project_seq" not in existing:
-            # Every run already recorded gets the number it would have had:
-            # its project's order, by id. Done once, on the upgrade.
-            con.execute(
-                "UPDATE runs SET project_seq = (SELECT COUNT(*) FROM runs earlier "
-                " WHERE earlier.layer IS NULL AND earlier.id <= runs.id "
-                " AND earlier.project_id IS runs.project_id) "
-                "WHERE layer IS NULL")
-    polls = {r["name"] for r in con.execute("PRAGMA table_info(runway_polls)")}
-    if polls:
-        for name, sql_type in RUNWAY_V12_COLUMNS:
-            if name not in polls:
-                con.execute(f"ALTER TABLE runway_polls ADD COLUMN {name} {sql_type}")
-    have = {r["name"] for r in con.execute("PRAGMA table_info(messages)")}
-    if have:
-        for name, sql_type in MESSAGES_V9_COLUMNS:
-            if name not in have:
-                con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
-    known = {r["name"] for r in con.execute("PRAGMA table_info(projects)")}
-    if known and "path" in known:
-        # A pre-v29 registry: one row per PATH. Bring it to the last
-        # path-keyed shape first — v24's rename and v27's slugs need the old
-        # columns — then rebuild it as the identity table.
-        if "work_id" in known:
-            con.execute(
-                "ALTER TABLE projects RENAME COLUMN work_id TO source_ref")
-        for name, sql_type in PROJECTS_V20_COLUMNS + PROJECTS_V26_COLUMNS \
-                + PROJECTS_V27_COLUMNS:
-            if name not in known:
-                con.execute(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
-        if "slug" not in known:
-            _backfill_project_slugs(con)
-        _rebuild_projects_v29(con)
-    cards = {r["name"] for r in con.execute("PRAGMA table_info(nod_requests)")}
-    if cards:
-        for name, sql_type in NOD_REQUESTS_V14_COLUMNS + NOD_REQUESTS_V24_COLUMNS:
-            if name not in cards:
-                con.execute(f"ALTER TABLE nod_requests ADD COLUMN {name} {sql_type}")
-        # Schema v25 (one-shot rename; source boundary). ONE SHOT: an escalation
-        # carries the same OPAQUE ref a run does, so the column stops spelling
-        # one source's name. The index is recreated under its new name by
-        # SCHEMA below; no reader accepts the old spelling.
-        if "work_item" in cards:
-            con.execute("DROP INDEX IF EXISTS idx_nod_requests_work")
-            con.execute("ALTER TABLE nod_requests RENAME COLUMN work_item TO ref")
-        elif "ref" not in cards:
-            con.execute("ALTER TABLE nod_requests ADD COLUMN ref TEXT")
-    # Recreate so an older database picks up new terminal statuses in WHEN.
-    con.execute("DROP TRIGGER IF EXISTS revoke_run_token")
-    # Both board-revision bodies changed in v22 (they now stamp the row);
-    # CREATE ... IF NOT EXISTS would leave a v19 database on the old pair.
-    con.execute("DROP TRIGGER IF EXISTS bump_board_revision_insert")
-    con.execute("DROP TRIGGER IF EXISTS bump_board_revision_update")
-    con.executescript(SCHEMA)
-    if existing and "revision" not in existing:
-        # Schema v22, one shot. A run recorded before the column existed
-        # carries no marker, so a consumer starting at cursor 0 would never
-        # see it. Touch each one and let the trigger stamp it — a table scan
-        # is rowid order, so the markers land in the order the runs happened.
-        con.execute("UPDATE runs SET revision=revision WHERE revision IS NULL")
-    con.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-        (SCHEMA_VERSION,),
-    )
-    con.commit()
-    return con
+    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        con.execute("BEGIN EXCLUSIVE")
+        if _has_tables(con):
+            version = _schema_version(con)
+            if version != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"orchestra: {target} is not a {SCHEMA_VERSION} database; "
+                    "leave it archived and initialize the v2 state directory"
+                )
+        else:
+            _initialize(con)
+        _migrate_scope_model(con)
+        _migrate_usage_breakdown(con)
+        _ensure_message_revision_triggers(con)
+        _ensure_v2_defaults(con)
+        _clear_subscription_costs(con)
+        con.commit()
+        return con
+    except BaseException:
+        con.rollback()
+        con.close()
+        raise
 
 
 def meta_get(con: sqlite3.Connection, key: str) -> str | None:
@@ -889,27 +962,59 @@ def meta_get(con: sqlite3.Connection, key: str) -> str | None:
 
 
 def meta_set(con: sqlite3.Connection, key: str, value: str) -> None:
-    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, value))
+    con.execute(
+        "INSERT INTO meta(key, value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def instance_id(con: sqlite3.Connection) -> str:
+    value = meta_get(con, "instance_id")
+    if not value:
+        raise RuntimeError("orchestra: v2 database has no instance identity")
+    return value
 
 
 BOARD_REVISION = "board_revision"
 
 
 def board_revision(con: sqlite3.Connection) -> int:
-    """The dashboard's invalidation counter (DESIGN §3). 0 on a fresh file."""
-    row = con.execute("SELECT value FROM meta WHERE key=?",
-                      (BOARD_REVISION,)).fetchone()
+    value = meta_get(con, BOARD_REVISION)
     try:
-        return int(row["value"]) if row else 0
-    except (TypeError, ValueError):
+        return int(value or 0)
+    except ValueError:
         return 0
 
 
 def bump_board_revision(con: sqlite3.Connection) -> None:
-    """Bump it for a board change no ``runs`` trigger sees — pause state,
-    runway, daemon health. ``http.record_health`` is the one caller, so the
-    board's staleness is capped at one sweeper tick even when nothing runs."""
     con.execute(
         "INSERT INTO meta(key, value) VALUES(?, 1) "
-        "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        (BOARD_REVISION,))
+        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+        (BOARD_REVISION,),
+    )
+
+
+def record_control(
+    con: sqlite3.Connection,
+    *,
+    actor: str,
+    action: str,
+    outcome: str,
+    target_type: str | None = None,
+    target_id: str | int | None = None,
+    request_id: str | None = None,
+    detail=None,
+) -> int:
+    """Append one bounded operator/configuration audit event."""
+    encoded = None if detail is None else json.dumps(
+        detail, ensure_ascii=False, default=str
+    )[:4000]
+    cur = con.execute(
+        "INSERT INTO control_events(actor, action, target_type, target_id, "
+        "request_id, detail, outcome, created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (actor, action, target_type,
+         None if target_id is None else str(target_id), request_id, encoded,
+         outcome, now()),
+    )
+    return int(cur.lastrowid)

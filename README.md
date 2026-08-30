@@ -1,185 +1,233 @@
-<img src="assets/orchestra-logo.svg" alt="Orchestra" width="360">
+# Orchestra
 
-## What this is
+Orchestra is a self-hosted agent fleet runner for one machine. Submit an
+executable request with a profile; Orchestra schedules it, runs it,
+lets it delegate bounded child runs, and retains the conversation, trace,
+usage, artifacts, and Git evidence. The same daemon serves the CLI, web
+console, and native Apple clients.
 
-Orchestra is a local execution plane for agent work. It accepts a mission from
-a person, an agent, or an external source, runs it through a configured agent CLI, and keeps
-a durable record of the run, its trace, controls, and outcome.
+Orchestra is not a work tracker. It has no tickets, claims, handoffs,
+acceptance workflow, source-system mirror, routing policy, verification
+policy, or Git landing policy. Integrations may use Orchestra to execute work,
+but those concepts remain outside it.
 
-The current release supports four harnesses: Codex, Claude Code, OpenCode, and
-Reasonix. Orchestra gives their runs a common operating surface. The harnesses'
-own tools, permissions, configuration, and model catalogs remain different.
+## The model
 
-Direct dispatch works without any source. Source automation and sign-off, isolated git
-landing, routing and conducting, model-based observation, Nod, runway, and the
-iOS client sit around the execution core. None is required for a direct run.
-The bridge's automated sign-off verifier is disabled by default.
+- **Run**: one admitted execution. Every root, child, retry, or explicit
+  continuation is a separately numbered run with durable lineage.
+- **Group**: an organizational label for related runs. Each group has its own
+  monotonic display number, such as `Research #18`. Group assignment is
+  immutable after admission. `General` always exists.
+- **Working directory**: a group may configure a daemon-host default for
+  future runs, and a root run may supply an explicit override. Paths are
+  write-only over the API and frozen at admission.
+- **Profile**: a managed launch configuration: runtime, model, effort,
+  timeouts, environment policy, tier, capacity, and runway source.
+- **Runtime**: the harness adapter used by a profile. Codex, Claude Code,
+  OpenCode, and Reasonix are polished built-ins; a configurable argv runtime
+  covers other harnesses without a plugin framework.
+- **Runway source**: provider/account/lane availability shared by one or more
+  profiles. A fresh definitive zero can hold starts; stale or unknown runway
+  never does.
+- **Observer**: an optional isolated agent runtime that reviews bounded run
+  evidence. It is supervision, not a worker run and not a routing engine.
+  Orchestra only accepts profiles whose adapter can be launched with tools
+  disabled: Claude Code, OpenCode, or Reasonix today.
 
-**Orchestra — one dispatcher, many runners, one problem.**
+One daemon and one SQLite database are authoritative. The daemon is the only
+normal writer; the CLI and every device use the HTTP API. The fleet is the
+configured execution capacity on that machine. There is no node membership,
+distributed queue, federation, or aggregate scheduler. A harness can still
+use SSH or another tool to work elsewhere.
 
-## Runs, isolation, and landing
+## Run request
 
-A manual dispatch uses an isolated worktree by default. Pass `--shared` only
-for work that can safely use the registered checkout, such as read-only
-research or inspection.
+Every launch reduces to the same v2 request:
 
-A successful isolated run has a branch named `orchestra/run-N`, which
-Orchestra automatically attempts to land. It rebases in a scratch worktree,
-runs declared checks and tripwires, then moves the base ref by compare-and-swap.
-If the base moved, Orchestra rebases and retries. A conflict or repeated race
-leaves the branch for intervention. After landing, Orchestra refreshes the
-owner's base checkout only when Git can preserve local edits.
-
-Landing does not review the diff against acceptance criteria. Without declared
-checks, it relies on tripwires and their optional mission-alignment judge, so
-configure a real test, lint, or build command before trusting automatic landing.
-
-Source automation lives in the sibling **work-bridge** project — a consumer
-that knows both sides so that neither knows the other. Its sweeper claims
-delegated items and requests isolated runs by default; an isolation failure
-records a failed launch and sends the item back for human attention, and
-unattended execution never falls back to the owner's checkout.
-
-## What it looks like
-
-Captions and the full set: [`docs/screenshots/`](docs/screenshots/README.md).
-
-![Statistics: worker time, tokens and cost, totalled and per profile](docs/screenshots/statistics.png)
-
-![Runway: remaining quota by provider and rolling window](docs/screenshots/runway.png)
-
-## What you need
-
-- Python 3.11 or later and [uv](https://docs.astral.sh/uv/). Orchestra uses the
-  standard library and SQLite and has no runtime package dependencies.
-- Git and a repository to work in.
-- At least one signed-in agent CLI: `codex`, `claude`, `opencode`, or
-  `reasonix`. Orchestra uses the CLI's existing authentication.
-- A source (through the bridge) only if you want delegated-item intake, project
-  discovery, planning, or writeback. Standalone projects use
-  `orchestra project add <name>`.
-
-`orchestra service` installs a launchd agent on macOS or a per-user Scheduled
-Task on Windows. The daemon can also run in the foreground.
-
-## Install
-
-```sh
-git clone https://github.com/batteryshark/orchestra
-cd orchestra
-uv sync
+```json
+{
+  "request_id": "mail-digest:2026-08-29",
+  "profile": "codex-medium",
+  "context": "Review today's unread mail and write a priority digest. Do not send, archive, or modify messages.",
+  "group": "Personal Ops",
+  "title": "Morning mail digest",
+  "cwd": "/Users/me/Automation/mail",
+  "ref": "opaque-caller-value",
+  "after": [{"run_id": 41, "condition": "success"}],
+  "requested_by": "automation:mail-digest",
+  "observer": "inherit"
+}
 ```
 
-## First run
+`request_id`, `profile`, and `context` are required. `context` is the one
+executable worker request; `title` is display metadata and never becomes the
+prompt. Replaying the same `request_id` returns the original admission. `ref`
+is stored and echoed but never interpreted. `after` accepts `success` or
+`terminal`; `observer` is `inherit`, `off`, or an Observer profile name. `cwd`
+is an optional daemon-host path, canonicalized and frozen but never returned.
 
-Prepare the central home at `~/.orchestra/` and install harness hooks:
+The selected profile is explicit. Orchestra does not choose or substitute a
+profile, including when runway is exhausted. Parents must name a child
+profile, and a child may use only the same or a lower capability tier.
 
-```sh
-uv run orchestra init
-uv run orchestra doctor
+## Scheduling and control
+
+Runs start FIFO subject to dependencies, global pause, global/profile
+capacity, runway holds, and scheduled retry time. These holds are visible.
+Profile priority is descriptive metadata only; it never reorders the queue.
+The lifecycle is:
+
+```text
+queued -> starting -> running <-> waiting -> completed
+                                      |----> failed | timed_out | stopped | skipped
 ```
 
-Mint a project identity if it does not come from a source (no path is stored —
-each dispatch names its checkout, and the run history remembers):
+A parent waiting for child results releases runtime capacity and later resumes
+the same run/session. A blocking question does the same. Operators can:
+
+- **Tell**: steer live when supported, otherwise deliver at a safe boundary.
+- **Interrupt**: cancel the active turn and resume the same run with new
+  direction. If no reliable session exists yet, Orchestra transparently
+  restarts from the frozen brief and records replay risk.
+- **Stop** or **Stop Tree**: stop one run or an explicit lineage subtree.
+- **Check**: request mechanical and optional Observer inspection.
+- **Retry** or **Continue**: create a new, separately numbered lineage run.
+
+Orchestra performs at most one conservative automatic retry for a recognized
+transient infrastructure failure. It is also a new run. Unknown and
+authentication failures stop and raise attention.
+
+## Attention, evidence, and artifacts
+
+The fleet Inbox contains blocking questions, profile-change proposals, and
+alerts. A blocking item has a correlation id, optional choices/deadline/
+fallback, and no default expiry. The first authorized answer wins and resumes
+the suspended run. Full threads also remain visible on each run.
+
+Orchestra retains run facts, messages, delivery receipts, normalized events,
+raw logs, Observer checks, usage, explicit artifacts, and Git checkpoints.
+Artifacts are published deliberately: Orchestra snapshots the selected file,
+validates paths and symlinks, records MIME/size/SHA-256, and serves immutable
+range-capable downloads. It never sweeps a workspace looking for outputs.
+
+When the frozen working directory is inside a Git repository, Orchestra
+automatically isolates execution in a per-run worktree and records
+base/head/branch/checkpoint/patch/diff evidence without exposing the host path.
+It does not review, rebase, merge, land, or decide whether the change is
+accepted.
+
+## Quick start
+
+Orchestra requires Python 3.11 or newer and has no runtime Python dependencies.
+The bootstrap binds to `127.0.0.1:8765` by default; it is an intentionally
+ordinary high local port, not a claimed protocol port, and remains configurable
+for tunnels, containers, or host collisions.
 
 ```sh
-uv run orchestra project add .
+python -m venv .venv
+./.venv/bin/pip install -e .
+orchestra init
+orchestra daemon
 ```
 
-Discover models, add a profile, and dispatch an isolated run:
+Normal configuration and operation go through the daemon:
 
 ```sh
-uv run orchestra profiles discover
-uv run orchestra profiles set fast --backend --model --effort --tier 1
-uv run orchestra dispatch --to fast "Fix the failing auth test"
+orchestra status
+orchestra groups create "Research"
+orchestra groups create name="Personal Ops" cwd="$PWD"
+orchestra profiles list
+orchestra profiles discover --local
+
+# init registers the built-in runtimes; create an explicit profile and runway
+orchestra runway-sources create name="Codex Primary" provider=codex \
+  adapter=codex account=personal
+orchestra profiles create name="Codex Medium" runtime_id=codex tier=2 \
+  effort=medium active_cap=4 runway_source_id=codex-primary
+
+orchestra dispatch --profile codex-medium \
+  --group Research --request-id research:local-agents:1 \
+  "Research practical local-agent observability patterns"
+
+orchestra runs --status running
+orchestra runs --status waiting
+orchestra statistics --group Research
+orchestra show 42
+orchestra thread 42
+orchestra outbox --status undeliverable
+orchestra artifacts 42
+orchestra changes 42
+orchestra tell 42 "Restrict the comparison to self-hosted systems."
+orchestra interrupt 42 "Stop browsing and synthesize the evidence now."
+orchestra check 42
+orchestra stop-tree 42
 ```
 
-Dispatch returns a run id as soon as the run starts. It does not mean the run
-succeeded. Inspect the durable outcome:
+Storage pruning is always review-then-apply, and evidence can be pinned:
 
 ```sh
-uv run orchestra runs --active
-uv run orchestra show 1
+orchestra storage report
+orchestra storage plan --older-than-days 90
+orchestra storage apply <plan-id>
+orchestra pin 42 --reason "reference run"
 ```
 
-## Run the daemon
+Fleet and Observer configuration use the same API:
 
 ```sh
-uv run orchestra daemon                     # foreground
-uv run orchestra service install --start    # launchd or Windows Scheduled Task
+orchestra settings
+orchestra settings set instance_name '"Studio Mac"'
+orchestra observer
+orchestra observer update enabled=true profile=observer-light
 ```
 
-The daemon serves the dashboard on port 3011 by default and prints its address.
-Browser access uses the shared key written by `orchestra init`, either in the
-`X-Orchestra-Key` header or as `?key=` on the first visit. Workers receive a
-revocable per-run token for restricted API access.
+Observer launches inherit no run token, operator token, profile environment,
+or runtime environment. Reasonix receives only its selected provider's
+validated credential in an isolated home; no unrelated provider state crosses
+the boundary. Unsupported adapters—including Codex, generic argv, and ACP—are
+rejected instead of being presented as isolated.
 
-From the dashboard or CLI you can inspect traces, send a correction through the
-run's supported delivery path, and stop a run:
+Only bootstrap, service lifecycle, legacy archive, backup/restore, and offline
+repair may write state without the daemon. `orchestra restore BACKUP` validates
+only; add `--apply` to replace state, preserving the displaced v2 directory in
+the archives directory and rebasing durable feed revisions so paired clients
+reconcile the restored truth.
+
+## Across devices
+
+The dependency-free web console and SwiftUI app use the same API. Desktop,
+web, and macOS expose Runs, Inbox, Outbox, Groups, Profiles, Runway, Fleet,
+and Settings. iPhone emphasizes Runs, Inbox, Groups, and Runway; iPad uses a
+sidebar. Run detail includes Thread, Artifacts, Changes, Raw Log, Lineage,
+Facts/Usage, and Observer.
+
+Operator devices pair with a short-lived one-time code or pairing URI and store a
+revocable token in a secure cookie or Keychain. Integrations receive
+fixed-authority service tokens; workers receive short-lived run tokens. Bring
+your own trusted private network and TLS/reverse proxy. Orchestra does not run
+a relay or APNs service.
+
+## Callbacks and integrations
+
+One optional argv callback command can receive low-volume JSON on stdin for
+`attention.opened`, `run.terminal`, and `observer.stopped`. It is best effort.
+Cursor feeds and stored evidence are the recovery truth.
+
+Workbridge is the only integration expected to understand both Slash Work and
+Orchestra. It chooses groups/profiles and optional working-directory bindings,
+owns routing and work policy,
+answers attention, verifies results, and lands changes through the public
+Orchestra API. Orchestra remains equally useful for mail, research, browser,
+document, and operations missions with Workbridge absent.
+
+See [the design contract](DESIGN.md), [API contract](docs/API.md),
+[feature ledger](docs/FEATURE_LEDGER.md), and [migration guide](docs/MIGRATION.md).
+
+## Development
 
 ```sh
-uv run orchestra tell 7 "Keep the public API unchanged"
-uv run orchestra check 7
-uv run orchestra kill 7
+./.venv/bin/python run_tests.py -j 8
 ```
 
-Pausing prevents new runs from being admitted. Running workers, completion
-reporting, completion-only Nod actions, and health maintenance continue.
-
-## Install it as a command
-
-`uv run orchestra` works from a clone. To put the command on your path while
-keeping it linked to the working tree:
-
-```sh
-uv tool install --editable .
-```
-
-Restart an installed service after a code change:
-
-```sh
-orchestra service restart
-```
-
-## Teach an agent to drive it
-
-[`skills/orchestra/`](skills/orchestra/SKILL.md) explains how to register a
-project, dispatch, inspect a trace, send a correction, and land an isolated
-branch. Symlink it for tools that read the Claude skill format:
-
-```sh
-ln -sfn "$PWD/skills/orchestra" ~/.claude/skills/orchestra
-```
-
-## Where things live
-
-| What | Where |
-|---|---|
-| State: database, briefs, logs, worktrees | `~/.orchestra/` |
-| Database | `~/.orchestra/orchestra.db` |
-| Config | `~/.config/orchestra/config.toml` |
-| Isolated run branches | `orchestra/run-N` |
-| Environment overrides | `ORCHESTRA_*` |
-| Agent identity at the source | `orchestra` |
-
-On POSIX systems, the state root and its managed container directories are
-owner-only (`0700`) traversal boundaries.
-
-## The repository
-
-| Path | What |
-|---|---|
-| `orchestra/` | the execution core and built-in policy modules |
-| `orchestra/dashboard.html` | the dashboard, with no frontend build step |
-| `ios/` | the optional iOS client |
-| `assets/` | the mark and wordmark |
-| `docs/screenshots/` | the images above and their captions |
-| `tests/`, `run_tests.py` | the test suite and runner |
-| `DESIGN.md` | the current contract, implementation boundaries, and known gaps |
-
-`uv run orchestra --help` lists every command. Run
-`uv run orchestra <command> --help` for command-specific help.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+The Python service uses the standard library at runtime. The web client uses
+plain ES modules and CSS with no framework, build step, or CDN dependency.

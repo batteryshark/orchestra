@@ -1,1618 +1,775 @@
-"""orchestra CLI. Thin command functions; business logic lives in the modules."""
+"""Orchestra v2 CLI. Normal operations are HTTP clients, never DB writers."""
+from __future__ import annotations
+
 import argparse
 import json
 import os
-import signal
-import subprocess
+import shutil
 import sys
-from datetime import datetime, timezone
+import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
-from orchestra import (acp, auth, child_runs, config, daemon, db,
-                         dispatch,
-                         harnesses, hooks, http, merge, messaging, nod,
-                         observer, paths, proc, profile_edit, profiles, project,
-                         review, runway, service, supervise,
-                         traces, worktree)
-
-
-def _locate_dir(con, start) -> "project.Project | None":
-    """The project this directory belongs to: the run history — the
-    runner's own records are the address book."""
-    return project.for_dir(con, start)
+from orchestra import (
+    auth, client, config, db, fleet_config, maintenance, migration, paths,
+    service,
+)
 
 
-def _here(con) -> tuple:
-    """(project, merged config) for the current directory.
+def _request_id(value: str | None, prefix: str) -> str:
+    return value or f"{prefix}:{uuid.uuid4()}"
 
-    The project is None outside any known one: listing runs or profiles
-    must still work from an arbitrary directory now that state is central.
-    """
+
+def _data(value):
+    return value.get("data", value) if isinstance(value, dict) else value
+
+
+def _print(value, *, raw: bool = False):
+    if raw or not isinstance(value, (dict, list)):
+        print(json.dumps(value, indent=2, ensure_ascii=False) if isinstance(
+            value, (dict, list)) else value)
+        return
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def _client(args) -> client.Client:
+    return client.Client(getattr(args, "url", None), getattr(args, "token", None))
+
+
+def _run_id(args) -> int:
+    value = getattr(args, "run_id", None) or os.environ.get("ORCHESTRA_RUN_ID")
     try:
-        proj = _locate_dir(con, project.start_dir())
-    except (OSError, ValueError):
-        proj = None
-    return proj, config.load(proj.project_id if proj else None)
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("orchestra: --run-id is required outside a run") from exc
 
-
-def _find_project(con, selector: str) -> "project.Project":
-    hit = project.find(con, selector)
-    if hit is None:
-        raise SystemExit(f"orchestra: no project matches {selector!r} — "
-                         "`orchestra project list` names them")
-    return hit
-
-
-def _requester(cfg: dict) -> str:
-    return cfg.get("settings", {}).get("default_requester", "human")
-
-
-def _gate_dispatch(con, cfg: dict, requester: str) -> None:
-    """The pause switch is the one gate on a new run (DESIGN §4) — there is
-    no concurrency cap here or anywhere else.
-
-    DESIGN D2 seam: phase 4 inserts the budget-grant check here (an
-    agent-initiated dispatch draws from a human-issued grant) before any
-    run row is created.
-    """
-    state = dispatch.pause_state(con)
-    if state is not None:
-        raise SystemExit(
-            f"orchestra: dispatch is paused (since {state['at']}"
-            + (f" — {state['note']}" if state.get("note") else "")
-            + ").\nRun `orchestra resume` to start new runs again.")
-
-
-def _fetch_run(con, run_id: int, *, row_id_only: bool = False):
-    """The run a human means by that number (schema v18).
-
-    A typed number is THIS PROJECT's run number — the one the board shows —
-    resolved against the project the current directory belongs to. The row
-    id still works for anything that carries it (a branch name, a log file),
-    and is tried second, because the two spaces overlap: prex3's run 105 is
-    row 299, and row 105 is a different run of the same project.
-    """
-    hit = None if row_id_only else project.current(con)
-    project_id = hit.project_id if hit else None
-    if project_id is not None:
-        run = con.execute(
-            "SELECT * FROM runs WHERE project_id IS ? AND project_seq=? "
-            "AND layer IS NULL", (project_id, run_id)).fetchone()
-        if run:
-            return run
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    if not run:
-        raise SystemExit(
-            f"orchestra: no run {run_id} here"
-            + (" — `orchestra runs` lists this project's" if project_id
-               else "; this directory is not inside a registered project"))
-    return run
-
-
-def _target(con, args):
-    """Resolve ``args.run_id`` ONCE and rewrite it to the row id.
-
-    A typed number is this project's run number, which is NOT the row id, and
-    a dozen call sites go on to use ``args.run_id`` in SQL of their own —
-    including the one that kills a process. Translating in place means none
-    of them can act on a different run than the one that was found.
-    """
-    run = _fetch_run(con, args.run_id)
-    args.run_id = int(run["id"])
-    return run
-
-
-# --- commands ---------------------------------------------------------------
 
 def cmd_init(args):
-    """Central state means init creates nothing in the project (DESIGN §2):
-    it makes sure the shared home exists and reports what this directory
-    resolves to."""
-    root = Path.cwd().resolve()
-    if not (root / ".git").exists():
-        res = subprocess.run(["git", "init", "--quiet", str(root)],
-                             capture_output=True, text=True)
-        if res.returncode != 0:
-            raise SystemExit(
-                f"orchestra: cannot initialize git repository: {res.stderr.strip()}")
-    gp = config.ensure_global_config()
-    key, minted = http.ensure_key()
-    con = db.connect()
-    proj, _ = _here(con)
-    con.close()
-    # DESIGN §6: hooks are mandatory and install HERE, never by a separate
-    # command — a backend without its hook cannot be told anything.
-    try:
-        hook_lines = hooks.install_all()
-    except RuntimeError as exc:
-        raise SystemExit(f"orchestra: {exc}") from exc
-    print(f"orchestra: state is central at {paths.home()} — {root} gets no directory")
-    print(f"  global config: {gp}")
-    print(f"  database:      {paths.db_path()}")
-    addr = http.bind_address()
-    port = int(http.http_cfg().get("port") or http.DEFAULT_PORT)
-    print(f"  dashboard:     http://{addr}:{port}/?key=… "
-          f"(header {http.HEADER}; {http.KEY_ENV} overrides)")
-    # Printed once, at the moment it is minted: it goes into the iOS app and
-    # the browser by hand, and it is never printed or logged again.
-    print(f"  api key:       {key}" if minted
-          else "  api key:       already set (see [http] key in the config)")
-    print("  hooks:")
-    for line in hook_lines:
-        print(f"    {line}")
-    if proj:
-        print(f"  project:       {proj.slug} ({proj.project_id})")
-        print(f"  overrides:     [project.\"{proj.project_id}\"] in the global config")
-        # Which profiles this project may STAFF (W-0187). Absent is every
-        # profile, and saying so beats printing a list nobody wrote.
-        enabled = config.load(proj.project_id).get("enabled_profiles")
-        if enabled is None:
-            said = "all (no enabled_profiles set)"
-        else:
-            said = ", ".join(enabled) or "NONE — nothing can be staffed here"
-        print(f"  profiles:      {said}")
-    else:
-        print(f"  project:       no run history in {root} yet — dispatch "
-              "with --project <slug> once (mint one with "
-              "`orchestra project add <name>`) and it is remembered")
-
-
-def cmd_dispatch(args):
-    con = db.connect()
-    selector = getattr(args, "project", None)
-    path_arg = getattr(args, "path", None)
-    root = project.guard_run_path(path_arg) if path_arg else None
-    if root is not None and not root.is_dir():
-        raise SystemExit(f"orchestra: --path {root} is not a directory")
-    if selector:
-        proj = _find_project(con, selector)
-    else:
-        # No name given: the checkout names the project through the run
-        # history — the runner's own records are the address book.
-        start = root if root is not None else project.start_dir()
-        proj = _locate_dir(con, start)
-        if proj is None:
-            raise SystemExit(
-                f"orchestra: no project is known to run in {start}.\n"
-                "Name one with --project <slug> (`orchestra project list`), "
-                "or mint one first: `orchestra project add <name>`. The run "
-                "history remembers, so this is a first-time step.")
-    cfg = config.load(proj.project_id)
-    if root is None:
-        if selector:
-            # A NAMED project dispatched from anywhere: the default checkout
-            # is where it last ran — the runner's own records, not a stored
-            # setting.
-            root = project.last_root(con, proj.project_id)
-            if root is None:
-                raise SystemExit(
-                    f"orchestra: {proj.slug} has no known checkout yet — "
-                    "pass --path <dir> once; later dispatches remember it")
-        else:
-            root = project.start_dir()
-    requester = getattr(args, "requester", None) or _requester(cfg)
-    if proj.archived:
-        # DESIGN §1: parking stops the UNATTENDED lanes. A human dispatching
-        # by hand outranks that, so this is a notice, never a refusal.
-        print(f"orchestra: {proj.slug} is archived; dispatching anyway")
-    _gate_dispatch(con, cfg, requester)
-    mission = " ".join(args.mission)
-    if args.brief_file:
-        mission = Path(args.brief_file).read_text(encoding="utf-8")
-    if not mission.strip():
-        raise SystemExit("orchestra: empty mission (pass text, or --brief-file)")
-    # An ephemeral workspace has no repository to branch from and never had
-    # one (W-0312) — isolation is skipped there, never demanded.
-    isolate = args.worktree and not project.is_workspace(root)
-    # A staffing moment (W-0187): the project's enabled set gates it, and a
-    # profile it has not enabled is refused by name rather than swapped.
-    profile = config.staff_profile(cfg, args.to)
-    title = args.title or mission.strip().splitlines()[0][:80]
-
-    after_ids = []
-    for rid in args.after or []:
-        # The dependency edge stores the ROW id, whatever number was typed.
-        settled = int(_fetch_run(con, rid)["id"])
-        if settled not in after_ids:
-            after_ids.append(settled)
-    initial_status = "pending" if after_ids else "spawning"
-    _gate_dispatch(con, cfg, requester)
-    run, blocked = supervise.create_run(
-        con, profile=args.to, backend=profile["backend"],
-        model=profile.get("model"), title=title, requested_by=requester,
-        workdir=str(root), project_id=proj.project_id, status=initial_status,
-        ref=getattr(args, "ref", None), commit=not after_ids)
-    if run is None:
-        con.close()
-        if blocked == "paused":
-            raise SystemExit("orchestra: dispatch was paused before admission; "
-                             "run `orchestra resume` to start new runs again")
-        raise SystemExit(f"orchestra: run not admitted ({blocked})")
-    run_id, slug = int(run["id"]), run["slug"]
-
-    if after_ids:
-        for rid in after_ids:
-            con.execute(
-                "INSERT INTO dispatch_dependencies(run_id, depends_on_run) VALUES(?,?)",
-                (run_id, rid))
-        con.execute(
-            "INSERT INTO deferred_dispatches(run_id, mission, context, use_worktree, "
-            "created_at) VALUES(?,?,?,?,?)",
-            (run_id, mission, args.context, int(bool(isolate)), db.now()))
-        con.commit()
-        print(f"run {run_id} ({slug}): {args.to} queued after "
-              f"{','.join(map(str, after_ids))}")
-        # Prerequisites may already be settled; release immediately if so.
-        supervise.process_ready(con, supervise.spawn_supervisor)
-        con.close()
-        return
-
-    try:
-        supervise.prepare_launch(con, root, cfg, run, mission=mission,
-                                 context=args.context, use_worktree=isolate)
-        con.commit()
-    except BaseException as exc:
-        supervise.fail_launch(con, root, run_id, exc)
-        con.close()
-        raise
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    con.close()
-    print(f"run {run_id} ({slug}): {args.to} "
-          f"({profile['backend']}/{profile.get('model') or 'default'}) "
-          f"isolation={http.run_isolation(run)}"
-          + (f" worktree={run['workdir']}" if run["branch"] else ""))
-    if args.sync:
-        sys.exit(supervise.supervise(root, run_id))
-    try:
-        supervise.spawn_supervisor(root, run_id)
-    except BaseException as exc:
-        con = db.connect()
-        try:
-            supervise.fail_launch(con, root, run_id, exc)
-        finally:
-            con.close()
-        raise
-    print(f"dispatched async. `orchestra show {run_id}` for details.")
-
-
-def _print_dispatch(state: dict) -> None:
-    """The live run count sits beside the pause switch on purpose: seeing it
-    and being able to stop it is what replaces a concurrency ceiling
-    (DESIGN §4). There is no cap to print."""
-    if state["paused"]:
-        print(f"dispatch: PAUSED since {state['paused_at']}"
-              + (f" — {state['pause_note']}" if state["pause_note"] else "")
-              + f" · {state['live_runs']} live runs still going")
-    else:
-        print(f"dispatch: running · {state['live_runs']} live runs")
-    if state["waiting"]:
-        print(f"## waiting ({len(state['waiting'])}) — not started, not in_progress")
-        for w in state["waiting"]:
-            detail = f": {w['detail']}" if w["detail"] else ""
-            print(f"  {w['item_id']} [{w['reason']}{detail}] since {w['enqueued_at']}")
-    print()
-
-
-def cmd_pause(args):
-    con = db.connect()
-    state = dispatch.pause(con, " ".join(args.note) or None)
-    live = dispatch.live_runs(con)
-    con.close()
-    print(f"orchestra: dispatch paused at {state['at']}"
-          + (f" — {state['note']}" if state["note"] else ""))
-    print(f"  {live} in-flight run(s) untouched; no new run starts until "
-          "`orchestra resume`.")
-
-
-def cmd_resume(args):
-    con = db.connect()
-    was = dispatch.resume(con)
-    state = dispatch.state(con)
-    con.close()
-    if was is None:
-        print("orchestra: dispatch was not paused")
-    else:
-        print(f"orchestra: dispatch resumed (paused since {was['at']})")
-    print(f"  {state['live_runs']} live runs, {len(state['waiting'])} waiting — "
-          "the next sweep and the next daemon tick release them, in order.")
-
-
-def cmd_status(args):
-    con = db.connect()
-    proj, _ = _here(con)
-    here = proj.slug if proj else "no known project"
-    # Central state, so this is the whole workspace, not one project.
-    print(f"orchestra @ {paths.home()} — here: {here}\n")
-    _print_dispatch(dispatch.state(con))
-    active = list(con.execute(
-        f"SELECT * FROM runs WHERE status NOT IN {db.TERMINAL_SQL} ORDER BY id"))
-    print(f"## active runs ({len(active)})")
-    for r in active:
-        pending = [str(row["depends_on_run"]) for row in con.execute(
-            "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=? "
-            "ORDER BY depends_on_run", (r["id"],))] if r["status"] == "pending" else []
-        label = f"pending-on-{','.join(pending)}" if pending else r["status"]
-        print(f"  run {r['id']}: {r['profile']} "
-              f"[{label}/{http.run_isolation(r)}] since {r['started_at']} — "
-              f"{(r['title'] or '')[:50]}")
-    recent = list(con.execute(
-        f"SELECT * FROM runs WHERE status IN {db.TERMINAL_SQL} "
-        "AND layer IS NULL ORDER BY id DESC LIMIT 5"))
-    if recent:
-        print("## recent finished")
-        for r in recent[::-1]:
-            print(f"  run {r['id']}: {r['profile']} -> {r['status']} "
-                  f"[{http.run_isolation(r)}] — "
-                  f"{(r['title'] or '')[:50]}")
-    con.close()
-
-
-def cmd_runs(args):
-    con = db.connect()
-    # Control turns (W-0214) are not the fleet; `orchestra show <id>` still
-    # opens one directly.
-    where = ["layer IS NULL"]
-    if args.active:
-        where.append(f"status NOT IN {db.TERMINAL_SQL}")
-    params = []
-    if args.here:
-        proj, _ = _here(con)
-        where.append("project_id IS ?")
-        params.append(proj.project_id if proj else None)
-    rows = list(con.execute(
-        "SELECT r.*, (SELECT slug FROM projects p WHERE p.project_id=r.project_id "
-        "LIMIT 1) AS project FROM runs r"
-        + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id", params))
-    if args.json:
-        print(json.dumps([{**dict(r), "isolation": http.run_isolation(r)}
-                          for r in rows], indent=2))
-        con.close()
-        return
-    if not rows:
-        print("(no runs)")
-        con.close()
-        return
-    print(f"{'id':<4} {'slug':<18} {'project':<16} {'profile':<10} "
-          f"{'status':<10} {'mode':<11} {'started':<21} title")
-    for r in rows:
-        print(f"{r['id']:<4} {r['slug'] or '-':<18} {(r['project'] or '-')[:16]:<16} "
-              f"{r['profile']:<10} {r['status']:<10} "
-              f"{http.run_isolation(r):<11} {r['started_at']:<21} "
-              f"{(r['title'] or '')[:50]}")
-    con.close()
-
-
-def cmd_show(args):
-    con = db.connect()
-    r = _target(con, args)
-    print(f"isolation: {http.run_isolation(r)}")
-    for k in r.keys():
-        v = r[k]
-        if k == "summary" and v:
-            print(f"{k}:\n  " + v.replace("\n", "\n  "))
-        else:
-            print(f"{k}: {v}")
-    deps = [str(row["depends_on_run"]) for row in con.execute(
-        "SELECT depends_on_run FROM dispatch_dependencies WHERE run_id=? "
-        "ORDER BY depends_on_run", (args.run_id,))]
-    if deps:
-        print("depends_on: " + ", ".join(deps))
-    # DESIGN §6: an undelivered message is surfaced, not swallowed.
-    for row in messaging.undeliverable(con, args.run_id):
-        print(f"UNDELIVERED message {row['id']} from {row['sender']} "
-              f"({row['undeliverable_reason']}):\n  "
-              + row["body"].strip().replace("\n", "\n  "))
-    con.close()
-
-
-def _continuation_line(con, run_id: int):
-    """Return a run and every session continuation descended from it."""
-    return list(con.execute(
-        "WITH RECURSIVE continuation_ids(id) AS ("
-        "SELECT ? UNION SELECT r.id FROM runs r "
-        "JOIN continuation_ids c ON r.parent_run=c.id) "
-        "SELECT r.* FROM runs r JOIN continuation_ids c ON c.id=r.id ORDER BY r.id",
-        (run_id,),
-    ))
-
-
-def cmd_reply(args):
-    con = db.connect()
-    parent_run = _target(con, args)
-    cfg = config.load(parent_run["project_id"])
-    _gate_dispatch(con, cfg, _requester(cfg))
-    root = project.root_for(con, parent_run)
-    parent = _continuation_line(con, args.run_id)[-1]
-    if not parent["session_ref"]:
-        con.close()
-        raise SystemExit(
-            f"orchestra: run {parent['id']} has no session ref; dispatch a fresh run")
-    active = con.execute(
-        f"SELECT id, status FROM runs WHERE session_ref=? AND status NOT IN {db.TERMINAL_SQL} "
-        "ORDER BY id DESC LIMIT 1", (parent["session_ref"],)).fetchone()
-    if active:
-        con.close()
-        raise SystemExit(
-            f"orchestra: run {args.run_id}'s session is already active as run "
-            f"{active['id']} ({active['status']}) — use `orchestra interrupt` instead")
-    _gate_dispatch(con, cfg, _requester(cfg))
-    run_id = supervise.create_followup(
-        con, root, dict(parent), _requester(cfg), " ".join(args.message))
-    if run_id is None:
-        paused = dispatch.pause_state(con)
-        active = con.execute(
-            f"SELECT id, status FROM runs WHERE session_ref=? "
-            f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id DESC LIMIT 1",
-            (parent["session_ref"],)).fetchone()
-        con.close()
-        if paused is not None:
-            raise SystemExit("orchestra: dispatch was paused before admission; "
-                             "run `orchestra resume` to continue this session")
-        if active is not None:
-            raise SystemExit(f"orchestra: this session is already active as run "
-                             f"{active['id']} ({active['status']})")
-        raise SystemExit("orchestra: continuation was not admitted")
-    con.close()
-    requested_note = (f" (requested from run {args.run_id})"
-                      if parent["id"] != args.run_id else "")
-    print(f"run {run_id}: continuing run {parent['id']}'s session with "
-          f"{parent['profile']}{requested_note}")
-    if args.sync:
-        supervise.supervise(root, run_id)
-    else:
-        try:
-            supervise.spawn_supervisor(root, run_id)
-        except BaseException as exc:
-            con = db.connect()
-            try:
-                supervise.fail_launch(con, root, run_id, exc)
-            finally:
-                con.close()
-            raise
-
-
-def cmd_spawn(args):
-    """`orchestra spawn --to <profile> "<mission>"` — a run asks for help.
-
-    This WRITES a request and returns. The lead's own supervisor claims it,
-    checks the bounds, and starts the children — a worker never launches a
-    process from inside its own sandbox (child_runs).
-    """
+    if args.archive_legacy:
+        report = migration.archive_legacy(execute=True)
+        report["legacy_hooks"] = migration.retire_legacy_hooks(execute=True)
+        print(f"archived legacy state at {report['archive']}")
+        remaining = [item for item in report["legacy_hooks"]
+                     if item.get("error") or
+                     item.get("found") != item.get("removed") or
+                     item.get("trust_found", 0) !=
+                     item.get("trust_removed", 0)]
+        if remaining:
+            print("warning: some legacy harness hooks could not be retired; "
+                  "inspect `orchestra archive-legacy` output")
+    location, created = config.ensure()
     con = db.connect()
     try:
-        token = os.environ.get(auth.TOKEN_ENV, "")
-        identity = auth.identify(con, token, None) if token else None
-        identity_run = identity.run_id if identity else None
-        # The token's run is a ROW id; a typed --run is a human's number.
-        run_id = (int(_fetch_run(con, args.run_id)["id"]) if args.run_id
-                  else identity_run)
-        if not run_id:
-            raise SystemExit(
-                "orchestra: spawn is for a running run to ask for help; it "
-                f"needs {auth.TOKEN_ENV} in the environment, or --run")
-        cfg = config.load(_project_id(con, run_id))
-        parent = child_runs.validate_parent(con, cfg, int(run_id), identity_run)
-        child_runs.validate_targets(cfg, parent, args.to)
-        request_id = child_runs.enqueue(
-            con, parent, args.to, " ".join(args.mission),
-            title=args.title, context=args.context,
-            shared_workdir=args.shared_workdir)
+        for adapter in ("codex", "claude", "opencode", "reasonix"):
+            if fleet_config.find_runtime(con, adapter) is None:
+                fleet_config.create_runtime(
+                    con, adapter.title(), adapter, slug=adapter,
+                    capabilities={"launch": True, "resume": True, "trace": True,
+                                  "interrupt": True},
+                    actor="init")
+        if not con.execute("SELECT 1 FROM profiles LIMIT 1").fetchone():
+            for adapter in ("codex", "claude", "opencode", "reasonix"):
+                if shutil.which(adapter):
+                    fleet_config.create_profile(
+                        con, adapter.title(), adapter, slug=adapter, tier=2,
+                        actor="init")
+        token = None
+        if not con.execute("SELECT 1 FROM devices LIMIT 1").fetchone():
+            record, token = auth.bootstrap_device(con, args.device_name)
+            client.save_token(config.api_url(), token)
+            print(f"paired operator device {record['name']} ({record['device_id']})")
+        print(f"Orchestra v2 initialized at {paths.state_dir()}")
+        print(f"  instance:  {db.instance_id(con)}")
+        print(f"  bootstrap: {location}{' (created)' if created else ''}")
+        print(f"  API:       {config.api_url()}")
+        if token:
+            print(f"  token:     {token}")
+            print("  stored in Keychain (or the owner-only local fallback); shown once")
+        print("Create or import profiles, then dispatch a run or configure a group CWD.")
     finally:
         con.close()
-    print(f"spawn request {request_id}: {', '.join(args.to)} for run {run_id}. "
-          "Your supervisor starts them; keep working until they settle.")
-
-
-def _project_id(con, run_id: int) -> str | None:
-    row = con.execute("SELECT project_id FROM runs WHERE id=?",
-                      (run_id,)).fetchone()
-    return row["project_id"] if row else None
-
-
-def cmd_interrupt(args):
-    """`tell` and `interrupt` both land here: same row, same delivery. A run
-    that already finished is NOT a target — DESIGN §6 forbids re-aiming a
-    message at a later run, so the caller is sent to `reply` instead."""
-    if args.message_file:
-        try:
-            body = Path(args.message_file).read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise SystemExit(
-                f"orchestra: cannot read message file '{args.message_file}': {exc}") from exc
-    else:
-        body = " ".join(args.message)
-    if not body.strip():
-        raise SystemExit("orchestra: the message must not be empty")
-    con = db.connect()
-    r = _target(con, args)
-    cfg = config.load(r["project_id"])
-    if r["status"] in db.RUN_TERMINAL:
-        con.close()
-        raise SystemExit(f"orchestra: run {args.run_id} already {r['status']} — "
-                         f"use `orchestra reply {args.run_id} \"...\"` instead")
-    if not r["session_ref"]:
-        con.close()
-        raise SystemExit(f"orchestra: run {args.run_id}'s session isn't identified yet "
-                         "(happens ~10s after spawn) — retry in a moment")
-    # W-0104: an ACP run holds a live protocol channel, so there is no safe
-    # boundary to queue behind and nothing to kill — the supervisor steers the
-    # message into the running turn (Reasonix) or sends it as the next prompt
-    # on the same session (OpenCode). The row carries no delivery_offset, so
-    # the delivery state stops claiming a pending boundary.
-    live = acp.run_transport(cfg, r["profile"]) == "acp"
-    try:
-        messaging.queue_tell(con, args.run_id, _requester(cfg), body, r["log_path"],
-                             boundary=not live)
-    except messaging.RunClosed:
-        latest = _target(con, args)
-        con.close()
-        raise SystemExit(f"orchestra: run {args.run_id} already {latest['status']} — "
-                         f"use `orchestra reply {args.run_id} \"...\"` instead")
-    if args.now:
-        con.execute(f"UPDATE runs SET status='interrupt' WHERE id=? "
-                    f"AND status NOT IN {db.TERMINAL_SQL}", (args.run_id,))
-        con.commit()
-        if r["pid"] and not live:
-            outcome, detail = proc.signal_owned_group(
-                r["pid"], r["pid_identity"], signal.SIGTERM)
-            if outcome == "refused":
-                print(f"orchestra: run {args.run_id} not signalled: {detail}",
-                      file=sys.stderr)
-        how = ("the worker's turn is cancelled gracefully over ACP and the same "
-               "session continues with the message" if live else
-               "the worker resumes its session with the message and continues "
-               "the mission")
-        print(f"run {args.run_id} interrupted now — {how}")
-    else:
-        con.commit()
-        if live:
-            when = ("mid-turn" if r["backend"] == "reasonix"
-                    else "at the end of the current turn, on the same live session")
-            print(f"message queued for run {args.run_id} over ACP — delivered "
-                  f"{when}, with no kill and no resume")
-        else:
-            print(f"message queued for run {args.run_id}'s next safe action boundary; "
-                  f"`orchestra interrupt {args.run_id} \"...\" --now` for an emergency stop")
-    con.close()
-
-
-def cmd_ask(args):
-    """The worker's blocking verb (DESIGN §6).
-
-    It does not block THIS process: it files the question and returns. The
-    session is what blocks — its Stop hook holds it open until the answer
-    (or the declared fallback) comes back through `orchestra hook`.
-    """
-    question = " ".join(args.question).strip()
-    if not question:
-        raise SystemExit("orchestra: ask needs a question")
-    if args.target not in ("human", "me", "owner"):
-        raise SystemExit(
-            f"orchestra: ask can only target the human, not '{args.target}'. "
-            "the current peer scope is one human and one run; use "
-            "`orchestra tell <run> \"...\"` to send a run a message.")
-    run_id = args.run_id or paths.env("ORCHESTRA_RUN_ID") or None
-    if not run_id:
-        raise SystemExit("orchestra: ask runs inside a run — pass --run RUN outside one")
-    con = db.connect()
-    # ORCHESTRA_RUN_ID and --run carry a ROW id, set by machines.
-    run = _fetch_run(con, int(run_id), row_id_only=True)
-    if run["status"] in db.RUN_TERMINAL:
-        con.close()
-        raise SystemExit(f"orchestra: run {run_id} is already {run['status']}")
-    cfg = config.load(run["project_id"])
-    try:
-        request_id, seconds = messaging.file_question(con, cfg, run, question)
-    except (nod.NodError, nod.NodChannelError) as exc:
-        # A worker must hear that its question did NOT go out, not a traceback.
-        raise SystemExit(f"orchestra: the question was not filed: {exc}") from None
-    finally:
-        con.close()
-    print(f"question filed with the human as Nod request {request_id}. "
-          f"End your turn now — the answer arrives as your next instruction. "
-          f"If nobody answers within {seconds}s you will be told to proceed "
-          f"on your own judgement.")
-
-
-def cmd_hook(args):
-    """The one hook binary Claude, Codex and Reasonix all run (DESIGN §6).
-
-    Reads the harness's event JSON on stdin, prints the harness's answer on
-    stdout. Prints nothing and touches nothing outside a Orchestra run.
-    """
-    payload = {}
-    if not sys.stdin.isatty():
-        try:
-            raw = sys.stdin.read()
-            payload = json.loads(raw) if raw.strip() else {}
-        except (OSError, UnicodeError, ValueError):
-            payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    try:
-        text = hooks.run_hook(args.backend, payload, bind=args.bind,
-                              event=args.event, session=args.session)
-    except Exception as exc:  # a hook must never take the harness down with it
-        print(f"orchestra hook: {exc.__class__.__name__}: {exc}", file=sys.stderr)
-        text = None
-    out = hooks.render(args.backend, text, context=args.bind,
-                       lifecycle=args.event == "PostCompact")
-    if out:
-        print(out)
-
-
-def cmd_kill(args):
-    con = db.connect()
-    r = _target(con, args)
-    if r["status"] in db.RUN_TERMINAL:
-        print(f"run {args.run_id} already {r['status']}")
-        con.close()
-        return
-    con.execute(
-        "UPDATE deferred_dispatches SET status='cancelled', processed_at=? "
-        "WHERE run_id=? AND status='pending'", (db.now(), args.run_id))
-    changed = con.execute(
-        f"UPDATE runs SET status='killed', worker_status=COALESCE(worker_status, "
-        f"'killed'), finished_at=? WHERE id=? "
-        f"AND status NOT IN {db.TERMINAL_SQL}", (db.now(), args.run_id))
-    con.commit()
-    if changed.rowcount != 1:
-        latest = _target(con, args)
-        print(f"run {args.run_id} already {latest['status']}")
-        con.close()
-        return
-    has_worker = r["pid"] is not None
-    signal_outcome = "gone" if not has_worker else "refused"
-    signal_detail = None
-    if has_worker:
-        signal_outcome, signal_detail = proc.signal_owned_group(
-            r["pid"], r["pid_identity"], signal.SIGTERM)
-        if signal_outcome == "signalled":
-            print(f"sent SIGTERM to run {args.run_id} (pid {r['pid']})")
-        elif signal_outcome == "gone":
-            print(f"run {args.run_id} marked killed (process already gone)")
-        else:
-            print(f"orchestra: run {args.run_id} not signalled: {signal_detail}",
-                  file=sys.stderr)
-    else:
-        print(f"run {args.run_id} marked killed")
-    try:
-        supervise.finalize_if_unowned(
-            con, args.run_id, worker_gone=signal_outcome == "gone")
-    except Exception as exc:
-        print(f"orchestra: run {args.run_id} cleanup deferred: {exc}",
-              file=sys.stderr)
-    # Dependents of a killed prerequisite are declined synchronously; no
-    # supervisor may exist to do it for a pending run.
-    supervise.process_ready(con, supervise.spawn_supervisor)
-    con.close()
-
-
-def cmd_check(args):
-    """`orchestra check <run>` — the spin observer's judgement, on demand.
-
-    Same three layers and the same three outcomes as the scheduled look
-    (DESIGN §7): a correction is delivered, a stop escalates with its
-    reasoning, and everything else just prints.
-    """
-    con = db.connect()
-    _target(con, args)  # exits with a clear message for a bad id
-    try:
-        result = http.check_run(con, args.run_id, observe=not args.mechanical)
-    finally:
-        con.close()
-    print(f"run {args.run_id}: {result['verdict']}")
-    for key in ("alive", "silent_for", "elapsed_seconds"):
-        print(f"  {key}: {result[key]}")
-    seen = result.get("observer") or {}
-    if seen.get("error"):
-        print(f"  observer: {seen['error']}")
-    elif seen.get("skipped"):
-        print(f"  observer: skipped — {seen['skipped']}")
-    elif seen:
-        print(f"  observer ({seen['action']}): {seen['reason']}")
-    if result.get("loop"):
-        print(f"  loop check ({result['loop']['action']}): {result['loop']['reason']}")
-
-
-def _here_cfg() -> dict:
-    """Config merged with the current directory's per-project overrides."""
-    con = db.connect()
-    try:
-        return _here(con)[1]
-    finally:
-        con.close()
-
-
-PICK = "\0pick"  # `--model` with no value means "show me the real list"
-
-
-def _authority() -> str:
-    """The CLI's half of the DESIGN §5 split.
-
-    A worker's environment carries its own per-run token (W-0176); a human's
-    shell does not. The token is checked against the database, so it is a
-    credential and not a claim — but only at the HTTP surface is that
-    containment: this process reads the config file and the database
-    directly, so a worker that unsets the variable is limited by the
-    filesystem, not by this function. The ORCHESTRA_RUN_ID fallback stays for
-    exactly that reason — it costs nothing and it still catches the honest
-    worker whose token was never minted.
-    """
-    con = db.connect()
-    try:
-        if auth.run_from_env(con):
-            return "agent"
-    finally:
-        con.close()
-    return "agent" if paths.env("ORCHESTRA_RUN_ID") else "human"
-
-
-def _choose(label: str, choices: list[str], current=None, free: bool = False):
-    """Numbered pick from a real list — the CLI half of the dashboard's
-    picker. Never invents a list; ``free`` allows typing where discovery has
-    nothing to offer (claude publishes no model listing)."""
-    if not choices:
-        if not free:
-            raise SystemExit(f"orchestra: nothing to pick for {label} — run "
-                             "`orchestra profiles discover` to see why")
-        return input(f"{label} (typed; discovery has no list) "
-                     f"[{current or ''}]: ").strip() or current
-    print(f"\n{label}:")
-    for i, choice in enumerate(choices, 1):
-        print(f"  {i:>2}. {choice}" + ("  (current)" if choice == current else ""))
-    while True:
-        raw = input(f"pick 1-{len(choices)}"
-                    + (f" [{current}]" if current else "") + ": ").strip()
-        if not raw and current:
-            return current
-        if raw.isdigit() and 1 <= int(raw) <= len(choices):
-            return choices[int(raw) - 1]
-        print("  not one of the numbers above")
-
-
-def _report(result: dict, name: str) -> None:
-    if result.get("error"):
-        raise SystemExit(f"orchestra: {result['error']}")
-    if not result.get("applied"):
-        print(f"profile {name}: this change commits spend, so it was recorded "
-              f"for the human ({result.get('escalation') or 'filed'}).")
-        print("  needs: " + ", ".join(result.get("needs") or []))
-        print("  `orchestra profiles` prints it until a human applies it.")
-        return
-    if result.get("removed"):
-        print(f"profile {name}: removed from {paths.global_config_path()}")
-    elif result.get("unchanged"):
-        print(f"profile {name}: already that way, nothing written")
-    else:
-        print(f"profile {name}: {', '.join(result['changed'])} "
-              f"→ {paths.global_config_path()}")
-
-
-def _profiles_set(args) -> None:
-    """Add or edit one profile, with the same pickers the dashboard uses."""
-    name = args.name
-    existing = dict(config.load().get("profiles", {}).get(name) or {})
-    options = profile_edit.discovery_options()
-    changes: dict = {}
-
-    backend = args.backend
-    if backend == PICK or (backend is None and not existing):
-        backend = _choose("harness", list(profile_edit.BACKENDS),
-                          existing.get("backend"))
-    if backend:
-        changes["backend"] = backend
-    chosen = backend or existing.get("backend") or "opencode"
-    opts = options.get(chosen) or {}
-    models = [m["id"] for m in opts.get("models") or []]
-
-    model = args.model
-    if model == PICK or (model is None and not existing):
-        model = _choose(f"{chosen} model", models, existing.get("model"),
-                        free=bool(opts.get("free_model")) or not models)
-    if model:
-        changes["model"] = model
-
-    if opts.get("supports_effort") is False:
-        if args.effort:
-            raise SystemExit(f"orchestra: {chosen} takes no effort — "
-                             + str(opts.get("effort_note") or ""))
-        if existing.get("effort"):
-            changes["effort"] = ""  # a value the launch would silently drop
-    else:
-        effort = args.effort
-        picked = next((m for m in opts.get("models") or []
-                       if m["id"] == (model or existing.get("model"))), {})
-        if effort == PICK:
-            effort = _choose("effort", list(picked.get("efforts") or []),
-                             existing.get("effort"),
-                             free=bool(opts.get("free_effort")))
-        if effort:
-            changes["effort"] = effort
-
-    for flag, key in (("variant", "variant"), ("tier", "tier"),
-                      ("note", "note"), ("sandbox", "sandbox")):
-        value = getattr(args, flag, None)
-        if value is not None:
-            changes[key] = value
-    if args.priority is not None:
-        changes["priority"] = args.priority
-    _report(profile_edit.save(name, changes, authority=_authority(),
-                              options=options), name)
-
-
-def _print_waiting(rows) -> None:
-    """Profile changes an agent asked for and may not make (DESIGN §5).
-
-    The offline view of the escalation record: with every source down this is
-    still the whole request, values included.
-    """
-    for row in rows:
-        print(f"\nwaiting on you — {row['title']} ({row['request_id']})")
-        for line in (row["body"] or "").splitlines():
-            print(f"  {line}" if line else "")
-
-
-def cmd_profiles(args):
-    if args.action == "note":
-        _report(profile_edit.save(args.name, {"note": " ".join(args.text)},
-                                  authority=_authority()), args.name)
-        return
-    if args.action == "set":
-        return _profiles_set(args)
-    if args.action == "rm":
-        _report(profile_edit.save(args.name, {}, delete=True,
-                                  authority=_authority()), args.name)
-        return
-    if args.action == "discover":  # needs no config; discovery asks the tools
-        found = profiles.discover()
-        print("orchestra profiles discover — what the installed harnesses offer\n")
-        oc = found["opencode"]
-        print("## opencode (`opencode models`)")
-        if oc["error"]:
-            print(f"  unavailable: {oc['error']}")
-        else:
-            for provider, models in sorted(oc["data"].items()):
-                shown = ", ".join(models[:8]) + \
-                    (f", … +{len(models) - 8} more" if len(models) > 8 else "")
-                print(f"  {provider} ({len(models)}): {shown}")
-        cx = found["codex"]
-        print("\n## codex (`codex debug models`)")
-        if cx["error"]:
-            print(f"  unavailable: {cx['error']}")
-        else:
-            for m in cx["data"]:
-                efforts = "|".join(m["efforts"]) or "-"
-                print(f"  {m['model']}  efforts: {efforts}"
-                      + (f" (default {m['default_effort']})" if m["default_effort"] else ""))
-        rx = found["reasonix"]
-        print(f"\n## reasonix ({profiles.REASONIX_CONFIG})")
-        if rx["error"]:
-            print(f"  unavailable: {rx['error']}")
-        else:
-            for p in rx["data"]:
-                efforts = "|".join(p["efforts"]) or "-"
-                print(f"  {p['provider']}: {', '.join(p['models'])}  efforts: {efforts}"
-                      + (f" (default {p['default_effort']})" if p["default_effort"] else ""))
-        print(f"\n## claude\n  {found['claude']['error']}")
-        return
-    con = db.connect()
-    try:
-        entries = _here(con)[1].get("profiles", {})
-        polls = {p["provider"]: p for p in runway.latest_polls(con)}
-        # DESIGN §5: a change an agent may not make itself is recorded, not
-        # applied. This is the offline view of that record — with every
-        # source down it is still the whole request, values included.
-        waiting = nod.unmirrored_of_kind(con, nod.PROFILE_CHANGE)
-    finally:
-        con.close()
-    if not entries:
-        print("(no profiles configured)")
-        _print_waiting(waiting)  # never hidden: it is the offline record
-        return
-    burns = runway.profile_burns(entries, polls)
-    # Routing order (W-0181): priority first, `nice`-style — lower is more
-    # preferred — then name. The same order the dashboard and the planner see.
-    print(f"{'name':<12} {'harness':<9} {'model':<24} {'effort':<7} "
-          f"{'pri':<4} tier")
-    for name in sorted(entries, key=lambda n: (config.priority_of(entries[n]), n)):
-        p = entries[name]
-        tier = config.tier_of(p.get("tier"))
-        print(f"{name:<12} {p.get('backend', 'opencode'):<9} "
-              f"{p.get('model') or '(harness default)':<24} "
-              f"{p.get('effort') or '-':<7} "
-              f"{config.priority_of(p):<4} "
-              f"{f'{tier} {config.TIERS[tier]}' if tier else '-'}")
-        age = profiles.note_age(p.get("note_at"))
-        if p.get("note"):
-            print(f"{'':<12} note: {p['note']}" + (f" ({age})" if age else ""))
-        if name in burns:
-            print(f"{'':<12} exhausted: {burns[name]}")
-    _print_waiting(waiting)
-
-
-def cmd_doctor(args):
-    print("orchestra doctor\n")
-    for tool in (*harnesses.SUPPORTED, "git"):
-        path = proc.which(tool)
-        print(f"  {tool:<9} {'available · ' + path if path else 'not found'}")
-    gp = paths.global_config_path()
-    print(f"\n  global config: {gp} ({'present' if gp.is_file() else 'absent'})")
-    print(f"  orchestra home: {paths.home()}")
-    con = db.connect()
-    print(f"  database:     {paths.db_path()}")
-    proj, cfg = _here(con)
-    print(f"  here:         {proj if proj else 'not inside a registered project'}")
-    total = con.execute("SELECT COUNT(*) AS n FROM runs").fetchone()["n"]
-    active = con.execute(
-        f"SELECT COUNT(*) AS n FROM runs WHERE status NOT IN {db.TERMINAL_SQL}"
-    ).fetchone()["n"]
-    known = con.execute(
-        "SELECT COUNT(DISTINCT project_id) AS n FROM projects").fetchone()["n"]
-    print(f"  runs: {total} total, {active} active across {known} cached projects")
-    print(f"  profiles: {', '.join(sorted(cfg.get('profiles', {}))) or '(none)'}")
-    # W-0189: a spin observer that cannot run means NOTHING is watching any
-    # run, and that used to be silent. Doctor names the fix.
-    for line in observer.status_report(cfg):
-        print(line)
-    print(f"  service:  {service.status_line()}")
-    # DESIGN §6: a backend whose hook is missing (or whose Codex trust was
-    # never provisioned) cannot be told anything, so doctor says so plainly.
-    for line in hooks.hook_report():
-        print(line)
-    stranded = messaging.undeliverable(con)
-    if stranded:
-        runs_hit = sorted({int(r["run_id"]) for r in stranded})
-        print(f"  messages: {len(stranded)} undelivered on run(s) "
-              + ", ".join(str(r) for r in runs_hit))
-    channels = nod.from_cfg(cfg)
-    print("  nod:      " + (", ".join(
-        f"{role} {'configured' if channels and role in channels.configured else 'unconfigured'}"
-        for role in nod.ROLES) if cfg.get("nod", {}).get("enabled")
-        else "off ([nod] enabled = false)"))
-    # Whether a secret exists, never the secret.
-    port = int(http.http_cfg(cfg).get("port") or http.DEFAULT_PORT)
-    surface = (f"http://{http.bind_address(cfg)}:{port}/" if http.load_key(cfg)
-               else "off — no shared secret; run `orchestra init`")
-    print(f"  http:     {surface}")
-    con.close()
 
 
 def cmd_daemon(args):
-    sys.exit(daemon.run(interval=args.interval, once=args.once))
-
-
-def cmd_service(args):
-    if args.action == "install":
-        sys.exit(service.install(start=args.start))
-    if args.action == "uninstall":
-        sys.exit(service.uninstall())
-    if args.action == "restart":
-        sys.exit(service.restart())
-    sys.exit(service.status())
-
-
-def cmd_runway(args):
-    """DESIGN §11: poll every provider adapter, store the poll, print it.
-    Never fails on a provider — an adapter outage prints as unknown."""
-    # The CLI polls EVERY adapter: the board hides a provider nobody is
-    # staffed on, and this is where the owner can still see one.
-    results = runway.poll_all(config.load(), all_providers=True)
-    con = db.connect()
-    runway.record(con, results)
-    con.close()
-    if args.json:
-        print(json.dumps([r.as_dict() for r in results], indent=2))
-        return
-    print(f"{'provider':<10} {'window':<8} {'remaining':<14} {'resets':<14} note")
-    for r in results:
-        for line in runway.format_lines(r):  # one row per window (W-0179)
-            print(line)
-
-
-def _dur(seconds: float | None) -> str:
-    if not seconds:
-        return "0m"
-    minutes = int(seconds) // 60
-    return f"{minutes // 60}h {minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
-
-
-def _stat(value, money: bool = False) -> str:
-    """Null is "not captured" and prints as such — never as a zero."""
-    if value is None:
-        return "–"
-    return f"${value:,.4f}" if money else f"{value:,}"
-
-
-def _spend(value, billing: str) -> str:
-    """A plan-backed run has no price (W-0179). "plan" says so; a 0 or a bare
-    dash both read as free work."""
-    return "plan" if billing == "plan" else _stat(value, money=True)
-
-
-def cmd_stats(args):
-    """DESIGN §11 statistics, the same numbers the dashboard shows — it is
-    the same function. Tokens/cost read the run rows the supervisor stamped
-    at completion; a dash means no backend usage was captured."""
-    con = db.connect()
-    stats = http._statistics(con, instrumentation_limit=getattr(args, "runs", 30))
-    con.close()
-    if args.json:
-        print(json.dumps(stats, indent=2))
-        return
-    print(f"runs         {stats['runs_total']} total, {stats['runs_active']} active")
-    print(f"worker time  {_dur(stats['worker_seconds'])}")
-    print(f"tokens       {_stat(stats['tokens_total'])}")
-    print(f"cost         {_stat(stats['cost_usd'], money=True)}"
-          + (f"  ({stats['plan_runs']} plan-backed runs have no price)"
-             if stats.get("plan_runs") else ""))
-    by_status = "  ".join(f"{k} {stats['by_status'][k]}"
-                          for k in sorted(stats["by_status"])) or "–"
-    print(f"by status    {by_status}\n")
-    print(f"{'profile':<20} {'runs':>5} {'active':>7} {'time':>9} "
-          f"{'tokens':>14} {'cost':>12}")
-    for p in stats["by_profile"]:
-        print(f"{p['profile'][:20]:<20} {p['runs']:>5} {p['active']:>7} "
-              f"{_dur(p['seconds']):>9} {_stat(p['tokens']):>14} "
-              f"{_spend(p['cost'], p.get('billing', 'api')):>12}")
-    report = stats["instrumentation"]
-    print(f"\ninstrumentation  latest {report['runs_count']} of "
-          f"{report['window']} requested runs")
-    print(f"turns {report['turns']}  compactions {report['compactions']}  "
-          f"classification {report['classification_rate'] * 100:.1f}%  "
-          f"failure {(_stat(report['failure_rate']))}  "
-          f"landings/hour {_stat(report['landings_per_hour'])}")
-    print(f"{'tool class':<14} {'calls':>7} {'errors':>7} {'rate':>7} "
-          f"{'time':>9} {'timed':>7}")
-    for kind, item in report["tools"].items():
-        print(f"{kind:<14} {item['calls']:>7} {item['errors']:>7} "
-              f"{item['error_rate'] * 100:>6.1f}% {_dur(item['seconds']):>9} "
-              f"{item['timed_calls']:>7}")
-    if report["gap_candidates"]:
-        print("\ngap candidates")
-        for gap in report["gap_candidates"][:10]:
-            print(f"{gap['count']:>4}  {gap['kind']}: {gap['value']}")
-
-
-def cmd_review(args):
-    """W-0130: how each profile DID, not how much it ran — outcomes per
-    (profile, model) over terminal runs, worst first. The router reads tier,
-    priority and profile notes; this is the evidence for adjusting them."""
-    con = db.connect()
-    rows = review.performance(con)
-    con.close()
-    if args.json:
-        print(json.dumps(rows, indent=2))
-        return
-    if not rows:
-        print("no finished runs to review")
-        return
-    print(f"{'profile':<14} {'model':<26} {'runs':>5} {'ok':>5} "
-          f"{'f/t/k':>7} {'avg':>7} {'tokens':>14} {'cost':>12}  note")
-    for r in rows:
-        notes = []
-        if r["uncaptured"]:
-            notes.append(f"{r['uncaptured']} without usage")
-        if r["plan_runs"]:
-            notes.append(f"{r['plan_runs']} plan-backed (no price)")
-        breaks = f"{r['failed']}/{r['timeout']}/{r['killed']}"
-        print(f"{r['profile'][:14]:<14} {(r['model'] or '–')[:26]:<26} "
-              f"{r['runs']:>5} {r['success'] * 100:>4.0f}% "
-              f"{breaks:>7} "
-              f"{_dur(r['avg_seconds']):>7} {_stat(r['tokens']):>14} "
-              f"{_stat(r['cost'], money=True):>12}  {'; '.join(notes)}")
-    print("\ninfluence routing: `orchestra profiles note <name> \"...\"` — "
-          "the staffing turn reads notes, tier and priority.")
-
-
-
-def cmd_merge(args):
-    con = db.connect()
-    # The by-hand retry judges tripwires against the same mission the
-    # automatic landing does — the row is found by its branch name, and the
-    # run's own record says which checkout the branch lives in.
-    row = con.execute("SELECT * FROM runs WHERE branch=? ORDER BY id DESC LIMIT 1",
-                      (args.branch,)).fetchone()
-    mission = merge.run_mission(dict(row)) if row else ""
-    root = project.root_for(con, row) if row else Path.cwd().resolve()
-    settings = config.load(row["project_id"] if row else None)
-    con.close()
-    result = merge.merge_run(root, args.branch, mission=mission,
-                             item_id=args.item,
-                             settings=settings)
-    print(json.dumps(result, indent=2))
-    if not result["ok"]:
-        raise SystemExit(1)
-
-
-def cmd_prune(args):
-    """W-0172: sweep run worktrees nobody owns. A live run's checkout is
-    skipped whatever it looks like."""
-    con = db.connect()
-    report = worktree.prune(con, force=args.force)
-    con.close()
-    removed = 0
-    for wt in report["worktrees"]:
-        if wt["removed"]:
-            removed += 1
-            print(f"prune: removed {wt['workdir']}")
-            for lost in wt["discarded"]:
-                print(f"  discarded: {lost}")
-        elif wt["kept"]:
-            print(f"prune: kept {wt['workdir']} — {wt['kept']}")
-        else:
-            print(f"prune: FAILED {wt['workdir']} — {wt['error']}")
-    for d in report["dirs"]:
-        print(f"prune: removed empty project directory {d}")
-    kept = [wt for wt in report["worktrees"] if not wt["removed"]]
-    print(f"prune: {removed} worktree(s) removed, {len(kept)} kept, "
-          f"{len(report['dirs'])} empty directory(ies) removed")
-    if any(wt["kept"] and not wt.get("live") for wt in kept) and not args.force:
-        print("prune: pass --force to remove those and discard what they hold "
-              "(a live run's worktree is never removed)")
-
-
-def cmd_project(args):
-    """Project IDENTITY management (schema v29). A project is a slug and
-    settings, not a folder: checkouts belong to each dispatch, and the run
-    history remembers where a project usually runs."""
-    con = db.connect()
-    try:
-        if args.action == "list":
-            # DESIGN §1: an archived project is parked, so it is off this
-            # list until --all asks for it. Its runs are never hidden.
-            rows = project.all_projects(con, include_archived=args.all)
-            if not rows:
-                print("no projects. `orchestra project add <name>` mints one.")
-                return
-            slugw = max(len(r.slug or "") for r in rows)
-            for r in rows:
-                where = project.last_root(con, r.project_id)
-                mark = "  (archived)" if r.archived else ""
-                print(f"{r.slug or '-':<{slugw}}  "
-                      f"{'local ' if r.local else 'source'}  {r.project_id}"
-                      f"  {r.name or ''}"
-                      + (f"  · runs in {where}" if where else "") + mark)
-            return
-        if args.action in ("archive", "unarchive"):
-            want = args.action == "archive"
-            hit = project.set_archived(con, args.selector, want)
-            if hit is None:
-                print(f"orchestra: no project matches {args.selector!r}")
-                return
-            print(f"{'archived' if want else 'unarchived'} {hit.slug}")
-            return
-        if args.action == "forget":
-            print(f"forgot {args.selector}"
-                  if project.forget(con, args.selector)
-                  else f"orchestra: no project matches {args.selector!r}")
-            return
-        # `add`: mint identity. A directory argument (the old muscle memory,
-        # `project add .`) contributes only its NAME; no path is stored.
-        raw = args.path or "."
-        as_dir = Path(raw).expanduser()
-        name = args.name or (as_dir.resolve().name if as_dir.is_dir() else raw)
-        made = project.create(con, name)
-        print(f"{made.slug}\n  project id: {made.project_id}"
-              f"\n  name:       {made.name}")
-        print("\nNo path is stored: each dispatch names its checkout, and "
-              "the run history remembers.\nDispatch with:\n"
-              f"  orchestra dispatch --project {made.slug} --path <dir> "
-              "--to <profile> \"<mission>\"\n"
-              "or run it from inside the checkout after that first time.")
-    finally:
-        con.close()
-
-
-def cmd_traces(args):
-    """DESIGN §7 retention: normalized events live forever, raw logs do not.
-    A live run is never touched — only terminal runs age out."""
-    con = db.connect()
-    if args.action == "messages":
-        rows = traces.run_messages(con, args.run_id)
-        con.close()
-        print(json.dumps(rows, indent=2))
-        return
-    if args.action == "audit":
-        since = args.since or datetime.now().astimezone().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).astimezone(timezone.utc).isoformat()
-        rows = traces.wait_audit(con, since)
-        con.close()
-        if args.json:
-            print(json.dumps({"since": since, "findings": rows}, indent=2))
-            return
-        for row in rows:
-            print(f"run {row['run_id']} event {row['event_id']} "
-                  f"{row['category']}: {row['command']}")
-        print(f"traces: {len(rows)} wait/poll tool call(s) since {since}")
-        return
-    days = args.days if args.days is not None else traces.retention_days(config.load())
-    pruned = traces.prune_raw_logs(con, days=days, dry_run=args.dry_run)
-    con.close()
-    if days <= 0:
-        print("traces: raw logs are kept forever (raw_log_retention_days = 0);"
-              " set a positive day count, or pass --days, to prune")
-        return
-    if not pruned:
-        print(f"traces: no raw log older than {days}d on a terminal run")
-        return
-    total = sum(p["bytes"] for p in pruned)
-    verb = "would prune" if args.dry_run else "pruned"
-    for p in pruned:
-        note = f" ({p['error']})" if p.get("error") else ""
-        print(f"traces: {verb} run {p['run_id']} {p['log_path']} "
-              f"{p['bytes']}B{note}")
-    print(f"traces: {verb} {len(pruned)} raw log(s), {total}B "
-          "(normalized events kept)")
-
-
-def _nod_or_exit() -> "nod.Nod":
-    channels = nod.from_cfg(config.load())
-    if channels is None:
-        raise SystemExit(
-            "orchestra: the human loop is off — set [nod] enabled = true in "
-            f"{paths.global_config_path()}, and write base_url plus a "
-            f"<channel>_channel/<channel>_token pair to "
-            f"{nod.DEFAULT_SECRETS_FILE} (chmod 600)")
-    return channels
-
-
-def _nod_client_for(channels, con, args):
-    """The channel client for a request id the user named.
-
-    ``--channel`` wins; otherwise the channel recorded when the card was
-    filed decides. A token only works for its own channel, so this never
-    falls back to trying both.
-    """
-    if args.channel:
-        return channels.for_role(args.channel)
-    return channels.for_request(con, args.request_id)
-
-
-def cmd_nod(args):
-    """Manual surface for the human loop (DESIGN §8). Not wired to runs yet."""
-    channels = _nod_or_exit()
-    con = db.connect()
-    try:
-        if args.action == "status":
-            print(f"nod: {channels.base_url}")
-            for role in nod.ROLES:
-                client = channels.clients.get(role)
-                print(f"  {role:<10} "
-                      + (f"channel {client.channel_id}" if client
-                         else "unconfigured (no token/channel pair)"))
-            try:
-                nod.health(channels.base_url, timeout=5)
-                print("  health     reachable")
-            except nod.NodError as exc:
-                print(f"  health     {exc}")
-        elif args.action == "test":
-            got = nod.alert(
-                channels, "Orchestra can reach this Nod server and issue requests.\n\n"
-                          "Nothing is wrong. Dismiss this card.",
-                title="Orchestra: Nod configuration check", con=con)
-            print(f"filed {got['request_id']} to the {nod.ALERTS} channel"
-                  + (" (deduped)" if got.get("deduped") else ""))
-        elif args.action == "show":
-            client = _nod_client_for(channels, con, args)
-            view = client.decision(args.request_id)
-            decision = view.get("decision") or {}
-            print(f"{view.get('request_id', args.request_id)}  {view.get('status')}"
-                  f"  [{client.role}]")
-            if decision:
-                print(f"  option: {decision.get('option_id')} "
-                      f"({decision.get('option_kind')})")
-                if decision.get("text"):
-                    print(f"  text:   {decision['text']}")
-                print(f"  at:     {decision.get('resolved_at')}")
-            row = con.execute("SELECT * FROM nod_requests WHERE request_id=?",
-                              (args.request_id,)).fetchone()
-            if row:
-                print(f"  local:  kind={row['kind']} run={row['run_id']} "
-                      f"item={row['ref']}")
-        elif args.action == "cancel":
-            client = _nod_client_for(channels, con, args)
-            client.cancel(args.request_id)
-            print(f"cancelled {args.request_id} on the {client.role} channel")
-    except (nod.NodError, nod.NodChannelError) as exc:
-        raise SystemExit(f"orchestra: {exc}")
-    finally:
-        con.close()
+    from orchestra import daemon
+    run = getattr(daemon, "run", None) or getattr(daemon, "main", None)
+    if run is None:
+        raise SystemExit("orchestra: daemon entry point is unavailable")
+    return run(interval=args.interval)
 
 
 def cmd_supervise(args):
-    sys.exit(supervise.supervise(Path(args.root), args.run_id))
+    """Internal detached-process entry point used by the daemon."""
+    from orchestra import supervise
+    return supervise.supervise(Path(args.root), args.run_id)
 
 
-# --- parser -----------------------------------------------------------------
-
-def main():
-    _win_stdio()
-    p = argparse.ArgumentParser(
-        prog="orchestra",
-        description="Local execution plane for Codex, Claude Code, OpenCode, "
-                    "and Reasonix: run missions behind one durable lifecycle, "
-                    "trace, control, and result surface.")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    s = sub.add_parser("init", help="prepare the central ~/.orchestra home and "
-                                    "report this directory's registered project")
-    s.set_defaults(fn=cmd_init)
-
-    s = sub.add_parser("dispatch", help="dispatch a mission to a worker profile, async")
-    s.add_argument("mission", nargs="*")
-    s.add_argument("--to", required=True, metavar="PROFILE", help="launch profile name")
-    s.add_argument("--project", metavar="SLUG",
-                   help="target project by slug, id, or registered path "
-                        "(default: the current directory's project)")
-    s.add_argument("--path", metavar="DIR",
-                   help="the checkout this run branches from and lands into "
-                        "(default: the project's registered path); with no "
-                        "--project, the path names the project too")
-    s.add_argument("--after", type=int, action="append", metavar="RUN",
-                   help="launch only after this run succeeds (repeatable)")
-    s.add_argument("--brief-file", help="read the mission from a file")
-    s.add_argument("--context", help="extra context appended to the brief")
-    s.add_argument("--title")
-    s.add_argument("--ref", help="opaque tracking token stored on the run and "
-                   "echoed back; the core never parses it")
-    s.add_argument("--requester", help="requested_by recorded on the run "
-                   "(default: [settings] default_requester)")
-    isolation = s.add_mutually_exclusive_group()
-    isolation.add_argument("--worktree", dest="worktree", action="store_true",
-                           default=True,
-                           help="run in an isolated git worktree (default)")
-    isolation.add_argument("--shared", dest="worktree", action="store_false",
-                           help="run in the registered checkout; use for read-only work")
-    s.add_argument("--sync", action="store_true", help="supervise in the foreground")
-    s.set_defaults(fn=cmd_dispatch)
-
-    s = sub.add_parser("status", help="workspace overview: dispatch state, "
-                                      "live run count, waiting items, runs")
-    s.set_defaults(fn=cmd_status)
-
-    s = sub.add_parser("pause", help="stop new runs starting; live runs, reporting, "
-                                     "and daemon maintenance continue")
-    s.add_argument("note", nargs="*", help="why, shown wherever the pause is")
-    s.set_defaults(fn=cmd_pause)
-
-    s = sub.add_parser("resume", help="allow new runs to start again")
-    s.set_defaults(fn=cmd_resume)
-
-    s = sub.add_parser("runs", help="list runs across every project")
-    s.add_argument("--active", action="store_true")
-    s.add_argument("--here", action="store_true",
-                   help="only this directory's project")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_runs)
-
-    s = sub.add_parser("show", help="run details")
-    s.add_argument("run_id", type=int)
-    s.set_defaults(fn=cmd_show)
-
-    s = sub.add_parser("reply", help="continue a finished run's backend session")
-    s.add_argument("run_id", type=int)
-    s.add_argument("message", nargs="+")
-    s.add_argument("--sync", action="store_true")
-    s.set_defaults(fn=cmd_reply)
-
-    # `tell` and `interrupt` write the SAME row: tell is DESIGN §6's name for
-    # the non-blocking, safe-boundary delivery, interrupt --now is the
-    # emergency stop variant of it.
-    s = sub.add_parser("tell", help="send a running worker a message through "
-                                    "live ACP or the next exec boundary "
-                                    "(DESIGN §6)")
-    s.add_argument("run_id", type=int)
-    s.add_argument("message", nargs="*")
-    s.add_argument("--file", dest="message_file", help="read the message from a file")
-    s.set_defaults(fn=cmd_interrupt, now=False)
-
-    s = sub.add_parser("ask", help="ask the human a blocking question; the run's "
-                                   "session waits for Nod or its declared fallback")
-    s.add_argument("target", help="who to ask — 'human'")
-    s.add_argument("question", nargs="+")
-    s.add_argument("--run", dest="run_id", type=int,
-                   help="the asking run (default: $ORCHESTRA_RUN_ID)")
-    s.set_defaults(fn=cmd_ask)
-
-    s = sub.add_parser("hook", help="internal: the lifecycle hook every supported "
-                                    "harness runs; installed by `orchestra init`")
-    s.add_argument("--backend", default="claude",
-                   choices=harnesses.SUPPORTED)
-    s.add_argument("--bind", action="store_true",
-                   help="SessionStart: record the harness session id")
-    s.add_argument("--event", help="the event name, when the harness cannot "
-                                   "put it on stdin (OpenCode's plugin)")
-    s.add_argument("--session", help="harness session id, same reason")
-    s.set_defaults(fn=cmd_hook)
-
-    s = sub.add_parser("interrupt",
-                       help="deliver a message to a running worker (guaranteed)")
-    s.add_argument("run_id", type=int)
-    s.add_argument("message", nargs="*")
-    s.add_argument("--file", dest="message_file", help="read the message from a file")
-    s.add_argument("--now", action="store_true",
-                   help="interrupt the active turn instead of normal delivery")
-    s.set_defaults(fn=cmd_interrupt)
-
-    s = sub.add_parser("kill", help="stop a run")
-    s.add_argument("run_id", type=int)
-    s.set_defaults(fn=cmd_kill)
-
-    s = sub.add_parser("check", help="judge a run now: stall, loop, and an "
-                                     "optional configured observer turn "
-                                     "(DESIGN §7)")
-    s.add_argument("run_id", type=int)
-    s.add_argument("--mechanical", action="store_true",
-                   help="skip the observer turn; liveness and loop shape only")
-    s.set_defaults(fn=cmd_check)
-
-    s = sub.add_parser("profiles",
-                       help="list, add, edit and remove launch profiles; "
-                            "discover models; set notes")
-    s.set_defaults(fn=cmd_profiles, action=None)
-    psub = s.add_subparsers(dest="action")
-    psub.add_parser("discover",
-                    help="enumerate models/efforts the installed harnesses offer")
-    pn = psub.add_parser("note", help="set a profile's headroom note")
-    pn.add_argument("name", metavar="PROFILE")
-    pn.add_argument("text", nargs="+", help='e.g. "10%% weekly left, resets Sunday"')
-
-    # Parity with the dashboard editor: the same pickers, the same config
-    # file, the same authority split. A bare --model/--effort/--backend
-    # offers the real list rather than taking a typed string.
-    ps = psub.add_parser("set", help="add or edit a profile (writes the config file)")
-    ps.add_argument("name", metavar="PROFILE")
-    for flag, helptext in (("backend", "harness: opencode|codex|claude|reasonix"),
-                           ("model", "model id, from discovery"),
-                           ("effort", "reasoning effort the model declares")):
-        ps.add_argument(f"--{flag}", nargs="?", const=PICK, help=helptext)
-    ps.add_argument("--variant", help="opencode's stand-in for effort")
-    ps.add_argument("--tier", help="1 workhorse | 2 generalist | 3 heavy; "
-                                   "tier 1 volunteers the observer, tier 2 the planner")
-    ps.add_argument("--priority", type=int,
-                    help="0-99, like a linux nice value: LOWER is more "
-                         "preferred. Orders profiles of the same tier (default 50)")
-    ps.add_argument("--sandbox", help="codex execution sandbox")
-    ps.add_argument("--note", help="headroom note; its age is stamped now")
-
-    pr = psub.add_parser("rm", help="remove a profile from the config file")
-    pr.add_argument("name", metavar="PROFILE")
-
-    s = sub.add_parser("runway", help="provider quota/balance, stored per poll")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_runway)
-
-    s = sub.add_parser("stats", help="runs, worker time, tokens and cost per "
-                                     "profile (DESIGN §11)")
-    s.add_argument("--json", action="store_true")
-    s.add_argument("--runs", type=int, default=30,
-                   help="instrument the latest N worker runs (default: 30)")
-    s.set_defaults(fn=cmd_stats)
-
-    s = sub.add_parser("review", help="performance review of runners: outcomes "
-                                      "per profile/model, worst first (W-0130)")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(fn=cmd_review)
-
-    s = sub.add_parser("merge", help="run declared checks and tripwires, then "
-                                    "land a run branch on the base")
-    s.add_argument("branch", help="run branch, e.g. orchestra/run-7")
-    s.add_argument("--item", help="source item id, for the merge commit message")
-    s.set_defaults(fn=cmd_merge)
-
-    s = sub.add_parser("prune", help="remove run worktrees nobody owns and the "
-                                     "empty project directories they leave")
-    s.add_argument("--force", action="store_true",
-                   help="also remove worktrees holding uncommitted or unmerged "
-                        "work, reporting what was discarded")
-    s.set_defaults(fn=cmd_prune)
-
-    s = sub.add_parser("nod", help="the human loop: file/inspect Nod decision cards")
-    s.set_defaults(fn=cmd_nod)
-    nsub = s.add_subparsers(dest="action", required=True)
-    nsub.add_parser("status", help="which channels have a token, and is Nod up")
-    nsub.add_parser("test", help="file a dismiss-only alert to prove config works")
-    for action, helptext in (("show", "read a request's decision"),
-                             ("cancel", "withdraw a pending request")):
-        ns = nsub.add_parser(action, help=helptext)
-        ns.add_argument("request_id")
-        ns.add_argument("--channel", choices=nod.ROLES,
-                        help="channel the request was filed to; default: the "
-                             "channel recorded when Orchestra filed it")
-
-    s = sub.add_parser("doctor", help="check tools and config health")
-    s.set_defaults(fn=cmd_doctor)
-
-    s = sub.add_parser("daemon", help="run the Orchestra daemon in the foreground")
-    s.add_argument("--interval", type=int, help="seconds between ticks")
-    s.add_argument("--once", action="store_true", help="one tick, then exit")
-    s.set_defaults(fn=cmd_daemon)
-
-    s = sub.add_parser("service",
-                       help="manage the user-session supervisor for the daemon "
-                            "(launchd on macOS, scheduled task on Windows)")
-    s.add_argument("action", choices=("install", "uninstall", "status", "restart"))
-    s.add_argument("--start", action="store_true",
-                   help="also load and start it now (install only)")
-    s.set_defaults(fn=cmd_service)
-
-    s = sub.add_parser("spawn", help="ask for help: bounded child runs on "
-                                     "weaker profiles")
-    s.set_defaults(fn=cmd_spawn, run_id=None, title=None, context=None,
-                   shared_workdir=False)
-    s.add_argument("mission", nargs="+", help="what the children are to do")
-    s.add_argument("--to", action="append", required=True, metavar="PROFILE",
-                   help="a profile to hand a piece to; repeat for a batch")
-    s.add_argument("--run", dest="run_id", type=int,
-                   help="the lead run (default: the caller's own)")
-    s.add_argument("--title", help="short title for the child runs")
-    s.add_argument("--context", help="extra context for the brief")
-    s.add_argument("--shared-workdir", action="store_true",
-                   help="work in the lead's checkout instead of a worktree")
-
-    s = sub.add_parser("project", help="project identities: slug, settings, "
-                                       "and the parked flag — no paths")
-    s.set_defaults(fn=cmd_project, action="add", path=None, name=None,
-               project=None, all=False, selector=None)
-    psub = s.add_subparsers(dest="action")
-    pa = psub.add_parser("add", help="mint a project identity; a directory "
-                                     "argument contributes only its name")
-    pa.add_argument("path", nargs="?",
-                    help="a name, or a directory whose name to use "
-                         "(default: the current directory's)")
-    pa.add_argument("--name", help="explicit name")
-    pl = psub.add_parser("list", help="every project, owner-minted or "
-                                      "source-cached")
-    pl.add_argument("--all", action="store_true",
-                    help="include archived projects, marked")
-    pl.set_defaults(path=None, name=None)
-    pf = psub.add_parser("forget", help="drop an owner-minted project")
-    pf.add_argument("selector", help="slug or project id")
-    pf.set_defaults(name=None, path=None)
-    for action, blurb in (("archive", "park a project: hide it and stop "
-                                      "unattended dispatch into it"),
-                          ("unarchive", "bring a parked project back")):
-        pp = psub.add_parser(action, help=blurb)
-        pp.add_argument("selector", help="slug or project id")
-        pp.set_defaults(name=None, path=None)
-
-    s = sub.add_parser("traces", help="run traces: raw-log retention and "
-                                      "a run's inbox/outbox (DESIGN §7)")
-    s.set_defaults(fn=cmd_traces, action="prune", run_id=None, days=None,
-                   dry_run=False)
-    tsub = s.add_subparsers(dest="action")
-    tp = tsub.add_parser("prune", help="age out raw backend logs of TERMINAL "
-                                       "runs; normalized events are kept")
-    tp.add_argument("--days", type=int,
-                    help="override settings.raw_log_retention_days")
-    tp.add_argument("--dry-run", action="store_true")
-    tp.set_defaults(run_id=None)
-    tm = tsub.add_parser("messages", help="one run's messages, badged "
-                                          "queued/delivered/answered")
-    tm.add_argument("run_id", type=int)
-    tm.set_defaults(days=None, dry_run=False)
-    ta = tsub.add_parser("audit", help="list run tool calls that sleep, wait "
-                                         "for CI, or poll durable records")
-    ta.add_argument("--since", help="inclusive ISO-8601 timestamp; default today")
-    ta.add_argument("--json", action="store_true")
-    ta.set_defaults(run_id=None, days=None, dry_run=False)
-
-    s = sub.add_parser("_supervise")  # internal: detached supervisor entry
-    s.add_argument("run_id", type=int)
-    s.add_argument("--root", required=True)
-    s.set_defaults(fn=cmd_supervise)
-
-    args = p.parse_args()
-    args.fn(args)
+def cmd_observe(args):
+    """Internal detached-process entry point used by the Observer scheduler."""
+    from orchestra import daemon
+    return daemon.observe(args.check_id)
 
 
-def _win_stdio() -> None:
-    """Windows consoles default to cp1252; Orchestra's copy uses arrows and §."""
-    if sys.platform != "win32":
+def cmd_archive(args):
+    report = migration.archive_legacy(execute=args.apply)
+    report["legacy_hooks"] = migration.retire_legacy_hooks(execute=args.apply)
+    _print(report)
+
+
+def cmd_repair(args):
+    con = db.connect()
+    try:
+        maintenance.require_offline(con)
+        integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+        foreign = [tuple(row) for row in con.execute("PRAGMA foreign_key_check")]
+        pending = [dict(row) for row in con.execute(
+            "SELECT request_id,method,path,created_at FROM request_replays "
+            "WHERE response_json IS NULL ORDER BY created_at")]
+        report = {"integrity": integrity, "foreign_key_violations": foreign,
+                  "unfinished_requests": pending}
+        _print(report)
+        return 0 if integrity == "ok" and not foreign else 1
+    finally:
+        con.close()
+
+
+def cmd_import_v1(args):
+    plan = migration.operator_import_plan(
+        Path(args.config).expanduser() if args.config else None,
+        Path(args.database).expanduser() if args.database else None)
+    if not args.apply:
+        _print({**plan, "dry_run": True})
         return
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure:
-            reconfigure(encoding="utf-8", errors="replace")
+    con = db.connect()
+    try:
+        result = migration.apply_operator_import(con, plan)
+    finally:
+        con.close()
+    _print({"dry_run": False, "applied": result, "dropped": plan["dropped"],
+            "never_imported": plan["never_imported"]})
+
+
+def cmd_backup(args):
+    destination = Path(args.destination).expanduser() if args.destination else None
+    _print(maintenance.backup(destination))
+
+
+def cmd_restore(args):
+    _print(maintenance.restore(Path(args.backup), apply=args.apply))
+
+
+def cmd_pair(args):
+    parsed = urlsplit(args.pairing)
+    endpoint = None
+    if parsed.scheme == "orchestra":
+        values = parse_qs(parsed.query)
+        pairing_id = (values.get("pairing_id") or [""])[0]
+        code = (values.get("code") or [""])[0]
+        endpoint = (values.get("endpoint") or [None])[0]
+    else:
+        pairing_id, separator, code = args.pairing.partition(":")
+        if not separator:
+            pairing_id, code = "", pairing_id
+    if not code:
+        raise SystemExit("orchestra: pairing must be a code, Orchestra URI, or ID:CODE")
+    api_client = client.Client(args.url or endpoint, token="")
+    result = api_client.post("/api/v2/pairing/redeem", {
+        "request_id": _request_id(getattr(args, "request_id", None), "pair"),
+        "pairing_id": pairing_id, "code": code, "label": args.name})
+    token = _data(result)["token"]
+    client.save_token(api_client.url, token)
+    print(f"paired {_data(result)['device']['label']} with {api_client.url}")
+
+
+def cmd_run(args):
+    context = " ".join(args.context).strip()
+    if args.file:
+        context = Path(args.file).read_text(encoding="utf-8")
+    body = {
+        "request_id": _request_id(args.request_id, "run"),
+        "profile": args.profile, "context": context,
+        "group": args.group, "title": args.title, "cwd": args.cwd,
+        "ref": args.ref,
+        "requested_by": args.requested_by, "observer": args.observer,
+        "after": [{"run_id": value, "condition": args.after_condition}
+                  for value in args.after],
+    }
+    result = _data(_client(args).post("/api/v2/runs", body))
+    if args.json:
+        return _print(result)
+    run = result["run"]
+    print(f"{run['display']} · global {run['id']} · {run['status']} · "
+          f"{run['profile_name']}")
+    if run.get("hold"):
+        print(f"  held: {run['hold']['detail']}")
+
+
+def cmd_runs(args):
+    result = _data(_client(args).get(
+        "/api/v2/runs", group=args.group,
+        profile=args.profile, status=args.status, q=args.query,
+        limit=args.limit, cursor=args.cursor))
+    if args.json:
+        return _print(result)
+    for run in result["items"]:
+        hold = f" · {run['hold']['detail']}" if run.get("hold") else ""
+        print(f"{run['display']:<24} {run['status']:<10} "
+              f"{run['profile_name']:<18} {(run.get('title') or '')[:70]}{hold}")
+    if result.get("next_cursor"):
+        print(f"next cursor: {result['next_cursor']}")
+
+
+def cmd_show(args):
+    _print(_data(_client(args).get(f"/api/v2/runs/{args.run_id}")))
+
+
+def cmd_status(args):
+    value = _data(_client(args).get("/api/v2/snapshot"))
+    if args.json:
+        return _print(value)
+    scheduler = value["scheduler"]
+    inbox = value["inbox"]
+    print(f"{value['instance']['name']} · {value['daemon']['status']} · "
+          f"{scheduler['active']} active · {scheduler['queued']} queued · "
+          f"{inbox['open']} inbox")
+    if scheduler.get("paused"):
+        print("  starts paused")
+
+
+def cmd_run_view(args):
+    endpoint = {
+        "thread": "thread", "events": "events", "lineage": "lineage",
+        "artifacts": "artifacts", "changes": "changes",
+        "observations": "observer",
+    }[args.command]
+    query = {}
+    if getattr(args, "cursor", None):
+        query["cursor"] = args.cursor
+    if getattr(args, "limit", None):
+        query["limit"] = args.limit
+    _print(_data(_client(args).get(
+        f"/api/v2/runs/{args.run_id}/{endpoint}", **query)))
+
+
+def cmd_statistics(args):
+    _print(_data(_client(args).get(
+        "/api/v2/statistics", group=args.group,
+        profile=args.profile, status=args.status)))
+
+
+def cmd_control(args):
+    action = args.command
+    body = {"request_id": _request_id(args.request_id,
+                                      f"{action}:{args.run_id}")}
+    if hasattr(args, "text"):
+        body["text"] = " ".join(args.text).strip()
+    if action == "continue":
+        body["context"] = body.pop("text")
+    for key in ("context", "profile"):
+        value = getattr(args, key, None)
+        if value is not None:
+            body[key] = value
+    result = _data(_client(args).post(
+        f"/api/v2/runs/{args.run_id}/{action}", body))
+    _print(result) if args.json else print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_children(args):
+    run_id = _run_id(args)
+    body = {"request_id": _request_id(args.request_id, f"child:{run_id}"),
+            "profile": args.profile, "context": " ".join(args.context),
+            "title": args.title}
+    _print(_data(_client(args).post(
+        f"/api/v2/runs/{run_id}/children", body)))
+
+
+def cmd_ask(args):
+    run_id = _run_id(args)
+    body = {"request_id": _request_id(args.request_id, f"attention:{run_id}"),
+            "kind": args.kind, "title": args.title,
+            "body": " ".join(args.question), "blocking": not args.nonblocking,
+            "choices": args.choice, "deadline": args.deadline}
+    _print(_data(_client(args).post(
+        f"/api/v2/runs/{run_id}/attention", body)))
+
+
+def cmd_artifact(args):
+    run_id = _run_id(args)
+    body = {"request_id": _request_id(args.request_id,
+                                      f"artifact:{run_id}"),
+            "path": args.path, "name": args.name}
+    _print(_data(_client(args).post(
+        f"/api/v2/runs/{run_id}/artifacts", body)))
+
+
+def cmd_resource(args):
+    noun = args.resource
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "list":
+        result = _data(api_client.get(f"/api/v2/{noun}",
+                                      include_archived=args.include_archived))
+        if args.json:
+            return _print(result)
+        for item in result["items"]:
+            suffix = " [archived]" if item.get("archived") else ""
+            print(f"{item.get('slug',''):<22} {item.get('name','')}{suffix}")
+        return
+    body = {"request_id": _request_id(args.request_id,
+                                      f"{noun}:{action}")}
+    if action == "create":
+        body.update(_pairs(args.value, plain_name=noun == "groups"))
+        response = api_client.post(f"/api/v2/{noun}", body)
+    else:
+        body.update(_pairs(args.value))
+        response = api_client.patch(f"/api/v2/{noun}/{args.selector}", body)
+    _print(_data(response))
+
+
+def cmd_profile_discovery(args):
+    """Ask the Orchestra host for its real model/effort catalogs."""
+    _print(_data(_client(args).get(
+        "/api/v2/profile-discovery", local=args.local)))
+
+
+def _pairs(values, *, plain_name: bool = False) -> dict:
+    if plain_name and values and all("=" not in value for value in values):
+        return {"name": " ".join(values)}
+    out = {}
+    for value in values or []:
+        key, separator, raw = value.partition("=")
+        if not separator:
+            raise SystemExit(f"orchestra: expected KEY=JSON, got {value!r}")
+        try:
+            out[key] = json.loads(raw)
+        except ValueError:
+            out[key] = raw
+    return out
+
+
+def cmd_inbox(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "list":
+        result = _data(api_client.get(
+            "/api/v2/inbox", state=args.state, kind=args.kind, limit=args.limit,
+            cursor=args.cursor))
+        if args.json:
+            return _print(result)
+        for item in result["items"]:
+            print(f"{item['id']:>5} {item['kind']:<18} {item['title']}"
+                  + (f" · {item['display']}" if item.get("display") else ""))
+        if result.get("next_cursor"):
+            print(f"next cursor: {result['next_cursor']}")
+        return
+    body = {"request_id": _request_id(args.request_id,
+                                      f"answer:{args.attention_id}"),
+            "answer": " ".join(args.answer), "choice": args.choice}
+    _print(_data(api_client.post(
+        f"/api/v2/attention/{args.attention_id}/{action}", body)))
+
+
+def cmd_outbox(args):
+    result = _data(_client(args).get(
+        "/api/v2/outbox", direction=args.direction, status=args.status,
+        kind=args.kind, run_id=args.run_id, limit=args.limit,
+        cursor=args.cursor))
+    if args.json:
+        return _print(result)
+    for item in result["items"]:
+        display = item.get("display") or f"run {item['run_id']}"
+        body = " ".join((item.get("body") or "").split())
+        print(f"{item['id']:>6} {display:<24} {item['direction']:<8} "
+              f"{item['status']:<13} {item['kind']:<18} {body[:90]}")
+    if result.get("next_cursor"):
+        print(f"next cursor: {result['next_cursor']}")
+
+
+def cmd_pause(args):
+    body = {"request_id": _request_id(args.request_id, f"scheduler:{args.command}"),
+            "note": " ".join(args.note) if hasattr(args, "note") else None}
+    _print(_data(_client(args).post(f"/api/v2/scheduler/{args.command}", body)))
+
+
+def cmd_runway(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "list":
+        return _print(_data(api_client.get("/api/v2/runway-sources")))
+    body = {"request_id": _request_id(args.request_id,
+                                      f"runway:{args.source}:refresh")}
+    _print(_data(api_client.post(
+        f"/api/v2/runway-sources/{args.source}/refresh", body)))
+
+
+def cmd_devices(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "list":
+        return _print(_data(api_client.get("/api/v2/devices")))
+    body = {"request_id": _request_id(args.request_id, f"device:{action}")}
+    if action == "pairing":
+        body["label"] = args.label
+        return _print(_data(api_client.post("/api/v2/devices/pairing", body)))
+    body["revoked"] = True
+    _print(_data(api_client.patch(f"/api/v2/devices/{args.device_id}", body)))
+
+
+def cmd_service_tokens(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "list":
+        return _print(_data(api_client.get("/api/v2/service-tokens")))
+    body = {"request_id": _request_id(args.request_id, f"service:{action}")}
+    if action == "create":
+        body.update({"name": args.name, "authorities": args.authority})
+        return _print(_data(api_client.post("/api/v2/service-tokens", body)))
+    body["revoked"] = True
+    _print(_data(api_client.patch(
+        f"/api/v2/service-tokens/{args.token_id}", body)))
+
+
+def cmd_storage(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "report":
+        return _print(_data(api_client.get("/api/v2/storage")))
+    if action == "plan":
+        body = {
+            "request_id": _request_id(args.request_id, "storage:plan"),
+            "older_than_days": args.older_than_days,
+        }
+        if args.kind:
+            body["kinds"] = args.kind
+        return _print(_data(api_client.post("/api/v2/storage/prune-plan", body)))
+    body = {"request_id": _request_id(
+        args.request_id, f"storage:apply:{args.plan_id}")}
+    _print(_data(api_client.post(
+        f"/api/v2/storage/prune-plans/{args.plan_id}/apply", body)))
+
+
+def cmd_settings(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "list":
+        return _print(_data(api_client.get("/api/v2/settings")))
+    try:
+        value = json.loads(args.value)
+    except ValueError:
+        value = args.value
+    body = {"request_id": _request_id(args.request_id,
+                                      f"setting:{args.key}"),
+            "key": args.key, "value": value}
+    if args.expected_revision is not None:
+        body["expected_revision"] = args.expected_revision
+    _print(_data(api_client.patch("/api/v2/settings", body)))
+
+
+def cmd_observer_settings(args):
+    action = args.action or args.default_action
+    api_client = _client(args)
+    if action == "show":
+        return _print(_data(api_client.get("/api/v2/observer")))
+    body = {"request_id": _request_id(args.request_id, "observer:update"),
+            **_pairs(args.value)}
+    _print(_data(api_client.patch("/api/v2/observer", body)))
+
+
+def cmd_pin(args):
+    body = {"request_id": _request_id(
+        args.request_id, f"evidence:{args.command}:{args.run_id}")}
+    if args.command == "pin" and args.reason:
+        body["reason"] = args.reason
+    _print(_data(_client(args).post(
+        f"/api/v2/runs/{args.run_id}/{args.command}", body)))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="orchestra",
+                                     description="Run an agent fleet on this machine")
+    parser.add_argument("--url")
+    parser.add_argument("--token")
+    parser.add_argument("--json", action="store_true")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init")
+    init.add_argument("--device-name", default="CLI")
+    init.add_argument("--archive-legacy", action="store_true")
+    init.set_defaults(func=cmd_init)
+    daemon = sub.add_parser("daemon")
+    daemon.add_argument("--interval", type=float, default=1.0)
+    daemon.set_defaults(func=cmd_daemon)
+    internal = sub.add_parser("_supervise", help=argparse.SUPPRESS)
+    internal.add_argument("run_id", type=int)
+    internal.add_argument("--root", required=True)
+    internal.set_defaults(func=cmd_supervise)
+    observe = sub.add_parser("_observe", help=argparse.SUPPRESS)
+    observe.add_argument("check_id", type=int)
+    observe.set_defaults(func=cmd_observe)
+    archive = sub.add_parser("archive-legacy")
+    archive.add_argument("--apply", action="store_true")
+    archive.set_defaults(func=cmd_archive)
+    repair = sub.add_parser("repair")
+    repair.set_defaults(func=cmd_repair)
+    backup = sub.add_parser("backup")
+    backup.add_argument("destination", nargs="?")
+    backup.set_defaults(func=cmd_backup)
+    restore = sub.add_parser("restore")
+    restore.add_argument("backup")
+    restore.add_argument("--apply", action="store_true")
+    restore.set_defaults(func=cmd_restore)
+    importer = sub.add_parser("import-v1")
+    importer.add_argument("--config")
+    importer.add_argument("--database")
+    importer.add_argument("--apply", action="store_true")
+    importer.set_defaults(func=cmd_import_v1)
+    pair = sub.add_parser("pair")
+    pair.add_argument("pairing")
+    pair.add_argument("--name", required=True)
+    pair.add_argument("--request-id")
+    pair.set_defaults(func=cmd_pair)
+
+    status = sub.add_parser("status")
+    status.set_defaults(func=cmd_status)
+
+    run = sub.add_parser("run", aliases=["dispatch"])
+    run.add_argument("--profile", required=True)
+    run.add_argument("--group", default="general")
+    run.add_argument("--title")
+    run.add_argument("--cwd")
+    run.add_argument("--ref")
+    run.add_argument("--requested-by", default="cli")
+    run.add_argument("--observer", default="inherit")
+    run.add_argument("--after", type=int, action="append", default=[])
+    run.add_argument("--after-condition", choices=("success", "terminal"),
+                     default="success")
+    run.add_argument("--file")
+    run.add_argument("--request-id")
+    run.add_argument("context", nargs="*")
+    run.set_defaults(func=cmd_run)
+    runs_parser = sub.add_parser("runs")
+    for flag in ("group", "profile", "status"):
+        runs_parser.add_argument(f"--{flag}")
+    runs_parser.add_argument("--query")
+    runs_parser.add_argument("--limit", type=int, default=100)
+    runs_parser.add_argument("--cursor")
+    runs_parser.set_defaults(func=cmd_runs)
+    show = sub.add_parser("show")
+    show.add_argument("run_id", type=int)
+    show.set_defaults(func=cmd_show)
+    for name in ("thread", "events", "lineage", "artifacts", "changes",
+                 "observations"):
+        view = sub.add_parser(name)
+        view.add_argument("run_id", type=int)
+        if name in {"thread", "events"}:
+            view.add_argument("--cursor")
+            view.add_argument("--limit", type=int, default=200)
+        view.set_defaults(func=cmd_run_view)
+    statistics = sub.add_parser("statistics")
+    for flag in ("group", "profile", "status"):
+        statistics.add_argument(f"--{flag}")
+    statistics.set_defaults(func=cmd_statistics)
+
+    for name in ("tell", "interrupt"):
+        control = sub.add_parser(name)
+        control.add_argument("run_id", type=int)
+        control.add_argument("text", nargs="+")
+        control.add_argument("--request-id")
+        control.set_defaults(func=cmd_control)
+    continuation = sub.add_parser("continue")
+    continuation.add_argument("run_id", type=int)
+    continuation.add_argument("text", nargs="+")
+    continuation.add_argument("--profile")
+    continuation.add_argument("--request-id")
+    continuation.set_defaults(func=cmd_control)
+    for name in ("stop", "stop-tree", "check"):
+        control = sub.add_parser(name)
+        control.add_argument("run_id", type=int)
+        control.add_argument("--request-id")
+        control.set_defaults(func=cmd_control)
+    retry = sub.add_parser("retry")
+    retry.add_argument("run_id", type=int)
+    retry.add_argument("--context")
+    retry.add_argument("--profile")
+    retry.add_argument("--request-id")
+    retry.set_defaults(func=cmd_control)
+    child = sub.add_parser("child")
+    child.add_argument("--run-id", type=int)
+    child.add_argument("--profile", required=True)
+    child.add_argument("--title")
+    child.add_argument("--request-id")
+    child.add_argument("context", nargs="+")
+    child.set_defaults(func=cmd_children)
+    ask = sub.add_parser("ask")
+    ask.add_argument("--run-id", type=int)
+    ask.add_argument("--kind", choices=("question", "decision"), default="question")
+    ask.add_argument("--title", default="Input needed")
+    ask.add_argument("--choice", action="append")
+    ask.add_argument("--deadline")
+    ask.add_argument("--nonblocking", action="store_true")
+    ask.add_argument("--request-id")
+    ask.add_argument("question", nargs="+")
+    ask.set_defaults(func=cmd_ask)
+    artifact = sub.add_parser("artifact")
+    artifact.add_argument("--run-id", type=int)
+    artifact.add_argument("--name")
+    artifact.add_argument("--request-id")
+    artifact.add_argument("path")
+    artifact.set_defaults(func=cmd_artifact)
+
+    for noun in ("groups", "runtimes", "profiles", "runway-sources"):
+        resource = sub.add_parser(noun)
+        resource.set_defaults(resource=noun, default_action="list",
+                              include_archived=False, func=cmd_resource)
+        actions = resource.add_subparsers(dest="action")
+        listing = actions.add_parser("list")
+        listing.add_argument("--include-archived", action="store_true")
+        listing.set_defaults(func=cmd_resource)
+        create = actions.add_parser("create")
+        create.add_argument("value", nargs="+", help="KEY=JSON")
+        create.add_argument("--request-id")
+        create.set_defaults(func=cmd_resource)
+        update = actions.add_parser("update")
+        update.add_argument("selector")
+        update.add_argument("value", nargs="+", help="KEY=JSON")
+        update.add_argument("--request-id")
+        update.set_defaults(func=cmd_resource)
+        if noun == "profiles":
+            discover = actions.add_parser("discover")
+            discover.add_argument(
+                "--local", action="store_true",
+                help="also probe standard localhost inference-server ports")
+            discover.set_defaults(func=cmd_profile_discovery)
+
+    inbox = sub.add_parser("inbox")
+    inbox.set_defaults(default_action="list", state="open", kind=None, limit=100,
+                       cursor=None, func=cmd_inbox)
+    inbox_actions = inbox.add_subparsers(dest="action")
+    inbox_list = inbox_actions.add_parser("list")
+    inbox_list.add_argument("--state", default="open")
+    inbox_list.add_argument("--kind")
+    inbox_list.add_argument("--limit", type=int, default=100)
+    inbox_list.add_argument("--cursor")
+    inbox_list.set_defaults(func=cmd_inbox)
+    for name in ("answer", "approve", "reject", "acknowledge"):
+        answer = inbox_actions.add_parser(name)
+        answer.add_argument("attention_id", type=int)
+        answer.add_argument("answer", nargs="*")
+        answer.add_argument("--choice")
+        answer.add_argument("--request-id")
+        answer.set_defaults(func=cmd_inbox)
+
+    outbox = sub.add_parser("outbox")
+    outbox.add_argument("--direction",
+                        choices=("inbound", "outbound", "system"))
+    outbox.add_argument("--status",
+                        choices=("pending", "delivered", "undeliverable"))
+    outbox.add_argument("--kind")
+    outbox.add_argument("--run-id", type=int)
+    outbox.add_argument("--limit", type=int, default=100)
+    outbox.add_argument("--cursor")
+    outbox.set_defaults(func=cmd_outbox)
+
+    for name in ("pause", "resume"):
+        command = sub.add_parser(name)
+        command.add_argument("note", nargs="*")
+        command.add_argument("--request-id")
+        command.set_defaults(func=cmd_pause)
+    runway_parser = sub.add_parser("runway")
+    runway_parser.set_defaults(default_action="list", func=cmd_runway)
+    runway_actions = runway_parser.add_subparsers(dest="action")
+    runway_actions.add_parser("list").set_defaults(func=cmd_runway)
+    refresh = runway_actions.add_parser("refresh")
+    refresh.add_argument("source")
+    refresh.add_argument("--request-id")
+    refresh.set_defaults(func=cmd_runway)
+
+    devices = sub.add_parser("devices")
+    devices.set_defaults(default_action="list", func=cmd_devices)
+    device_actions = devices.add_subparsers(dest="action")
+    device_actions.add_parser("list").set_defaults(func=cmd_devices)
+    pairing = device_actions.add_parser("pairing")
+    pairing.add_argument("--label", default="New device")
+    pairing.add_argument("--request-id")
+    pairing.set_defaults(func=cmd_devices)
+    revoke = device_actions.add_parser("revoke")
+    revoke.add_argument("device_id")
+    revoke.add_argument("--request-id")
+    revoke.set_defaults(func=cmd_devices)
+
+    tokens = sub.add_parser("service-tokens")
+    tokens.set_defaults(default_action="list", func=cmd_service_tokens)
+    token_actions = tokens.add_subparsers(dest="action")
+    token_actions.add_parser("list").set_defaults(func=cmd_service_tokens)
+    create_token = token_actions.add_parser("create")
+    create_token.add_argument("name")
+    create_token.add_argument("--authority", action="append", required=True)
+    create_token.add_argument("--request-id")
+    create_token.set_defaults(func=cmd_service_tokens)
+    revoke_token = token_actions.add_parser("revoke")
+    revoke_token.add_argument("token_id")
+    revoke_token.add_argument("--request-id")
+    revoke_token.set_defaults(func=cmd_service_tokens)
+
+    storage_parser = sub.add_parser("storage")
+    storage_parser.set_defaults(default_action="report", func=cmd_storage)
+    storage_actions = storage_parser.add_subparsers(dest="action")
+    storage_actions.add_parser("report").set_defaults(func=cmd_storage)
+    plan = storage_actions.add_parser("plan")
+    plan.add_argument("--older-than-days", type=int, default=30)
+    plan.add_argument("--kind", action="append",
+                      choices=("raw_logs", "artifacts"))
+    plan.add_argument("--request-id")
+    plan.set_defaults(func=cmd_storage)
+    apply = storage_actions.add_parser("apply")
+    apply.add_argument("plan_id")
+    apply.add_argument("--request-id")
+    apply.set_defaults(func=cmd_storage)
+
+    settings = sub.add_parser("settings")
+    settings.set_defaults(default_action="list", func=cmd_settings)
+    setting_actions = settings.add_subparsers(dest="action")
+    setting_actions.add_parser("list").set_defaults(func=cmd_settings)
+    set_setting = setting_actions.add_parser("set")
+    set_setting.add_argument("key")
+    set_setting.add_argument("value")
+    set_setting.add_argument("--expected-revision", type=int)
+    set_setting.add_argument("--request-id")
+    set_setting.set_defaults(func=cmd_settings)
+
+    observer_parser = sub.add_parser("observer")
+    observer_parser.set_defaults(default_action="show", func=cmd_observer_settings)
+    observer_actions = observer_parser.add_subparsers(dest="action")
+    observer_actions.add_parser("show").set_defaults(func=cmd_observer_settings)
+    observer_update = observer_actions.add_parser("update")
+    observer_update.add_argument("value", nargs="+", help="KEY=JSON")
+    observer_update.add_argument("--request-id")
+    observer_update.set_defaults(func=cmd_observer_settings)
+    for name in ("pin", "unpin"):
+        pin = sub.add_parser(name)
+        pin.add_argument("run_id", type=int)
+        if name == "pin":
+            pin.add_argument("--reason")
+        pin.add_argument("--request-id")
+        pin.set_defaults(func=cmd_pin)
+
+    service_parser = sub.add_parser("service")
+    service_parser.add_argument("action", choices=("install", "uninstall", "status", "restart"))
+    service_parser.add_argument("--start", action="store_true")
+    service_parser.set_defaults(func=lambda args: getattr(service, args.action)(
+        args.start) if args.action == "install" else getattr(service, args.action)())
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args.func(args)
+        return 0 if result is None else result
+    except client.ClientError as exc:
+        print(f"orchestra: {exc}", file=sys.stderr)
+        return 1
+    except (ValueError, RuntimeError) as exc:
+        print(f"orchestra: {exc}", file=sys.stderr)
+        return 1

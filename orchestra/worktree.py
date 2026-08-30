@@ -1,12 +1,7 @@
-"""Isolated worktree workdirs + skills folder propagation (ported).
+"""Isolated git worktrees and harness-scoped context propagation.
 
-DESIGN §12: a run gets the skill directory for ITS OWN backend plus the
-shared set, never all four. Another harness's directory can carry hooks
-that fire inside a run Orchestra is already hooking.
-
-Worktrees are also given BACK here (W-0172): ``remove`` retires one run's
-checkout, ``prune`` sweeps the orphans. One rule outranks everything else in
-this file — a worktree belonging to a live run is never touched.
+Only Orchestra-owned linked checkouts are changed or removed. The group's
+owner checkout is never staged, committed, reset, cleaned, or merged.
 """
 import re
 import shutil
@@ -58,7 +53,7 @@ def recent_commits(workdir: Path, count: int = RECENT_COMMITS,
                    since: str | None = None) -> list[str]:
     """What landed here lately, newest first, as `sha subject` lines.
 
-    A run starts in a fresh worktree with no memory of the project, so without
+    A run starts in a fresh worktree with no memory of the repository, so without
     this it cannot tell work that is waiting to be done from work that landed
     an hour ago. That is how two runs came to build the same thing at once.
 
@@ -79,7 +74,8 @@ def recent_commits(workdir: Path, count: int = RECENT_COMMITS,
 def status(workdir: Path) -> str:
     """Dirty check: non-empty means uncommitted changes."""
     result = subprocess.run(
-        ["git", "-C", str(workdir), "status", "--porcelain"],
+        ["git", "-C", str(workdir), "status", "--porcelain",
+         "--untracked-files=all"],
         capture_output=True,
         text=True,
     )
@@ -101,16 +97,23 @@ def untracked_context_paths(workdir: Path) -> list[str]:
         )
         if tracked.returncode != 0:
             excluded.append(name)
+            continue
+        untracked = subprocess.run(
+            ["git", "-C", str(workdir), "ls-files", "--others",
+             "--exclude-standard", "--", name],
+            capture_output=True, text=True)
+        excluded.extend(
+            line for line in untracked.stdout.splitlines() if line.strip())
     return excluded
 
 
 def global_skills_dir() -> Path:
-    """The overlay every run sees, central state like everything else (§2)."""
-    return paths.home() / "skills"
+    """The v2-local overlay every run sees."""
+    return paths.state_dir() / "skills"
 
 
 def submodules(root: Path, workdir: Path) -> bool:
-    """Populate a new worktree's submodules, if the project has any.
+    """Populate a new worktree's submodules, if the repository has any.
 
     ``git worktree add`` leaves every declared submodule as an EMPTY
     directory. A worker that needs one to build cannot build, and it will
@@ -132,15 +135,14 @@ def submodules(root: Path, workdir: Path) -> bool:
     # Without this every worktree clones godot-cpp from GitHub again: minutes
     # and a network per run, for bytes already on the disk. A submodule the
     # source has not checked out keeps its declared url.
+    command = ["git", "-C", str(workdir)]
     for name, rel in _declared_submodules(root).items():
         if (root / rel / ".git").exists():
-            subprocess.run(
-                ["git", "-C", str(workdir), "config",
-                 f"submodule.{name}.url", str(root / rel)],
-                capture_output=True, text=True, timeout=30)
+            command += ["-c", f"submodule.{name}.url={root / rel}"]
+    command += ["-c", "protocol.file.allow=always", "submodule", "update",
+                "--init", "--recursive"]
     res = subprocess.run(
-        ["git", "-C", str(workdir), "-c", "protocol.file.allow=always",
-         "submodule", "update", "--init", "--recursive"],
+        command,
         capture_output=True, text=True, timeout=600)
     if res.returncode != 0:
         print(f"orchestra: submodules not populated in {workdir}: "
@@ -150,7 +152,7 @@ def submodules(root: Path, workdir: Path) -> bool:
 
 
 def _declared_submodules(root: Path) -> dict:
-    """``{submodule name: path}`` from the project's .gitmodules."""
+    """``{submodule name: path}`` from the repository's .gitmodules."""
     res = subprocess.run(
         ["git", "config", "-f", str(root / ".gitmodules"), "--get-regexp",
          r"^submodule\..*\.path$"], capture_output=True, text=True, timeout=30)
@@ -169,7 +171,8 @@ def sync_skills(root: Path, workdir: Path, backend: str | None = None) -> list[s
     Git worktrees only contain tracked files, so untracked .agents/.claude/etc.
     would otherwise be missing for the delegated tool. An unknown/absent
     backend gets the shared set only -- never another harness's directory.
-    Finally ~/.orchestra/skills/ is overlaid, per entry, project skills winning.
+    Finally the v2 fleet skill directory is overlaid, per entry, group-local
+    repository skills winning.
     """
     synced = []
     for d in [*SHARED_DIRS, *([BACKEND_DIRS[backend]] if backend in BACKEND_DIRS else [])]:
@@ -189,7 +192,7 @@ def sync_skills(root: Path, workdir: Path, backend: str | None = None) -> list[s
         for entry in sorted(overlay.iterdir()):
             dest = dest_root / entry.name
             if dest.exists():
-                continue  # the project defines this skill: it wins
+                continue  # the repository defines this skill: it wins
             dest_root.mkdir(parents=True, exist_ok=True)
             if entry.is_dir():
                 shutil.copytree(entry, dest, ignore=_IGNORE)
@@ -199,26 +202,34 @@ def sync_skills(root: Path, workdir: Path, backend: str | None = None) -> list[s
     return synced
 
 
-def create(root: Path, run_id: int, project_id: str,
+def create(root: Path, run_id: int, group_slug: str,
            start_point: str | None = None,
            backend: str | None = None) -> tuple[Path, str]:
     """Create a git worktree for an isolated run; returns (workdir, branch).
 
-    Worktrees live centrally at ~/.orchestra/projects/<slug>/worktrees/run-N
-    (DESIGN §2), never inside the project.
+    Worktrees live centrally at ``v2/worktrees/<group>/run-N``, never inside
+    the owner checkout.
     """
     if not (root / ".git").exists():
-        raise SystemExit("orchestra: --worktree needs the project to be a git repository")
+        raise RuntimeError("worktree isolation needs a git repository CWD")
     branch = f"orchestra/run-{run_id}"
-    wt = paths.worktrees_dir(project_id) / f"run-{run_id}"
+    wt = paths.worktrees_dir(group_slug) / f"run-{run_id}"
+    # A fresh database restarts run ids, but the user's repository keeps the
+    # branches earlier generations made. Step past any taken name.
+    suffix = 1
+    while (_git(root, ["show-ref", "--verify", "--quiet",
+                       f"refs/heads/{branch}"]).returncode == 0 or wt.exists()):
+        suffix += 1
+        branch = f"orchestra/run-{run_id}-{suffix}"
+        wt = paths.worktrees_dir(group_slug) / f"run-{run_id}-{suffix}"
     cmd = ["git", "-C", str(root), "worktree", "add", "-b", branch, str(wt)]
     if start_point:
         cmd.append(start_point)
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise SystemExit(f"orchestra: git worktree failed: {res.stderr.strip()}")
-    submodules(root, wt)
     try:
+        submodules(root, wt)
         sync_skills(root, wt, backend)
     except BaseException:
         # The linked checkout and branch already exist at this point. A
@@ -231,9 +242,40 @@ def create(root: Path, run_id: int, project_id: str,
     return wt, branch
 
 
-# --- giving a worktree back (W-0172) ----------------------------------------
+def restore(root: Path, run_id: int, group_slug: str, branch: str,
+            backend: str | None = None) -> Path:
+    """Recreate the stable checkout for a retained run branch.
 
-RUN_DIR_RE = re.compile(r"^run-(\d+)$")
+    Waiting releases process capacity and its linked checkout after a
+    checkpoint. A later answer or child result loads the same session against
+    the same path by checking the retained branch out again.
+    """
+    wt = paths.worktrees_dir(group_slug) / f"run-{int(run_id)}"
+    if wt.exists():
+        root_of = main_root(wt)
+        if root_of == root.resolve():
+            return wt
+        raise RuntimeError(f"worktree path already exists and is not owned: {wt}")
+    exists = _git(root, ["show-ref", "--verify", "--quiet",
+                         f"refs/heads/{branch}"])
+    if exists.returncode != 0:
+        raise RuntimeError(f"retained run branch does not exist: {branch}")
+    result = _git(root, ["worktree", "add", str(wt), branch])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cannot restore worktree for {branch}: {result.stderr.strip()}")
+    try:
+        submodules(root, wt)
+        sync_skills(root, wt, backend)
+    except BaseException:
+        remove(wt, root, branch=branch, force=True)
+        raise
+    return wt
+
+
+# --- giving a worktree back (DESIGN §14) ------------------------------------
+
+RUN_DIR_RE = re.compile(r"^run-(\d+)(?:-\d+)?$")
 
 
 def _git(root: Path, args: list[str]) -> subprocess.CompletedProcess:
@@ -242,7 +284,7 @@ def _git(root: Path, args: list[str]) -> subprocess.CompletedProcess:
 
 
 def main_root(workdir: Path) -> Path | None:
-    """The project checkout a linked worktree belongs to, or None when the
+    """The owner checkout a linked worktree belongs to, or None when the
     directory is not a git worktree at all."""
     r = _git(workdir, ["rev-parse", "--git-common-dir"])
     if r.returncode != 0:
@@ -262,8 +304,8 @@ def dirty_paths(workdir: Path) -> list[str]:
     """
     try:
         lines = [ln for ln in status(workdir).splitlines() if ln.strip()]
-    except RuntimeError:
-        return []
+    except RuntimeError as exc:
+        return [f"status unavailable: {exc}"]
     context = untracked_context_paths(workdir)
     out = []
     for line in lines:
@@ -288,32 +330,22 @@ def live_holders(con, workdir: Path, ignore_run: int | None = None) -> list[int]
         and int(r["id"]) != ignore_run]
 
 
-def removal_risks(workdir: Path, root: Path | None = None,
-                  branch: str | None = None, base: str | None = None) -> list[str]:
+def removal_risks(workdir: Path) -> list[str]:
     """Why removing this checkout could lose work.
 
     Uncommitted changes die with the directory, so they always count.
-    Commits on the run branch do NOT — ``git worktree remove`` never deletes a
-    branch — so they count only when the caller names a ``base`` and wants the
-    conservative answer (``orchestra prune``). The terminal-state removal passes
-    no base on purpose: the merge step is what consumes that branch next, and
-    it cannot delete it while this checkout still holds it.
+    Commits do not count: ``git worktree remove`` retains the run branch, which
+    is the durable checkpoint and evidence handle.
     """
     risks = []
     dirty = dirty_paths(workdir)
     if dirty:
         risks.append(f"{len(dirty)} uncommitted change(s): {', '.join(dirty[:3])}")
-    if base and branch and root:
-        ahead = [ln for ln in _git(root, ["rev-list", f"{base}..{branch}"]
-                                   ).stdout.splitlines() if ln]
-        if ahead:
-            risks.append(f"{len(ahead)} commit(s) on {branch} not on {base} "
-                         f"(the branch keeps them; only the checkout goes)")
     return risks
 
 
 def remove(workdir, root: Path | None = None, branch: str | None = None,
-           base: str | None = None, force: bool = False) -> dict:
+           force: bool = False) -> dict:
     """Remove ONE run worktree. The branch is never deleted here.
 
     Returns {"workdir", "branch", "removed", "kept", "discarded", "error"}:
@@ -326,7 +358,7 @@ def remove(workdir, root: Path | None = None, branch: str | None = None,
     exists = workdir.exists()
     root = root or (main_root(workdir) if exists else None)
     if exists:
-        risks = removal_risks(workdir, root, branch, base)
+        risks = removal_risks(workdir)
         if root is None and any(workdir.iterdir()):
             risks.append("not a git worktree")
         if risks and not force:
@@ -373,46 +405,56 @@ def discard_created(workdir: Path, root: Path, branch: str) -> dict:
     return report
 
 
-def _base_branch(root: Path) -> str | None:
-    """What a run branch is measured against.
+def branch_exists(root: Path, branch: str) -> bool:
+    return _git(root, ["show-ref", "--verify", "--quiet",
+                       f"refs/heads/{branch}"]).returncode == 0
 
-    ponytail: the project's checked-out branch, merge.py's own default. A
-    project that overrides [merge] base only makes prune more conservative,
-    never less; read the config here if that ever stops being true.
+
+def branch_merged(root: Path, branch: str) -> bool:
+    """True when the branch's work is already contained in the current HEAD."""
+    return _git(root, ["merge-base", "--is-ancestor", branch,
+                       "HEAD"]).returncode == 0
+
+
+def merge_into_owner(root: Path, branch: str) -> dict:
+    """Merge one retained run branch into the owner checkout's current branch.
+
+    An operator convenience, never automatic. Refuses a dirty owner checkout
+    and any conflicted merge; a refused merge is aborted so the checkout is
+    left exactly as found.
     """
-    return _git(root, ["symbolic-ref", "--short", "HEAD"]).stdout.strip() or None
+    if not branch_exists(root, branch):
+        raise RuntimeError(f"run branch does not exist: {branch}")
+    if branch_merged(root, branch):
+        raise RuntimeError(f"run branch is already merged: {branch}")
+    if status(root).strip():
+        raise RuntimeError(
+            "owner checkout has uncommitted changes; commit or stash them first")
+    merged = _git(root, ["merge", "--no-edit", branch])
+    if merged.returncode != 0:
+        _git(root, ["merge", "--abort"])
+        raise RuntimeError(
+            f"merge refused: {(merged.stderr or merged.stdout).strip()[:300]}")
+    head_commit = _git(root, ["rev-parse", "HEAD"]).stdout.strip()
+    return {"merged": True, "branch": branch, "commit": head_commit}
 
 
 def prune(con, force: bool = False) -> dict:
-    """Sweep every worktree container: ~/.orchestra/projects/<slug>/worktrees
-    and the pre-v27 ~/.orchestra/worktrees/<key> layout — orphan checkouts
-    first, then the directories the removals emptied.
+    """Sweep Orchestra's v2 per-group worktree directories.
 
     An orphan is a worktree whose run row is terminal or gone. A live run's
     worktree is skipped and reported, never removed — not even with --force.
+    Pre-reset state is an archive and is intentionally never mutated here.
     """
-    home = paths.home()
     out = {"worktrees": [], "dirs": []}
-    legacy = home / "worktrees"
-    containers = []
-    if legacy.is_dir():
-        containers += sorted(p for p in legacy.iterdir() if p.is_dir())
-    projects = home / "projects"
-    if projects.is_dir():
-        containers += sorted(p / "worktrees" for p in projects.iterdir()
-                             if (p / "worktrees").is_dir())
+    root = paths.worktrees_dir()
+    containers = sorted(path for path in root.iterdir() if path.is_dir())
     for container in containers:
         for wt in sorted(p for p in container.iterdir() if p.is_dir()):
             out["worktrees"].append(_prune_one(con, wt, force))
         if not any(container.iterdir()):
             container.rmdir()
             out["dirs"].append(str(container))
-            parent = container.parent
-            # The project's own dir goes only when NOTHING else lives in it —
-            # a workspace or a future artifact keeps it.
-            if parent not in (legacy, home) and not any(parent.iterdir()):
-                parent.rmdir()
-                out["dirs"].append(str(parent))
     return out
 
 
@@ -431,4 +473,4 @@ def _prune_one(con, wt: Path, force: bool) -> dict:
                 "discarded": [], "error": None, "live": True}
     root = main_root(wt)
     return remove(wt, root, branch=run["branch"] if run is not None else None,
-                  base=_base_branch(root) if root else None, force=force)
+                  force=force)

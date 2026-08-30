@@ -1,13 +1,11 @@
-"""Profile discovery and display helpers (DESIGN D10).
+"""Profile discovery and display helpers.
 
 Model/effort lists come from the supported harnesses themselves — a profile is
 assembled from real lists, never typed and hoped. Discovery fails soft per
 backend: a missing or broken CLI reports why and the others still print.
 
-The headroom note (``note`` / ``note_at`` on a profile) surfaces in
-``orchestra profiles`` with its age. It is routing intent for planners and
-humans: the D1 planner packet is its dispatch-context consumer (phase 4);
-it is never injected into worker briefs.
+The optional headroom note is operator context and is never injected into
+worker briefs.
 """
 import json
 import subprocess
@@ -117,12 +115,11 @@ def discover(runner=_run, reasonix_config: Path = REASONIX_CONFIG) -> dict:
     return results
 
 
-# --- local inference servers (W-0306 idea 3) --------------------------------
+# --- local inference servers ------------------------------------------------
 
 # Default localhost ports only: Ollama's own listing, and the OpenAI-style
 # /v1/models that LM Studio and vLLM serve. The probe exists so a local-model
-# profile can be assembled without remembering a model id no harness CLI
-# lists (docs/investigations/W-0306-yeschef.md).
+# profile can be assembled without remembering a model id no harness CLI lists.
 LOCAL_SERVERS = (
     ("ollama", "http://127.0.0.1:11434/api/tags"),
     ("lmstudio", "http://127.0.0.1:1234/v1/models"),
@@ -150,7 +147,7 @@ def discover_local(fetch=None, servers=None) -> list[dict]:
 
     Every failure is silence, never an error entry: on most machines every
     probe hits a closed port, and that is not news. A machine without these
-    servers must see nothing new (W-0306 idea 3).
+    servers must see nothing new.
     """
     fetch = fetch or _fetch_json
     found: list[dict] = []

@@ -1,168 +1,510 @@
 import Foundation
+import UserNotifications
+
+struct RunFilters: Hashable, Sendable {
+    var search = ""
+    var groupID: String?
+    var profileID: String?
+    var status: String?
+
+    var isEmpty: Bool {
+        search.isEmpty && groupID == nil && profileID == nil && status == nil
+    }
+}
+
+struct MessageFilters: Hashable, Sendable {
+    var direction: String?
+    var status: String?
+    var kind: String?
+}
 
 @MainActor
 final class AppState: ObservableObject {
-    /// Every daemon this phone knows. Persisted as JSON; each server's key
-    /// lives in its own Keychain item, never here.
-    @Published private(set) var servers: [Server] = AppState.loadServers() {
-        didSet { AppState.saveServers(servers) }
+    @Published private(set) var servers = AppState.loadServers() {
+        didSet { Self.saveServers(servers) }
     }
-    /// Which one the app is talking to. Switching is a context change, not a
-    /// filter: the snapshot is dropped so no screen can show one daemon's runs
-    /// under another's name.
     @Published private(set) var selectedServerID: UUID? =
-        UserDefaults.standard.string(forKey: "selectedServerID").flatMap(UUID.init)
-    @Published private(set) var snapshot: Snapshot?
-    @Published private(set) var error: String?
+        UserDefaults.standard.string(forKey: "v2.selectedServerID").flatMap(UUID.init)
+    @Published private(set) var snapshot: FleetSnapshot?
+    @Published private(set) var globalStatistics: RunStatistics?
+    @Published private(set) var contextualStatistics: RunStatistics?
+    @Published private(set) var runs: [Run] = []
+    @Published private(set) var inbox: [AttentionItem] = []
+    @Published private(set) var messages: [RunMessage] = []
+    @Published private(set) var groups: [RunGroup] = []
+    @Published private(set) var runtimes: [RuntimeConfig] = []
+    @Published private(set) var profiles: [Profile] = []
+    @Published private(set) var runwaySources: [RunwaySource] = []
+    @Published private(set) var devices: [Device] = []
+    @Published private(set) var serviceTokens: [ServiceTokenRecord] = []
+    @Published private(set) var settings: [FleetSetting] = []
+    @Published private(set) var runCursor: String?
+    @Published private(set) var inboxCursor: String?
+    @Published private(set) var messageCursor: String?
     @Published private(set) var loading = false
-    /// Nil means every project. Persisted, because the pick is a working
-    /// context and losing it on every launch is its own small annoyance.
-    @Published var selectedProjectID: String? = UserDefaults.standard.string(forKey: "selectedProjectID") {
-        didSet { UserDefaults.standard.set(selectedProjectID, forKey: "selectedProjectID") }
-    }
+    @Published private(set) var runQueryLoading = false
+    @Published private(set) var error: String?
+    @Published var notice: String?
+    @Published var filters = RunFilters()
+    @Published var messageFilters = MessageFilters()
+    @Published private(set) var notificationsEnabled =
+        UserDefaults.standard.bool(forKey: "v2.notificationsEnabled")
+
+    private var lastEventID: String?
+    private var invalidationRefreshTask: Task<Void, Never>?
+    private var loadedRunFilters = RunFilters()
 
     var selectedServer: Server? {
         servers.first { $0.id == selectedServerID } ?? servers.first
     }
 
-    var serverURL: String { selectedServer?.url ?? "" }
-    var key: String { selectedServer.map { Keychain.load(for: $0.keyAccount) } ?? "" }
-
     var isConfigured: Bool {
         guard let server = selectedServer else { return false }
-        return URL(string: server.url) != nil
+        return (try? Self.validURL(server.url)) != nil
             && !Keychain.load(for: server.keyAccount).isEmpty
     }
 
-    func api() throws -> OrchestraAPI {
-        guard let server = selectedServer,
-              let url = URL(string: server.url), let scheme = url.scheme,
-              ["http", "https"].contains(scheme), url.host != nil else {
-            throw APIError.invalidURL
-        }
-        return OrchestraAPI(baseURL: url, key: Keychain.load(for: server.keyAccount))
+    var filteredRuns: [Run] {
+        runs
     }
 
-    // --- the server list --------------------------------------------------
+    func groupName(_ id: String) -> String? { groups.first { $0.id == id }?.name }
+    func profileName(_ id: String) -> String? { profiles.first { $0.id == id }?.name }
+    func runtimeName(_ id: String) -> String? { runtimes.first { $0.id == id }?.name }
 
-    /// Add or update one server. The key is written first and rolled back if
-    /// the URL turns out to be unusable, so a half-saved server never becomes
-    /// the selected one.
+    func api(token: String? = nil, endpoint: String? = nil) throws -> OrchestraAPI {
+        let url: URL
+        if let endpoint { url = try Self.validURL(endpoint) }
+        else if let server = selectedServer { url = try Self.validURL(server.url) }
+        else { throw APIError.invalidURL }
+        let credential = token ?? selectedServer.map { Keychain.load(for: $0.keyAccount) } ?? ""
+        return OrchestraAPI(baseURL: url, token: credential)
+    }
+
     @discardableResult
-    func saveServer(id: UUID?, label: String, url: String, key: String) throws -> Server {
-        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsed = URL(string: trimmedURL), let scheme = parsed.scheme,
-              ["http", "https"].contains(scheme), parsed.host != nil else {
-            throw APIError.invalidURL
-        }
-        var server: Server
+    func saveServer(id: UUID? = nil, label: String, endpoint: String,
+                    token: String, instanceID: String? = nil) throws -> Server {
+        let url = try Self.validURL(endpoint).absoluteString
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedToken.isEmpty else { throw APIError.http(400, "A device or service token is required.") }
+        let server: Server
         if let id, let index = servers.firstIndex(where: { $0.id == id }) {
-            server = servers[index]
-            server.label = label
-            server.url = trimmedURL
-            try Keychain.save(trimmedKey, for: server.keyAccount)
-            servers[index] = server
+            var edited = servers[index]
+            edited.label = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            edited.url = url
+            if let instanceID { edited.instanceID = instanceID }
+            try Keychain.save(trimmedToken, for: edited.keyAccount)
+            servers[index] = edited
+            server = edited
         } else {
-            // The very first server inherits the pre-multi-server Keychain
-            // account, so an upgrading phone keeps the key it already had.
-            let account = servers.isEmpty ? Keychain.legacyAccount : nil
-            server = Server(label: label, url: trimmedURL, keyAccount: account)
-            try Keychain.save(trimmedKey, for: server.keyAccount)
-            servers.append(server)
+            let created = Server(label: label, url: url, instanceID: instanceID)
+            try Keychain.save(trimmedToken, for: created.keyAccount)
+            servers.append(created)
+            server = created
         }
-        if selectedServerID == nil { select(server.id) }
+        select(server.id)
         return server
     }
 
     func removeServer(_ server: Server) {
         Keychain.delete(account: server.keyAccount)
         servers.removeAll { $0.id == server.id }
-        if selectedServerID == server.id {
-            select(servers.first?.id)
+        if selectedServerID == server.id { select(servers.first?.id) }
+    }
+
+    func select(_ id: UUID?) {
+        guard selectedServerID != id else { return }
+        selectedServerID = id
+        UserDefaults.standard.set(id?.uuidString, forKey: "v2.selectedServerID")
+        clearFleet()
+    }
+
+    func refresh(quiet: Bool = false) async {
+        guard isConfigured else { return }
+        if !quiet { loading = true }
+        defer { loading = false }
+        do {
+            let priorAttentionCount = snapshot == nil ? nil : inbox.count
+            let priorUndeliverable = snapshot?.messages.undeliverable
+            let client = try api()
+            let currentMessageFilters = messageFilters
+            let currentRunFilters = filters
+            async let snapshotValue = client.snapshot()
+            async let runValue = client.runs(
+                q: currentRunFilters.search, group: currentRunFilters.groupID,
+                profile: currentRunFilters.profileID,
+                status: currentRunFilters.status)
+            async let statisticsValue = try? await client.statistics()
+            async let inboxValue = try? await client.inbox()
+            async let messageValue = try? await client.outbox(
+                direction: currentMessageFilters.direction,
+                status: currentMessageFilters.status,
+                kind: currentMessageFilters.kind)
+            async let groupValue = try? await client.groups()
+            async let runtimeValue = try? await client.runtimes()
+            async let profileValue = try? await client.profiles()
+            async let runwayValue = try? await client.runwaySources()
+            async let deviceValue = try? await client.devices()
+            async let tokenValue = try? await client.serviceTokens()
+            async let settingValue = try? await client.settings()
+            let required = try await (snapshotValue, runValue)
+            let optional = await (statisticsValue, inboxValue, messageValue,
+                                  groupValue, runtimeValue,
+                                  profileValue, runwayValue, deviceValue,
+                                  tokenValue, settingValue)
+            try accept(instanceID: required.0.instanceID)
+            try accept(instanceID: required.1.instanceID)
+            snapshot = required.0.value
+            if currentRunFilters == filters {
+                let firstRuns = required.1.value.items
+                let preserveRuns = quiet && loadedRunFilters == currentRunFilters
+                    && runs.count > firstRuns.count
+                if preserveRuns {
+                    let firstIDs = Set(firstRuns.map(\.id))
+                    runs = (firstRuns + runs.filter { !firstIDs.contains($0.id) })
+                        .sorted { $0.id > $1.id }
+                } else {
+                    runs = firstRuns
+                    runCursor = required.1.value.nextCursor
+                }
+                loadedRunFilters = currentRunFilters
+            }
+            if let value = optional.0 {
+                try accept(instanceID: value.instanceID)
+                globalStatistics = value.value
+            }
+            if let value = optional.1 {
+                try accept(instanceID: value.instanceID)
+                let first = value.value.items
+                if quiet && inbox.count > first.count {
+                    let firstIDs = Set(first.map(\.id))
+                    inbox = first + inbox.filter { !firstIDs.contains($0.id) }
+                } else {
+                    inbox = first
+                    inboxCursor = value.value.nextCursor
+                }
+            }
+            if let value = optional.2 {
+                try accept(instanceID: value.instanceID)
+                if currentMessageFilters == messageFilters {
+                    let first = value.value.items
+                    if quiet && messages.count > first.count {
+                        let firstIDs = Set(first.map(\.id))
+                        messages = first + messages.filter { !firstIDs.contains($0.id) }
+                    } else {
+                        messages = first
+                        messageCursor = value.value.nextCursor
+                    }
+                }
+            }
+            if let value = optional.3 {
+                try accept(instanceID: value.instanceID)
+                groups = value.value.items
+            }
+            if let value = optional.4 {
+                try accept(instanceID: value.instanceID)
+                runtimes = value.value.items
+            }
+            if let value = optional.5 {
+                try accept(instanceID: value.instanceID)
+                profiles = value.value.items
+            }
+            if let value = optional.6 {
+                try accept(instanceID: value.instanceID)
+                runwaySources = value.value.items
+            }
+            if let value = optional.7 {
+                try accept(instanceID: value.instanceID)
+                devices = value.value.items
+            }
+            if let value = optional.8 {
+                try accept(instanceID: value.instanceID)
+                serviceTokens = value.value.items
+            }
+            if let value = optional.9 {
+                try accept(instanceID: value.instanceID)
+                settings = value.value.items
+            }
+            error = nil
+            await updateNotifications(previousAttention: priorAttentionCount,
+                                      previousUndeliverable: priorUndeliverable)
+        } catch {
+            report(error)
         }
     }
 
-    /// Switching daemons drops everything the last one said. A stale snapshot
-    /// under a new server's name is worse than an empty screen.
-    func select(_ id: UUID?) {
-        guard id != selectedServerID else { return }
-        selectedServerID = id
-        UserDefaults.standard.set(id?.uuidString, forKey: "selectedServerID")
-        snapshot = nil
-        error = nil
-        selectedProjectID = nil  // projects are one daemon's, never shared
+    func loadMoreRuns() async {
+        guard let runCursor else { return }
+        let requested = loadedRunFilters
+        guard requested == filters else { return }
+        do {
+            let value = try await api().runs(
+                cursor: runCursor, q: requested.search, group: requested.groupID,
+                profile: requested.profileID,
+                status: requested.status)
+            guard requested == filters, requested == loadedRunFilters else { return }
+            try accept(instanceID: value.instanceID)
+            let known = Set(runs.map(\.id))
+            runs.append(contentsOf: value.value.items.filter { !known.contains($0.id) })
+            self.runCursor = value.value.nextCursor
+        } catch { report(error) }
     }
 
-    // --- persistence ------------------------------------------------------
+    func refreshRunsForFilters() async {
+        let requested = filters
+        runQueryLoading = true
+        runs = []
+        runCursor = nil
+        defer {
+            if requested == filters { runQueryLoading = false }
+        }
+        if !requested.search.trimmed.isEmpty {
+            do { try await Task.sleep(for: .milliseconds(300)) }
+            catch { return }
+        }
+        do {
+            let value = try await api().runs(
+                q: requested.search, group: requested.groupID,
+                profile: requested.profileID,
+                status: requested.status)
+            guard requested == filters else { return }
+            try accept(instanceID: value.instanceID)
+            runs = value.value.items
+            runCursor = value.value.nextCursor
+            loadedRunFilters = requested
+        } catch is CancellationError {
+        } catch {
+            guard requested == filters else { return }
+            report(error)
+        }
+    }
 
-    private static let serversKey = "servers"
+    func loadMoreInbox() async {
+        guard let inboxCursor else { return }
+        do {
+            let value = try await api().inbox(cursor: inboxCursor)
+            try accept(instanceID: value.instanceID)
+            let known = Set(inbox.map(\.id))
+            inbox.append(contentsOf: value.value.items.filter { !known.contains($0.id) })
+            self.inboxCursor = value.value.nextCursor
+        } catch { report(error) }
+    }
+
+    func refreshMessages() async {
+        let requested = messageFilters
+        do {
+            let value = try await api().outbox(
+                direction: requested.direction, status: requested.status,
+                kind: requested.kind)
+            guard requested == messageFilters else { return }
+            try accept(instanceID: value.instanceID)
+            messages = value.value.items
+            messageCursor = value.value.nextCursor
+        } catch {
+            guard requested == messageFilters else { return }
+            report(error)
+        }
+    }
+
+    func loadMoreMessages() async {
+        guard let messageCursor else { return }
+        let requested = messageFilters
+        do {
+            let value = try await api().outbox(
+                cursor: messageCursor, direction: requested.direction,
+                status: requested.status, kind: requested.kind)
+            guard requested == messageFilters else { return }
+            try accept(instanceID: value.instanceID)
+            let known = Set(messages.map(\.id))
+            messages.append(contentsOf: value.value.items.filter { !known.contains($0.id) })
+            self.messageCursor = value.value.nextCursor
+        } catch { report(error) }
+    }
+
+    func refreshContextualStatistics() async {
+        let requested = filters
+        guard requested.search.trimmed.isEmpty else {
+            contextualStatistics = nil
+            return
+        }
+        guard requested.groupID != nil || requested.profileID != nil
+                || requested.status != nil else {
+            contextualStatistics = globalStatistics
+            return
+        }
+        do {
+            let response = try await api().statistics(
+                group: requested.groupID, profile: requested.profileID,
+                status: requested.status)
+            guard requested == filters else { return }
+            try accept(instanceID: response.instanceID)
+            contextualStatistics = response.value
+        } catch {
+            guard requested == filters else { return }
+            contextualStatistics = nil
+        }
+    }
+
+    func discoverProfiles(local: Bool) async -> ProfileDiscovery? {
+        do {
+            let response = try await api().profileDiscovery(local: local)
+            try accept(instanceID: response.instanceID)
+            return response.value
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
+    func monitorInvalidations() async {
+        while !Task.isCancelled, isConfigured {
+            do {
+                let client = try api()
+                for try await event in client.invalidations(lastEventID: lastEventID) {
+                    if let id = event.id { lastEventID = id }
+                    invalidationRefreshTask?.cancel()
+                    invalidationRefreshTask = Task {
+                        try? await Task.sleep(for: .milliseconds(250))
+                        guard !Task.isCancelled else { return }
+                        await refresh(quiet: true)
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                try? await Task.sleep(for: .seconds(4))
+            }
+        }
+    }
+
+    func redeemPairing(endpoint: String, claim: String, label: String) async throws {
+        let parsed = try PairingClaim.parse(claim)
+        let chosenEndpoint = parsed.endpoint ?? endpoint
+        let client = try api(token: "", endpoint: chosenEndpoint)
+        let response = try await client.redeemPairing(
+            pairingID: parsed.pairingID, code: parsed.code, label: label)
+        _ = try saveServer(label: label, endpoint: chosenEndpoint,
+                           token: response.value.token, instanceID: response.instanceID)
+        await refresh()
+    }
+
+    func connect(endpoint: String, token: String, label: String) async throws {
+        let response = try await api(token: token, endpoint: endpoint).snapshot()
+        _ = try saveServer(label: label, endpoint: endpoint, token: token,
+                           instanceID: response.instanceID)
+        await refresh()
+    }
+
+    func report(_ error: Error) {
+        self.error = error.localizedDescription
+    }
+
+    func setNotifications(_ enabled: Bool) async {
+        if enabled {
+            do {
+                let granted = try await UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .badge, .sound])
+                notificationsEnabled = granted
+            } catch {
+                notificationsEnabled = false
+                report(error)
+            }
+        } else {
+            notificationsEnabled = false
+            try? await UNUserNotificationCenter.current().setBadgeCount(0)
+        }
+        UserDefaults.standard.set(notificationsEnabled, forKey: "v2.notificationsEnabled")
+    }
+
+    func succeeded(_ message: String) async {
+        notice = message
+        error = nil
+        await refresh(quiet: true)
+    }
+
+    private func accept(instanceID: String) throws {
+        guard let server = selectedServer else { throw APIError.invalidURL }
+        if let expected = server.instanceID, expected != instanceID {
+            throw APIError.instanceChanged(expected: expected, received: instanceID)
+        }
+        if server.instanceID == nil,
+           let index = servers.firstIndex(where: { $0.id == server.id }) {
+            servers[index].instanceID = instanceID
+        }
+    }
+
+    private func updateNotifications(previousAttention: Int?,
+                                     previousUndeliverable: Int?) async {
+        guard notificationsEnabled else { return }
+        let center = UNUserNotificationCenter.current()
+        try? await center.setBadgeCount(inbox.count + (snapshot?.messages.undeliverable ?? 0))
+        let content = UNMutableNotificationContent()
+        if let previousAttention, inbox.count > previousAttention,
+           let newest = inbox.first {
+            content.title = newest.blocking
+                ? "Orchestra needs an answer" : "Orchestra attention"
+            content.body = newest.prompt ?? newest.message ?? "Open Inbox for details."
+        } else if let previousUndeliverable,
+                  let current = snapshot?.messages.undeliverable,
+                  current > previousUndeliverable {
+            content.title = "Orchestra message undeliverable"
+            content.body = "Open Inbox / Outbox to inspect the failed delivery receipt."
+        } else {
+            return
+        }
+        content.sound = .default
+        try? await center.add(UNNotificationRequest(
+            identifier: "orchestra-inbox-\(UUID().uuidString)",
+            content: content, trigger: nil))
+    }
+
+    private func clearFleet() {
+        snapshot = nil
+        globalStatistics = nil
+        contextualStatistics = nil
+        runs = []
+        inbox = []
+        messages = []
+        groups = []
+        runtimes = []
+        profiles = []
+        runwaySources = []
+        devices = []
+        serviceTokens = []
+        settings = []
+        runCursor = nil
+        loadedRunFilters = RunFilters()
+        inboxCursor = nil
+        messageCursor = nil
+        lastEventID = nil
+        invalidationRefreshTask?.cancel()
+        invalidationRefreshTask = nil
+        filters = RunFilters()
+        messageFilters = MessageFilters()
+        error = nil
+    }
+
+    private static func validURL(_ text: String) throws -> URL {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), components.host != nil else {
+            throw APIError.invalidURL
+        }
+        if components.path.isEmpty { components.path = "/" }
+        guard let url = components.url else { throw APIError.invalidURL }
+        return url
+    }
+
+    private static let serversKey = "v2.servers"
 
     private static func loadServers() -> [Server] {
-        let defaults = UserDefaults.standard
-        if let data = defaults.data(forKey: serversKey),
-           let stored = try? JSONDecoder().decode([Server].self, from: data) {
-            return stored
-        }
-        // Migration: the single server this app used to hold. Its key stays
-        // where it is, under the legacy account, and the entry points at it.
-        guard let url = defaults.string(forKey: "serverURL"), !url.isEmpty,
-              !Keychain.load().isEmpty else { return [] }
-        let migrated = [Server(label: "", url: url,
-                               keyAccount: Keychain.legacyAccount)]
-        saveServers(migrated)
-        return migrated
+        guard let data = UserDefaults.standard.data(forKey: serversKey) else { return [] }
+        return (try? JSONDecoder().decode([Server].self, from: data)) ?? []
     }
 
     private static func saveServers(_ servers: [Server]) {
         guard let data = try? JSONEncoder().encode(servers) else { return }
         UserDefaults.standard.set(data, forKey: serversKey)
-    }
-
-    func refresh() async {
-        guard isConfigured else { return }
-        loading = true
-        defer { loading = false }
-        do {
-            snapshot = try await api().snapshot()
-            error = nil
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
-
-    /// Runs the tabs display: every run, or one project's.
-    var runs: [Run] {
-        let all = snapshot?.runs ?? []
-        guard let selectedProjectID else { return all }
-        return all.filter { $0.projectID == selectedProjectID }
-    }
-
-    var liveRuns: [Run] { runs.filter(\.live) }
-
-    /// The latest control turn for what the tabs display. Scoped like `runs`:
-    /// a staffing decision about another project pinned above this board
-    /// reads as if it happened here.
-    var pinnedTurn: Run? {
-        let turns = snapshot?.pinnedTurns ?? []
-        guard let selectedProjectID else { return turns.first }
-        return turns.first { $0.projectID == selectedProjectID }
-    }
-    var projects: [Project] { snapshot?.projects ?? [] }
-    var profiles: [Profile] { snapshot?.profiles ?? [] }
-    var selectedProject: Project? {
-        projects.first { $0.projectID == selectedProjectID }
-    }
-
-    // --- actions the views call; each refreshes so the UI cannot drift -----
-
-    func perform(_ body: @escaping (OrchestraAPI) async throws -> Void) async -> String? {
-        do {
-            try await body(try api())
-            await refresh()
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
     }
 }

@@ -21,14 +21,15 @@ Two colours only. The three bars differ by opacity on the same gray:
 | `orchestra-mark.svg` | anywhere a square is wanted: docs, README hero, social card | plain `<img>`; it carries its own ground, so no background needed |
 | `orchestra-logo.svg` | README and any page wanting mark + name | `<img>`; the tile is its own ground, one file covers light and dark |
 | `orchestra-favicon.svg` | browser tab | `<link rel="icon" type="image/svg+xml" href="assets/orchestra-favicon.svg">` |
-| `orchestra-icon-1024.png` | iOS app icon, the 1024×1024 App Store slot | drop into the `AppIcon` asset set |
+| `orchestra-icon-1024.png` | Apple app icon source | drop into the shared `AppIcon` asset set; derive the native macOS size slots from it |
 
 Three copies live outside this directory and have to be edited with it:
 `orchestra/dashboard.html` inlines the favicon as a data URI and draws the
 bars (no tile) as inline SVG in its header,
-`ios/Orchestra/Assets.xcassets/AppIcon.appiconset/` holds a copy of the
-1024px PNG, and `ios/Orchestra/Components.swift` draws the mark as SwiftUI
-shapes. Change a bar here and all three need the same change.
+`ios/Orchestra/Assets.xcassets/AppIcon.appiconset/` holds the 1024px iOS source
+plus its native macOS size variants, and `ios/Orchestra/Components.swift`
+draws the mark as SwiftUI shapes. Change a bar here and all three need the same
+change.
 
 The logo names its type as Inter with a system-sans fallback; no font file
 ships with it, so a machine without Inter renders the fallback.

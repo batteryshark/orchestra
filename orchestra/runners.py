@@ -8,7 +8,7 @@ status flows from the transcript, never from asking the worker to report.
 import json
 import sys
 
-from orchestra import config, harnesses, paths
+from orchestra import config, harnesses, runway
 
 # Verified against the installed CLIs: `opencode run` has no --add-dir and
 # no equivalent directory flag.
@@ -91,19 +91,18 @@ def next_lane(profile: dict, env: dict[str, str], log_path: str,
 def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
     """Apply per-process backend policy without changing the user's global config.
 
-    Two OpenCode-only things ride on ``OPENCODE_CONFIG_CONTENT``:
+    Two OpenCode-only policies ride on ``OPENCODE_CONFIG_CONTENT``:
 
     1. OpenCode's ``run --auto`` can leave a native task child blocked forever
        on its own permission ask. Supervised workers get explicit orchestration
        from Orchestra instead, so deny native/plugin delegation to avoid that
         unobservable deadlock. ``opencode_native_subagents = true`` on a profile
         deliberately restores them.
-    2. OpenCode has no shell hooks (DESIGN §6), so Orchestra's JS plugin is
-        delivered PER RUN here rather than installed into the user's own
-        ``~/.config/opencode`` — the human's interactive sessions stay clean.
+    2. OpenCode's whole-directory snapshot duplicates Orchestra's retained
+       Git evidence, so it is disabled unless the profile opts back in.
 
-    Profile ``env`` is applied here so exec, ACP, and control turns share one
-    seam. Lane quota still wins after that and strips the API credentials.
+    Profile ``env`` is applied here so exec and ACP share one seam. Lane quota
+    still wins after that and strips the API credentials.
     """
     env = config.apply_profile_env(profile, env)
     if profile.get("backend") == "claude" and lane_of(profile) == "quota":
@@ -113,7 +112,6 @@ def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
         return updated
     if profile.get("backend") != "opencode":
         return env
-    plugin = paths.opencode_plugin_path()
     deny_delegation = not profile.get("opencode_native_subagents")
 
     raw = env.get("OPENCODE_CONFIG_CONTENT", "")
@@ -142,16 +140,6 @@ def apply_backend_env(profile: dict, env: dict[str, str]) -> dict[str, str]:
         # ``opencode_snapshots = true`` to restore them, and the human's own
         # interactive sessions are untouched either way.
         content.setdefault("snapshot", False)
-    # ponytail: referenced by absolute path, because OPENCODE_CONFIG_CONTENT is
-    # inline JSON with no directory to resolve a relative path against. Only
-    # added when the file is really there, so a run never dies on a missing
-    # plugin; `orchestra init` writes it. If a future OpenCode rejects absolute
-    # plugin paths, drop the file into a temp OPENCODE_CONFIG_DIR per run.
-    if plugin.exists():
-        listed = content.get("plugin")
-        listed = list(listed) if isinstance(listed, list) else []
-        if str(plugin) not in listed:
-            content["plugin"] = [*listed, str(plugin)]
     updated = dict(env)
     updated["OPENCODE_CONFIG_CONTENT"] = json.dumps(
         content, ensure_ascii=False, separators=(",", ":")
@@ -164,7 +152,7 @@ def build_cmd(profile: dict, *, workdir: str, title: str, prompt: str,
     backend = profile["backend"]
     model = profile.get("model")
     extra = list(profile.get("extra_args", []))
-    # DESIGN §12: declared read-only directories outside the worktree.
+    # DESIGN §5: declared read-only directories outside the worktree.
     # claude/codex/reasonix take --add-dir; `opencode run` has no such flag
     # and would die on an unknown one. ponytail: an OpenCode run simply does
     # not get them -- revisit when opencode grows a directory flag.
@@ -267,10 +255,9 @@ def build_cmd(profile: dict, *, workdir: str, title: str, prompt: str,
             cmd += ["--model", model]
         if profile.get("effort"):
             cmd += ["--effort", str(profile["effort"])]
-        # Reasonix's own `--max-steps`. NOT a profile field any more (W-0181:
-        # "what is a step budget and why do we have it") — the editor neither
-        # writes nor documents it. A hand-written key is still passed through,
-        # so an existing config keeps behaving the way it did.
+        # Reasonix's own `--max-steps` is not a managed profile field. The
+        # editor neither writes nor documents it, but an imported host value
+        # still passes through.
         if "max_steps" in profile:
             cmd += ["--max-steps", str(profile["max_steps"])]
         # A supervised run has nobody to answer a permission ask, so an
@@ -336,13 +323,14 @@ def parse_log(log_path: str, max_bytes: int | None = None) -> tuple[str | None, 
     return session, last_text
 
 
-# --- usage capture (DESIGN §11) ---------------------------------------------
+# --- usage capture (DESIGN §13) ---------------------------------------------
 # One reader per backend, each keyed to the event that carries that backend's
 # OWN totals. Verified against real transcripts (see tests/test_runners.py
 # fixtures). Anything else is unrecognized and yields null: the run row says
 # "not captured" rather than a guessed mapping.
 
 EMPTY_USAGE = {"tokens_in": None, "tokens_out": None, "tokens_total": None,
+               "tokens_cache_read": None, "tokens_cache_write": None,
                "cost_usd": None, "usage_source": None}
 
 
@@ -354,7 +342,7 @@ def _num(value):
 
 def _sum(*values):
     """Sum of the numeric parts, or None when none of them was a number: an
-    absent count is not a zero count (DESIGN §11 — null, never a wrong
+    absent count is not a zero count (DESIGN §13 — null, never a wrong
     number). A reported zero IS a number and stays zero."""
     found = [v for v in (_num(v) for v in values) if v is not None]
     return sum(found) if found else None
@@ -372,7 +360,9 @@ def _usage_claude(obj):
     tout = _sum(usage.get("output_tokens"))
     if tin is None and tout is None:
         return None
-    return tin, tout, _sum(tin, tout), _num(obj.get("total_cost_usd"))
+    return (tin, tout, _sum(tin, tout), _num(obj.get("total_cost_usd")),
+            _num(usage.get("cache_read_input_tokens")),
+            _num(usage.get("cache_creation_input_tokens")))
 
 
 def _usage_reasonix(obj):
@@ -389,7 +379,7 @@ def _usage_reasonix(obj):
     cost = _num(obj.get("total_cost_usd"))
     if cost is None and obj.get("currency") in (None, "USD", "usd"):
         cost = _num(obj.get("total_cost"))  # another currency stays null, not mislabelled
-    return tin, tout, _sum(tin, tout), cost
+    return tin, tout, _sum(tin, tout), cost, None, None
 
 
 def _usage_codex(obj):
@@ -403,7 +393,8 @@ def _usage_codex(obj):
     if tin is None and tout is None:
         return None
     total = _num(usage.get("total_tokens"))
-    return tin, tout, total if total is not None else _sum(tin, tout), None
+    return (tin, tout, total if total is not None else _sum(tin, tout), None,
+            _num(usage.get("cached_input_tokens")), None)
 
 
 def _usage_opencode(obj):
@@ -420,15 +411,16 @@ def _usage_opencode(obj):
     if tin is None and tout is None:
         return None
     total = _num(tokens.get("total"))
-    return tin, tout, total if total is not None else _sum(tin, tout), _num(part.get("cost"))
+    return (tin, tout, total if total is not None else _sum(tin, tout),
+            _num(part.get("cost")), _num(cache.get("read")), _num(cache.get("write")))
 
 
 USAGE_PARSERS = {"claude": _usage_claude, "codex": _usage_codex,
                  "opencode": _usage_opencode, "reasonix": _usage_reasonix}
 
 
-def parse_usage(log_path: str, backend: str) -> dict:
-    """Token/cost totals for a run, from its own worker log (DESIGN §11).
+def parse_usage(log_path: str, backend: str, model: str | None = None) -> dict:
+    """Token/cost totals for a run, from its own worker log (DESIGN §13).
 
     Best-effort by contract: an unknown backend, an unreadable log, or a log
     with no recognizable usage event returns every value None. It never
@@ -437,7 +429,7 @@ def parse_usage(log_path: str, backend: str) -> dict:
     parser = USAGE_PARSERS.get(backend)
     if parser is None:
         return dict(EMPTY_USAGE)
-    tin = tout = total = cost = None
+    tin = tout = total = cost = cache_read = cache_write = None
     seen = False
     try:
         with open(log_path, errors="replace") as handle:
@@ -458,15 +450,22 @@ def parse_usage(log_path: str, backend: str) -> dict:
                 if found is None:
                     continue
                 seen = True
-                line_in, line_out, line_total, line_cost = found
+                (line_in, line_out, line_total, line_cost,
+                 line_cache_read, line_cache_write) = found
                 tin, tout = _sum(tin, line_in), _sum(tout, line_out)
                 total, cost = _sum(total, line_total), _sum(cost, line_cost)
+                cache_read = _sum(cache_read, line_cache_read)
+                cache_write = _sum(cache_write, line_cache_write)
     except OSError:
         return dict(EMPTY_USAGE)
     if not seen:
         return dict(EMPTY_USAGE)
+    provider = runway.provider_of(backend, model)
+    billed_cost = None if runway.kind_of(provider) == "plan" else cost
     return {"tokens_in": _int(tin), "tokens_out": _int(tout), "tokens_total": _int(total),
-            "cost_usd": round(cost, 6) if cost is not None else None,
+            "tokens_cache_read": _int(cache_read),
+            "tokens_cache_write": _int(cache_write),
+            "cost_usd": round(billed_cost, 6) if billed_cost is not None else None,
             "usage_source": backend}
 
 

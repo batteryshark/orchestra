@@ -5,7 +5,7 @@ Every module builds its own tempdir, its own ORCHESTRA_HOME and its own fake
 servers, so nothing is shared and nothing has to run in order.
 
     uv run python run_tests.py            # everything
-    uv run python run_tests.py merge http # substring match on module names
+    uv run python run_tests.py execution api # substring match on module names
     uv run python run_tests.py -j 4       # fewer workers
 
 """

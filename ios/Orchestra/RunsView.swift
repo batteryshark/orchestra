@@ -1,335 +1,267 @@
 import SwiftUI
 
-/// The fleet, newest first, live work at the top.
-///
-/// The web dashboard sorts live runs above history because a live run is the
-/// only one you can still change. Two sections say the same thing without a
-/// filter control the owner has to remember to set.
 struct RunsView: View {
     @EnvironmentObject private var state: AppState
-    @State private var query = ""
-    @State private var actionError: String?
-
-    /// Honours `-openRun <id>` once, when that run is in the snapshot.
-    private func openRequestedRun() {
-        let arguments = ProcessInfo.processInfo.arguments
-        guard path.isEmpty,
-              let at = arguments.firstIndex(of: "-openRun"),
-              let id = arguments[safe: at + 1].flatMap(Int.init),
-              let run = state.runs.first(where: { $0.id == id })
-        else { return }
-        path = [.run(run)]
-    }
-
-    private var matching: [Run] {
-        let runs = state.runs.sorted { $0.id > $1.id }
-        let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !needle.isEmpty else { return runs }
-        return runs.filter { run in
-            [String(run.id), run.title, run.workItem, run.slug, run.profile,
-             run.project, run.status]
-                .compactMap { $0 }
-                .contains { $0.lowercased().contains(needle) }
-        }
-    }
-
-    @State private var path: [RunsRoute] = []
+    @State private var showingDispatch = false
 
     var body: some View {
-        NavigationStack(path: $path) {
-            VStack(spacing: 0) {
-                ConnectionBanner()
-                list
-            }
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("Runs")
-            .toolbar { ServerToolbarMenu(); ProjectToolbarMenu() }
-            .navigationDestination(for: RunsRoute.self) { route in
-                switch route {
-                case let .run(run): RunDetailView(run: run)
-                case .decisions: DecisionLogView()
+        Group {
+            if (state.loading && state.snapshot == nil) ||
+                (state.runQueryLoading && state.runs.isEmpty) {
+                LoadingState(label: "Loading runs…")
+            } else if state.filteredRuns.isEmpty {
+                VStack(spacing: 0) {
+                    statistics
+                    filters
+                    EmptyState(icon: "play.square.stack", title: "No matching runs",
+                               message: state.filters.isEmpty
+                               ? "Start a run to put this fleet to work."
+                               : "Change or clear the current filters.")
                 }
-            }
-            .searchable(text: $query, prompt: "id, title, work item, profile")
-            // Everything searched here is an identifier — a slug, a profile
-            // name, W-0171. Autocapitalising the first letter is wrong every
-            // time, and autocorrect turns "ds-flash" into something else.
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            // The sibling of ContentView's `-startTab`: `-openRun 30` pushes
-            // that run's detail as soon as a snapshot is available, so a
-            // screenshot of any sub-tab needs no taps at all.
-            //
-            // This used to hang off `.onChange(of: state.runs.count)` alone and
-            // silently did nothing whenever a snapshot was ALREADY loaded when
-            // the view appeared: the count never changed, so the deep link
-            // never fired and the screenshot agent gave up and tapped instead.
-            // Fire on appear as well, and keep trying while the count moves,
-            // since the run may not be in the first snapshot either.
-            .onAppear { openRequestedRun() }
-            .onChange(of: state.runs.count) { _, _ in openRequestedRun() }
-            .alert("That did not go through", isPresented: .init(
-                get: { actionError != nil },
-                set: { if !$0 { actionError = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(actionError ?? "")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var list: some View {
-        let live = matching.filter(\.live)
-        let rest = matching.filter { !$0.live }
-        List {
-            // W-0214: the most recent control turn for THIS project — the
-            // staffing, merge, or observer decision that just happened —
-            // pinned above the fleet.
-            // It is never in `state.runs`, so the badge and the live count
-            // do not move for it. It opens the same detail screen as a run.
-            // I-0081: the latest decision is one line of a series. The second
-            // row is the way into the rest of it — the turns going back, which
-            // is where the observer's reasoning is actually readable.
-            if query.isEmpty, let turn = state.pinnedTurn {
-                Section("Latest decision") {
-                    NavigationLink(value: RunsRoute.run(turn)) { TurnRow(turn: turn) }
-                    NavigationLink(value: RunsRoute.decisions) {
-                        Label("Decision log", systemImage: "list.bullet.rectangle")
-                            .font(.subheadline)
-                    }
-                }
-            }
-            if !live.isEmpty {
-                Section("Live · \(live.count)") {
-                    ForEach(live) { row($0) }
-                }
-            }
-            if !rest.isEmpty {
-                Section(live.isEmpty ? "Runs" : "History") {
-                    ForEach(rest) { row($0) }
-                }
-            }
-            if matching.isEmpty {
-                ContentUnavailableView(
-                    query.isEmpty ? "No runs" : "No match",
-                    systemImage: query.isEmpty ? "tray" : "magnifyingglass",
-                    description: Text(query.isEmpty
-                        ? "Nothing has run in this project yet."
-                        : "No run matches “\(query)”.")
-                )
-            }
-        }
-        .listStyle(.insetGrouped)
-        .refreshable { await state.refresh() }
-    }
-
-    private func row(_ run: Run) -> some View {
-        NavigationLink(value: RunsRoute.run(run)) { RunRow(run: run) }
-            .swipeActions(edge: .trailing) {
-                if run.live {
-                    Button("Stop", systemImage: "stop.circle", role: .destructive) {
-                        Task {
-                            actionError = await state.perform { try await $0.stop(runID: run.id) }
+            } else {
+                List {
+                    Section { statistics.listRowInsets(.init()) }
+                    Section { filters.listRowInsets(.init()) }
+                    Section {
+                        ForEach(state.filteredRuns) { run in
+                            NavigationLink { RunDetailView(run: run) } label: { RunRow(run: run) }
                         }
                     }
+                    if state.runCursor != nil {
+                        Section { Button("Load older runs") { Task { await state.loadMoreRuns() } } }
+                    }
                 }
-            }
-    }
-}
-
-/// What the Runs tab can push. A plain `[Run]` path could not carry the
-/// decision log, and a view-based link beside a value-based path is the one
-/// combination SwiftUI does not keep straight.
-enum RunsRoute: Hashable {
-    case run(Run)
-    case decisions
-}
-
-/// Every control turn, newest first (I-0081).
-///
-/// The snapshot pins one turn per project — the newest. That reads as a single
-/// line with no history, which is not what a decision is: the observer looked
-/// at this run four times before it stopped it. This screen is the series, and
-/// each row opens the same detail screen, so the reasoning is the trace tab
-/// that already exists.
-///
-/// Scoped like the board it hangs off: the project picker on the Runs tab
-/// decides which project's turns these are.
-struct DecisionLogView: View {
-    @EnvironmentObject private var state: AppState
-    @State private var turns: [Run] = []
-    @State private var layer: String?
-    @State private var error: String?
-    @State private var loaded = false
-
-    /// The four layers a turn can come from. A closed set in the daemon, so
-    /// the picker names them rather than asking what exists.
-    private static let layers = ["observer", "router", "merge", "conductor"]
-
-    var body: some View {
-        List {
-            if let error {
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-            ForEach(turns) { turn in
-                NavigationLink(value: RunsRoute.run(turn)) { TurnRow(turn: turn) }
-            }
-            if turns.isEmpty && loaded && error == nil {
-                ContentUnavailableView(
-                    "No decisions",
-                    systemImage: "brain",
-                    description: Text(layer == nil
-                        ? "Nothing has been decided in this project yet."
-                        : "No \(layer ?? "") turn in this project yet.")
-                )
+                .listStyle(.plain)
             }
         }
-        .listStyle(.insetGrouped)
-        .navigationTitle("Decision log")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationTitle("Runs")
+        .searchable(text: $state.filters.search, prompt: "Search runs…")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button { layer = nil } label: {
-                        if layer == nil {
-                            Label("All layers", systemImage: "checkmark")
-                        } else {
-                            Text("All layers")
-                        }
-                    }
-                    Divider()
-                    ForEach(Self.layers, id: \.self) { name in
-                        Button { layer = name } label: {
-                            if layer == name {
-                                Label(name, systemImage: "checkmark")
-                            } else {
-                                Text(name)
-                            }
-                        }
-                    }
+            ServerToolbarMenu()
+            ToolbarItem(placement: .automatic) {
+                Button { showingDispatch = true } label: { Label("New run", systemImage: "plus") }
+                    .disabled(state.groups.isEmpty || state.profiles.filter(\.enabled).isEmpty)
+            }
+        }
+        .sheet(isPresented: $showingDispatch) { DispatchView() }
+        .refreshable { await state.refresh() }
+        .task(id: state.filters) {
+            async let runs: Void = state.refreshRunsForFilters()
+            async let statistics: Void = state.refreshContextualStatistics()
+            _ = await (runs, statistics)
+        }
+    }
+
+    private var statistics: some View {
+        let visible = state.filteredRuns
+        let hasContextFilters = state.filters.groupID != nil
+            || state.filters.profileID != nil || state.filters.status != nil
+        let exact = state.filters.search.trimmed.isEmpty
+            ? (hasContextFilters ? state.contextualStatistics : state.globalStatistics)
+            : nil
+        let total = state.globalStatistics?.runs
+            ?? state.snapshot?.counts.runsTotal ?? state.runs.count
+        let context = exact?.runs ?? visible.count
+        let active = exact.map { stats in
+            ["starting", "running", "waiting"].reduce(0) {
+                $0 + (stats.byStatus[$1] ?? 0)
+            }
+        } ?? visible.filter {
+            ["starting", "running", "waiting"].contains($0.status)
+        }.count
+        let loadedUsage = visible.compactMap { $0.combinedUsage ?? $0.usage }
+        let tokens = exact?.combinedUsage?.totalTokens
+            ?? loadedUsage.compactMap(\.totalTokens).reduce(0, +)
+        let cost = exact?.combinedUsage?.costUSD
+            ?? loadedUsage.compactMap(\.costUSD).reduce(0, +)
+        return LazyVGrid(columns: [GridItem(.adaptive(minimum: 120))], spacing: 8) {
+            MetricCard(value: "\(context) / \(total)",
+                       label: exact == nil ? "visible / fleet" : "context / fleet")
+            MetricCard(value: active.formatted(),
+                       label: exact == nil ? "active visible" : "active in context")
+            MetricCard(value: tokens.formatted(),
+                       label: exact == nil ? "tokens visible" : "tokens in context")
+            MetricCard(value: Optional(cost).money,
+                       label: exact == nil ? "metered API cost visible" : "metered API cost in context")
+        }
+        .padding(.vertical, 8)
+    }
+
+    private var filters: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack {
+                FilterMenu(title: "Group", selected: state.filters.groupID,
+                           options: state.groups.map { ($0.id, $0.name) }) {
+                    state.filters.groupID = $0
+                }
+                FilterMenu(title: "Profile", selected: state.filters.profileID,
+                           options: state.profiles.map { ($0.id, $0.name) }) {
+                    state.filters.profileID = $0
+                }
+                FilterMenu(title: "Status", selected: state.filters.status,
+                           options: ["queued", "starting", "running", "waiting",
+                                     "completed", "failed", "timed_out", "stopped", "skipped"]
+                            .map { ($0, $0.replacingOccurrences(of: "_", with: " ").capitalized) }) {
+                    state.filters.status = $0
+                }
+                if !state.filters.isEmpty {
+                    Button("Clear", systemImage: "xmark.circle") { state.filters = RunFilters() }
+                        .buttonStyle(.borderless)
+                }
+            }
+            .padding(.vertical, 5)
+        }
+    }
+}
+
+private struct FilterMenu: View {
+    let title: String
+    let selected: String?
+    let options: [(String, String)]
+    let select: (String?) -> Void
+
+    var body: some View {
+        Menu {
+            Button("All") { select(nil) }
+            ForEach(options, id: \.0) { id, label in
+                Button {
+                    select(id)
                 } label: {
-                    HStack(spacing: 5) {
-                        Text(layer ?? "All layers").lineLimit(1)
-                        Image(systemName: "line.3.horizontal.decrease.circle")
-                            .font(.caption2)
+                    if id == selected { Label(label, systemImage: "checkmark") }
+                    else { Text(label) }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(selected.flatMap { id in options.first { $0.0 == id }?.1 } ?? title)
+                Image(systemName: "chevron.down").font(.caption2)
+            }
+        }
+        .buttonStyle(.bordered)
+    }
+}
+
+private struct DispatchView: View {
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var groupID = ""
+    @State private var profileID = ""
+    @State private var title = ""
+    @State private var request = ""
+    @State private var cwd = ""
+    @State private var sending = false
+
+    private var activeGroups: [RunGroup] {
+        state.groups.filter { !$0.archived }
+    }
+
+    private var workerProfiles: [Profile] {
+        state.profiles.filter(\.enabled)
+    }
+
+    private var selectedGroup: RunGroup? {
+        state.groups.first { $0.id == groupID }
+    }
+
+    private var placementIssue: String? {
+        if !groupID.isEmpty, !activeGroups.contains(where: { $0.id == groupID }) {
+            return "The selected group is no longer available."
+        }
+        if !profileID.isEmpty, !workerProfiles.contains(where: { $0.id == profileID }) {
+            return "The selected worker profile is no longer available."
+        }
+        return nil
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Run") {
+                    TextField("Title (optional)", text: $title)
+                }
+                Section("Placement") {
+                    Picker("Group", selection: $groupID) {
+                        if !groupID.isEmpty,
+                           !activeGroups.contains(where: { $0.id == groupID }) {
+                            Text("Selected group · unavailable").tag(groupID).disabled(true)
+                        }
+                        ForEach(activeGroups) { Text($0.name).tag($0.id) }
+                    }
+                    Picker("Profile", selection: $profileID) {
+                        if !profileID.isEmpty,
+                           !workerProfiles.contains(where: { $0.id == profileID }) {
+                            Text("Selected profile · unavailable").tag(profileID).disabled(true)
+                        }
+                        ForEach(workerProfiles) { profile in
+                            Text("\(profile.name) · \(profile.tierName)").tag(profile.id)
+                        }
+                    }
+                    if let placementIssue {
+                        Label(placementIssue, systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
                     }
                 }
+                Section {
+                    TextEditor(text: $request).frame(minHeight: 160)
+                } header: {
+                    Text("Context")
+                } footer: {
+                    Text("Tell the run what to do and include any background it needs.")
+                }
+                Section {
+                    TextField("Optional host path override", text: $cwd)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                } header: {
+                    Text("Working directory")
+                } footer: {
+                    Text(selectedGroup?.cwdConfigured == true
+                         ? "Leave blank to use this group's configured default. The saved path is private and is never shown here."
+                         : "Leave blank to let Orchestra choose a managed working directory.")
+                }
             }
+            .navigationTitle("New run")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Run") { dispatch() }
+                        .disabled(sending || groupID.isEmpty || profileID.isEmpty
+                                  || request.trimmed.isEmpty || placementIssue != nil)
+                }
+            }
+            .disabled(sending)
+            .overlay { if sending { ProgressView() } }
+            .task { seed() }
         }
-        // Reloads when the filter changes: the daemon applies the layer, so
-        // the page is a hundred of the turns asked for, not a hundred of
-        // everything with four of them left after a local filter.
-        .task(id: layer) { await load() }
-        .refreshable { await load() }
     }
 
-    private func load() async {
-        do {
-            turns = try await state.api().turns(projectID: state.selectedProjectID,
-                                                layer: layer)
-            error = nil
-        } catch {
-            self.error = error.localizedDescription
+    private func seed() {
+        groupID = activeGroups.first(where: { $0.slug == "general" })?.id
+            ?? activeGroups.first?.id ?? ""
+        profileID = workerProfiles.first?.id ?? ""
+    }
+
+    private func dispatch() {
+        sending = true
+        Task {
+            defer { sending = false }
+            do {
+                let admission = try await state.api().dispatch(
+                    group: groupID, profile: profileID,
+                    title: title.trimmed.nilIfEmpty, request: request.trimmed,
+                    cwd: cwd.trimmed.nilIfEmpty
+                ).value
+                await state.succeeded(admission.created
+                                      ? "Created \(admission.run.display ?? "run \(admission.run.id)")"
+                                      : "Reused \(admission.run.display ?? "run \(admission.run.id)")")
+                dismiss()
+            } catch { state.report(error) }
         }
-        loaded = true
     }
 }
 
-/// One control turn: which layer decided, what it decided, and when. The
-/// summary names the escalation it produced. Opens the ordinary run detail
-/// screen, where its transcript is the trace tab.
-private struct TurnRow: View {
-    let turn: Run
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(systemName: "brain")
-                    .font(.caption)
-                    // The observer is the layer the owner reads for; the
-                    // other three are the machine staffing and judging itself.
-                    .foregroundStyle(turn.layer == "observer" ? Color.accentColor : .secondary)
-                    .accessibilityLabel("Control turn")
-                Text(turn.layer ?? "turn")
-                    .font(.subheadline.monospaced().weight(.semibold))
-                Text("· \(turn.profile)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 6)
-                StatusChip(status: turn.status)
-            }
-            if !turn.summary.isEmpty {
-                Text(turn.summary)
-                    .font(.subheadline)
-                    .lineLimit(3)
-            }
-            if let at = turn.finishedAt ?? turn.startedAt {
-                Text(at.relativeStamp)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.vertical, 3)
-    }
-}
-
-/// One line of the fleet: what it is, how it is doing, whose work it is.
-private struct RunRow: View {
-    let run: Run
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(run.live ? Color.green : Color.clear)
-                    .frame(width: 7, height: 7)
-                    .accessibilityLabel(run.live ? "Live" : "")
-                Text("#\(run.id)")
-                    .font(.subheadline.monospaced().weight(.semibold))
-                if let tag = run.workItem ?? run.slug, !tag.isEmpty {
-                    Text(tag)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 6)
-                StatusChip(status: run.status)
-            }
-            Text(run.displayTitle)
-                .font(.subheadline)
-                .lineLimit(2)
-            HStack(spacing: 6) {
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                if let elapsed = run.elapsedSeconds {
-                    Text(elapsed.durationLabel)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            if !run.blockedOn.isEmpty {
-                Label(
-                    "Blocked on " + run.blockedOn.map { "#\($0)" }.joined(separator: ", "),
-                    systemImage: "hand.raised"
-                )
-                .font(.caption2)
-                .foregroundStyle(.orange)
-            }
-        }
-        .padding(.vertical, 3)
-    }
-
-    private var subtitle: String {
-        [run.project, run.profile]
-            .compactMap { $0?.isEmpty == false ? $0 : nil }
-            .joined(separator: " · ")
-    }
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

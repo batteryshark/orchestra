@@ -1,55 +1,26 @@
-"""Normalized traces: one events table, four supported harness parsers.
+"""Normalized traces: one events table for every supported runtime stream.
 
-DESIGN §7. The supervisor already tails each backend's JSONL, so ingest maps
+The supervisor tails each runtime's JSONL, so ingest maps
 every line into ONE shape — assistant text, reasoning, tool call, tool
 result, permission request, human injection, lifecycle — and stores a ~2KB
 truncated payload plus the byte offset of the line it came from.
 
 **The raw file stays the source of truth.** These JSONL formats are
 undocumented and drift, so a parser is best-effort by contract: an unknown
-or malformed line is counted and skipped, never raised, and ``expand()``
-always goes back to the file for the untruncated value.
-
-Retention: normalized events are kept indefinitely. Raw logs are kept
-forever by default (``raw_log_retention_days = 0``); a positive value ages
-them out, for TERMINAL runs only, when `orchestra traces prune` runs.
-
-HTTP seam (DESIGN §3, item W-0100): ``http.py`` calls
-``stream_run_trace()``, ``stream_daemon_log()``, ``stream_run_log()``,
-``stream_board()``, ``events_for_run()`` and ``run_messages()`` from here. Nothing in this module
-imports http. The four streams share ``sse()``, ``SSE_RETRY_MS`` and the
-stop-aware ``_pause()``; ``stream_board()`` is the odd one — an invalidation,
-not a trace — but it belongs beside the machinery it reuses.
+or malformed line is counted and skipped, never raised. Raw files remain the
+full-fidelity record; normalized rows remain useful after explicit pruning.
 """
 import json
-import re
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import db, paths, profiles, runners
+from orchestra import db, profiles, runners
 
 KINDS = ("assistant_text", "reasoning", "tool_call", "tool_result",
          "permission_request", "human_injection", "lifecycle")
 
-MAX_PAYLOAD = 2048          # ~2KB truncated payload (DESIGN §7)
+MAX_PAYLOAD = 2048          # ~2KB truncated payload (DESIGN §13)
 MAX_CHUNK = 4_000_000       # bytes read per ingest pass
-# 0 means KEEP FOREVER, and it is the default: raw logs are the full-detail
-# record of every run's input and output, kept for later analysis. Pruning is
-# opt-in — a positive day count in the config, and a human running
-# `orchestra traces prune`.
-DEFAULT_RAW_RETENTION_DAYS = 0
-SSE_RETRY_MS = 3000
-DAEMON_LOGS = ("daemon.out.log", "daemon.err.log")
-
-_WAIT_PATTERNS = (
-    ("sleep", re.compile(r"(?:^|[;&|]\s*)sleep(?:\s|$)", re.I)),
-    ("ci_poll", re.compile(
-        r"\bgh\s+(?:pr\s+checks|run\s+(?:watch|view))\b", re.I)),
-    ("record_poll", re.compile(
-        r"(?:^|[;&|]\s*)(?:work\s+(?:show|get|list)|"
-        r"orchestra\s+(?:show|runs|status))(?:\s|$)", re.I)),
-)
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -249,7 +220,7 @@ def _reasonix(obj) -> list[dict] | None:
     kind = obj.get("kind")
     if kind is None:
         # The run's last line only. Claude's parser already reads it, and
-        # the whole object becomes the payload so W-0142 (statistics) can
+        # the whole object becomes the payload so statistics can
         # read total_cost_usd and usage back out.
         return _claude(obj) if obj.get("type") else None
     mapped = _REASONIX_FRAGMENTS.get(kind)
@@ -276,7 +247,7 @@ def _reasonix(obj) -> list[dict] | None:
     return None
 
 
-# --- ACP transport (W-0104, DESIGN §6) --------------------------------------
+# --- ACP transport (DESIGN §5) ----------------------------------------------
 # The second transport feeds THIS table, not a second one: ``acp.py`` writes
 # every JSON-RPC frame into the same raw log (tagged ``_dir`` / ``_ts`` /
 # ``_method``), so byte offsets, expand-in-place, SSE and retention are the
@@ -360,7 +331,7 @@ def parse_line(backend: str, line: str) -> list[dict] | None:
         return None
     if not isinstance(obj, dict):
         return None
-    # W-0104: an ACP frame is self-describing, so the transport is read off
+    # An ACP frame is self-describing, so the transport is read off
     # the line rather than looked up per run. No backend's own stream-json
     # carries a `jsonrpc` key.
     parser = _acp if obj.get("jsonrpc") == "2.0" else PARSERS.get(backend)
@@ -387,8 +358,8 @@ def progress(log_path: str, backend: str) -> str | None:
     trace at call time.
 
     Current fields carry current facts: a progress line that repeats a
-    stale count makes a healthy run indistinguishable from a hung one
-    (I-0121). Counted through ``parse_line`` so every tool the backend
+    stale count makes a healthy run indistinguishable from a hung one.
+    Counted through ``parse_line`` so every tool the backend
     reports is one -- counting shell commands alone froze run 234 at "1
     tool call" for 40 minutes while it made 84.
 
@@ -464,6 +435,14 @@ def cursor(con, run_id: int):
                        (run_id,)).fetchone()
 
 
+def _backend(snapshot: str | None) -> str:
+    try:
+        value = json.loads(snapshot or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(value.get("adapter") or "") if isinstance(value, dict) else ""
+
+
 def _save_cursor(con, run_id: int, offset: int, seq: int, skipped: int) -> None:
     con.execute(
         "INSERT INTO trace_cursors(run_id, byte_offset, seq, skipped, updated_at) "
@@ -536,12 +515,12 @@ def ingest(con, run_id: int, log_path=None, backend: str | None = None) -> dict:
     Returns {"events": n, "skipped": n, "offset": n}.
     """
     if log_path is None or backend is None:
-        run = con.execute("SELECT log_path, backend FROM runs WHERE id=?",
+        run = con.execute("SELECT log_path,runtime_snapshot FROM runs WHERE id=?",
                           (run_id,)).fetchone()
         if not run:
             return {"events": 0, "skipped": 0, "offset": 0}
         log_path = log_path or run["log_path"]
-        backend = backend or run["backend"]
+        backend = backend or _backend(run["runtime_snapshot"])
     row = cursor(con, run_id)
     offset = int(row["byte_offset"]) if row else 0
     seq = int(row["seq"]) if row else 0
@@ -581,6 +560,18 @@ def ingest(con, run_id: int, log_path=None, backend: str | None = None) -> dict:
     return {"events": written, "skipped": skipped, "offset": offset + end + 1}
 
 
+def drain(con, run_id: int, log_path=None, backend: str | None = None) -> dict:
+    """Ingest every complete line currently present, including large bursts."""
+    events = 0
+    while True:
+        before = cursor(con, run_id)
+        previous = int(before["byte_offset"]) if before else 0
+        result = ingest(con, run_id, log_path, backend)
+        events += int(result["events"])
+        if int(result["offset"]) <= previous:
+            return {**result, "events": events}
+
+
 def record_injection(con, run_id: int, sender: str, body: str) -> None:
     """A human message delivered into a run has no raw-file backing, so it is
     written straight into the normalized stream with byte_offset -1."""
@@ -588,8 +579,7 @@ def record_injection(con, run_id: int, sender: str, body: str) -> None:
 
 
 def record_lifecycle(con, run_id: int, name: str, payload: str = "") -> None:
-    """Same, for something a hook observed that the raw log does not carry
-    (DESIGN §6: OpenCode's ``permission.asked`` reaches Orchestra only here)."""
+    """Record a supervisor lifecycle fact with no raw-file backing."""
     _record_synthetic(con, run_id, _ev("lifecycle", name, payload))
 
 
@@ -600,450 +590,3 @@ def _record_synthetic(con, run_id: int, event: dict) -> None:
     _save_cursor(con, run_id, int(row["byte_offset"]) if row else 0, seq,
                  int(row["skipped"]) if row else 0)
     con.commit()
-
-
-# --- reading ----------------------------------------------------------------
-
-def _as_dict(row) -> dict:
-    out = dict(row)
-    out["truncated"] = bool(out.get("truncated"))
-    return out
-
-
-def events_for_run(con, run_id: int, after_id: int = 0,
-                   limit: int = 500) -> list[dict]:
-    """Append-only page of normalized events, oldest first."""
-    return [_as_dict(r) for r in con.execute(
-        "SELECT * FROM events WHERE run_id=? AND id>? ORDER BY id LIMIT ?",
-        (run_id, after_id, limit))]
-
-
-def wait_audit(con, since: str) -> list[dict]:
-    """List worker tool calls that wait for CI or poll durable records."""
-    findings = []
-    rows = con.execute(
-        "SELECT e.id, e.run_id, e.name, e.payload, e.created_at, r.slug "
-        "FROM events e JOIN runs r ON r.id=e.run_id "
-        "WHERE e.kind='tool_call' AND e.created_at>=? ORDER BY e.id", (since,))
-    for row in rows:
-        command = _tool_command(row["payload"])
-        if not command:
-            continue
-        for category, pattern in _WAIT_PATTERNS:
-            if pattern.search(command):
-                findings.append({
-                    "category": category, "run_id": int(row["run_id"]),
-                    "slug": row["slug"], "event_id": int(row["id"]),
-                    "at": row["created_at"], "tool": row["name"],
-                    "command": command[:500],
-                })
-                break
-    return findings
-
-
-def _tool_command(payload: str) -> str:
-    try:
-        value = json.loads(payload)
-    except (TypeError, ValueError):
-        return ""
-    if isinstance(value, list):
-        return " ".join(str(part) for part in value)
-    if isinstance(value, str):
-        return value
-    return runners._find_command(value) or ""
-
-
-def expand(con, event_id: int) -> dict:
-    """Untruncated payload for one event, re-read from the raw file.
-
-    The raw line is the source of truth; the stored payload is the fallback
-    when the raw log has aged out or the event never had a file backing.
-    """
-    row = con.execute(
-        "SELECT e.*, r.log_path, r.backend FROM events e "
-        "JOIN runs r ON r.id=e.run_id WHERE e.id=?", (event_id,)).fetchone()
-    if not row:
-        raise KeyError(f"no event {event_id}")
-    result = _as_dict(row)
-    result["raw"] = None
-    result["source"] = "stored"
-    if row["byte_offset"] < 0 or not row["log_path"]:
-        return result
-    try:
-        with open(row["log_path"], "rb") as handle:
-            handle.seek(row["byte_offset"])
-            raw = handle.read(row["byte_length"]).decode("utf-8", "replace")
-    except OSError:
-        return result  # raw log pruned; the truncated payload is what is left
-    result["raw"] = raw
-    result["source"] = "raw"
-    # Re-derive the full payload from the same parser that produced the row,
-    # so an expanded event reads identically to a short one. One line can
-    # yield several events (a Claude message carries text + tool_use), so
-    # match by position first and fall back to the first same-kind block.
-    lines = raw.splitlines()
-    if len(lines) > 1:
-        # A coalesced fragment run spans its lines; rebuild it the way
-        # ingest did rather than positionally.
-        merged = "".join(
-            candidate["payload"]
-            for line in lines for candidate in parse_line(row["backend"], line) or []
-            if candidate.get("merge") and candidate["kind"] == row["kind"])
-        if merged:
-            result["payload"] = merged
-            result["truncated"] = False
-        return result
-    candidates = parse_line(row["backend"], raw) or []
-    siblings = [r["id"] for r in con.execute(
-        "SELECT id FROM events WHERE run_id=? AND byte_offset=? ORDER BY seq",
-        (row["run_id"], row["byte_offset"]))]
-    index = siblings.index(event_id) if event_id in siblings else -1
-    if 0 <= index < len(candidates) and candidates[index]["kind"] == row["kind"]:
-        candidates = [candidates[index]]
-    for candidate in candidates:
-        if candidate["kind"] == row["kind"]:
-            result["payload"] = candidate["payload"]
-            result["truncated"] = False
-            break
-    return result
-
-
-# --- inbox / outbox ---------------------------------------------------------
-
-# Inbound = written TO the run. An `ask` is the run's own question, so it is
-# outbound; the human's `answer` comes back in (DESIGN §6).
-_INBOUND_KINDS = {"interrupt", "tell", "answer", ""}
-
-
-def run_messages(con, run_id: int) -> list[dict]:
-    """Every message for one run, badged queued / delivered / answered.
-
-    DESIGN §7: knowing what happened to a message is the feature. Rendering
-    belongs to the dashboard; this is only the data.
-
-    ponytail: "answered" is inferred — an inbound message counts as answered
-    once the run produced an outbound message after it was delivered. There
-    is no reply linkage in `messages` yet; add a `reply_to` column with
-    `ask` (§6/§8) and read it here instead.
-    """
-    rows = list(con.execute(
-        "SELECT id, sender, body, kind, created_at, delivery_offset, delivered_at, "
-        "undeliverable_at, undeliverable_reason "
-        "FROM messages WHERE run_id=? ORDER BY id", (run_id,)))
-    outbound_after = {}
-    latest_outbound = None
-    for row in reversed(rows):
-        outbound_after[row["id"]] = latest_outbound
-        if row["kind"] not in _INBOUND_KINDS:
-            latest_outbound = row["id"]
-    out = []
-    for row in rows:
-        inbound = row["kind"] in _INBOUND_KINDS
-        if not inbound:
-            state = "delivered"          # the run said it; nothing to await
-        elif row["undeliverable_at"]:
-            # DESIGN §6: marked and surfaced, never dropped, never re-aimed
-            # at a later run.
-            state = "undeliverable"
-        elif not row["delivered_at"]:
-            state = "queued"
-        elif outbound_after[row["id"]] is not None:
-            state = "answered"
-        else:
-            state = "delivered"
-        out.append({
-            "id": row["id"], "sender": row["sender"], "body": row["body"],
-            "kind": row["kind"], "created_at": row["created_at"],
-            "delivered_at": row["delivered_at"],
-            "direction": "inbound" if inbound else "outbound",
-            "state": state,
-            "undeliverable_reason": row["undeliverable_reason"],
-            # DESIGN §7 boundary-pending badge: queued behind a safe action
-            # boundary the backend has not reached yet.
-            "pending_boundary": bool(inbound and not row["delivered_at"]
-                                     and row["delivery_offset"] is not None),
-        })
-    return out
-
-
-# --- retention --------------------------------------------------------------
-
-def retention_days(cfg: dict | None = None) -> int:
-    settings = (cfg or {}).get("settings", {}) if isinstance(cfg, dict) else {}
-    try:
-        days = int(settings.get("raw_log_retention_days",
-                                DEFAULT_RAW_RETENTION_DAYS))
-    except (TypeError, ValueError):
-        days = DEFAULT_RAW_RETENTION_DAYS
-    return max(0, days)
-
-
-def prune_raw_logs(con, days: int | None = None, cfg: dict | None = None,
-                   dry_run: bool = False, now=None) -> list[dict]:
-    """Delete raw logs of TERMINAL runs older than ``days``. Never a live run.
-
-    Normalized events are kept indefinitely, so pruning loses only the
-    expand-in-place detail. Ingest runs once more per candidate first, so
-    nothing unread is thrown away. ``days == 0`` is keep-forever, the
-    default: the call refuses to prune anything rather than reading zero as
-    "everything is old enough".
-    """
-    days = days if days is not None else retention_days(cfg)
-    if days <= 0:
-        return []
-    cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=days)) \
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = list(con.execute(
-        "SELECT r.id, r.log_path, r.backend, r.status, r.finished_at FROM runs r "
-        "LEFT JOIN trace_cursors c ON c.run_id=r.id "
-        f"WHERE r.status IN {db.TERMINAL_SQL} AND r.finished_at IS NOT NULL "
-        "AND r.finished_at < ? AND r.log_path IS NOT NULL "
-        "AND c.raw_pruned_at IS NULL ORDER BY r.id", (cutoff,)))
-    pruned = []
-    for row in rows:
-        path = Path(row["log_path"])
-        if not path.is_file():
-            continue
-        size = path.stat().st_size
-        entry = {"run_id": int(row["id"]), "log_path": str(path),
-                 "bytes": size, "status": row["status"],
-                 "finished_at": row["finished_at"]}
-        if dry_run:
-            pruned.append(entry)
-            continue
-        ingest(con, int(row["id"]), str(path), row["backend"])
-        try:
-            path.unlink()
-        except OSError as exc:
-            entry["error"] = str(exc)
-            pruned.append(entry)
-            continue
-        con.execute(
-            "INSERT INTO trace_cursors(run_id, byte_offset, seq, skipped, "
-            "raw_pruned_at, updated_at) VALUES(?,0,0,0,?,?) "
-            "ON CONFLICT(run_id) DO UPDATE SET raw_pruned_at=excluded.raw_pruned_at, "
-            "updated_at=excluded.updated_at",
-            (int(row["id"]), db.now(), db.now()))
-        con.commit()
-        pruned.append(entry)
-    return pruned
-
-
-# --- SSE (called by the http.py seam, DESIGN §3 / W-0100) -------------------
-
-def sse(data, *, event: str | None = None, event_id=None) -> str:
-    """One SSE frame. Payload is JSON; multi-line bodies stay legal."""
-    body = data if isinstance(data, str) else _json(data)
-    lines = []
-    if event_id is not None:
-        lines.append(f"id: {event_id}")
-    if event:
-        lines.append(f"event: {event}")
-    lines += [f"data: {chunk}" for chunk in body.split("\n")]
-    return "\n".join(lines) + "\n\n"
-
-
-def _pause(stop, seconds: float) -> None:
-    """Sleep, but wake immediately when the seam's stop Event is set."""
-    if stop is not None and hasattr(stop, "wait"):
-        stop.wait(seconds)
-    else:
-        time.sleep(seconds)
-
-
-def _terminal(con, run_id: int) -> bool:
-    row = con.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
-    return bool(row) and row["status"] in db.RUN_TERMINAL
-
-
-def stream_run_trace(run_id: int, after_id: int = 0, *, stop=None,
-                     poll: float = 1.0, con=None, page: int = 500):
-    """Append-only SSE stream of one run's normalized events.
-
-    Yields ``str`` frames; the http seam writes them as
-    ``text/event-stream``. ``after_id`` is the client's ``Last-Event-ID``.
-    Ends with an ``end`` frame once the run is terminal and drained, so a
-    finished run's stream closes instead of polling forever.
-    """
-    owned = con is None
-    con = con or db.connect()
-    try:
-        yield f"retry: {SSE_RETRY_MS}\n\n"
-        while stop is None or not stop.is_set():
-            batch = events_for_run(con, run_id, after_id, page)
-            for row in batch:
-                after_id = row["id"]
-                yield sse(row, event="trace", event_id=row["id"])
-            if len(batch) == page:
-                continue  # drain a backlog before sleeping
-            if _terminal(con, run_id):
-                # One more pass: the supervisor's final ingest may land
-                # between the SELECT and the status read.
-                final = events_for_run(con, run_id, after_id, page)
-                for row in final:
-                    after_id = row["id"]
-                    yield sse(row, event="trace", event_id=row["id"])
-                if not final:
-                    yield sse({"run_id": run_id, "reason": "terminal"}, event="end")
-                    return
-                continue
-            yield ": keepalive\n\n"
-            _pause(stop, poll)
-    finally:
-        if owned:
-            con.close()
-
-
-def stream_board(after: int = 0, *, stop=None, poll: float = 1.0,
-                 keepalive: float = 15.0, con=None):
-    """INVALIDATION stream for the dashboard board (DESIGN §3).
-
-    The one stream here that carries no payload. It yields a frame only when
-    ``meta.board_revision`` moves, and the frame says nothing but the new
-    number: the client then REFETCHES ``GET /api/snapshot``. Keeping the
-    state on the one snapshot route keeps auth, shape, version and gzip in
-    one place — an SSE mirror of the payload would be a second surface to
-    keep honest, and the board is a whole-fleet read, not an append-only log
-    like a trace.
-
-    ``after`` is the client's ``Last-Event-ID``. A reconnect with a stale
-    revision gets its frame on the first pass, which is why the comparison is
-    ``!=`` and not ``>``: a rebuilt database counts from zero again and the
-    board must still resync rather than go silent forever.
-
-    Never ends on its own — the board outlives every run — so the keepalive
-    comment is what stops an idle intermediary from dropping the connection.
-    """
-    owned = con is None
-    con = con or db.connect()
-    try:
-        yield f"retry: {SSE_RETRY_MS}\n\n"
-        quiet = 0.0
-        while stop is None or not stop.is_set():
-            current = db.board_revision(con)
-            if current != after:
-                after, quiet = current, 0.0
-                yield sse({"revision": current}, event="board", event_id=current)
-            else:
-                quiet += poll
-                if quiet >= keepalive:
-                    quiet = 0.0
-                    yield ": keepalive\n\n"
-            _pause(stop, poll)
-    finally:
-        if owned:
-            con.close()
-
-
-def daemon_log_paths() -> list[Path]:
-    return [paths.logs_dir() / name for name in DAEMON_LOGS]
-
-
-def parse_daemon_cursor(last_event_id: str | None) -> dict[str, int]:
-    """Decode a daemon-log ``Last-Event-ID`` (``out.log@1234,err.log@0``)."""
-    out: dict[str, int] = {}
-    for chunk in (last_event_id or "").split(","):
-        name, _, offset = chunk.partition("@")
-        if name.strip() and offset.strip().isdigit():
-            out[name.strip()] = int(offset)
-    return out
-
-
-def stream_daemon_log(after: dict[str, int] | None = None, *, stop=None,
-                      poll: float = 1.0, tail_bytes: int = 8192,
-                      files=None, event: str = "daemon", done=None):
-    """Append-only SSE stream of the daemon's OWN log (DESIGN §7).
-
-    Separate from a run trace: this answers "is the service healthy and
-    doing its job" — sweeper passes, claims, dispatches, escalations,
-    errors. Tails stdout and stderr; with no cursor it starts ``tail_bytes``
-    back from the end so a fresh viewer sees recent context, not the year.
-    Runs until ``stop`` is set or the consumer closes the generator.
-
-    ``files``/``event``/``done`` are what ``stream_run_log`` borrows: the
-    same tail, pointed at one run's raw log, under its own event name, with
-    an end condition. ``done=None`` is the daemon's own case — its log has no
-    end, so it never leaves this loop on its own.
-    """
-    after = dict(after or {})
-    targets = [Path(f) for f in files] if files else daemon_log_paths()
-    offsets = {}
-    for path in targets:
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        offsets[path.name] = after.get(path.name, max(0, size - tail_bytes))
-    yield f"retry: {SSE_RETRY_MS}\n\n"
-    while stop is None or not stop.is_set():
-        # Sample "is it over" BEFORE the read, so bytes written just before
-        # the run went terminal are still in this pass — the same extra pass
-        # stream_run_trace makes against the same race.
-        ending = done is not None and done()
-        moved = False
-        for path in targets:
-            try:
-                with open(path, "rb") as handle:
-                    handle.seek(offsets[path.name])
-                    data = handle.read(MAX_CHUNK)
-            except OSError:
-                continue
-            end = data.rfind(b"\n")
-            if end < 0:
-                continue
-            for raw in data[:end].split(b"\n"):
-                line = raw.decode("utf-8", "replace").rstrip("\r")
-                offsets[path.name] += len(raw) + 1
-                if not line.strip():
-                    continue
-                moved = True
-                yield sse({"file": path.name, "line": line}, event=event,
-                          event_id=",".join(f"{n}@{o}" for n, o in offsets.items()))
-        if moved:
-            continue
-        if ending:
-            return  # drained, and the writer has stopped writing
-        yield ": keepalive\n\n"
-        _pause(stop, poll)
-
-
-def stream_run_log(run_id: int, after: dict[str, int] | None = None, *,
-                   stop=None, poll: float = 1.0, tail_bytes: int = 8192,
-                   con=None):
-    """Append-only SSE tail of ONE run's RAW harness output (DESIGN §7).
-
-    The normalized trace says what the PARSER understood. When a run looks
-    stuck that is the wrong surface, because the question is what the CLI is
-    doing, not what we made of it. So this is the raw log the supervisor
-    already writes, tailed read-only and rendered as text — no PTY, no
-    terminal emulator, nothing that could write back into the run. The
-    machinery is ``stream_daemon_log``'s, including the ``tail_bytes`` start:
-    a fresh viewer of a gigabyte log reads one page, never the file.
-
-    Two ways it ends instead of polling forever. ``pruned`` when the raw log
-    aged out — DESIGN §7 keeps the normalized events and drops the file, and
-    a silent empty stream would read as the hung run this route exists to
-    disprove. ``end`` once the run is terminal and the tail is drained.
-    """
-    owned = con is None
-    con = con or db.connect()
-    try:
-        row = con.execute("SELECT log_path FROM runs WHERE id=?",
-                          (run_id,)).fetchone()
-        path = Path(row["log_path"]) if row and row["log_path"] else None
-        cur = cursor(con, run_id)
-        # A live run may not have opened its log yet, so a missing file is
-        # only "pruned" once the run is over.
-        if path is None or (cur and cur["raw_pruned_at"]) or (
-                not path.is_file() and _terminal(con, run_id)):
-            yield sse({"run_id": run_id, "reason": "pruned"}, event="pruned")
-            return
-        yield from stream_daemon_log(after, stop=stop, poll=poll,
-                                     tail_bytes=tail_bytes, files=[path],
-                                     event="raw",
-                                     done=lambda: _terminal(con, run_id))
-        if stop is None or not stop.is_set():
-            yield sse({"run_id": run_id, "reason": "terminal"}, event="end")
-    finally:
-        if owned:
-            con.close()
