@@ -1,470 +1,515 @@
-"""Detached supervisor: runs one worker process to completion.
+"""One-run execution and operator controls for Orchestra v2.
 
-DESIGN D3, simplified from Orchestra's 1,388-LOC counterpart:
-- Liveness is process-level and costs zero tokens: a growing log is
-  progress; silence past ``stall_timeout`` kills; the hard ``timeout``
-  caps everything. No periodic check-in injection (killed), no quota
-  checks (phase 4), no child runs (later phase).
-- ``orchestra tell`` / ``orchestra interrupt`` record a pending delivery; the
-  worker is stopped at the next safe action boundary (or immediately with
-  --now) and its session is resumed with the message embedded directly in
-  the prompt, so delivery is guaranteed without an inbox tool call. The
-  harness's Stop hook claims the same rows when it reaches a stop first
-  (DESIGN §6, ``messaging.claim_pending``); whichever gets there first wins,
-  and anything still queued when the run ends is marked undeliverable.
-- Dependency release is event-driven: finalization launches any deferred
-  run whose prerequisites just settled.
+The daemon alone claims FIFO capacity. A detached supervisor owns one admitted
+run, executes frozen runtime/profile snapshots, and writes only that run's
+lifecycle, trace, evidence, messages, and lineage consequences.
 """
+from __future__ import annotations
+
 import json
 import os
-import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from orchestra import (acp, auth, brief, callbacks, child_runs, config, db,
-                       dispatch, handoff, merge, messaging, names, observer,
-                       paths, project, runners, traces, worktree)
+from orchestra import (acp, attention, auth, callbacks, child_runs, config, db,
+                       messaging, paths, retry, runners, runway, runtime, runs, traces,
+                       worktree)
 from orchestra.proc import (enrich_path, process_identity, raise_file_limit,
-                            resolve_cmd,
-                            session_kwargs, terminate_group, which)
+                            resolve_cmd, session_kwargs, signal_owned_group,
+                            terminate_group)
 
-EARLY_REF_WINDOW = 90  # seconds to keep scanning the log for a session ref
-POLL_INTERVAL = 0.5
-LAUNCH_FAILURE_PREFIXES = (
-    "Launch setup failed:", "Deferred launch failed:", "Retry launch failed:")
+POLL_INTERVAL = 0.25
+EARLY_REF_WINDOW = 90
+DEFAULT_TIMEOUT_SECONDS = 4 * 60 * 60
+MAX_DIFF_BYTES = 16 * 1024 * 1024
+TERMINAL = frozenset(db.RUN_TERMINAL)
 
 
-def create_run(con, *, profile: str, backend: str, requested_by: str,
-               workdir: str, model: str | None = None,
-               title: str | None = None, project_id: str | None = None,
-               status: str = "spawning", ref: str | None = None,
-               parent_run: int | None = None,
-               session_ref: str | None = None, retry_of: int | None = None,
-               routed_reason: str | None = None, pause_gate: bool = True,
-               commit: bool = True) -> tuple[sqlite3.Row | None, str | None]:
-    """Atomically reserve and create one worker run.
+class ExecutionError(RuntimeError):
+    pass
 
-    Admission starts with SQLite's write lock, then reads the pause switch and
-    live reservations. That ordering is the contract: two sweepers, replies,
-    or retry finalizers may race, but only one can commit the same work,
-    session, parent, or retry lineage. Callers enter with a clean connection;
-    ``commit=False`` intentionally leaves the transaction this function opened
-    available so related local rows can be attached atomically.
 
-    A policy refusal is data, not an exception: ``(None, reason)``. Database
-    and programming errors still raise.
-    """
-    if status not in {"pending", "spawning", "running"}:
-        raise ValueError(f"worker run cannot start in status {status!r}")
-    if con.in_transaction:
-        raise RuntimeError("run admission requires a clean database transaction")
-    con.execute("BEGIN IMMEDIATE")
+def _json(raw, fallback=None):
+    if isinstance(raw, dict):
+        return dict(raw)
     try:
-        blocked = None
-        if pause_gate and dispatch.paused(con):
-            blocked = "paused"
-        elif ref:
-            if retry_of is not None:
-                # A delayed retry may wake after a newer attempt already
-                # settled. That newer result owns the item; repeating stale
-                # work would be a regression, not resilience.
-                active = con.execute(
-                    "SELECT id FROM runs WHERE ref=? AND layer IS NULL "
-                    "AND id>? ORDER BY id DESC LIMIT 1",
-                    (ref, int(retry_of))).fetchone()
-            else:
-                active = con.execute(
-                    f"SELECT id FROM runs WHERE ref=? AND layer IS NULL "
-                    f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
-                    (ref,)).fetchone()
-            if active is not None:
-                blocked = f"ref:{active['id']}"
-        if blocked is None and session_ref:
-            active = con.execute(
-                f"SELECT id FROM runs WHERE session_ref=? AND layer IS NULL "
-                f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
-                (session_ref,)).fetchone()
-            if active is not None:
-                blocked = f"session:{active['id']}"
-        if blocked is None and parent_run is not None:
-            active = con.execute(
-                f"SELECT id FROM runs WHERE parent_run=? AND layer IS NULL "
-                f"AND status NOT IN {db.TERMINAL_SQL} ORDER BY id LIMIT 1",
-                (int(parent_run),)).fetchone()
-            if active is not None:
-                blocked = f"parent:{active['id']}"
-        if blocked is None and retry_of is not None:
-            prior = con.execute(
-                "SELECT id FROM runs WHERE retry_of=? AND layer IS NULL "
-                "ORDER BY id LIMIT 1", (int(retry_of),)).fetchone()
-            if prior is not None:
-                blocked = f"retry:{prior['id']}"
-        if blocked is not None:
-            con.rollback()
-            return None, blocked
-
-        run_id = None
-        for _ in range(names.MAX_ATTEMPTS + 4):
-            slug = names.assign_slug(con)
-            try:
-                cur = con.execute(
-                    "INSERT INTO runs(slug, profile, backend, model, title, "
-                    "requested_by, workdir, project_id, status, started_at, "
-                    "ref, parent_run, session_ref, retry_of, "
-                    "routed_reason, project_seq) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                    f"{db.NEXT_PROJECT_SEQ})",
-                    (slug, profile, backend, model, title, requested_by,
-                     str(workdir), project_id, status, db.now(), ref,
-                     parent_run, session_ref, retry_of,
-                     routed_reason, project_id))
-                run_id = int(cur.lastrowid)
-                break
-            except sqlite3.IntegrityError as exc:
-                if not names.is_unique_violation(exc):
-                    raise
-                names.reset_memory_cache()
-        if run_id is None:
-            raise RuntimeError("orchestra: could not mint a unique run slug")
-        row = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-        if commit:
-            con.commit()
-        return row, None
-    except BaseException:
-        con.rollback()
-        raise
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {} if fallback is None else fallback
+    return value if isinstance(value, dict) else ({} if fallback is None else fallback)
 
 
-def admit_pending(con, run_id: int) -> tuple[sqlite3.Row | None, str | None]:
-    """Atomically move one dependency-ready request into launch preparation."""
-    if con.in_transaction:
-        raise RuntimeError("deferred admission requires a clean database transaction")
-    con.execute("BEGIN IMMEDIATE")
+def _snapshots(run) -> tuple[dict, dict]:
+    return _json(run["profile_snapshot"]), _json(run["runtime_snapshot"])
+
+
+def _identity(pid: int) -> str | None:
+    for _ in range(10):
+        value = process_identity(pid)
+        if value:
+            return value
+        time.sleep(0.01)
+    return None
+
+
+def spawn_supervisor(root: Path, run_id: int) -> int:
+    """Start one detached supervisor and durably bind its PID identity."""
+    command = [sys.executable, "-m", "orchestra", "_supervise",
+               str(int(run_id)), "--root", str(root)]
+    error_log = paths.logs_dir() / f"supervisor-{int(run_id)}.log"
+    handle = open(error_log, "ab")
     try:
-        if dispatch.paused(con):
-            con.rollback()
-            return None, "paused"
-        req = con.execute(
-            "SELECT d.run_id, d.mission, d.context, d.use_worktree "
-            "FROM deferred_dispatches d JOIN runs r ON r.id=d.run_id "
-            "WHERE d.run_id=? AND d.status='pending' AND r.status='pending' "
-            "AND NOT EXISTS (SELECT 1 FROM dispatch_dependencies e "
-            "JOIN runs p ON p.id=e.depends_on_run WHERE e.run_id=d.run_id "
-            "AND NOT (p.status='done' AND "
-            "(p.branch IS NULL OR p.landing_status IN ('ok','skipped'))))",
-            (int(run_id),)).fetchone()
-        if req is None:
-            con.rollback()
-            return None, "not_ready"
-        claimed = con.execute(
-            "UPDATE deferred_dispatches SET status='processing' "
-            "WHERE run_id=? AND status='pending'", (int(run_id),))
-        admitted = con.execute(
-            "UPDATE runs SET status='spawning', started_at=? "
-            "WHERE id=? AND status='pending'", (db.now(), int(run_id)))
-        if claimed.rowcount != 1 or admitted.rowcount != 1:
-            con.rollback()
-            return None, "not_ready"
-        con.commit()
-        return req, None
-    except BaseException:
-        con.rollback()
-        raise
-
-
-def never_started(run) -> bool:
-    """True when a durable run row never reached a supervisor process."""
-    return (run is not None and run["status"] == "failed"
-            and str(run["summary"] or "").startswith(LAUNCH_FAILURE_PREFIXES))
-
-
-def _lineage_was_isolated(con, run) -> bool:
-    """Recover isolation intent through failed continuation/retry rows."""
-    current, seen = run, set()
-    while current is not None and int(current["id"]) not in seen:
-        seen.add(int(current["id"]))
-        if current["branch"]:
-            return True
-        if not never_started(current):
-            return False
-        previous_id = current["parent_run"] or current["retry_of"]
-        current = con.execute("SELECT * FROM runs WHERE id=?", (previous_id,)).fetchone() \
-            if previous_id else None
-    return False
-
-
-def spawn_supervisor(root: Path, run_id: int) -> None:
-    exe = shutil.which("orchestra")
-    cmd = [exe, "_supervise", str(run_id), "--root", str(root)] if exe else \
-        [sys.executable, "-m", "orchestra", "_supervise", str(run_id), "--root", str(root)]
-    # A supervisor that dies before writing anything used to leave no trace at
-    # all: stderr went to /dev/null, so run 9's instant death was invisible
-    # until its workdir was inspected by hand. Keep the last words.
-    err = paths.logs_dir() / f"supervisor-{run_id}.log"
-    try:
-        handle = open(err, "ab")
-    except OSError:
-        handle = subprocess.DEVNULL
-    try:
-        proc = subprocess.Popen(resolve_cmd(cmd), stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=handle,
-                                **session_kwargs(detached=True))
+        process = subprocess.Popen(
+            resolve_cmd(command), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=handle,
+            **session_kwargs(detached=True))
     finally:
-        if handle is not subprocess.DEVNULL:
-            handle.close()
-    # Keep Popen alive and reap the detached child without delaying dispatch.
+        handle.close()
+    identity = _identity(process.pid)
     try:
-        threading.Thread(target=proc.wait, daemon=True).start()
-    except RuntimeError:
-        pass  # the detached child is already running; reaping is best-effort
-
-
-# --- launch preparation (shared by dispatch and deferred release) ----------
-
-def prepare_launch(con, root: Path, cfg: dict, run, *, mission: str,
-                   context: str | None = None, use_worktree: bool = False,
-                   snapshot: str | None = None,
-                   snapshot_protocol: str | None = None) -> None:
-    """Create the workdir, brief, and log for a run row about to launch."""
-    run_id = int(run["id"])
-    profile = config.profile_cfg(cfg, run["profile"])
-    # DESIGN §4: fail closed BEFORE anything is allocated. A harness whose CLI
-    # is missing used to surface only at exec — after the run row, the frozen
-    # brief, the raw log and an isolated worktree existed — leaving a dead run
-    # and an orphaned worktree instead of a refusal. PRESENCE only: the
-    # binary's PATH lookup is free, while auth is DESIGN §7's after-the-fact
-    # escalation and costs a process per launch to probe. The search uses the
-    # WORKER's PATH, not the daemon's: enrich_path is what lets a launchd job
-    # see the CLIs at all, so looking anywhere else would refuse a run that
-    # would have started.
-    harness = profile["backend"]
-    if which(harness, path=enrich_path(dict(os.environ)).get("PATH")) is None:
-        raise RuntimeError(
-            f"harness '{harness}' is not installed: no '{harness}' binary on "
-            f"PATH; run {run_id} did not start")
-    workdir, branch = str(root), None
-    base_commit = None
-    bp, lp = project.run_artifacts(con, run)
-    created = None
+        error_log.chmod(0o600)
+    except OSError:
+        pass
+    if identity is None:
+        terminate_group(process.pid, force=True)
+        raise ExecutionError(
+            f"supervisor {process.pid} has no durable process identity")
+    con = db.connect()
     try:
-        if use_worktree:
-            created, branch = worktree.create(
-                root, run_id, project.dir_key_for(con, run),
-                backend=profile["backend"])
-            workdir = str(created)
-        if (Path(workdir) / ".git").exists():
-            try:
-                base_commit = worktree.head(Path(workdir))
-            except RuntimeError:
-                base_commit = None  # fresh repository with no commits yet
-        # The item snapshot is frozen here, at dispatch; it is never re-read
-        # at resume (the immutability is load-bearing — Orchestra learned it
-        # the hard way). The protocol beside it is the source adapter's own
-        # rendering: whether this run's ref carries a checklist is the
-        # source's schema, which this module may not read (source boundary).
-        text = brief.compose(
-            run_id=run_id, slug=run["slug"], profile=profile,
-            mission=mission, requester=run["requested_by"], root=root,
-            workdir=workdir, extra_context=context, snapshot=snapshot,
-            snapshot_protocol=snapshot_protocol,
-            recent_commits=worktree.recent_commits(Path(workdir)),
-            cfg=cfg)
-        bp.write_text(text, encoding="utf-8")
-        lp.touch()
-        prepared = con.execute(
-            "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=?, repo=?, started_at=? WHERE id=? AND status='spawning'",
-            (str(bp), str(lp), workdir, branch, base_commit, str(root),
-             db.now(), run_id),
+        changed = con.execute(
+            "UPDATE runs SET supervisor_pid=?,supervisor_pid_identity=? "
+            "WHERE id=? AND status='starting' AND "
+            "(supervisor_pid IS NULL OR supervisor_pid=?)",
+            (process.pid, identity, int(run_id), process.pid),
         )
-        if prepared.rowcount != 1:
-            raise RuntimeError("run admission expired during launch preparation")
-    except BaseException:
-        for artifact in (bp, lp):
-            try:
-                artifact.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if created is not None and branch is not None:
-            try:
-                cleanup = worktree.discard_created(created, root, branch)
-            except Exception as cleanup_error:
-                cleanup = {"removed": False, "branch_deleted": False,
-                           "error": str(cleanup_error)}
-            if not cleanup["removed"] or not cleanup["branch_deleted"]:
-                con.execute(
-                    "UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
-                    (str(created) if not cleanup["removed"] else str(root),
-                     branch, base_commit, run_id))
-        raise
-
-
-def fail_launch(con, root: Path, run_id: int, error: BaseException | str,
-                prefix: str = "Launch setup failed") -> dict:
-    """Finalize a prepared run that never reached a supervisor."""
-    root = Path(root)
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    cleanup = None
-    workdir = run["workdir"] if run is not None else str(root)
-    branch = run["branch"] if run is not None else None
-    base_commit = run["base_commit"] if run is not None else None
-    owns_checkout = (run is not None and run["supervisor_pid"] is None
-                     and branch == f"orchestra/run-{run_id}"
-                     and Path(workdir).name == f"run-{run_id}")
-    if owns_checkout:
-        try:
-            cleanup = worktree.discard_created(Path(workdir), root, branch)
-        except Exception as exc:
-            cleanup = {"removed": False, "branch_deleted": False,
-                       "error": str(exc)}
-        if cleanup["removed"]:
-            workdir = str(root)
-        if cleanup["branch_deleted"]:
-            branch = None
-            base_commit = None
-    reason = str(error)[:1000] or error.__class__.__name__
-    con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
-                (workdir, branch, base_commit, run_id))
-    con.commit()
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    if run is not None:
-        finalize_run(con, run, "failed", None,
-                     restart_note=f"{prefix}: {reason}")
-    return cleanup or {"removed": False, "branch_deleted": False, "error": None}
-
-
-def rehome(con, root: Path, previous, run_id: int) \
-        -> tuple[str, str | None, str | None, bool]:
-    """SEAM (W-0191): where a run started FROM ``previous`` stands, and on what
-    branch. Returns ``(workdir, branch, base_commit, created)``.
-
-    Every path that re-dispatches from an earlier run goes through here —
-    ``create_followup`` (continuation) and ``observer._retry_row`` (retry) —
-    because the earlier run's world may be GONE: a terminal run gives its
-    worktree back (DESIGN §2) and a merged run's branch is deleted (§9). A row
-    that copies both fields starts a process in a directory that no longer
-    exists and dies instantly with ``FileNotFoundError`` (live runs 9 and 28).
-
-    An isolated previous run whose worktree was released gets a fresh worktree
-    on a fresh branch. Failure is returned to the caller; it never downgrades
-    an isolated lineage to the owner's checkout. A shared-checkout run returns
-    to the project root, and an existing workdir is kept unchanged.
-    """
-    workdir = Path(previous["workdir"] or root)
-    branch = previous["branch"]
-    created = False
-    root = Path(root)
-    isolated = _lineage_was_isolated(con, previous)
-    lost_isolation = (isolated and never_started(previous)
-                      and workdir.resolve() == root.resolve())
-    if not workdir.exists() or lost_isolation:
-        # The caller's root is the live checkout. project.root_for falls back
-        # to the run's own workdir when the project is unknown, which is the
-        # very path that is gone — so only consult it if the caller's is not
-        # a repository.
-        base = Path(root)
-        if not (base / ".git").exists():
-            base = project.root_for(con, previous)
-        workdir, branch = base, None
-        if isolated:  # it was isolated; give it isolation again
-            workdir, branch = worktree.create(
-                base, run_id, project.dir_key_for(con, previous),
-                backend=previous["backend"])
-            created = True
-    base_commit = previous["base_commit"]
-    if (workdir / ".git").exists():
-        try:
-            base_commit = worktree.head(workdir)
-        except RuntimeError:
-            base_commit = None
-    return str(workdir), branch, base_commit, created
-
-
-def reserve_followup(con, root: Path, parent, requester: str,
-                     title: str | None = None, *, commit: bool = True):
-    """Reserve a continuation before any source claim or filesystem setup."""
-    return create_run(
-        con, profile=parent["profile"], backend=parent["backend"],
-        model=parent["model"],
-        title=title or f"continuation of run {parent['id']}",
-        requested_by=requester, workdir=str(root),
-        project_id=parent["project_id"], parent_run=int(parent["id"]),
-        session_ref=parent["session_ref"], ref=parent["ref"], commit=commit)
-
-
-def prepare_followup(con, root: Path, parent, run, text: str) -> int:
-    """Freeze and re-home an already reserved continuation."""
-    run_id = int(run["id"])
-    bp, lp = project.run_artifacts(con, run)
-    workdir, branch, base_commit, created = str(root), None, None, False
-    try:
-        workdir, branch, base_commit, created = rehome(
-            con, root, parent, run_id)
-        landed = (worktree.recent_commits(Path(root), since=parent["base_commit"])
-                  if parent["base_commit"] and (Path(root) / ".git").exists() else [])
-        bp.write_text(
-            brief.compose_continuation(
-                run_id=run_id, parent_run=parent["id"], instructions=text,
-                landed=landed), encoding="utf-8")
-        lp.touch()
-        prepared = con.execute(
-            "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-            "base_commit=?, repo=?, started_at=? WHERE id=? AND status='spawning'",
-            (str(bp), str(lp), workdir, branch, base_commit, str(root),
-             db.now(), run_id))
-        if prepared.rowcount != 1:
-            raise RuntimeError("run admission expired during continuation setup")
         con.commit()
-        return run_id
-    except BaseException as exc:
-        for artifact in (bp, lp):
-            try:
-                artifact.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if created and branch:
-            con.execute("UPDATE runs SET workdir=?, branch=?, base_commit=? WHERE id=?",
-                        (workdir, branch, base_commit, run_id))
-        fail_launch(con, root, run_id, exc, prefix="Deferred launch failed")
-        raise
+    finally:
+        con.close()
+    if changed.rowcount != 1:
+        terminate_group(process.pid, force=True)
+        raise ExecutionError(f"run {run_id} was no longer available to launch")
+    try:
+        threading.Thread(target=process.wait, daemon=True).start()
+    except RuntimeError:
+        pass
+    return process.pid
 
 
-def create_followup(con, root: Path, parent, requester: str, text: str,
-                    title: str | None = None) -> int | None:
-    """Reserve and prepare a run that resumes the parent's backend session."""
-    run, _blocked = reserve_followup(con, root, parent, requester, title)
+def _active(run) -> bool:
+    return run is not None and run["status"] not in TERMINAL
+
+
+def _record_control(con, run_id: int, actor: str, action: str, outcome: str,
+                    request_id: str | None = None, detail=None) -> int:
+    with con:
+        audit_id = db.record_control(
+            con, actor=actor, action=action, outcome=outcome,
+            target_type="run", target_id=run_id, request_id=request_id,
+            detail=detail)
+    return audit_id
+
+
+def tell(con: sqlite3.Connection, run_id: int, body: str,
+         actor: str = "operator", *, request_id: str | None = None) -> dict:
+    run = runs.find(con, int(run_id))
+    if not _active(run):
+        raise ExecutionError(
+            f"run {run_id} is {run['status'] if run else 'missing'}")
+    message_id = messaging.queue_tell(
+        con, int(run_id), actor, body, run["log_path"], boundary=True,
+        correlation_id=request_id)
+    audit_id = _record_control(
+        con, int(run_id), actor, "run.tell", "queued", request_id,
+        {"message_id": message_id})
+    result = dict(con.execute("SELECT * FROM messages WHERE id=?",
+                              (message_id,)).fetchone())
+    result["control_audit_id"] = audit_id
+    _, runtime_snapshot = _snapshots(run)
+    capabilities = _json(runtime_snapshot.get("capabilities"))
+    result["delivery_mode"] = (
+        "live" if run["status"] == "running"
+        and runtime_snapshot.get("adapter") == "acp"
+        and capabilities.get("steer_method") else
+        "safe_boundary" if run["status"] == "running" else "next_turn")
+    return result
+
+
+def interrupt(con: sqlite3.Connection, run_id: int, body: str,
+              actor: str = "operator", *, request_id: str | None = None) -> dict:
+    """Cancel the current turn; its supervisor resumes the same run."""
+    run = runs.find(con, int(run_id))
+    if not _active(run):
+        raise ExecutionError(
+            f"run {run_id} is {run['status'] if run else 'missing'}")
+    try:
+        offset = os.path.getsize(run["log_path"]) if run["log_path"] else 0
+    except OSError:
+        offset = 0
+    message_id = messaging.post(
+        con, int(run_id), direction="inbound", sender=actor, body=body,
+        kind="interrupt", correlation_id=request_id, delivery_offset=offset)
+    _, runtime_snapshot = _snapshots(run)
+    if run["session_ref"] and _runtime_can_resume(runtime_snapshot):
+        resume_mode = "same_session"
+    elif run["session_ref"]:
+        resume_mode = "frozen_brief_replay_risk"
+    else:
+        resume_mode = "pending_session_capture"
+    audit_id = _record_control(
+        con, int(run_id), actor, "run.interrupt", "queued", request_id,
+        {"message_id": message_id, "resume_mode": resume_mode,
+         "fallback": "frozen_brief_replay_risk"})
+    result = dict(con.execute("SELECT * FROM messages WHERE id=?",
+                              (message_id,)).fetchone())
+    result.update({
+        "control_audit_id": audit_id,
+        "delivery_mode": "cancel_current_turn",
+        "resume_mode": resume_mode,
+        "fallback": "frozen_brief_replay_risk",
+    })
+    return result
+
+
+def _tree(con: sqlite3.Connection, run_id: int) -> list[int]:
+    return [int(row["id"]) for row in con.execute(
+        "WITH RECURSIVE tree(id) AS (SELECT id FROM runs WHERE id=? UNION ALL "
+        "SELECT r.id FROM runs r JOIN tree ON r.parent_run_id=tree.id "
+        "OR r.retry_of_run_id=tree.id OR r.continuation_of_run_id=tree.id) "
+        "SELECT id FROM tree ORDER BY id DESC", (int(run_id),))]
+
+
+def stop(con: sqlite3.Connection, run_id: int, actor: str = "operator", *,
+         tree: bool = False, request_id: str | None = None,
+         reason: str = "Stopped by operator") -> dict:
+    """Stop exactly one run, or its explicit descendant tree."""
+    ids = _tree(con, run_id) if tree else [int(run_id)]
+    if not ids:
+        raise ExecutionError(f"no run {run_id}")
+    rows = [con.execute("SELECT * FROM runs WHERE id=?", (item,)).fetchone()
+            for item in ids]
+    if rows[0] is None:
+        raise ExecutionError(f"no run {run_id}")
+    signals: list[tuple[object, str, str]] = []
+    for run in rows:
+        if run is None or run["status"] in TERMINAL or run["pid"] is None:
+            continue
+        outcome, detail = signal_owned_group(
+            int(run["pid"]), run["pid_identity"], 0)
+        if outcome == "refused":
+            _record_control(con, int(run["id"]), actor, "run.stop", "refused",
+                            request_id, {"reason": detail})
+            raise ExecutionError(detail)
+        signals.append((run, outcome, detail))
+    changed_ids: list[int] = []
+    timestamp = db.now()
+    with con:
+        for run in rows:
+            if run is None:
+                continue
+            changed = con.execute(
+                f"UPDATE runs SET status='stopped',waiting_kind=NULL,hold_reason=NULL,"
+                f"finished_at=?,summary=?,run_token_hash=NULL "
+                f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
+                (timestamp, reason[:2000], int(run["id"])),
+            )
+            if changed.rowcount:
+                changed_ids.append(int(run["id"]))
+        audit_id = db.record_control(
+            con, actor=actor, action="run.stop_tree" if tree else "run.stop",
+            outcome="ok", target_type="run", target_id=run_id,
+            request_id=request_id, detail={"stopped_run_ids": changed_ids})
+    for run, outcome, _ in signals:
+        if int(run["id"]) in changed_ids and outcome == "signalled":
+            signal_owned_group(int(run["pid"]), run["pid_identity"], signal.SIGTERM)
+    for item in changed_ids:
+        _after_terminal(con, item)
+    return {"run_id": int(run_id), "tree": bool(tree),
+            "control_audit_id": audit_id,
+            "stopped_run_ids": changed_ids}
+
+
+def check(con: sqlite3.Connection, run_id: int, actor: str = "operator", *,
+          request_id: str | None = None) -> dict:
+    """Return deterministic live facts; this spends no model turn."""
+    run = runs.find(con, int(run_id))
     if run is None:
+        raise ExecutionError(f"no run {run_id}")
+    process = "none"
+    if run["pid"] is not None:
+        process, _ = signal_owned_group(
+            int(run["pid"]), run["pid_identity"], 0)
+        if process == "signalled":
+            process = "alive"
+    supervisor = "none"
+    if run["supervisor_pid"] is not None:
+        supervisor, _ = signal_owned_group(
+            int(run["supervisor_pid"]), run["supervisor_pid_identity"], 0)
+        if supervisor == "signalled":
+            supervisor = "alive"
+    latest = con.execute(
+        "SELECT MAX(seq) AS seq,COUNT(*) AS count FROM events WHERE run_id=?",
+        (int(run_id),),).fetchone()
+    blockers = con.execute(
+        "SELECT COUNT(*) FROM attention_requests WHERE run_id=? AND status='open' "
+        "AND blocking=1", (int(run_id),)).fetchone()[0]
+    pending = con.execute(
+        "SELECT COUNT(*) FROM messages WHERE run_id=? AND direction='inbound' "
+        "AND status='pending'", (int(run_id),)).fetchone()[0]
+    _, runtime_snapshot = _snapshots(run)
+    result = {
+        "run_id": int(run_id), "status": run["status"],
+        "waiting_kind": run["waiting_kind"], "hold_reason": run["hold_reason"],
+        "process": process, "pid": run["pid"],
+        "supervisor": supervisor, "supervisor_pid": run["supervisor_pid"],
+        "progress": traces.progress(run["log_path"],
+                                    runtime_snapshot.get("adapter", "")),
+        "event_count": int(latest["count"] or 0),
+        "last_event_seq": int(latest["seq"] or 0),
+        "pending_messages": int(pending), "blocking_attention": int(blockers),
+        "active_children": [child["id"] for child in
+                            child_runs.active_children(con, int(run_id))],
+    }
+    result["control_audit_id"] = _record_control(
+        con, int(run_id), actor, "run.check", "ok", request_id,
+        {"status": run["status"], "process": process,
+         "supervisor": supervisor})
+    return result
+
+
+def _git_head(path: Path) -> str | None:
+    try:
+        return worktree.head(path)
+    except RuntimeError:
         return None
-    return prepare_followup(con, root, parent, run, text)
 
 
-# --- safe-boundary message delivery ----------------------------------------
-
-def _pending_delivery_offset(con, run_id: int) -> int | None:
-    row = con.execute(
-        "SELECT MAX(delivery_offset) AS offset FROM messages "
-        "WHERE run_id=? AND kind='interrupt' AND delivered_at IS NULL "
-        "AND undeliverable_at IS NULL AND delivery_offset IS NOT NULL",
-        (run_id,),
-    ).fetchone()
-    return int(row["offset"]) if row and row["offset"] is not None else None
+def _repo_root(path: Path) -> Path | None:
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip()).resolve()
 
 
-def _mark_pending_delivered(con, run_id: int) -> list:
-    """W-0098 seam: the Stop hook claims the same rows, so the claim (and the
-    trace it writes) lives in one place — ``messaging.claim_pending``."""
-    return messaging.claim_pending(con, run_id)
+def _is_repo(path: Path) -> bool:
+    return _repo_root(path) is not None
+
+
+def _prepare_workdir(con: sqlite3.Connection, run) -> object:
+    """Allocate or restore only Orchestra-owned isolation."""
+    run = runs.find(con, int(run["id"]))
+    _, runtime_snapshot = _snapshots(run)
+    adapter = runtime_snapshot.get("adapter")
+    # Admission freezes the requested CWD. A later group edit affects future
+    # runs only; an admitted run must never silently execute elsewhere.
+    source_cwd = Path(run["cwd"])
+    root = Path(run["repo"]) if run["repo"] else _repo_root(source_cwd)
+    state_home = paths.home().resolve()
+    if (root is not None and not run["repo"]
+            and source_cwd.resolve().is_relative_to(state_home)
+            and not root.resolve().is_relative_to(state_home)):
+        # A managed workspace inside ORCHESTRA_HOME must never ride an
+        # enclosing user repository (a git-init'd $HOME, most commonly).
+        root = None
+    relative = source_cwd.relative_to(root) if root else Path()
+    workdir = Path(run["workdir"] or source_cwd)
+    branch = run["branch"]
+    if branch:
+        if not workdir.is_dir():
+            if root is None:
+                raise ExecutionError("retained worktree has no repository root")
+            worktree_root = worktree.restore(
+                root, int(run["id"]), run["group_slug"], branch, adapter)
+            workdir = worktree_root / relative
+    elif root is not None and run["isolation"] != "shared":
+        worktree_root, branch = worktree.create(
+            root, int(run["id"]), run["group_slug"], backend=adapter)
+        workdir = worktree_root / relative
+        con.execute(
+            "UPDATE runs SET repo=?,workdir=?,branch=?,base_commit=? WHERE id=?",
+            (str(root), str(workdir), branch, _git_head(root), int(run["id"])))
+        con.commit()
+    elif run["isolation"] == "worktree":
+        raise ExecutionError("worktree isolation requires a git repository CWD")
+    else:
+        workdir = source_cwd
+        con.execute(
+            "UPDATE runs SET repo=NULL,workdir=?,base_commit=NULL WHERE id=?",
+            (str(workdir), int(run["id"])))
+        con.commit()
+    if not workdir.is_dir():
+        raise ExecutionError(f"run workdir is unavailable: {workdir}")
+    try:
+        # macOS TCC lets stat succeed on a protected volume while the read
+        # itself gets EPERM, so is_dir() alone admits a workdir the worker
+        # cannot use. Fail here with remediation instead of a worker EPERM.
+        os.listdir(workdir)
+    except PermissionError as exc:
+        # macOS attributes file access to the executed Mach-O binary, so the
+        # grant must name the resolved interpreter, never a wrapper script.
+        raise ExecutionError(
+            f"the daemon was denied read access to {workdir} "
+            f"({exc.strerror}). On macOS, grant Full Disk Access to "
+            f"{Path(sys.executable).resolve()} in System Settings > Privacy & "
+            "Security, then run `orchestra service restart`. Or use a CWD on "
+            "the internal disk.") from exc
+    if str(workdir) != run["workdir"]:
+        con.execute("UPDATE runs SET workdir=? WHERE id=?",
+                    (str(workdir), int(run["id"])))
+        con.commit()
+    runs._write_brief(con, int(run["id"]))  # the isolated path is now frozen for this turn
+    con.commit()
+    log_path = Path(
+        run["log_path"] or paths.run_dir(int(run["id"])) / "worker.jsonl")
+    log_path.touch()
+    try:
+        log_path.chmod(0o600)
+    except OSError:
+        pass
+    return runs.find(con, int(run["id"]))
+
+
+def _pending(con: sqlite3.Connection, run_id: int) -> list[dict]:
+    return [dict(row) for row in con.execute(
+        "SELECT * FROM messages WHERE run_id=? AND direction='inbound' "
+        "AND status='pending' ORDER BY id", (int(run_id),))]
+
+
+def _trace_context(con: sqlite3.Connection, run_id: int) -> str:
+    rows = list(con.execute(
+        "SELECT kind,name,payload FROM events WHERE run_id=? ORDER BY seq DESC "
+        "LIMIT 20", (int(run_id),)))[::-1]
+    if not rows:
+        return "No normalized trace was captured before the interruption."
+    lines = []
+    for row in rows:
+        name = f" ({row['name']})" if row["name"] else ""
+        payload = " ".join((row["payload"] or "").split())[:300]
+        lines.append(f"- {row['kind']}{name}: {payload}")
+    return "\n".join(lines)
+
+
+def _replay_audit(con: sqlite3.Connection, run_id: int, reason: str) -> None:
+    existing = con.execute(
+        "SELECT 1 FROM supervision_events WHERE run_id=? AND detector='resume' "
+        "AND action='replay_risk' AND reason=?", (int(run_id), reason)).fetchone()
+    if existing:
+        return
+    con.execute(
+        "INSERT INTO supervision_events(run_id,detector,action,reason,detail_json,"
+        "created_at) VALUES(?,'resume','replay_risk',?,?,?)",
+        (int(run_id), reason,
+         json.dumps({"risk": "the previous turn may have made non-idempotent "
+                              "external changes before a session reference existed"},
+                    separators=(",", ":")), db.now()),
+    )
+    con.commit()
+
+
+def _restart_prompt(con: sqlite3.Connection, run, pending: list[dict],
+                    reason: str) -> str:
+    brief_text = Path(run["brief_path"]).read_text(encoding="utf-8")
+    _replay_audit(con, int(run["id"]), reason)
+    delivery = messaging.render_delivery(pending) if pending else (
+        "Continue the original mission and verify prior external side effects.")
+    return (f"{brief_text}\n\n--- restart context ---\n{reason}. The prior turn "
+            "may have been cancelled after non-idempotent external actions; "
+            "verify their state before repeating them.\n\nRecent trace:\n"
+            f"{_trace_context(con, int(run['id']))}\n\n{delivery}")
+
+
+def _prompt(con: sqlite3.Connection, run, pending: list[dict]) -> str:
+    brief_text = Path(run["brief_path"]).read_text(encoding="utf-8")
+    if not pending:
+        return brief_text if not run["session_ref"] else (
+            "Continue the original mission from the current session and end with "
+            "a concise result summary.")
+    delivery = messaging.render_delivery(pending)
+    if run["session_ref"]:
+        return delivery + "\n\nEnd with a concise result summary."
+    prior_turn = run["worker_status"] is not None or any(
+        row["kind"] == "interrupt" for row in pending)
+    if not prior_turn:
+        try:
+            prior_turn = os.path.getsize(run["log_path"]) > 0
+        except OSError:
+            pass
+    if prior_turn:
+        return _restart_prompt(
+            con, run, pending,
+            "resume requested before a reliable session reference was captured")
+    return f"{brief_text}\n\n--- initial messages ---\n{delivery}"
+
+
+def _runtime_can_resume(snapshot: dict) -> bool:
+    adapter = str(snapshot.get("adapter") or "")
+    if adapter in runtime.BUILTIN_ADAPTERS or adapter == "acp":
+        return True
+    capabilities = _json(snapshot.get("capabilities"))
+    if "resume" in capabilities:
+        return bool(capabilities["resume"])
+    command = snapshot.get("command", snapshot.get("command_json", ()))
+    if isinstance(command, str):
+        try:
+            command = json.loads(command)
+        except ValueError:
+            command = ()
+    return isinstance(command, list) and any(
+        "{session_ref}" in part for part in command if isinstance(part, str))
+
+
+def _claim_exact(con: sqlite3.Connection, run_id: int,
+                 rows: list[dict]) -> None:
+    if not rows:
+        return
+    ids = [int(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    con.execute(
+        f"UPDATE messages SET status='delivered',delivered_at=? WHERE run_id=? "
+        f"AND status='pending' AND id IN ({placeholders})",
+        (db.now(), int(run_id), *ids),)
+    con.commit()
+    for row in rows:
+        traces.record_injection(con, int(run_id), row["sender"], row["body"])
+
+
+def _requeue_exact(con: sqlite3.Connection, run_id: int,
+                   rows: list[dict]) -> None:
+    if not rows:
+        return
+    ids = [int(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    con.execute(
+        f"UPDATE messages SET status='pending',delivered_at=NULL WHERE run_id=? "
+        f"AND direction='inbound' AND status='delivered' "
+        f"AND id IN ({placeholders})",
+        (int(run_id), *ids),
+    )
+    con.commit()
+
+
+def _session_missing_since(log_path: str, offset: int) -> str | None:
+    try:
+        with open(log_path, "rb") as source:
+            source.seek(offset)
+            text = source.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if any(marker in line.casefold() for marker in runners.SESSION_GONE):
+            return line.strip()[:300]
+    return None
 
 
 def _read_log_events(log_path: str, offset: int,
                      max_bytes: int = 4_000_000) -> tuple[list[dict], int]:
-    """Read complete JSONL events after ``offset`` without consuming a partial line."""
     try:
         with open(log_path, "rb") as source:
             source.seek(offset)
@@ -473,210 +518,345 @@ def _read_log_events(log_path: str, offset: int,
         return [], offset
     end = data.rfind(b"\n")
     if end < 0:
-        # One unusually large event must not stall boundary watching forever;
-        # skipping its first bounded chunk never makes an unsafe interruption.
         return [], offset + len(data) if len(data) == max_bytes else offset
     events = []
     for raw in data[:end].splitlines():
         try:
-            event = json.loads(raw)
+            value = json.loads(raw)
         except (UnicodeDecodeError, ValueError):
             continue
-        if isinstance(event, dict):
-            events.append(event)
+        if isinstance(value, dict):
+            events.append(value)
     return events, offset + end + 1
 
 
-def _is_safe_boundary(backend: str, event: dict) -> bool:
-    """Recognize a completed action boundary in each runner's JSONL protocol."""
-    event_type = event.get("type")
+def _safe_boundary(adapter: str, event: dict) -> bool:
+    kind = event.get("type")
     part = event.get("part") or {}
-    if backend == "opencode":
-        return event_type == "step_finish" or part.get("type") == "step-finish"
-    if backend == "codex":
+    if adapter == "opencode":
+        return kind == "step_finish" or part.get("type") == "step-finish"
+    if adapter == "codex":
         item = event.get("item") or {}
-        return event_type == "item.completed" and item.get("type") in {
-            "command_execution", "file_change", "patch", "mcp_tool_call", "web_search",
-        }
-    if backend == "claude" and event_type == "user":
+        return kind == "item.completed" and item.get("type") in {
+            "command_execution", "file_change", "patch", "mcp_tool_call",
+            "web_search"}
+    if adapter == "claude" and kind == "user":
         content = (event.get("message") or {}).get("content") or []
         return any(isinstance(item, dict) and item.get("type") == "tool_result"
                    for item in content)
     return False
 
 
-def _resume_prompt(messages: list) -> str:
-    """Render delivered message bodies for a backend-session resume. The
-    supervisor already owns the bodies, so no inbox round-trip is needed."""
-    joined = "\n\n".join(f"[message from {m['sender']}]\n{m['body']}" for m in messages)
-    return (
-        "Apply the following delivered message(s) now, then continue the original "
-        f"mission.\n\n{joined}\n\n"
-        "End with the usual handoff summary as your final message."
-    )
-
-
-# --- process control --------------------------------------------------------
-
-def _ts_to_epoch(ts: str) -> float:
-    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-
-
-def _stall_seconds(raw) -> int | None:
-    if raw is False or raw is None:
-        return None
+def _terminate(process: subprocess.Popen, grace: float = 10) -> None:
+    terminate_group(process.pid)
     try:
-        seconds = int(raw)
-    except (TypeError, ValueError):
-        raise SystemExit("orchestra: stall_timeout must be an integer number of seconds")
-    if seconds < 0:
-        raise SystemExit("orchestra: stall_timeout must be zero or positive")
-    return seconds or None
-
-
-def _terminate_process_group(pid: int) -> None:
-    terminate_group(pid)
-
-
-def _wait_after_term(child: subprocess.Popen, timeout: float = 15) -> None:
-    try:
-        child.wait(timeout=timeout)
+        process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
-        # It already had its SIGTERM and its grace period. This is the kill.
-        terminate_group(child.pid, force=True)
+        terminate_group(process.pid, force=True)
         try:
-            child.wait(timeout=2)
-        except Exception:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             pass
 
 
-def _run_proc(con, run, cmd, env, log_path, run_id, deadline,
-              stall_timeout: int | None, root: Path | None = None,
-              cfg: dict | None = None) -> tuple[str, int | None]:
-    """Start one worker process; wait with stall detection + hard timeout +
-    early session-ref capture + safe-boundary interrupt watching.
-    Returns (outcome, exit_code) where outcome is 'exit' | 'timeout'."""
-    backend = run["backend"]
-    # SEAM (W-0166): the spin observer. Layers (b) and (c) — mechanical loop
-    # detection and the out-of-band observer turn — hang off this one object;
-    # layer (a) is the stall detection already in the loop below.
-    spin = observer.Watcher(run_id, run["project_id"])
+def _set_session(con: sqlite3.Connection, run_id: int, log_path: str) -> None:
+    current = con.execute("SELECT session_ref FROM runs WHERE id=?",
+                          (int(run_id),)).fetchone()
+    if current and not current["session_ref"]:
+        session_ref, _ = runners.parse_log(log_path)
+        if session_ref:
+            con.execute("UPDATE runs SET session_ref=? WHERE id=?",
+                        (session_ref, int(run_id)))
+            con.commit()
+
+
+def _run_exec_turn(con: sqlite3.Connection, run, plan: runtime.LaunchPlan,
+                   pending: list[dict], timeout: int,
+                   stall_timeout: int | None) -> tuple[str, int | None]:
+    run_id, adapter = int(run["id"]), plan.adapter
+    log_path = run["log_path"]
+    try:
+        turn_offset = os.path.getsize(log_path)
+    except OSError:
+        turn_offset = 0
+    stdin = subprocess.PIPE if plan.stdin is not None else subprocess.DEVNULL
     with open(log_path, "ab") as log:
-        proc = subprocess.Popen(
-            resolve_cmd(cmd), stdin=subprocess.DEVNULL, stdout=log,
-            stderr=subprocess.STDOUT, cwd=run["workdir"],
-            env=env, **session_kwargs())
-    cur = con.execute(
-        "UPDATE runs SET pid=?, pid_identity=?, status='running' "
-        f"WHERE id=? AND status NOT IN {db.TERMINAL_SQL}",
-        (proc.pid, process_identity(proc.pid), run_id))
+        process = subprocess.Popen(
+            resolve_cmd(list(plan.argv)), stdin=stdin, stdout=log,
+            stderr=subprocess.STDOUT, cwd=run["workdir"], env=plan.env,
+            **session_kwargs())
+    identity = _identity(process.pid)
+    if identity is None and process.poll() is None:
+        _terminate(process)
+        raise ExecutionError(
+            f"worker {process.pid} has no durable process identity")
+    changed = con.execute(
+        "UPDATE runs SET pid=?,pid_identity=?,status='running',worker_status=NULL,"
+        "worker_exit_code=NULL WHERE id=? AND status='starting'",
+        (process.pid, identity, run_id),)
     con.commit()
-    if cur.rowcount == 0:  # killed before we could claim it
-        _terminate_process_group(proc.pid)
-        _wait_after_term(proc)
-        return "exit", proc.poll()
-    started = time.time()
-    have_ref = bool(run["session_ref"])
+    if changed.rowcount != 1:
+        _terminate(process)
+        return "stopped", process.poll()
+    if plan.stdin is not None and process.stdin is not None:
+        def feed() -> None:
+            try:
+                process.stdin.write(plan.stdin.encode())
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=feed, daemon=True).start()
+    _claim_exact(con, run_id, pending)
+    started = last_progress = time.monotonic()
     try:
         last_size = os.path.getsize(log_path)
     except OSError:
         last_size = 0
-    last_progress = started
-    pending_after: int | None = None
-    scan_offset = 0
+    initial_tells = [row for row in pending if row["kind"] == "tell"]
+    tell_ids = {int(row["id"]) for row in initial_tells}
+    scan_offset = min((int(row["delivery_offset"] or 0)
+                       for row in initial_tells), default=last_size)
     while True:
-        try:
-            exit_code = proc.wait(timeout=POLL_INTERVAL)
-            return "exit", exit_code
-        except subprocess.TimeoutExpired:
-            pass
-        now = time.time()
-        latest = con.execute("SELECT status, session_ref FROM runs WHERE id=?",
-                             (run_id,)).fetchone()
-        if latest and (latest["status"] == "interrupt"
-                       or latest["status"] in db.RUN_TERMINAL):
-            _terminate_process_group(proc.pid)
-            _wait_after_term(proc)
-            return "exit", proc.poll()
-        if latest and latest["session_ref"]:
-            have_ref = True
-        elif not have_ref and now - started < EARLY_REF_WINDOW:
-            ref, _ = runners.parse_log(log_path, max_bytes=65536)
-            if ref:
-                con.execute("UPDATE runs SET session_ref=? WHERE id=?", (ref, run_id))
-                con.commit()
-                have_ref = True
-        # A worker asking for help WRITES a request; this is the only place
-        # that turns one into running children, and it is outside the
-        # worker's sandbox on purpose (child_runs).
-        if root is not None and cfg is not None:
-            try:
-                child_runs.process_pending(con, root, cfg, run_id,
-                                           spawn_supervisor)
-            except Exception as exc:  # help must never kill the lead
-                print(f"orchestra: run {run_id} spawn request failed: {exc}",
-                      file=sys.stderr)
-        pending = _pending_delivery_offset(con, run_id)
-        if pending is not None:
-            if pending_after != pending:
-                pending_after = pending
-                scan_offset = pending
-            events, scan_offset = _read_log_events(log_path, scan_offset)
-            # Never stop before the session is resumable; a later boundary or
-            # the natural process exit will deliver the message instead.
-            if have_ref and any(_is_safe_boundary(backend, e) for e in events):
-                con.execute("UPDATE runs SET status='interrupt' WHERE id=?", (run_id,))
-                con.commit()
-                _terminate_process_group(proc.pid)
-                _wait_after_term(proc)
-                return "exit", proc.poll()
-        else:
-            pending_after = None
-        # A growing log is the backend-neutral progress signal.
+        code = process.poll()
         try:
             size = os.path.getsize(log_path)
         except OSError:
             size = last_size
         if size > last_size:
-            last_size = size
-            last_progress = now
-            # Normalize what just arrived (DESIGN §7). Reads only the new
-            # bytes, so the trace is live without a second tailer.
-            traces.ingest(con, run_id, log_path, backend)
-        spin.poll(con)  # rate-limited; the model turn runs on its own thread
-        # W-0098 seam: a run held open by its Stop hook waiting on an `ask`
-        # produces no output for as long as the human takes. That is not a
-        # stall — killing it would throw away the answer. The hard timeout
-        # still caps it.
-        if stall_timeout and now - last_progress >= stall_timeout \
-                and messaging.open_ask(con, run_id) is None:
-            con.execute(
-                "UPDATE runs SET summary=? WHERE id=?",
-                (f"Stalled: no worker output for {int(now - last_progress)}s "
-                 "(stall_timeout)", run_id))
-            con.commit()
-            _terminate_process_group(proc.pid)
-            _wait_after_term(proc)
-            return "timeout", None
-        if now > deadline:
-            _terminate_process_group(proc.pid)
-            _wait_after_term(proc)
-            return "timeout", None
+            last_size, last_progress = size, time.monotonic()
+            if time.monotonic() - started <= EARLY_REF_WINDOW:
+                _set_session(con, run_id, log_path)
+        traces.ingest(con, run_id, log_path, adapter)
+        child_runs.process_pending(con, run_id)
+        current = con.execute(
+            "SELECT status,session_ref FROM runs WHERE id=?", (run_id,)
+        ).fetchone()
+        waiting = current and current["status"] == "waiting"
+        terminal = current and current["status"] in TERMINAL
+        queued = _pending(con, run_id)
+        interrupts = [row for row in queued if row["kind"] == "interrupt"]
+        tells = [row for row in queued if row["kind"] == "tell"]
+        if code is not None:
+            traces.drain(con, run_id, log_path, adapter)
+            _set_session(con, run_id, log_path)
+            if terminal:
+                return current["status"], code
+            if waiting:
+                return "suspend", code
+            missing = _session_missing_since(log_path, turn_offset) \
+                if code != 0 and run["session_ref"] else None
+            if missing:
+                _replay_audit(
+                    con, run_id, f"saved session could not be loaded: {missing}")
+                _requeue_exact(con, run_id, pending)
+                con.execute("UPDATE runs SET session_ref=NULL WHERE id=?", (run_id,))
+                con.commit()
+                return "resume", code
+            return ("resume", code) if queued else (
+                "completed" if code == 0 else "failed", code)
+        if terminal or waiting or interrupts:
+            _terminate(process)
+            traces.drain(con, run_id, log_path, adapter)
+            _set_session(con, run_id, log_path)
+            if terminal:
+                return current["status"], process.poll()
+            return ("suspend" if waiting else "resume"), process.poll()
+        if tells:
+            current_tell_ids = {int(row["id"]) for row in tells}
+            offset = min(int(row["delivery_offset"] or 0) for row in tells)
+            if current_tell_ids != tell_ids:
+                tell_ids, scan_offset = current_tell_ids, offset
+            events, scan_offset = _read_log_events(log_path, scan_offset)
+            if any(_safe_boundary(adapter, event) for event in events):
+                _terminate(process)
+                traces.drain(con, run_id, log_path, adapter)
+                _set_session(con, run_id, log_path)
+                return "resume", process.poll()
+        now = time.monotonic()
+        if now - started >= timeout:
+            _terminate(process)
+            traces.drain(con, run_id, log_path, adapter)
+            _set_session(con, run_id, log_path)
+            return "timed_out", process.poll()
+        if stall_timeout and now - last_progress >= stall_timeout:
+            _terminate(process)
+            traces.drain(con, run_id, log_path, adapter)
+            _set_session(con, run_id, log_path)
+            return "timed_out", process.poll()
+        time.sleep(POLL_INTERVAL)
 
 
-# --- completion -------------------------------------------------------------
+def _acp_result(method: str, frame: dict):
+    if "error" in frame:
+        error = frame.get("error") or {}
+        raise ExecutionError(f"{method}: {error.get('message') or error}")
+    return frame.get("result")
 
-def _checkpoint_commit(run: dict, terminal_status: str) -> str | None:
-    """Commit an isolated worktree's leftover changes so nothing is lost.
 
-    Shared-tree runs write into the human's checkout; Orchestra never
-    auto-commits there. Isolated runs leave files; this is the only commit
-    on the run branch, for every backend — including ones that could commit.
-    """
+def _acp_drain(peer: acp.Peer, turn: int, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if peer.response(turn) is not None:
+                return
+        except acp.AcpError:
+            return
+        time.sleep(0.05)
+
+
+def _run_acp(con: sqlite3.Connection, run, plan: runtime.LaunchPlan,
+             initial_prompt: str, initial_pending: list[dict], timeout: int,
+             stall_timeout: int | None, profile: dict,
+             runtime_snapshot: dict) -> tuple[str, int | None]:
+    """Run ACP turns without coupling execution to any one harness."""
+    run_id = int(run["id"])
+    peer = acp.Peer(
+        plan.argv, cwd=run["workdir"], env=plan.env, log_path=run["log_path"],
+        on_request=lambda method, params: (
+            acp.permission_answer(profile, params)
+            if method == "session/request_permission" else None))
+    started = time.monotonic()
+    try:
+        peer.start()
+        if peer.proc is None:
+            raise ExecutionError("ACP runtime started without a process")
+        identity = _identity(peer.proc.pid)
+        if identity is None and peer.proc.poll() is None:
+            terminate_group(peer.proc.pid, force=True)
+            raise ExecutionError(
+                f"ACP worker {peer.proc.pid} has no durable process identity")
+        changed = con.execute(
+            "UPDATE runs SET pid=?,pid_identity=?,status='running',"
+            "worker_status=NULL,worker_exit_code=NULL WHERE id=? AND status='starting'",
+            (peer.proc.pid, identity, run_id),)
+        con.commit()
+        if changed.rowcount != 1:
+            return "stopped", None
+        initialized = peer.call("initialize", {
+            "protocolVersion": acp.PROTOCOL_VERSION,
+            "clientCapabilities": {"fs": {"readTextFile": False,
+                                           "writeTextFile": False},
+                                   "terminal": False},
+            "clientInfo": {"name": "orchestra", "version": "2"},
+        }) or {}
+        if initialized.get("protocolVersion") != acp.PROTOCOL_VERSION:
+            raise ExecutionError("ACP protocol version mismatch")
+        capabilities = initialized.get("agentCapabilities") or {}
+        prompt, pending = initial_prompt, initial_pending
+        session_ref = run["session_ref"]
+        loaded = False
+        if session_ref and capabilities.get("loadSession"):
+            try:
+                peer.call("session/load", {"sessionId": session_ref,
+                                           "cwd": run["workdir"],
+                                           "mcpServers": []})
+            except acp.AcpError as exc:
+                reason = f"ACP saved session could not be loaded: {exc}"
+                prompt = _restart_prompt(con, run, pending, reason)
+            else:
+                loaded = True
+        if not loaded:
+            if session_ref:
+                reason = "ACP runtime does not support loading the saved session"
+                if not capabilities.get("loadSession"):
+                    prompt = _restart_prompt(con, run, pending, reason)
+            created = peer.call("session/new", {"cwd": run["workdir"],
+                                                "mcpServers": []}) or {}
+            session_ref = created.get("sessionId")
+        if not session_ref:
+            raise ExecutionError("ACP runtime created no session")
+        con.execute("UPDATE runs SET session_ref=? WHERE id=?",
+                    (session_ref, run_id))
+        con.commit()
+        if profile.get("model"):
+            try:
+                peer.call("session/set_model", {"sessionId": session_ref,
+                                                "modelId": profile["model"]})
+            except acp.AcpError:
+                pass
+        last_rx, last_progress = peer.last_rx, time.monotonic()
+        steer_method = (_json(runtime_snapshot.get("capabilities"))
+                        .get("steer_method"))
+        while True:
+            turn = peer.request("session/prompt", {
+                "sessionId": session_ref,
+                "prompt": [{"type": "text", "text": prompt}],
+            })
+            _claim_exact(con, run_id, pending)
+            while True:
+                frame = peer.response(turn)
+                if frame is not None:
+                    _acp_result("session/prompt", frame)
+                    break
+                traces.ingest(con, run_id, run["log_path"], "acp")
+                child_runs.process_pending(con, run_id)
+                current = con.execute(
+                    "SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+                queued = _pending(con, run_id)
+                interrupts = [row for row in queued if row["kind"] == "interrupt"]
+                if current and (current["status"] in TERMINAL or
+                                current["status"] == "waiting" or interrupts):
+                    peer.notify("session/cancel", {"sessionId": session_ref})
+                    _acp_drain(peer, turn)
+                    if current["status"] in TERMINAL:
+                        return current["status"], None
+                    if current["status"] == "waiting":
+                        return "suspend", None
+                    prompt, pending = _prompt(con, runs.find(con, run_id), queued), queued
+                    break
+                tells = [row for row in queued if row["kind"] == "tell"]
+                if tells and isinstance(steer_method, str) and steer_method:
+                    try:
+                        peer.call(steer_method, {
+                            "sessionId": session_ref,
+                            "prompt": [{"type": "text",
+                                        "text": messaging.render_delivery(tells)}],
+                        }, timeout=30)
+                    except acp.AcpError:
+                        pass
+                    else:
+                        _claim_exact(con, run_id, tells)
+                now = time.monotonic()
+                if peer.last_rx > last_rx:
+                    last_rx, last_progress = peer.last_rx, time.monotonic()
+                if now - started >= timeout or (
+                        stall_timeout and now - last_progress >= stall_timeout):
+                    peer.notify("session/cancel", {"sessionId": session_ref})
+                    _acp_drain(peer, turn)
+                    return "timed_out", None
+                time.sleep(POLL_INTERVAL)
+            queued = _pending(con, run_id)
+            if queued:
+                prompt, pending = _prompt(con, runs.find(con, run_id), queued), queued
+                continue
+            return "completed", 0
+    except acp.AcpError as exc:
+        current = runs.find(con, run_id)
+        if current is not None and current["status"] in TERMINAL:
+            return current["status"], None
+        if current is not None and current["status"] == "waiting":
+            return "suspend", None
+        con.execute("UPDATE runs SET summary=? WHERE id=?",
+                    (f"ACP runtime failed: {exc}"[:2000], run_id))
+        con.commit()
+        return "failed", None
+    finally:
+        if peer.proc is not None and peer.proc.poll() is None:
+            terminate_group(peer.proc.pid)
+        peer.close()
+        traces.drain(con, run_id, run["log_path"], "acp")
+
+
+def _checkpoint(run: dict, status: str) -> str | None:
     if not run.get("branch"):
         return None
     workdir = Path(run["workdir"])
-    if not (workdir / ".git").exists():
+    if not _is_repo(workdir):
         return None
     if worktree.status(workdir):
         pathspec = ["."]
@@ -686,587 +866,368 @@ def _checkpoint_commit(run: dict, terminal_status: str) -> str | None:
             ["git", "-C", str(workdir), "add", "-A", "--", *pathspec],
             capture_output=True, text=True, timeout=60)
         if added.returncode != 0:
-            raise RuntimeError(f"automatic checkpoint staging failed: {added.stderr.strip()}")
+            raise ExecutionError(
+                f"checkpoint staging failed: {added.stderr.strip()}")
         staged = subprocess.run(
-            ["git", "-C", str(workdir), "diff", "--cached", "--quiet"], timeout=60)
+            ["git", "-C", str(workdir), "diff", "--cached", "--quiet"],
+            timeout=60)
         if staged.returncode not in (0, 1):
-            raise RuntimeError("cannot inspect staged checkpoint changes")
+            raise ExecutionError("cannot inspect staged checkpoint")
         if staged.returncode == 1:
             committed = subprocess.run(
-                ["git", "-C", str(workdir),
-                 "-c", "user.name=Orchestra", "-c", "user.email=orchestra@localhost",
-                 "-c", "commit.gpgSign=false",
-                 "commit", "--no-verify", "-m",
-                 f"orchestra: checkpoint run {run['id']} ({terminal_status})"],
+                ["git", "-C", str(workdir), "-c", "user.name=Orchestra",
+                 "-c", "user.email=orchestra@localhost",
+                 "-c", "commit.gpgSign=false", "commit", "--no-verify", "-m",
+                 f"orchestra: checkpoint run {run['id']} ({status})"],
                 capture_output=True, text=True, timeout=60)
             if committed.returncode != 0:
-                raise RuntimeError(
-                    f"automatic checkpoint commit failed: {committed.stderr.strip()}")
-    # HEAD is also the durable "checkpoint attempted" receipt when there was
-    # no diff. NULL means finalization never reached this boundary.
+                raise ExecutionError(
+                    f"checkpoint commit failed: {committed.stderr.strip()}")
     return worktree.head(workdir)
 
 
-def _ferry_check_failure(con, cfg: dict, run, status: str, *,
-                         boundary: bool = True) -> bool:
-    """Checkpoint a completed turn and ferry a failed declared check back.
-
-    The run stays live. Its next turn receives the check result through the
-    normal message path, so the worker never has to watch CI or query a row.
-    """
-    settings = merge.merge_cfg(cfg)
-    if status != "done" or not run["branch"] or not settings["checks"]:
-        return False
-    try:
-        checkpoint = _checkpoint_commit(dict(run), status)
-    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-        print(f"orchestra: run {run['id']} check ferry checkpoint failed: {exc}",
-              file=sys.stderr)
-        return False  # finalization records the same checkpoint failure
-    con.execute("UPDATE runs SET checkpoint_commit=? WHERE id=?",
-                (checkpoint, run["id"]))
-    con.commit()
-    checks, ok = merge.run_checks(settings, Path(run["workdir"]))
-    if ok:
-        return False
-    failed = checks[-1]
-    output = (failed["output"] or "(no output)").strip()
-    body = ("A declared merge check failed after your completed turn. Fix the "
-            "failure, then finish the mission again. Do not wait or poll for "
-            "the check; Orchestra runs it after each completed turn.\n\n"
-            f"check: {failed['name']}\ncommand: {failed['command']}\n"
-            f"exit: {failed['exit_code']}\noutput:\n{output}")
-    messaging.queue_tell(
-        con, int(run["id"]), "orchestra:merge-check", body, run["log_path"],
-        boundary=boundary)
-    return True
-
-
-def release_worktree(con, run: dict, status: str) -> str | None:
-    """SEAM (W-0172): a terminal run gives its isolated checkout back.
-
-    Called once at finalization, after the checkpoint commit and before any
-    merge step needs the run branch deletable — a branch still checked out
-    here cannot be deleted. The branch is untouched; only the checkout goes.
-    Returns a note for the run summary when the worktree was KEPT, else None.
-    """
-    if status not in db.RUN_TERMINAL or not run.get("branch"):
-        return None  # a shared-tree run works in the human's own checkout
+def _write_patch(run: dict, head: str | None) -> str | None:
     workdir = Path(run["workdir"])
-    root = worktree.main_root(workdir)
-    if root is None or root == workdir.resolve():
-        return None  # gone already, or the run ran in the main checkout
-    if worktree.live_holders(con, workdir, ignore_run=int(run["id"])):
-        return None  # a follow-up run is still working in this checkout
-    report = worktree.remove(workdir, root, branch=run["branch"])
+    base = run.get("base_commit")
+    if not base or not head or not _is_repo(workdir):
+        return None
+    target = paths.run_dir(int(run["id"])) / "git.patch"
+    command = ["git", "-C", str(workdir), "diff", "--binary", "--no-ext-diff"]
+    command += [f"{base}..{head}"] if run.get("branch") else [base]
+    with open(target, "wb") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.PIPE,
+                                   **session_kwargs())
+        try:
+            _, error = process.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            terminate_group(process.pid, force=True)
+            process.wait()
+            raise ExecutionError("git patch capture timed out")
+    if process.returncode != 0:
+        raise ExecutionError(
+            f"git patch capture failed: {(error or b'').decode(errors='replace')[:500]}")
+    size = target.stat().st_size
+    if size > MAX_DIFF_BYTES:
+        marker = b"\n# Orchestra: patch truncated at 16 MiB\n"
+        with open(target, "r+b") as output:
+            output.truncate(MAX_DIFF_BYTES - len(marker))
+            output.seek(0, os.SEEK_END)
+            output.write(marker)
+    target.chmod(0o600)
+    return str(target)
+
+
+def _capture_evidence(con: sqlite3.Connection, run_id: int,
+                      status: str) -> str | None:
+    run = dict(runs.find(con, run_id))
+    if not _is_repo(Path(run["workdir"])):
+        return None
+    try:
+        checkpoint = _checkpoint(run, status)
+        head = checkpoint or _git_head(Path(run["workdir"]))
+        patch = _write_patch(run, head)
+        con.execute(
+            "UPDATE runs SET checkpoint_commit=COALESCE(?,checkpoint_commit),"
+            "head_commit=COALESCE(?,head_commit),diff_path=COALESCE(?,diff_path) "
+            "WHERE id=?", (checkpoint, head, patch, run_id))
+        con.commit()
+        return None
+    except (ExecutionError, OSError, subprocess.SubprocessError) as exc:
+        return f"Git evidence capture failed; worktree retained: {exc}"
+
+
+def _release_worktree(con: sqlite3.Connection, run_id: int) -> str | None:
+    run = dict(runs.find(con, run_id))
+    if not run.get("branch"):
+        return None
+    location = _repo_root(Path(run["workdir"])) or Path(run["workdir"])
+    root = worktree.main_root(location)
+    if root is None or root == location.resolve():
+        return None
+    if worktree.live_holders(con, location, ignore_run=run_id):
+        return None
+    report = worktree.remove(location, root, branch=run["branch"])
     if report["kept"]:
-        return f"Worktree kept at {workdir}: {report['kept']}"
+        return f"Worktree retained at {location}: {report['kept']}"
     if not report["removed"]:
-        return f"Worktree at {workdir} could not be removed: {report['error']}"
+        return f"Worktree could not be released: {report['error']}"
     return None
 
 
-def record_usage(con, run_id: int, backend: str, log_path: str | None) -> None:
-    """DESIGN §11 seam: stamp the run row with the backend's own token/cost
-    totals at completion, so the dashboard is a query and not a re-parse.
-    Uncapturable usage writes nulls — it never blocks finalization.
-    """
-    usage = runners.parse_usage(log_path, backend) if log_path else runners.EMPTY_USAGE
+def _usage(con: sqlite3.Connection, run) -> None:
+    _, runtime_snapshot = _snapshots(run)
+    adapter = runtime_snapshot.get("adapter", "")
+    profile_snapshot, _ = _snapshots(run)
+    value = runners.parse_usage(
+        run["log_path"], adapter, profile_snapshot.get("model"))
+    plan_provider = runway.provider_of(adapter, profile_snapshot.get("model"))
+    cost_sql = "?" if runway.kind_of(plan_provider) == "plan" else "COALESCE(?,cost_usd)"
     con.execute(
-        "UPDATE runs SET tokens_in=COALESCE(?, tokens_in), "
-        "tokens_out=COALESCE(?, tokens_out), "
-        "tokens_total=COALESCE(?, tokens_total), "
-        "cost_usd=COALESCE(?, cost_usd), "
-        "usage_source=COALESCE(?, usage_source) WHERE id=?",
-        (usage["tokens_in"], usage["tokens_out"], usage["tokens_total"],
-         usage["cost_usd"], usage["usage_source"], run_id))
+        "UPDATE runs SET tokens_in=COALESCE(?,tokens_in),"
+        "tokens_out=COALESCE(?,tokens_out),tokens_total=COALESCE(?,tokens_total),"
+        "tokens_cache_read=COALESCE(?,tokens_cache_read),"
+        "tokens_cache_write=COALESCE(?,tokens_cache_write),"
+        f"cost_usd={cost_sql},usage_source=COALESCE(?,usage_source) "
+        "WHERE id=?", (value["tokens_in"], value["tokens_out"],
+                       value["tokens_total"], value["tokens_cache_read"],
+                       value["tokens_cache_write"], value["cost_usd"],
+                       value["usage_source"], int(run["id"])))
 
 
-def finalize_run(con, run, status: str, exit_code: int | None, *,
-                 last_msg_file: str | None = None,
-                 restart_note: str | None = None) -> dict:
-    """Persist one terminal worker result and return its refreshed run row.
-
-    The terminal row, checkpoint identity, usage, delivery state, completion
-    notice, and retry hold become visible together before checkout release.
-    Repeating finalization enriches an existing terminal row without reopening
-    its outcome, checkpointing later edits, or duplicating its completion notice.
-    """
-    run = dict(run)
-    run_id = int(run["id"])
-    log_path = run.get("log_path")
-    preferred_text = None
-    preferred_output = None
-    preferred_durable = False
-
-    # Record what the worker returned before parsing, trace enrichment, or Git
-    # can fail. This is not the public terminal result; it is the receipt an
-    # orphan recovery pass uses to finish the same outcome instead of guessing
-    # `failed` merely because the supervisor died during finalization.
-    con.execute(
-        "UPDATE runs SET worker_status=COALESCE(worker_status, ?), "
-        "worker_exit_code=COALESCE(worker_exit_code, ?) WHERE id=?",
-        (status, exit_code, run_id))
-    con.commit()
-
-    # Codex's -o file is the authoritative last message. Preserve a preferred
-    # copy in the raw JSONL before the final ingest so every later consumer can
-    # derive the same result from result["log_path"].
-    if last_msg_file and Path(last_msg_file).is_file():
-        output = Path(last_msg_file)
-        preferred_output = output
-        try:
-            preferred_text = output.read_text(
-                encoding="utf-8", errors="replace").strip() or None
-            _, logged_text = runners.parse_log(log_path) if log_path else (None, None)
-            if not preferred_text or preferred_text == (logged_text or "").strip():
-                preferred_durable = True
-            elif log_path:
-                event = json.dumps({
-                    "type": "item.completed",
-                    "item": {"type": "agent_message", "text": preferred_text},
-                    "_orchestra": {"source": "codex-last-message"},
-                }, ensure_ascii=False).encode("utf-8") + b"\n"
-                with Path(log_path).open("ab+") as log:
-                    log.seek(0, os.SEEK_END)
-                    if log.tell():
-                        log.seek(-1, os.SEEK_END)
-                        if log.read(1) not in (b"\n", b"\r"):
-                            event = b"\n" + event
-                    log.write(event)
-                preferred_durable = True
-        except OSError as exc:
-            print(f"orchestra: run {run_id} could not preserve final output; "
-                  f"retained {output}: {exc}", file=sys.stderr)
-
-    if log_path:
-        traces.ingest(con, run_id, log_path, run["backend"])
-        session_ref, last_text = runners.parse_log(log_path)
-    else:
-        session_ref, last_text = None, preferred_text
-    if preferred_text and preferred_text != (last_text or "").strip():
-        # Even when the raw append failed, this process still has Codex's
-        # authoritative answer and can persist the terminal summary.
-        last_text = preferred_text
-    latest = con.execute(
-        "SELECT status, exit_code, summary, finished_at, checkpoint_commit, "
-        "EXISTS(SELECT 1 FROM messages WHERE run_id=runs.id "
-        "AND kind='completion') AS finalized FROM runs WHERE id=?",
-        (run_id,)).fetchone()
-    if latest is None:
-        raise RuntimeError(f"run {run_id} disappeared during finalization")
-    already_terminal = latest["status"] in db.RUN_TERMINAL
-    if already_terminal:
-        status = latest["status"]
-        if latest["exit_code"] is not None or status in ("killed", "halted"):
-            exit_code = latest["exit_code"]
-    # A summary this process already established — a stall, an ACP failure, a
-    # worker's own halt — is the answer and outranks anything read back.
-    authoritative = False
-    if latest["summary"] and (
-            (status == "timeout" and latest["summary"].startswith("Stalled:"))
-            or latest["summary"].startswith(acp.FAILURE_PREFIX)):
-        last_text = latest["summary"]
-        authoritative = True
-
-    summary = (last_text or "").strip()[:2000] or None
-    reason = handoff.halt_reason(last_text)
-    if reason and not already_terminal and status != "killed":
-        status = "halted"
-        summary = reason
-        authoritative = True
-    if status != "done" and not authoritative and log_path:
-        # WHY a run died beats the last thing the model happened to say
-        # before it did. Run 64 died on "the model is currently at capacity"
-        # and reported a .gitignore fragment, because the structured error
-        # was only consulted when the worker had emitted no text at all —
-        # and a worker that dies mid-task has almost always emitted some.
-        summary = runners.parse_failure(log_path) or summary
-    if restart_note and not already_terminal:
-        summary = (f"{summary}\n\n{restart_note}" if summary else restart_note)[:2000]
-
-    checkpoint_commit = latest["checkpoint_commit"]
-    checkpoint_note = None
-    if not latest["finalized"]:
-        try:
-            checkpoint_commit = _checkpoint_commit(run, status)
-        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-            if status == "done":
-                status, exit_code = "failed", exit_code or 1
-            checkpoint_note = f"Checkpoint error: {exc}"
-
-    # The result must exist before any external cleanup. A process death after
-    # this commit leaves one terminal fact the daemon can safely replay from;
-    # it must never infer an outcome from a vanished checkout.
-    con.execute("BEGIN IMMEDIATE")
-    try:
-        current = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-        if current is None:
-            raise RuntimeError(f"run {run_id} disappeared during finalization")
-        if current["status"] in db.RUN_TERMINAL:
-            status = current["status"]
-            if current["exit_code"] is not None or status in ("killed", "halted"):
-                exit_code = current["exit_code"]
-            if current["summary"]:
-                summary = current["summary"]
-        if checkpoint_note and checkpoint_note not in (summary or ""):
-            # LEADS. Appended, it sat past two thousand characters of a
-            # perfectly good handoff, and three PREX3 runs looked like they
-            # had succeeded while the board called them failed with no
-            # visible reason (2026-08-26).
-            summary = (f"{checkpoint_note}\n\n{summary}"
-                       if summary else checkpoint_note)[:2000]
-
-        con.execute(
-            "UPDATE runs SET status=?, exit_code=?, "
-            "session_ref=COALESCE(?, session_ref), summary=?, "
-            "checkpoint_commit=?, "
-            "finished_at=COALESCE(finished_at, ?) WHERE id=?",
-            (status, exit_code, session_ref, summary, checkpoint_commit,
-             db.now(), run_id))
-        observer.defer_retry(con, run_id)
-        stranded = messaging.mark_undeliverable(
-            con, run_id,
-            f"run ended ({status}) before the message reached a boundary")
-        record_usage(con, run_id, run["backend"], run["log_path"])
-        body = (f"run {run_id} finished: {status}"
-                + (f" (exit {exit_code})" if exit_code not in (None, 0) else "")
-                + (f"\n{stranded} message(s) were never delivered — see "
-                   f"`orchestra show {run_id}`" if stranded else "")
-                + (f"\n{summary[:800]}" if summary else ""))
-        con.execute(
-            "INSERT INTO messages(run_id, sender, body, kind, created_at) "
-            "SELECT ?, 'orchestra', ?, 'completion', ? WHERE NOT EXISTS ("
-            "SELECT 1 FROM messages WHERE run_id=? AND kind='completion')",
-            (run_id, body, db.now(), run_id))
-        con.commit()
-    except BaseException:
-        con.rollback()
-        raise
-
-    if preferred_output is not None and preferred_durable:
-        try:
-            preferred_output.unlink()
-        except OSError:
-            pass
-
-    # Cleanup is a consequence of the durable result. It is intentionally
-    # outside the transaction and may be retried by daemon policy recovery.
-    kept = release_worktree(con, run, status)
-    if kept:
-        current = con.execute("SELECT summary FROM runs WHERE id=?", (run_id,)).fetchone()
-        current_summary = current["summary"] if current else None
-        if kept not in (current_summary or ""):
-            current_summary = (f"{current_summary}\n\n{kept}"
-                               if current_summary else kept)[:2000]
-            con.execute("UPDATE runs SET summary=? WHERE id=?",
-                        (current_summary, run_id))
-            con.commit()
-    return dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+def _result_summary(run, status: str) -> str:
+    _, text = runners.parse_log(run["log_path"])
+    if status == "completed":
+        return (text or run["summary"] or "Completed.")[:4000]
+    if status == "timed_out":
+        return (run["summary"] or "Run exceeded its configured time limit.")[:4000]
+    return (run["summary"] or runners.parse_failure(run["log_path"])
+            or f"Run ended {status}.")[:4000]
 
 
-def notify_run_finished(cfg: dict, run) -> None:
-    """[settings] on_run_finished: one shell command fired after a run's
-    result and handoff are durable. A callback, not a policy — Orchestra
-    learns nothing about who listens, and a listener that misses one is
-    expected to have its own fallback poll."""
-    callbacks.fire(cfg, "on_run_finished",
-                   {"ORCHESTRA_RUN_ID": str(run["id"]),
-                    "ORCHESTRA_RUN_STATUS": str(run["status"])})
-
-
-def finalize_if_unowned(con, run_id: int, *, worker_gone: bool = False) -> bool:
-    """Finish a terminal row that has no process left to own finalization.
-
-    ``worker_gone`` is proof from the process-group probe, not an inference
-    from a stored PID. A live supervisor still owns finalization either way.
-    """
-    run = con.execute(
-        "SELECT *, EXISTS(SELECT 1 FROM messages WHERE run_id=runs.id "
-        "AND kind='completion') AS finalized FROM runs WHERE id=?",
-        (run_id,)).fetchone()
-    if run is None or run["status"] not in db.RUN_TERMINAL or run["finalized"] \
-            or run["supervisor_pid"] is not None \
-            or (run["pid"] is not None and not worker_gone):
+def _completion_message(con: sqlite3.Connection, run) -> bool:
+    if con.execute(
+        "SELECT 1 FROM messages WHERE run_id=? AND kind='completion' LIMIT 1",
+        (int(run["id"]),)).fetchone():
         return False
-    finalize_run(con, run, run["status"], run["exit_code"])
+    messaging.post(
+        con, int(run["id"]), direction="system", sender="orchestra",
+        body=f"{db.run_no(run)} ended {run['status']}.\n\n{run['summary'] or ''}",
+        kind="completion", status="delivered")
     return True
 
 
-def process_ready(con, launcher) -> list[dict]:
-    """Event-driven dependency release: decline broken chains, launch ready runs.
-
-    Called after every run finalization and after every ``--after`` dispatch.
-    One central database holds every project's runs, so root and config are
-    resolved per released run rather than passed in.
-    """
-    results: list[dict] = []
-    # Decline, cascading: a requires_success edge from an unsuccessful terminal
-    # prerequisite fails the dependent, which may fail its own dependents.
-    # ponytail: wait_for edges are schema-reserved; implement their release
-    # rule when something can create them.
-    while True:
-        con.execute("BEGIN IMMEDIATE")
-        try:
-            broken = [int(r["run_id"]) for r in con.execute(
-                "SELECT DISTINCT d.run_id FROM deferred_dispatches d "
-                "JOIN dispatch_dependencies e ON e.run_id=d.run_id "
-                "JOIN runs p ON p.id=e.depends_on_run "
-                "WHERE d.status='pending' AND e.kind='requires_success' "
-                f"AND p.status IN {db.TERMINAL_SQL} AND (p.status != 'done' "
-                "OR (p.branch IS NOT NULL AND p.landing_status='failed')) "
-                "AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.run_id=p.id "
-                "AND o.layer='retry' AND o.action='deferred' AND NOT EXISTS ("
-                "SELECT 1 FROM observations newer WHERE newer.run_id=o.run_id "
-                "AND newer.layer='retry' AND newer.id>o.id))")]
-            if not broken:
-                con.commit()
-                break
-            ts = db.now()
-            for rid in broken:
-                con.execute("UPDATE deferred_dispatches SET status='declined', "
-                            "processed_at=? WHERE run_id=?", (ts, rid))
-                con.execute("UPDATE runs SET status='failed', finished_at=?, "
-                            "summary='Declined: a prerequisite run did not succeed' "
-                            "WHERE id=? AND status='pending'", (ts, rid))
-                results.append({"run_id": rid, "status": "declined"})
-            con.commit()
-        except BaseException:
-            con.rollback()
-            raise
-    ready = list(con.execute(
-        "SELECT d.run_id "
-        "FROM deferred_dispatches d JOIN runs r ON r.id=d.run_id "
-        "WHERE d.status='pending' AND r.status='pending' AND NOT EXISTS ("
-        "  SELECT 1 FROM dispatch_dependencies e "
-        "  JOIN runs p ON p.id=e.depends_on_run "
-        "  WHERE e.run_id=d.run_id AND NOT (p.status='done' AND "
-        "  (p.branch IS NULL OR p.landing_status IN ('ok','skipped')))) "
-        "ORDER BY d.run_id"))
-    for req in ready:
-        run_id = int(req["run_id"])
-        admitted, blocked = admit_pending(con, run_id)
-        if admitted is None:
-            if blocked == "paused":
-                break
-            continue
-        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-        root = project.root_for(con, run)
-        try:
-            prepare_launch(con, root, config.load(run["project_id"]), run,
-                           mission=admitted["mission"],
-                           context=admitted["context"],
-                           use_worktree=bool(admitted["use_worktree"]))
-            con.execute("UPDATE deferred_dispatches SET status='fired', "
-                        "processed_at=? WHERE run_id=?", (db.now(), run_id))
-            con.commit()
-            launcher(root, run_id)
-            results.append({"run_id": run_id, "status": "fired"})
-        except BaseException as exc:
-            error = str(exc)[:1000] or exc.__class__.__name__
-            con.execute("UPDATE deferred_dispatches SET status='failed', "
-                        "processed_at=?, error=? WHERE run_id=?",
-                        (db.now(), error, run_id))
-            fail_launch(con, root, run_id, error, prefix="Deferred launch failed")
-            results.append({"run_id": run_id, "status": "failed", "error": error})
-    return results
+def _after_terminal(con: sqlite3.Connection, run_id: int) -> None:
+    run = runs.find(con, run_id)
+    if run is None or run["status"] not in TERMINAL:
+        return
+    first = _completion_message(con, run)
+    messaging.mark_undeliverable(
+        con, run_id, f"run ended {run['status']} before delivery")
+    child_runs.fail_unprocessed(
+        con, run_id, f"run ended {run['status']} before delegation was admitted")
+    for request in con.execute(
+            "SELECT id FROM attention_requests WHERE run_id=? AND status='open' "
+            "AND blocking=1 ORDER BY id", (run_id,)).fetchall():
+        attention.cancel(
+            con, int(request["id"]), actor="orchestra:terminal",
+            reason=f"run ended {run['status']}", notify_run=False)
+    if not first:
+        return
+    callbacks.emit(config.callback_command(), "run.terminal", {
+        "run_id": run_id, "status": run["status"],
+        "group_id": run["group_id"], "group_seq": run["group_seq"],
+        "summary": run["summary"],
+    }, audit_db=con)
+    decision = retry.decide(
+        run["status"], run["summary"],
+        automatic_retries=max(0, int(run["attempt"] or 1) - 1))
+    if decision["action"] == "retry":
+        runs.clone(
+            con, run_id, request_id=f"auto-retry:{run_id}", kind="retry",
+            requested_by="orchestra:retry",
+            not_before=(datetime.now(timezone.utc) + timedelta(seconds=5))
+            .strftime("%Y-%m-%dT%H:%M:%SZ"))
+    elif decision["action"] == "alert":
+        attention.open_request(
+            con, kind="alert", run_id=run_id,
+            title=f"{db.run_no(run)} needs attention",
+            body=decision["reason"] + (f"\n\n{run['summary']}" if run["summary"] else ""),
+            created_by="orchestra:retry",
+            correlation_id=f"terminal-alert:{run_id}",
+            callback_command=config.callback_command())
 
 
-# --- the run loop -----------------------------------------------------------
+def finalize_run(con: sqlite3.Connection, run, status: str,
+                 exit_code: int | None = None, *, summary: str | None = None) -> dict:
+    """Persist one terminal outcome, checkpoint evidence, and retry policy."""
+    if status not in TERMINAL:
+        raise ValueError(f"invalid terminal status: {status}")
+    run_id = int(run["id"])
+    current = runs.find(con, run_id)
+    if current is None:
+        raise ExecutionError(f"no run {run_id}")
+    traces.drain(con, run_id)
+    _set_session(con, run_id, current["log_path"])
+    evidence_note = _capture_evidence(con, run_id, status)
+    current = runs.find(con, run_id)
+    result_summary = summary or _result_summary(current, status)
+    if evidence_note:
+        result_summary = f"{result_summary}\n\n{evidence_note}"[:4000]
+    with con:
+        _usage(con, current)
+        con.execute(
+            "UPDATE runs SET status=?,waiting_kind=NULL,hold_reason=NULL,summary=?,"
+            "exit_code=?,worker_status=?,worker_exit_code=?,finished_at=COALESCE("
+            "finished_at,?),pid=NULL,pid_identity=NULL,supervisor_pid=NULL,"
+            "supervisor_pid_identity=NULL,run_token_hash=NULL WHERE id=?",
+            (status, result_summary, exit_code, status, exit_code, db.now(), run_id))
+    release_note = None if evidence_note else _release_worktree(con, run_id)
+    if release_note:
+        con.execute("UPDATE runs SET summary=substr(summary || ?,1,4000) WHERE id=?",
+                    ("\n\n" + release_note, run_id))
+        con.commit()
+    _after_terminal(con, run_id)
+    return dict(runs.find(con, run_id))
+
+
+def _wait_for_children(con: sqlite3.Connection, run, exit_code: int | None) -> bool:
+    run_id = int(run["id"])
+    generation = child_runs.result_generation(con, run_id)
+    if generation is None:
+        return False
+    delivered = con.execute(
+        "SELECT 1 FROM messages WHERE run_id=? AND kind='child_results' "
+        "AND correlation_id=? AND status='delivered' LIMIT 1",
+        (run_id, f"children:{run_id}:{generation}"),
+    ).fetchone()
+    if delivered is not None:
+        return False
+    evidence_note = _capture_evidence(con, run_id, "waiting")
+    summary = _result_summary(run, "completed")
+    if evidence_note:
+        summary = f"{summary}\n\n{evidence_note}"[:4000]
+    with con:
+        _usage(con, run)
+        con.execute(
+            "UPDATE runs SET status='waiting',waiting_kind='children',summary=?,"
+            "worker_status='completed',worker_exit_code=?,pid=NULL,pid_identity=NULL,"
+            "supervisor_pid=NULL,supervisor_pid_identity=NULL,run_token_hash=NULL "
+            "WHERE id=? AND status='running'",
+            (summary, exit_code, run_id))
+    if not evidence_note:
+        _release_worktree(con, run_id)
+    return True
+
+
+def _suspend(con: sqlite3.Connection, run_id: int) -> None:
+    note = _capture_evidence(con, run_id, "waiting")
+    with con:
+        con.execute(
+            "UPDATE runs SET pid=NULL,pid_identity=NULL,supervisor_pid=NULL,"
+            "supervisor_pid_identity=NULL,run_token_hash=NULL WHERE id=? "
+            "AND status='waiting'", (run_id,))
+        if note:
+            con.execute(
+                "UPDATE runs SET summary=substr(COALESCE(summary || char(10) || "
+                "char(10),'') || ?,1,4000) WHERE id=?", (note, run_id))
+    if not note:
+        _release_worktree(con, run_id)
+
+
+def _limits(profile: dict) -> tuple[int, int | None]:
+    raw_timeout = profile.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
+    try:
+        timeout = int(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionError("profile timeout_seconds must be an integer") from exc
+    if timeout <= 0:
+        raise ExecutionError("profile timeout_seconds must be positive")
+    profile_config = _json(profile.get("config"))
+    raw_stall = profile_config.get("stall_timeout_seconds")
+    if raw_stall in (None, 0, False):
+        return timeout, None
+    try:
+        stall = int(raw_stall)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionError("stall_timeout_seconds must be an integer") from exc
+    if stall < 0:
+        raise ExecutionError("stall_timeout_seconds cannot be negative")
+    return timeout, stall or None
+
+
+def _claim_supervisor(con: sqlite3.Connection, run_id: int) -> bool:
+    pid = os.getpid()
+    current = con.execute(
+        "SELECT supervisor_pid,supervisor_pid_identity,status FROM runs WHERE id=?",
+        (run_id,),).fetchone()
+    if current is None or current["status"] != "starting":
+        return False
+    if current["supervisor_pid"] not in (None, pid):
+        return False
+    identity = _identity(pid) or current["supervisor_pid_identity"]
+    changed = con.execute(
+        "UPDATE runs SET supervisor_pid=?,supervisor_pid_identity=? WHERE id=? "
+        "AND status='starting' AND (supervisor_pid IS NULL OR supervisor_pid=?)",
+        (pid, identity, run_id, pid),)
+    con.commit()
+    return changed.rowcount == 1
+
 
 def supervise(root: Path, run_id: int) -> int:
-    # The worker inherits this process's descriptor limit, and launchd's 256
-    # is below what a harness needs — piu-arcade-lift run 40 died in one
-    # second saying so (proc.raise_file_limit).
+    """Execute an admitted run until it waits or reaches a terminal state."""
+    del root  # the run's frozen workdir/repo fields, never a caller path, win
     raise_file_limit()
     con = db.connect()
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    if not run:
-        raise SystemExit(f"orchestra: run {run_id} not found")
-    # Claim the run for THIS supervisor process so a supervisor that dies
-    # before the completion UPDATE leaves a detectable orphan.
-    supervisor_pid = os.getpid()
-    claimed = con.execute(
-        "UPDATE runs SET supervisor_pid=?, supervisor_pid_identity=? "
-        "WHERE id=? AND status='spawning' AND supervisor_pid IS NULL",
-        (supervisor_pid, process_identity(supervisor_pid), run_id))
-    con.commit()
-    if claimed.rowcount != 1:
-        con.close()
-        return 1  # recovery or another supervisor won; never launch the worker
-    run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    cfg = config.load(run["project_id"])
-    profile = config.profile_cfg(cfg, run["profile"])
-    settings = cfg.get("settings", {})
-    timeout = int(profile.get("timeout")
-                  or settings.get("timeout", config.DEFAULT_RUN_TIMEOUT_SECONDS))
-    stall_timeout = _stall_seconds(profile.get(
-        "stall_timeout",
-        settings.get("stall_timeout", config.DEFAULT_STALL_TIMEOUT_SECONDS)))
-    deadline = _ts_to_epoch(run["started_at"]) + timeout
-    prompt = Path(run["brief_path"]).read_text(encoding="utf-8") if run["brief_path"] else (run["title"] or "")
-    brief_prompt = prompt
-    resume_ref = run["session_ref"] if run["parent_run"] else None
-    restart_note = None  # set when a dead session sent the work back to square one
-    # SEAM (W-0176): the run's own credential, minted once here — this is
-    # where a worker's environment is built, for both transports — and
-    # revoked by the database trigger when the run turns terminal. The raw
-    # value goes into the environment and nowhere else; only its hash is
-    # stored. A resume keeps the same token, so a resumed session is still
-    # the same caller to the API.
-    run_token = auth.mint(con, run_id)
-
-    status, exit_code, last_msg_file = "done", None, None
-    # SEAM (W-0104, DESIGN §6): the second transport. A profile with
-    # transport = "acp" runs over one persistent ACP peer instead of the exec
-    # loop below; absent means exec, unchanged for all four backends. There is
-    # no mid-run fallback between the two — see acp.supervise_run.
-    transport = acp.transport_for(profile)
-    parent_env = dict(os.environ, ORCHESTRA_ROOT=str(root), ORCHESTRA_RUN_ID=str(run_id),
-                      **{auth.TOKEN_ENV: run_token})
-    parent_env = enrich_path(parent_env)
-    parent_env = config.apply_worker_env(cfg, parent_env, root)
-    quota_fell_back = False
-    while transport == "exec":
-        cmd = runners.build_cmd(profile, workdir=run["workdir"],
-                                title=f"orchestra-run-{run_id}", prompt=prompt,
-                                resume_ref=resume_ref)
-        last_msg_file = None
-        if profile["backend"] == "codex" and not resume_ref:
-            last_msg_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt").name
-            cmd = cmd[:2] + ["-o", last_msg_file] + cmd[2:]  # `codex exec -o FILE ...`
-        env = runners.apply_backend_env(profile, parent_env)
-        if lane := runners.lane_of(profile):
-            runners.write_lane(run["log_path"], lane)
-        outcome, exit_code = _run_proc(con, run, cmd, env, run["log_path"],
-                                       run_id, deadline, stall_timeout,
-                                       root=root, cfg=cfg)
-        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-        if outcome == "timeout":
-            status = "timeout"
-            break
-        if run["status"] in ("killed", "halted"):
-            status = run["status"]
-            break
-        if run["status"] == "interrupt" or _pending_delivery_offset(con, run_id) is not None:
-            # Resume the same session after a safe-boundary stop, a --now stop,
-            # or a natural process exit that beat the next boundary.
-            if not run["session_ref"]:
-                status = "failed"  # cli guards against this; defensive only
-                break
-            resume_ref = run["session_ref"]
-            claimed = con.execute(
-                "UPDATE runs SET status='running' WHERE id=? AND status IN "
-                "('interrupt','running')", (run_id,))
-            con.commit()
-            if claimed.rowcount != 1:  # killed while we were deciding
-                latest = con.execute("SELECT status FROM runs WHERE id=?",
-                                     (run_id,)).fetchone()
-                status = latest["status"] if latest and latest["status"] in db.RUN_TERMINAL \
-                    else "failed"
-                break
-            delivered = _mark_pending_delivered(con, run_id)
-            con.commit()
-            prompt = _resume_prompt(delivered) if delivered else (
-                "Continue the original mission after the completed action boundary. "
-                "End with the usual handoff summary.")
-            continue
-        status = "done" if exit_code == 0 else "failed"
-        # SEAM (W-0191): a resume that CANNOT resume. The backend answered that
-        # the session is gone (a killed run's may never have survived, a
-        # harness prunes its own history), so there is no conversation to
-        # continue and no amount of retrying finds one. Start the same brief
-        # FRESH instead of failing the item — but exactly once, so a backend
-        # that says this every time still fails normally the second round.
-        gone = runners.session_missing(run["log_path"]) if (
-            status == "failed" and resume_ref and restart_note is None) else None
-        if gone:
-            restart_note = (f"Session {resume_ref} was gone ({gone}); "
-                            "the work restarted fresh in a new session.")
-            print(f"orchestra: run {run_id}: {restart_note}", file=sys.stderr)
-            resume_ref = None
-            # Clear the dead ref AND re-read the row: _run_proc decides whether
-            # to sniff the log for a session id from what it is handed, so a
-            # stale row would leave the fresh session unrecorded.
-            con.execute("UPDATE runs SET session_ref=NULL WHERE id=?", (run_id,))
-            con.commit()
-            run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            # Back to the brief — the fresh session has none of the context a
-            # resume prompt assumes. A message already claimed for delivery
-            # rides along; nothing else has seen it.
-            prompt = brief_prompt if prompt == brief_prompt \
-                else f"{brief_prompt}\n\n{prompt}"
-            continue
-        retry = runners.next_lane(profile, parent_env, run["log_path"],
-                                  quota_fell_back) if status == "failed" else None
-        if retry:
-            quota_fell_back = True
-            profile = retry
-            print(f"orchestra: run {run_id}: quota exhausted; retrying on the api lane",
-                  file=sys.stderr)
-            continue
-        if _ferry_check_failure(con, cfg, run, status):
-            resume_ref = run["session_ref"]
-            delivered = _mark_pending_delivered(con, run_id)
-            prompt = _resume_prompt(delivered)
-            if not resume_ref:
-                prompt = f"{brief_prompt}\n\n{prompt}"
-            if last_msg_file:
-                Path(last_msg_file).unlink(missing_ok=True)
-            continue
-        break
-
-    if transport == "acp":
-        env = runners.apply_backend_env(
-            profile, config.apply_worker_env(
-                cfg, enrich_path(dict(os.environ, ORCHESTRA_ROOT=str(root),
-                                      ORCHESTRA_RUN_ID=str(run_id),
-                                      **{auth.TOKEN_ENV: run_token})), root))
-        status, exit_code = acp.supervise_run(
-            con, run, profile, prompt=prompt, run_id=run_id, env=env,
-            deadline=deadline, stall_timeout=stall_timeout,
-            at_boundary=lambda: _ferry_check_failure(
-                con, cfg, run, "done", boundary=False))
-        run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-
-    # --- finalization ---
-    result = finalize_run(
-        con, run, status, exit_code, last_msg_file=last_msg_file,
-        restart_note=restart_note)
-    status = result["status"]
-
-    # Optional policy consumes the durable result. Landing remains strictly
-    # after release_worktree, which finalize_run owns.
-    landed = merge.at_completion(con, cfg, result)
-    if landed:
-        summary = result["summary"]
-        summary = (f"{summary}\n\n{landed}" if summary else landed)[:2000]
-        con.execute("UPDATE runs SET summary=? WHERE id=?", (summary, run_id))
-        con.commit()
-        result = dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
-    try:  # DESIGN §9: code files the handoff, never the agent
-        handoff.at_completion(con, result)
-    except Exception as exc:  # filing must never break finalization
-        print(f"orchestra: run {run_id} handoff filing failed: {exc}", file=sys.stderr)
-
-    # SEAM (W-0166): the §7 retry rule. Infrastructure-shaped failures are
-    # retried once with the same brief; a second one escalates. Runs BEFORE
-    # the dependency release, so a retry re-points the waiting dependents
-    # instead of letting them be declined.
-    observer.after_terminal(con, run_id)
-    # A lead that ended owes its unclaimed requests an answer, and a batch
-    # that just settled owes its lead the results — once (child_runs).
-    child_runs.fail_unprocessed(con, run_id, f"run {run_id} ended {status} "
-                                             "before this request was claimed")
     try:
-        wake_id = child_runs.maybe_wake_lead(con, root, run_id)
-    except Exception as exc:
-        wake_id = None
-        print(f"orchestra: run {run_id} child wakeup failed: {exc}",
-              file=sys.stderr)
-    process_ready(con, spawn_supervisor)  # dependency release (D3)
-    notify_run_finished(cfg, result)
-    con.close()
-    if wake_id:
-        spawn_supervisor(root, wake_id)
-    return 0 if status == "done" else 1
+        if not _claim_supervisor(con, int(run_id)):
+            return 1
+        run = _prepare_workdir(con, runs.find(con, int(run_id)))
+        profile, runtime_snapshot = _snapshots(run)
+        timeout, stall_timeout = _limits(profile)
+        token = auth.mint_run(con, int(run_id))
+        base_env = {
+            key: value for key, value in enrich_path(
+                config.worker_environment()).items()
+            if not key.startswith("ORCHESTRA_")
+        }
+        base_env.update({
+            "ORCHESTRA_RUN_ID": str(int(run_id)),
+            "ORCHESTRA_RUN_TOKEN": token,
+            "ORCHESTRA_URL": config.api_url(),
+        })
+        while True:
+            run = runs.find(con, int(run_id))
+            pending = _pending(con, int(run_id))
+            can_resume = _runtime_can_resume(runtime_snapshot)
+            if run["session_ref"] and pending and not can_resume:
+                prompt = _restart_prompt(
+                    con, run, pending,
+                    "the configured runtime cannot resume its saved session")
+                con.execute("UPDATE runs SET session_ref=NULL WHERE id=?",
+                            (int(run_id),))
+                con.commit()
+                run = runs.find(con, int(run_id))
+            else:
+                prompt = _prompt(con, run, pending)
+            plan = runtime.launch_plan(
+                runtime_snapshot, profile, workdir=run["workdir"],
+                title=run["title"] or f"orchestra-run-{run_id}", prompt=prompt,
+                run_id=int(run_id), session_ref=run["session_ref"],
+                inherited_env=base_env)
+            if plan.adapter == "acp":
+                outcome, exit_code = _run_acp(
+                    con, run, plan, prompt, pending, timeout, stall_timeout,
+                    profile, runtime_snapshot)
+            else:
+                outcome, exit_code = _run_exec_turn(
+                    con, run, plan, pending, timeout, stall_timeout)
+            run = runs.find(con, int(run_id))
+            if outcome == "resume":
+                con.execute(
+                    "UPDATE runs SET status='starting',pid=NULL,pid_identity=NULL "
+                    "WHERE id=? AND status='running'", (int(run_id),))
+                con.commit()
+                continue
+            if outcome == "suspend":
+                _suspend(con, int(run_id))
+                return 0
+            if outcome == "completed" and _wait_for_children(con, run, exit_code):
+                return 0
+            if outcome not in TERMINAL:
+                outcome = "failed"
+            result = finalize_run(con, run, outcome, exit_code)
+            return 0 if result["status"] == "completed" else 1
+    except BaseException as exc:
+        run = runs.find(con, int(run_id))
+        if run is not None and run["status"] not in TERMINAL:
+            finalize_run(con, run, "failed", None,
+                         summary=f"Execution failed: {exc}"[:4000])
+        print(f"orchestra: run {run_id}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        con.close()
+
+
+def never_started(run) -> bool:
+    return bool(run and run["status"] == "failed" and run["pid"] is None
+                and run["session_ref"] is None)

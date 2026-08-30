@@ -1,0 +1,20 @@
+{
+  "api_version": 2,
+  "instance_id": "7b9049b4-9097-4b8c-bfed-819129ab273e",
+  "data": {
+    "generated_at": "2026-08-29T12:00:00Z",
+    "instance": {"name": "Studio Mac", "platform": "darwin"},
+    "daemon": {"status": "healthy", "healthy": true, "last_tick_at": "2026-08-29T11:59:58Z"},
+    "scheduler": {"paused": false, "active": 1, "queued": 1, "max_active": 8},
+    "counts": {"runs_total": 31, "runs_active": 2, "runs_queued": 1},
+    "inbox": {"open": 2, "blocking": 1},
+    "messages": {"total": 14, "pending": 2, "delivered": 11,
+      "undeliverable": 1, "inbound": 5, "outbound": 8, "system": 1},
+    "observer": {"enabled": true, "profile_id": "profile-observer", "concurrency": 1,
+      "first_check_seconds": 300, "minimum_events": 5, "subsequent_check_seconds": 1800,
+      "authority": "correct_then_stop"},
+    "storage": {"database_bytes": 1024, "log_bytes": 2048,
+      "artifact_bytes": 4096, "checkpoint_bytes": 8192},
+    "future": {"ignored": true}
+  }
+}

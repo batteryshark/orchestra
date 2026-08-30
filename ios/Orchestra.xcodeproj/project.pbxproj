@@ -14,7 +14,20 @@
 		A10000000000000000000006 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* APIClient.swift */; };
 		A10000000000000000000007 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* Keychain.swift */; };
 		A10000000000000000000008 /* SnapshotDecoderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* SnapshotDecoderTests.swift */; };
-		A10000000000000000000009 /* snapshot-v6.json in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* snapshot-v6.json */; };
+		A10000000000000000000009 /* snapshot-v2.json in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* snapshot-v2.json */; };
+		C10000000000000000000001 /* OrchestraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* OrchestraApp.swift */; };
+		C10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* ContentView.swift */; };
+		C10000000000000000000003 /* RunDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* RunDetailView.swift */; };
+		C10000000000000000000004 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* AppState.swift */; };
+		C10000000000000000000005 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* Models.swift */; };
+		C10000000000000000000006 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* APIClient.swift */; };
+		C10000000000000000000007 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* Keychain.swift */; };
+		C10000000000000000000008 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F0 /* Components.swift */; };
+		C10000000000000000000009 /* RunsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F1 /* RunsView.swift */; };
+		C1000000000000000000000A /* RunwayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F3 /* RunwayView.swift */; };
+		C1000000000000000000000B /* ProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F4 /* ProfilesView.swift */; };
+		C1000000000000000000000C /* HealthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F5 /* HealthView.swift */; };
+		C1000000000000000000000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -30,39 +43,41 @@
 		A20000000000000000000006 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
 		A20000000000000000000007 /* Keychain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Keychain.swift; sourceTree = "<group>"; };
 		A20000000000000000000008 /* SnapshotDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotDecoderTests.swift; sourceTree = "<group>"; };
-		A20000000000000000000009 /* snapshot-v6.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "snapshot-v6.json"; sourceTree = "<group>"; };
+		A20000000000000000000009 /* snapshot-v2.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "snapshot-v2.json"; sourceTree = "<group>"; };
 		A2000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A200000000000000000000F0 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		A200000000000000000000F1 /* RunsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunsView.swift; sourceTree = "<group>"; };
 		A200000000000000000000F3 /* RunwayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunwayView.swift; sourceTree = "<group>"; };
 		A200000000000000000000F4 /* ProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilesView.swift; sourceTree = "<group>"; };
 		A200000000000000000000F5 /* HealthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthView.swift; sourceTree = "<group>"; };
-		A2000000000000000000000E /* snapshot-v7.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "snapshot-v7.json"; sourceTree = "<group>"; };
 		A2000000000000000000000D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A2000000000000000000000B /* Orchestra.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Orchestra.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000000000000000000000C /* OrchestraTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OrchestraTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C20000000000000000000001 /* Orchestra macOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Orchestra macOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		A60000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		A60000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		C60000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		A70000000000000000000001 = {isa = PBXGroup; children = (A70000000000000000000002 /* Orchestra */, A70000000000000000000003 /* OrchestraTests */, A70000000000000000000005 /* Products */); sourceTree = "<group>"; };
 		A70000000000000000000002 /* Orchestra */ = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000005, A20000000000000000000006, A20000000000000000000007, A2000000000000000000000A, A2000000000000000000000D, A200000000000000000000F0, A200000000000000000000F1, A200000000000000000000F3, A200000000000000000000F4, A200000000000000000000F5); path = Orchestra; sourceTree = "<group>"; };
 		A70000000000000000000003 /* OrchestraTests */ = {isa = PBXGroup; children = (A20000000000000000000008, A70000000000000000000004 /* Fixtures */); path = OrchestraTests; sourceTree = "<group>"; };
-		A70000000000000000000004 /* Fixtures */ = {isa = PBXGroup; children = (A20000000000000000000009, A2000000000000000000000E); path = Fixtures; sourceTree = "<group>"; };
-		A70000000000000000000005 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000B, A2000000000000000000000C); name = Products; sourceTree = "<group>"; };
+		A70000000000000000000004 /* Fixtures */ = {isa = PBXGroup; children = (A20000000000000000000009); path = Fixtures; sourceTree = "<group>"; };
+		A70000000000000000000005 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000B, C20000000000000000000001, A2000000000000000000000C); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
 		A50000000000000000000001 /* Orchestra */ = {isa = PBXNativeTarget; buildConfigurationList = A80000000000000000000001; buildPhases = (A90000000000000000000001, A60000000000000000000001, A90000000000000000000002); buildRules = (); dependencies = (); name = Orchestra; productName = Orchestra; productReference = A2000000000000000000000B; productType = "com.apple.product-type.application"; };
 		A50000000000000000000002 /* OrchestraTests */ = {isa = PBXNativeTarget; buildConfigurationList = A80000000000000000000002; buildPhases = (A90000000000000000000003, A60000000000000000000002, A90000000000000000000004); buildRules = (); dependencies = (A30000000000000000000002); name = OrchestraTests; productName = OrchestraTests; productReference = A2000000000000000000000C; productType = "com.apple.product-type.bundle.unit-test"; };
+		C50000000000000000000001 /* Orchestra macOS */ = {isa = PBXNativeTarget; buildConfigurationList = C80000000000000000000001; buildPhases = (C90000000000000000000001, C60000000000000000000001, C90000000000000000000002); buildRules = (); dependencies = (); name = "Orchestra macOS"; productName = "Orchestra macOS"; productReference = C20000000000000000000001; productType = "com.apple.product-type.application"; };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		A40000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {A50000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; A50000000000000000000002 = {CreatedOnToolsVersion = 26.6; TestTargetID = A50000000000000000000001; }; }; }; buildConfigurationList = A80000000000000000000003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A70000000000000000000001; productRefGroup = A70000000000000000000005; projectDirPath = ""; projectRoot = ""; targets = (A50000000000000000000001, A50000000000000000000002); };
+		A40000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {A50000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; A50000000000000000000002 = {CreatedOnToolsVersion = 26.6; TestTargetID = A50000000000000000000001; }; C50000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; }; }; buildConfigurationList = A80000000000000000000003; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A70000000000000000000001; productRefGroup = A70000000000000000000005; projectDirPath = ""; projectRoot = ""; targets = (A50000000000000000000001, C50000000000000000000001, A50000000000000000000002); };
 /* End PBXProject section */
 
 		A100000000000000000000F0 = {isa = PBXBuildFile; fileRef = A200000000000000000000F0; };
@@ -70,16 +85,17 @@
 		A100000000000000000000F3 = {isa = PBXBuildFile; fileRef = A200000000000000000000F3; };
 		A100000000000000000000F4 = {isa = PBXBuildFile; fileRef = A200000000000000000000F4; };
 		A100000000000000000000F5 = {isa = PBXBuildFile; fileRef = A200000000000000000000F5; };
-		A1000000000000000000000B = {isa = PBXBuildFile; fileRef = A2000000000000000000000E; };
 		A1000000000000000000000A = {isa = PBXBuildFile; fileRef = A2000000000000000000000D; };
 /* Begin PBXResourcesBuildPhase section */
 		A90000000000000000000002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A); runOnlyForDeploymentPostprocessing = 0; };
-		A90000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000009, A1000000000000000000000B); runOnlyForDeploymentPostprocessing = 0; };
+		A90000000000000000000004 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000009); runOnlyForDeploymentPostprocessing = 0; };
+		C90000000000000000000002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (C1000000000000000000000D); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A90000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007, A100000000000000000000F0, A100000000000000000000F1, A100000000000000000000F3, A100000000000000000000F4, A100000000000000000000F5); runOnlyForDeploymentPostprocessing = 0; };
 		A90000000000000000000003 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008); runOnlyForDeploymentPostprocessing = 0; };
+		C90000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (C10000000000000000000001, C10000000000000000000002, C10000000000000000000003, C10000000000000000000004, C10000000000000000000005, C10000000000000000000006, C10000000000000000000007, C10000000000000000000008, C10000000000000000000009, C1000000000000000000000A, C1000000000000000000000B, C1000000000000000000000C); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -87,10 +103,12 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		B10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Orchestra/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; }; name = Debug; };
-		B10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Orchestra/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; VALIDATE_PRODUCT = YES; }; name = Release; };
-		B10000000000000000000003 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Orchestra.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Orchestra"; }; name = Debug; };
-		B10000000000000000000004 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.dromond.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Orchestra.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Orchestra"; }; name = Release; };
+		B10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Orchestra/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 2.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SUPPORTS_MACCATALYST = NO; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		B10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Orchestra/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 2.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SUPPORTS_MACCATALYST = NO; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2"; VALIDATE_PRODUCT = YES; }; name = Release; };
+		B10000000000000000000003 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SUPPORTS_MACCATALYST = NO; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Orchestra.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Orchestra"; }; name = Debug; };
+		B10000000000000000000004 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SUPPORTS_MACCATALYST = NO; SWIFT_VERSION = 6.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Orchestra.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Orchestra"; }; name = Release; };
+		D10000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = Orchestra; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 2.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra.macos; PRODUCT_NAME = "Orchestra macOS"; SDKROOT = macosx; SWIFT_VERSION = 6.0; }; name = Debug; };
+		D10000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = Orchestra; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 2.0; PRODUCT_BUNDLE_IDENTIFIER = com.batteryshark.orchestra.macos; PRODUCT_NAME = "Orchestra macOS"; SDKROOT = macosx; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0; VALIDATE_PRODUCT = YES; }; name = Release; };
 		B10000000000000000000005 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; }; name = Debug; };
 		B10000000000000000000006 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; GCC_C_LANGUAGE_STANDARD = gnu17; SWIFT_COMPILATION_MODE = wholemodule; VALIDATE_PRODUCT = YES; }; name = Release; };
 /* End XCBuildConfiguration section */
@@ -99,6 +117,7 @@
 		A80000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000001, B10000000000000000000002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		A80000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000003, B10000000000000000000004); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		A80000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000005, B10000000000000000000006); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		C80000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (D10000000000000000000001, D10000000000000000000002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 	};
 	rootObject = A40000000000000000000001 /* Project object */;

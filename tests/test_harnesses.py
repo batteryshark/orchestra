@@ -1,13 +1,15 @@
 """One cross-module guard for the static supported-harness registry."""
+import tempfile
 import unittest
+from pathlib import Path
 
-from orchestra import acp, harnesses, profile_edit, runners, traces, worktree
+from orchestra import acp, harnesses, profiles, runners, traces, worktree
 
 
 class HarnessContractTests(unittest.TestCase):
     def test_each_harness_is_registered_on_its_public_surfaces(self) -> None:
-        fields = {"discovery", "launch", "resume", "trace", "correction",
-                  "usage", "add_directory", "transport"}
+        fields = {"discovery", "launch", "resume", "trace", "usage",
+                  "add_directory", "transport"}
         self.assertEqual(set(harnesses.SUPPORTED), set(harnesses.CAPABILITIES))
 
         for name in harnesses.SUPPORTED:
@@ -24,11 +26,15 @@ class HarnessContractTests(unittest.TestCase):
                     self.assertEqual(acp.build_acp_cmd(
                         {"name": name, "backend": name}), [name, "acp"])
 
-        surfaces = {
-            "discovery": profile_edit.picker_options({}),
-            "trace": traces.PARSERS,
-            "usage": runners.USAGE_PARSERS,
-        }
+        with tempfile.TemporaryDirectory() as directory:
+            def catalog(command):
+                if command[0] == "opencode":
+                    return "provider/model\n", None
+                return '{"models": []}', None
+            discovered = profiles.discover(
+                runner=catalog, reasonix_config=Path(directory) / "missing")
+        surfaces = {"discovery": discovered, "trace": traces.PARSERS,
+                    "usage": runners.USAGE_PARSERS}
         for capability, registered in surfaces.items():
             with self.subTest(capability=capability):
                 self.assertEqual(set(registered),

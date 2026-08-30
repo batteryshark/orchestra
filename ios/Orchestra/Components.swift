@@ -1,8 +1,5 @@
 import SwiftUI
 
-/// The Orchestra mark, drawn rather than shipped as an asset so it scales
-/// anywhere. Three vertical bars at different heights, like section levels
-/// on a mixing desk. Geometry matches assets/orchestra-mark.svg (128 grid).
 struct OrchestraMark: View {
     var tile = true
 
@@ -12,14 +9,14 @@ struct OrchestraMark: View {
     var body: some View {
         GeometryReader { proxy in
             let side = min(proxy.size.width, proxy.size.height)
-            let s = side / 128
+            let scale = side / 128
             ZStack(alignment: .topLeading) {
                 if tile {
-                    RoundedRectangle(cornerRadius: 24 * s).fill(Self.ink)
+                    RoundedRectangle(cornerRadius: 24 * scale).fill(Self.ink)
                 }
-                bar(s, x: 25, y: 55, height: 42, opacity: 0.45)
-                bar(s, x: 54, y: 30, height: 67, opacity: 1)
-                bar(s, x: 83, y: 46, height: 51, opacity: 0.7)
+                bar(scale, x: 25, y: 55, height: 42, opacity: 0.45)
+                bar(scale, x: 54, y: 30, height: 67, opacity: 1)
+                bar(scale, x: 83, y: 46, height: 51, opacity: 0.7)
             }
             .frame(width: side, height: side)
         }
@@ -27,229 +24,200 @@ struct OrchestraMark: View {
         .accessibilityLabel("Orchestra")
     }
 
-    private func bar(_ s: CGFloat, x: CGFloat, y: CGFloat,
+    private func bar(_ scale: CGFloat, x: CGFloat, y: CGFloat,
                      height: CGFloat, opacity: Double) -> some View {
-        RoundedRectangle(cornerRadius: 10 * s)
+        RoundedRectangle(cornerRadius: 10 * scale)
             .fill(Self.bar.opacity(opacity))
-            .frame(width: 20 * s, height: height * s)
-            .offset(x: x * s, y: y * s)
+            .frame(width: 20 * scale, height: height * scale)
+            .offset(x: x * scale, y: y * scale)
     }
 }
 
-/// A run's state, in the one colour the whole app agrees on.
 struct StatusChip: View {
     let status: String
 
-    var body: some View {
-        Text(status.replacingOccurrences(of: "_", with: " "))
-            .font(.caption2.weight(.bold))
-            .foregroundStyle(Self.color(status))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Self.color(status).opacity(0.14), in: Capsule())
-            .accessibilityLabel("Status: \(status)")
-    }
-
-    static func color(_ status: String) -> Color {
+    private var color: Color {
         switch status {
-        case "done": .green
-        case "running", "spawning": .blue
-        case "failed", "timeout": .red
-        case "killed": .orange
-        case "blocked", "waiting": .purple
+        case "completed", "healthy", "current", "enabled": .green
+        case "queued", "waiting", "stale", "paused": .orange
+        case "failed", "timed_out", "stopped", "disabled": .red
         default: .secondary
         }
+    }
+
+    var body: some View {
+        Text(status.replacingOccurrences(of: "_", with: " "))
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.12), in: Capsule())
+            .accessibilityLabel("Status: \(status)")
     }
 }
 
 struct MetricCard: View {
-    let title: String
     let value: String
-    let systemImage: String
-    var tint: Color = .accentColor
+    let label: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: systemImage).foregroundStyle(tint).font(.title3)
-            Text(value).font(.title2.bold()).contentTransition(.numericText())
-            Text(title).font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value).font(.title2.bold()).monospacedDigit()
+            Text(label).font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 }
 
-/// The project picker every tab carries, so switching context never means
-/// finding the one screen that owns it.
-struct ProjectToolbarMenu: ToolbarContent {
-    @EnvironmentObject private var state: AppState
+struct LoadingState: View {
+    let label: String
 
-    var body: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-                Button {
-                    state.selectedProjectID = nil
-                } label: {
-                    if state.selectedProjectID == nil {
-                        Label("All projects", systemImage: "checkmark")
-                    } else {
-                        Text("All projects")
-                    }
-                }
-                Divider()
-                ForEach(state.projects) { project in
-                    Button {
-                        state.selectedProjectID = project.projectID
-                    } label: {
-                        if project.projectID == state.selectedProjectID {
-                            Label(project.name, systemImage: "checkmark")
-                        } else {
-                            Text("\(project.name) · \(project.runs)")
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(state.error == nil ? Color.green : Color.orange)
-                        .frame(width: 7, height: 7)
-                    Text(state.selectedProject?.name ?? "All projects").lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
-                }
-            }
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text(label).foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
     }
 }
 
-/// Which daemon every screen is reading. Sits beside the project picker rather
-/// than inside Settings: switching machines is a thing done while looking at
-/// runs, not a thing done while configuring. Hidden entirely with one server,
-/// because a picker over a list of one is furniture.
-struct ServerToolbarMenu: ToolbarContent {
-    @EnvironmentObject private var state: AppState
-    @State private var settings = false
+struct EmptyState: View {
+    let icon: String
+    let title: String
+    let message: String
 
-    var body: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            Menu {
-                if state.servers.count > 1 {
-                    ForEach(state.servers) { server in
-                        Button {
-                            state.select(server.id)
-                        } label: {
-                            if server.id == state.selectedServer?.id {
-                                Label(server.displayName, systemImage: "checkmark")
-                            } else {
-                                Text(server.displayName)
-                            }
-                        }
-                    }
-                    Divider()
-                }
-                Button("Servers…", systemImage: "gear") { settings = true }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "server.rack").font(.caption)
-                    if state.servers.count > 1 {
-                        Text(state.selectedServer?.displayName ?? "").lineLimit(1)
-                        Image(systemName: "chevron.up.chevron.down").font(.caption2)
-                    }
-                }
-            }
-            .sheet(isPresented: $settings) { SettingsView() }
-        }
+    var body: some View {
+        ContentUnavailableView(title, systemImage: icon,
+                               description: Text(message))
     }
 }
 
-/// Shown when the last refresh failed. The data on screen is still the last
-/// good snapshot, so this says the connection broke — not that anything is
-/// wrong with what is displayed.
 struct ConnectionBanner: View {
     @EnvironmentObject private var state: AppState
 
     var body: some View {
         if let error = state.error {
-            HStack(spacing: 10) {
-                Image(systemName: "wifi.exclamationmark").foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Connection interrupted").font(.subheadline.weight(.semibold))
-                    Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                }
-                Spacer()
-                Button("Retry") { Task { await state.refresh() } }.buttonStyle(.bordered)
+            HStack(alignment: .top) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text(error).frame(maxWidth: .infinity, alignment: .leading)
+                Button("Retry") { Task { await state.refresh() } }
             }
-            .padding(12)
-            .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+            .font(.callout)
+            .foregroundStyle(.red)
+            .padding(10)
+            .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
             .padding(.horizontal)
         }
     }
 }
 
-/// Selectable, wrapping, left-aligned. Used wherever the app shows something
-/// the owner will want to copy: a branch, a commit, a path, a summary.
-struct WrappedText: View {
-    let text: String
-    var font: Font = .body
-    var color: Color = .primary
+struct ServerToolbarMenu: ToolbarContent {
+    @EnvironmentObject private var state: AppState
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .automatic) {
+            Menu {
+                ForEach(state.servers) { server in
+                    Button {
+                        state.select(server.id)
+                    } label: {
+                        if server.id == state.selectedServer?.id {
+                            Label(server.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(server.displayName)
+                        }
+                    }
+                }
+            } label: {
+                Label(state.selectedServer?.displayName ?? "Fleet",
+                      systemImage: "server.rack")
+            }
+            .accessibilityLabel("Selected fleet: \(state.selectedServer?.displayName ?? "none")")
+        }
+    }
+}
+
+struct RunRow: View {
+    @EnvironmentObject private var state: AppState
+    let run: Run
 
     var body: some View {
-        Text(text)
-            .font(font)
-            .foregroundStyle(color)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(run.isLive ? Color.green : Color.secondary.opacity(0.35))
+                    .frame(width: 8, height: 8)
+                Text(run.display ?? "\(state.groupName(run.groupID) ?? "General") #\(run.groupNumber)")
+                    .font(.caption.weight(.bold)).monospacedDigit()
+                Spacer()
+                StatusChip(status: run.status)
+            }
+            Text(run.title ?? run.context ?? "Run \(run.id)")
+                .font(.headline).lineLimit(2)
+            HStack(spacing: 8) {
+                Text(state.profileName(run.profileID) ?? run.profileID)
+                if let hold = run.hold { Text("Held: \(hold.detail ?? hold.kind)") }
+                if let waiting = run.waitingKind { Text("Waiting: \(waiting)") }
+                Spacer(minLength: 0)
+                Text((run.startedAt ?? run.queuedAt).relativeAge)
+            }
+            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .combine)
     }
 }
 
-extension Double {
-    /// "4m 12s" — durations read as durations, never as 252.0.
-    var durationLabel: String {
-        let total = Int(self)
-        if total < 60 { return "\(total)s" }
-        if total < 3600 { return "\(total / 60)m \(total % 60)s" }
-        return "\(total / 3600)h \((total % 3600) / 60)m"
+struct UsageView: View {
+    let usage: Usage?
+    let title: String
+
+    var body: some View {
+        GroupBox(title) {
+            HStack {
+                Fact(label: "Input", value: usage?.inputTokens?.formatted() ?? "—")
+                Spacer()
+                Fact(label: "Output", value: usage?.outputTokens?.formatted() ?? "—")
+                Spacer()
+                Fact(label: "Metered API cost", value: (usage?.costUSD).money)
+            }
+            .frame(maxWidth: .infinity)
+        }
     }
 }
 
-extension String {
-    /// "12m ago" from a daemon timestamp. A stamp that will not parse is shown
-    /// as it came, never dropped.
-    var relativeStamp: String {
-        guard let date = Self.stampParser.date(from: self) else { return self }
-        return Self.stampRelative.localizedString(for: date, relativeTo: Date())
+struct Fact: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text(value).textSelection(.enabled)
+        }
+        .accessibilityElement(children: .combine)
     }
+}
 
-    // Built once, never mutated after: both are configured here and only ever
-    // asked to format. `nonisolated(unsafe)` says exactly that — the
-    // alternative is a formatter per row, and a list of a hundred turns builds
-    // two hundred of them.
-    nonisolated(unsafe) private static let stampParser: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
-    nonisolated(unsafe) private static let stampRelative: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
-    }()
+extension String? {
+    var relativeAge: String {
+        guard let self,
+              let date = ISO8601DateFormatter().date(from: self) else { return "—" }
+        return date.formatted(.relative(presentation: .named))
+    }
 }
 
 extension Int {
-    /// "12,480" — token counts are read, not computed with.
-    var grouped: String {
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        return f.string(from: NSNumber(value: self)) ?? "\(self)"
-    }
+    var byteCount: String { ByteCountFormatter.string(fromByteCount: Int64(self), countStyle: .file) }
 }
 
-extension Array {
-    /// Bounds-checked read. Lives here rather than beside one view because
-    /// every file that parses launch arguments wants it.
-    subscript(safe index: Int) -> Element? {
-        indices.contains(index) ? self[index] : nil
+extension Double? {
+    var money: String {
+        guard let self else { return "—" }
+        return self.formatted(.currency(code: "USD").precision(.fractionLength(self >= 1 ? 2 : 4)))
     }
 }

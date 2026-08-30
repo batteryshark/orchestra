@@ -1,438 +1,395 @@
-# Orchestra: current architecture
+# Orchestra v2 architecture
 
-This document describes the current code. It separates the execution core from
-optional policy and calls out incomplete paths.
+This is the hard-reset contract. It replaces every earlier Orchestra schema,
+API, callback, client, and workflow assumption.
 
-## Mission
+## 1. Product boundary
 
-Orchestra is a local execution plane for agent work. It accepts a mission from
-a person, an agent, or an external source, starts the selected harness, and keeps a durable
-record of its lifecycle, trace, controls, and outcome.
+Orchestra is a standalone, single-host agent fleet runner and control plane. It
+accepts neutral executable requests, schedules configured local execution capacity,
+supervises agent runtimes, supports bounded delegation and operator control,
+and retains complete execution evidence.
 
-Codex, Claude Code, OpenCode, and Reasonix are the supported harnesses today.
-Orchestra normalizes how their runs are launched, observed, controlled, and
-reported. Harness-native tools, permissions, configuration, and model catalogs
-remain harness-specific.
+It deliberately does not model work. There are no tickets, task states,
+claims, leases, handoffs, acceptance gates, source-system caches, writeback
+queues, verification policy, review roles, or landing decisions. It is useful
+for code, research, mail, documents, browsers, operations, and other requests
+without any Workbridge or Slash Work installation.
 
-Source automation, git landing, routing, conducting, human escalation, provider
-runway, and the iOS client are policies or integrations. Direct dispatch does
-not require them.
+The invariants are:
 
-## Product boundary
+1. One explicit `RunRequest` admits every execution.
+2. A run is the only scheduled execution object.
+3. One daemon is the normal writer and SQLite is durable truth.
+4. Grouping never changes execution policy.
+5. A frozen working directory controls where execution occurs; profile controls how it occurs.
+6. Routing and result acceptance belong to callers, never Orchestra.
+7. Every mutation, wait, delivery failure, and terminal outcome is auditable.
+8. Raw evidence is retained even if derived views fail.
+9. Prefer SQLite, the standard library, process protocols, and native clients
+   over framework, plugin, broker, and distributed-system layers.
 
-Orchestra owns execution after it receives a mission. The caller owns intent. A
-source-backed conductor may decompose a human-delegated goal, but that is an
-optional policy rather than the definition of a run.
+## 2. One host, many clients
 
-Each run has a durable numeric id. A profile selects its harness, model, effort,
-and launch settings. As work proceeds, the run record accumulates raw output,
-normalized events, messages, usage when available, and a terminal summary.
-At completion, the refreshed run row is the result contract. Orchestra does not
-copy the same state into a second `RunResult` model.
+An Orchestra instance is one machine with:
 
-The twelve sections retain the old DESIGN section numbers because source
-comments use them as architectural signposts. Their content now describes
-current behavior rather than the original build plan.
+- one v2 SQLite database and generated `instance_id`;
+- one authoritative daemon, scheduler, and HTTP API;
+- configured groups, runtimes, profiles, runway sources, and credentials;
+- local workspaces, worktrees, logs, artifacts, and checkpoints;
+- browser, CLI, iPhone, iPad, and native macOS clients.
 
-## 1. External automation and the registry
+“Fleet” means the configured harness/profile capacity on that host. Orchestra
+has no node registry, leader election, membership protocol, remote worker
+lease, distributed lock, cross-node database, or aggregate scheduler. A run
+can operate another machine through tools such as SSH, but that does not make
+the remote machine an Orchestra node.
 
-Orchestra hosts NO source integration. The source automation — the sweep, the
-conductor, the verify lane, the findings filer, the router — lives in the
-sibling **work-bridge** project: a consumer that knows both sides so that
-neither knows the other. The bridge drives Orchestra through its library
-and API, keeps its own tables in its own ATTACHed database file, and runs
-as its own process (`workbridge sweep --watch`). Any other source (Linear,
-a cron script) integrates the same way: dispatch with a path, a brief, an
-opaque `ref` and `requester`; read the cursored results feed and the
-receipts.
+Clients may save several independent endpoints and switch between them. They
+must never imply that Orchestra balances or coordinates those instances.
 
-Orchestra's registry holds project IDENTITIES and nothing else (schema v29):
-one row per project — slug, name, provenance, parked flags. NO PATHS.
-Orchestra is a runner: the checkout a run works in is the caller's to supply
-at dispatch, and "where does this project usually run" is answered by the
-run history (`runs.repo`), not by stored configuration. A project enters the
-registry two ways:
+## 3. Groups and numbering
 
-- `orchestra project add <name>` mints an owner-local identity (a directory
-  argument contributes only its name).
-- An external caller (the work-bridge) caches its source's project
-  identities through the one core seam, `project.remember_identity`. Cached
-  identities the source stops naming are pruned unless runs or an owner's
-  override hold them; owner-minted rows are never a caller's to delete.
+A **Group** organizes runs. It has a stable id, unique name and slug, archive
+state, creation metadata, atomic next-number counter, and an optional
+write-only default working directory for future runs.
+`General` is created at initialization and is the default.
 
-The label-to-folder map is the BRIDGE's own `checkouts` table, in the
-bridge's own database file. An unattended dispatch is the bridge resolving
-its own labels; nothing in this repository reads that table.
+Every admitted root, child, retry, or explicit continuation receives:
 
-Every project carries a SLUG (v27): lowercase kebab-case, minted once from
-the name, unique, never rewritten by a refresh or rename. The slug is the
-HUMAN address: `dispatch --project <slug>` targets a project from anywhere,
-`POST /api/dispatch` addresses it the same way, and the project's own state
-directory is keyed by it, so troubleshooting starts from a name instead of
-a UUID. `project_id` stays the machine key everything joins on. Identity
-minting reaches every surface: the CLI, `POST /api/projects/add`, and the
-dashboard's projects panel.
+- a globally unique integer run id on the instance; and
+- the next immutable sequence number within its group.
 
-A registered project may be ARCHIVED, which means parked rather than hidden.
-The source's flag is the DEFAULT, not the owner: a source marks its own
-projects archived and serves the flag, the adapter's refresh copies it into
-`projects.archived`, so archiving a project there parks it in Orchestra with
-no local action. The owner's own answer sits above it in
-`projects.archived_override` — NULL follows the source, 0 or 1 is a decision
-made here and wins. Effective archived is
-`COALESCE(archived_override, archived, 0)`, and core code reads that derived
-boolean and never asks who set it. `orchestra project archive` parks ANY
-project, source-backed or not, because archiving means "hide this from
-Orchestra and stop dispatching for it" — Orchestra's own decision about its
-own surface, which no refresh may overwrite. `project forget` still refuses a
-source-cached identity, since the next refresh would put the row back and the
-removal would look broken. A parked project is off `orchestra project list` (`--all` shows
-it, marked) and off the dashboard's project picker, and the bridge's
-unattended lanes skip its items. Nothing else changes: manual
-`orchestra dispatch` still runs and only prints a notice, a run already in
-flight is untouched, and statistics, run listings, `orchestra show`, and every
-run the project already owns read exactly as before.
+The human label is `Group Name #N`. Group assignment cannot change after
+admission. Resuming the same suspended run and running an Observer check do not
+consume numbers. Renaming a group changes the current display prefix but not
+run identity. Archived groups remain filterable and retain their history.
 
-What the bridge does with its source — claiming, ferrying, reporting, sign-off,
-the conductor's planner turns — is the bridge's own documentation, tested
-in its own repository. Orchestra needs none of it for registration or
-direct dispatch.
+Groups do not contain a default profile, runtime, runway source,
+priority, routing rule, or concurrency policy.
 
-## 2. Daemon and central state
+## 4. Working directories and repository isolation
 
-SQLite state, briefs, raw logs, and worktrees live under `~/.orchestra/`.
-Configuration lives at `~/.config/orchestra/config.toml`. Projects do not need
-a local Orchestra state directory. On POSIX systems, the state root and its
-managed containers are owner-only (`0700`) traversal boundaries.
+A root run may provide an explicit `cwd`. Otherwise Orchestra uses its group's
+optional default; if neither exists it creates a persistent managed group
+workspace. The daemon expands and canonicalizes the selected host path,
+requires an existing directory, and freezes the result at admission. Children,
+retries, and continuations inherit that frozen directory. Later group edits
+affect only future root runs.
 
-Per-project state lives under one slug-keyed area,
-`~/.orchestra/projects/<slug>/`. A worker run's own artifacts — `brief.md`
-and the raw `log.jsonl`, with room for future outputs beside them — file at
-`runs/run-<seq>/`, named by the PROJECT's run number because that is the
-number humans quote from the board; `worktrees/run-<id>` holds isolated
-checkouts (named by the row id, which is also the branch number), and
-`workspace` serves a project with no folder of its own. A row with no
-project number — a control turn, a pre-v27 run — keeps the flat `briefs/`
-and `logs/` layout keyed by the globally unique row id, and readers never
-derive either path: the run row's `brief_path`/`log_path` are the record.
-Pre-v27 directories (`worktrees/<id>`, `workspaces/<id>`) are still read
-and pruned where they already exist; nothing is moved under a live run.
+Paths are write-only configuration. Public projections expose only whether a
+group has a default and whether a run selected its directory from the run,
+group, managed fallback, or lineage inheritance. When the frozen directory is
+inside a Git repository, Orchestra automatically creates a per-run worktree
+at the repository root and runs in the corresponding relative subdirectory.
+Repository detection and isolation are internal execution behavior, not a
+caller-selected policy axis.
 
-Raw logs are kept forever by default (`raw_log_retention_days = 0`): they
-are the full-detail record of every run's input and output, held for later
-analysis. Pruning is opt-in — a positive day count, plus a human running
-`orchestra traces prune`.
+## 5. Runtimes and profiles
 
-A direct run follows this path:
+A **Runtime** describes a process/session protocol. Codex, Claude Code,
+OpenCode, and Reasonix are first-class built-ins with normalized launch,
+session, steering, interrupt, event, usage, and completion behavior. A
+configurable argv/ACP runtime supports another harness without loading Python
+plugins or granting an in-process extension surface.
+
+V2 launches one adapter process or session per run. The runtime boundary keeps
+a future proven PydanticAI or pi-agent implementation possible without
+pretending that a resident worker pool exists today.
+
+Observer is a stricter use of that boundary. Its process receives a minimal
+OS/bootstrap environment, a bounded evidence prompt, no workspace, no run or
+operator credential, and no delegation surface. A profile is Observer-capable
+only when its adapter has an enforceable tool-free launch: Claude Code,
+OpenCode, and Reasonix today. Codex, generic argv, and ACP are rejected for
+Observer use until they can prove the same property.
+
+A **Profile** is a managed launch configuration that references one runtime.
+It includes model, effort, environment and sandbox policy, timeouts,
+capabilities, tier, display priority, optional active cap, optional runway
+source, and enabled state. A run snapshots the non-secret effective runtime
+and profile configuration at admission. Secrets remain in provider stores,
+daemon environment, or a local mode-0600 secret file and are always redacted
+from API, export, logs, and snapshots.
+
+Tiers are capability bounds:
+
+- tier 1: workhorse;
+- tier 2: generalist;
+- tier 3: heavy.
+
+The root profile is always explicit. Orchestra never routes between profiles.
+A parent explicitly names each child profile, which may be the same tier or a
+lower tier but never a higher tier. Profile priority is metadata for display
+and external policy; it never changes FIFO scheduling.
+
+## 6. Managed configuration
+
+SQLite is authoritative for groups, runtimes, profiles,
+runway source definitions, Observer settings, fleet settings, devices, and
+service tokens. Configuration changes go through the daemon and create control
+audit rows. Export is a redacted interchange document, not an alternate source
+of truth.
+
+Only bootstrap location, daemon/service startup values, and secrets remain
+outside SQLite. V2 deletes the comment-preserving TOML editor and does not
+maintain two configuration paths.
+
+## 7. Admission contract
+
+`RunRequest` v2 contains:
 
 ```text
-human or program                         work-bridge (optional)
-       \                                      /
-                    mission + profile
-                            |
-                    durable run row
-                            |
-             prepare brief, log, and optional worktree
-                            |
-                  detached supervisor
-                            |
-          Codex | Claude | OpenCode | Reasonix
-                            |
-             raw log + normalized trace + controls
-                            |
-                 terminal status and summary
-                            |
-          optional landing; receipts for any consumer
+request_id    required  caller idempotency key
+profile       required  enabled profile id or name
+context       required  self-contained executable request
+group         optional  group id/name; defaults to General
+title         optional  human display label
+cwd           optional  write-only daemon-host directory override
+ref           optional  opaque caller correlation value
+after         optional  run dependencies with success|terminal condition
+requested_by  optional  stable audit label
+observer      optional  inherit|off|observer profile; defaults to inherit
 ```
 
-Manual CLI dispatch, the bridge's sweeping and conducting, retries, and
-resolver runs create run rows through several paths. They converge on `prepare_launch`
-and the same supervisor. W-0293 tracks the missing single
-`RunRequest -> Run` admission seam.
+Only `request_id` deduplicates. Replaying it returns the original admission;
+`ref` is stored and indexed but never interpreted. Admission validates the
+working directory, profile/runtime availability, dependency ids and conditions,
+Observer selection, and lineage bounds in one transaction. It then
+allocates the group number and freezes the run brief/configuration snapshot.
 
-Rehome is required before a continuation or retry whose original worktree has
-been released. This keeps a resumed harness session out of a stale path.
+## 8. Scheduler and lifecycle
 
-## 3. HTTP and clients
+The daemon is the only scheduler. Ready runs start in admission order. The
+global active cap defaults to eight; profiles may add smaller caps. A global
+pause prevents starts but does not interrupt active runs or maintenance.
 
-The daemon serves a versioned snapshot API, trace streams, action routes, and
-the static dashboard on one port. Reads and actions require either the human
-secret or a scoped per-run token. A run token can read shared state but can act
-only on its own run; termination revokes it. `POST /api/projects/add`
-mints a project identity and `POST /api/dispatch` starts a run against a
-named project — both human-key only, the same admission path the CLI uses,
-so a client that is not a terminal can create a project and put work into it.
+Queued runs expose exactly why they are held:
 
-The dashboard and iOS app are optional clients of that API. The iOS bundle
-identifier and Keychain service keep their shipped string for upgrade and
-Keychain compatibility; every name in the project and on the phone is
-Orchestra.
+- dependency condition not yet met;
+- global pause;
+- global active capacity;
+- profile active capacity;
+- fresh definitive runway exhaustion; or
+- scheduled retry time.
 
-Run outcomes leave through a CURSORED READ, not a callback. Every run row
-carries `revision`, a monotonic marker the same triggers stamp that bump the
-board counter, and `GET /api/runs?since=<revision>` pages the rows past a
-caller's cursor. Orchestra holds no subscriber list, no endpoint and no
-delivery state, so it cannot learn who consumes it; the consumer's own cursor
-is the delivery guarantee, which is why no retry queue exists on this side.
-The source adapter reads it like any other consumer would. A push relay could
-subscribe and POST without Orchestra learning anything (source boundary).
+Stale, unknown, or unlinked runway never blocks a run. Orchestra never selects
+a substitute profile.
 
-The HTTP server can bind to loopback or a discovered Tailscale address. Host
-checks still apply on a tailnet — but the shared key does not have to: a
-peer `tailscale whois` resolves to a login is treated as the human, on by
-default, because the tailnet is the boundary and the phone should not carry
-a key. Loopback and this machine's OWN tailscale address never count
-(workers run on this machine — the same hole `trust_local` documents), and
-`[http] tailnet_logins` narrows trust to listed logins. `tailnet_auth =
-false` restores key-only access.
+The externally meaningful lifecycle is:
 
-## 4. Dispatch and isolation
+```text
+queued -> starting -> running <-> waiting -> completed
+                                      |----> failed
+                                      |----> timed_out
+                                      |----> stopped
+                                      |----> skipped
+```
 
-Manual dispatch uses an isolated worktree by default. `--shared` is an explicit
-choice for read-only work or another case where the caller accepts use of the
-registered checkout. Concurrent mutation is safe only when each run has an
-isolated checkout.
+`waiting` has a kind such as `input` or `children` and does not consume active
+runtime capacity. A failed `success` dependency causes a dependent to become
+`skipped`; a `terminal` dependency accepts any terminal predecessor.
 
-A project is not one checkout, and the core stores no checkout at all
-(schema v29). The caller supplies the repository: `dispatch --path` (and
-`path` on `POST /api/dispatch`) names it outright; a bare dispatch uses the
-current directory; a dispatch that only NAMES a project (`--project`) uses
-the checkout the project last ran in — the run history, not a setting —
-else the adapter's map, else it asks for `--path` once. The run row records
-its checkout as `runs.repo` (v28, backfilled at v29), and `project.root_for`
-reads it, so landing, retries, and diffs return to the checkout the run
-actually came from. With no `--project`, the checkout also names the
-project: the run history first, then the adapter's map. The worktree and
-artifacts still file under `~/.orchestra/projects/<slug>/`, and a
-caller-named path inside `~/.orchestra` itself is refused (the workspace
-excepted) — a worktree of the run database is never what anyone meant.
+Crash repair relies on durable process/session identity. It never equates a
+PID, process creation, or an empty log with successful execution.
 
-An isolated run uses a branch named `orchestra/run-N`. The bridge's
-unattended dispatches request isolation by default too. If worktree setup or rehoming
-fails, launch fails closed; unattended execution never changes to the owner's
-checkout. A project's `worktree = false` in the source's own config table is the explicit shared mode.
+## 9. Delegation, continuation, and retries
 
-Orchestra has no global, per-project, or per-profile concurrency cap. The
-visible live count and pause switch are the admission controls. Pause stops
-manual and policy-driven admission, including continuations and ready dependency
-launches. Live work, automatic landing, completion reporting, failed dependency
-settlement, completion-only Nod actions, runway and project refresh, source message
-ferrying, and health maintenance continue. Ordinary conductor events,
-infrastructure retries, resolver answers, and completion judgments are retained
-for resume. A paused judgment does not spend its planner turn.
+A running worker may request child runs through its bounded run token. The
+parent names the profile and supplies bounded executable Context. Default maximum
+child depth is two; hard/configurable bounds include three children per parent
+and three concurrently active children. All children are ordinary runs,
+inherit the frozen group and CWD, receive their own group number, and record parent
+lineage.
 
-## 5. Profiles and supported harnesses
+When a parent turn finishes before children settle, the parent becomes
+`waiting:children`, releases runtime capacity, and resumes the same run/session
+once results are ready. This resume does not create a continuation run.
 
-Profiles are global launch templates, not durable worker identities. A profile
-names a harness, model, effort, priority, tier, and launch settings. A project
-may restrict which global profiles it can use.
+Explicit **Retry** and **Continue** controls do create new runs. Retry freezes
+the prior request/configuration plus requested adjustments; Continue uses the
+prior result as bounded context for a new request. Both inherit group/CWD and
+record their lineage type.
 
-Orchestra does not expose child-run settings or delegation guidance. There is
-no child launcher; a real parent/child lifecycle should be added only with an
-end-to-end use case.
+Orchestra may create one automatic retry for a conservatively recognized
+transient infrastructure failure. It is a new, numbered run with the same
+group, frozen CWD, and profile. Unknown or authentication failures do not retry;
+they stop and create attention. No retry reroutes profiles.
 
-One static capability table records discovery, launch, resume, traces,
-correction, usage, additional-directory support, and transport for the four
-supported harnesses. A completeness test checks the concrete integration
-surfaces against that table. It is product data, not a plug-in framework.
+## 10. Messages, attention, and controls
 
-Write authority is split by cost. An agent may retune a note or lower an
-effort; anything that commits spend — a model, a harness, a new profile, a
-raised effort, or the tier/priority a planner routes on — is refused and
-RECORDED instead. Config editing knows no record system: `profile_edit`
-writes one escalation record (§8's `nod_requests`, carrying the profile, the
-keys and their values) and stops. Delivery is a later, retryable read of that
-record: a source adapter files the decision the human answers, and
-`orchestra profiles` prints the request until then, so the values are
-readable from the CLI with every source down.
+Every run has a durable thread with sender, kind, body, timestamps, delivery
+state, receipt, and failure reason.
 
-The durable write comes FIRST, before any delivery is attempted. The earlier
-shape filed the decision and kept the request only in its return value, so
-every failure path reported that a human was needed while destroying what it
-asked for (2026-08-28: an agent's request reached neither the source nor any local
-row, and the values were unrecoverable).
+The fleet-wide Inbox is backed by first-class **Attention** records:
 
-There is no team, roster, council, squad, or other grouping layer.
+- blocking question or decision, with correlation id, optional choices,
+  optional deadline/fallback, and no default expiry;
+- profile-change proposal with an explicit patch and rationale; or
+- nonblocking alert.
 
-## 6. Execution and messaging
+A blocking item suspends the run as `waiting:input`, releases its runtime slot,
+and does not retain a sleeping harness process. The first authorized answer
+wins transactionally. The response is inserted into the thread and the same
+run/session resumes. Current-profile effort or note reductions may be applied
+by the worker directly; other profile changes require an approve/reject
+proposal. Orchestra validates and applies an approved patch.
 
-`prepare_launch` freezes the brief and item snapshot, creates the raw log, and
-optionally prepares an isolated worktree. The detached supervisor mints a
-per-run control token, builds the harness command, starts it, and records its
-terminal status and handoff.
+Controls are:
 
-Queued `tell` messages reach an exec harness at a safe turn boundary. Immediate
-stop, resume, and session continuation use each harness's supported mechanism.
-The optional ACP transport provides a persistent protocol session for configured
-OpenCode or Reasonix profiles; ordinary process execution is the default.
+- **Tell**: live steer when supported, otherwise safe-boundary delivery.
+- **Interrupt**: cancel the active turn then resume the same run with new
+  direction. Before a reliable session reference exists, restart from the
+  frozen brief, trace summary, and new message, with explicit replay-risk
+  evidence.
+- **Stop**: target only the selected run.
+- **Stop Tree**: target the selected run and descendants explicitly.
+- **Check**: run mechanical inspection and optional Observer review.
+- **Retry** and **Continue**: admit lineage runs as defined above.
 
-OpenCode native subagents are denied by default because Orchestra cannot observe
-or control them. `opencode_native_subagents = true` restores that
-harness-native behavior. Orchestra has no replacement child launcher yet.
+Every control accepts an idempotency request id where replay matters and
+creates a control audit record. Undeliverable messages remain visible; they are
+never silently dropped or redirected.
 
-## 7. Traces and supervision
+## 11. Observer
 
-Parsers turn raw harness output into common trace events for the CLI, dashboard,
-iOS client, messages, and usage accounting. Normalized events provide the
-durable shared view. Raw logs preserve harness-specific detail and are kept
-forever by default; pruning terminal runs' logs is opt-in (§2). Normalization
-does not make harness-native tools identical.
+Observer is one first-class, configurable agent-runtime subsystem. It is not a
+control turn, seat, worker run, child, reviewer, router, or Nod integration.
+There is one fleet default Observer profile or observation is disabled.
 
-The supervisor enforces configurable hard and stall timeouts and runs
-mechanical loop checks. A manual `check` can add an out-of-band model judgment
-when an observer profile is available. Neither replaces deterministic
-timeouts.
+Observer receives only bounded Context and a trace window. It gets no
+workspace, tools, worker run token, or delegation authority. Its activity and
+checks are stored separately from worker runs, group numbering, and ordinary
+run statistics. Observer usage/cost is separately visible and also included
+in combined cost.
 
-A transient infrastructure failure gets one automatic retry of the same
-brief. A recognized non-refreshable authentication failure does not: Orchestra
-escalates it until the operator reauthenticates, then the work must be
-dispatched afresh.
+The default schedule is a first check after five minutes and at least five new
+events, followed by checks no more often than every thirty minutes and only
+when new events exist. Observer concurrency defaults to one.
 
-## 8. Optional human loop
+Authority is “correct, then stop”: the first adverse judgment may Tell; a
+repeated adverse judgment after new evidence may stop the run. An Observer
+stop emits an Inbox alert and optional callback. Mechanical supervision,
+failure classification, and retry remain deterministic subsystems.
 
-Nod can deliver blocking decisions and alerts outside the worker session. It is
-disabled by default. Run summaries remain local, and source-backed runs also keep
-their comments at the source.
+## 12. Runway
 
-The CLI retains direct `ask`, `show`, and `cancel` operations for this
-adapter. Nod is not part of the minimum execution path.
+A runway source is a named provider/account/lane measurement definition.
+Multiple accounts and lanes are first class, and multiple profiles may link to
+one source. Built-in adapters cover supported providers; a custom adapter is a
+configured argv command that reads/writes bounded JSON. There is no generic
+HTTP mapping language or plugin SDK.
 
-## 9. Completion and landing
+Each observation records windows, reset times, value/remaining capacity,
+freshness, adapter outcome, and timestamp. The UI starts with sources, shows
+linked profiles, history and burn, and marks stale/unknown data honestly. Only
+a fresh definitive zero creates a scheduler hold.
 
-Completion records the final handoff and usage, checkpoints isolated changes,
-and releases the worktree. A completed shared-checkout run has no Orchestra
-branch to land.
+## 13. Evidence and artifacts
 
-Landing operates in a scratch worktree. It rebases onto the base, runs declared
-project checks, evaluates mechanical tripwires, and updates the base ref with
-compare-and-swap. The owner's checkout is not used as the merge worktree.
+Evidence is retained indefinitely by default:
 
-Landing has no acceptance-criteria review stage. The enforceable policy is
-declared checks plus mechanical tripwires, with an optional mission-alignment
-judgment for tripped limits. Output identifies the checks and tripwires that
-actually ran.
+- run request, frozen profile/runtime snapshot, lifecycle, holds, and lineage;
+- thread messages, attention, receipts, and control events;
+- raw runtime logs and normalized trace events;
+- worker and Observer usage/cost;
+- Observer checks and decisions;
+- explicitly published artifacts; and
+- Git base/head/branch/checkpoint/patch/diff facts.
 
-Landing reports to no source. It stamps `landing_status` and `landing_commit`
-on the run row and writes its report into the run's own thread. A source
-adapter reads that receipt and posts the fact, because rebasing a branch and
-moving a ref must not know a record system exists (source boundary).
+Artifact publication is explicit. A worker names a file under its work
+directory; Orchestra rejects traversal and escaping symlinks, copies the bytes
+to immutable run-owned storage, and records name, media type, size, SHA-256,
+and timestamps. The API supports metadata, range reads, and download. Web and
+Apple clients preview common text, Markdown, images, PDF, audio, and video
+metadata and download everything else. Orchestra never scans or sweeps a
+workspace for “interesting” output.
 
-Landing is a POLICY, and `[merge] enabled = false` turns the automatic path
-off: the run then ends at its branch and a `landing_status` of `skipped`,
-kept for whatever lands it — a human, or an external agentic lander that
-reads the receipts and posts its own facts. Dependents still release on a
-skipped landing, the adapter's report posts the result comment but no
-lifecycle fact, and no checklist criterion is declined on the run's behalf.
-An explicit retry (`retry_landing`) still lands: the switch gates the
-automatic path, never the owner's own hand.
+Storage management reports usage, provides a dry-run prune, and protects
+pinned evidence. Worktrees may be released after checkpointing; branches and
+checkpoints remain. Deletion is always an explicit operator action.
 
-Every successful run's final handoff is parsed. Findings and proposals are filed
-only when a source is configured and the run has source context. They have no local
-durable collection, so the dashboard and iOS client do not present one.
+## 14. Git boundary
 
-## 10. The conductor (moved out)
+When the frozen CWD belongs to a repository, Orchestra automatically creates a
+per-run worktree when needed without mutating the owner's checkout. Orchestra
+records branch, base, head, checkpoints, patch, and diff as execution evidence.
+Repository detection and containment are internal execution behavior, not a
+public routing or isolation policy.
 
-The conductor lives in the work-bridge project with the rest of the source
-automation. Its planner turns still record as `layer` rows in `runs`
-(through the library), so the dashboard shows them like any control turn —
-but no conductor code exists in this repository.
+Orchestra does not run acceptance checks, assign reviewers, judge changes,
+resolve conflicts, rebase, merge, land, update an owner checkout, or emit a
+landing receipt. Workbridge, another integration, or a human owns those
+decisions. A successful code run is complete with its result, artifacts, and
+retained Git evidence.
 
-## 11. Statistics and runway
+## 15. Authentication and network boundary
 
-Run rows retain elapsed worker time, harness usage, token counts, and cost when
-the harness reports them. `stats` and the clients aggregate those records.
+V2 has three credential types:
 
-Runway polls provider capacity through provider-specific mechanisms and can feed
-the optional router. It is auxiliary telemetry, not an execution gate.
+- paired operator-device tokens, created through a short-lived one-time code or
+  pairing URI, stored hashed, individually revocable, and held in Keychain or
+  a secure same-origin cookie;
+- service tokens with fixed authorities such as dispatch, read, control, and
+  answer, but never device or daemon administration; and
+- short-lived run tokens scoped to that run's worker routes and revoked at
+  terminal state.
 
-## 12. Run environment and platform support
+There is no general RBAC, user/org model, secret broker, or multi-tenant
+sandbox claim. `/health` exposes only minimal liveness. Every v2 resource and
+stream route is authenticated. Operators bring a trusted private network and
+TLS/reverse proxy; Orchestra does not provide public relay or TLS automation.
 
-Each harness keeps its native tools and sandbox. Declared `add_dirs` request
-additional-directory access through harness-native flags; the resulting
-permissions vary by harness. The run brief reserves git writes for Orchestra.
-Process-level containment is not implemented.
+Active first-party clients may badge or notify locally. Reliable background
+push belongs to an external callback adapter; v2 does not contain APNs.
 
-`orchestra service` installs a LaunchAgent on macOS or a per-user Scheduled
-Task on Windows. There is no service installer for other platforms. The
-repository contains zero third-party Python runtime dependencies.
+The bootstrap defaults to loopback port 8765 as a human-addressable local
+choice, not an ecosystem reservation. The host setting is explicit and a bind
+collision fails clearly; tunnel, proxy, and client-side forwarding collisions
+remain operator-visible infrastructure concerns.
 
-## Result and policy boundary
+## 16. API and clients
 
-On entry, supervisor finalization records the worker's outcome so a crash during
-enrichment cannot change success into an inferred failure. It then ingests the
-last trace, checkpoints isolated changes, and atomically records the terminal
-row, usage, message delivery state, completion notice, and any retry hold. That
-commit precedes worktree release. The refreshed row is the result.
+The sole public contract is `/api/v2/...`, described by OpenAPI 3.1 at
+`/api/v2/openapi.json`. Normal CLI operations use it too. Resource lists use
+bounded pagination or cursors. Run and Inbox feeds are durable reconciliation
+surfaces; SSE supplies invalidation and live evidence, with a slow fallback
+refresh after suspension or loss.
 
-Landing, findings, retry handling, dependency release, and source reporting then
-consume it. Landing and handoff completion leave structured receipts on the same
-row; the daemon replays any missing consumer after proving the old supervisor
-and worker are gone. Source reporting waits for completion, landing, handoff, and
-retry policy to settle, so an execution outcome cannot be mistaken for a landed
-result or a failure that is already being retried.
+Mutation endpoints use caller request ids for idempotency where duplication
+would matter and always audit the acting credential. The API never returns a
+secret, arbitrary workspace path, or unredacted environment.
 
-## Load-bearing rules
+The build-free web console uses ES modules and CSS. Shared SwiftUI code targets
+iPhone, iPad, and native macOS rather than treating Catalyst as the only Mac
+client. Both implement code/URI pairing, secure credential storage, adaptive
+navigation, and native artifact previews.
 
-These invariants hold in the current code. Changing one breaks an assumption
-another subsystem already depends on.
+## 17. Integration boundary
 
-1. Never downgrade an isolated run to the owner's checkout — a failed worktree
-   setup would silently let unattended runs mutate the human's tree; enforced in
-   `supervise.py` (`prepare_launch` raises, `rehome` returns the failure).
-2. Never merge in the owner's checkout — the merge would collide with the
-   uncommitted work a checkout routinely holds; `merge.py` rebases in a
-   throwaway worktree and moves the base with `git update-ref`.
-3. Never write a source item's status from a run — status has one writer class,
-   the human, and a run that transitions an item overwrites the human's own
-   move (the source's status rule); the bridge's client offers no status call.
-4. Never let the worker report to a source — a worker that files its own
-   findings can forget, self-approve, or hand itself work; `handoff.py`
-   parses and enforces the protocol after the run, and the bridge files the
-   entries from the stamped receipt.
-5. Never let a run token act on a sibling run — the shared secret is in every
-   worker's environment, so route authority is the only containment; `auth.py`
-   holds the whole table, and an unlisted route is the human's.
-6. Never store a run token, only its SHA-256 — a stored token outlives the run
-   that held it; `auth.py` writes the hash, and the `revoke_run_token` trigger
-   in `db.py` nulls it at every terminal status.
-7. Never stop a run without recording why — a stop that reached nobody is
-   indistinguishable from a crash; `observer.py` writes the observation and
-   escalates before it signals the process.
-8. Never let a run launch its own children, and never above its own tier — a
-   self-launching worker escapes the depth, per-run, and concurrency bounds,
-   and an upward hand-off is a decomposition the human never approved;
-   `child_runs.py` checks both under one write lock in the parent's supervisor.
-9. Never let a runway adapter raise — capacity telemetry is auxiliary, and a
-   scraper fault must not block dispatch; every adapter in `runway.py` is
-   wrapped by `@soft` and returns `remaining=None` with a reason.
-10. Never touch a worktree a live run holds — the run loses the directory its
-    process is standing in; `worktree.py` checks `live_holders` before `remove`
-    and `prune`.
-11. Never build a second result model — the refreshed run row is the result,
-    and a parallel object would drift from the row that landing, findings,
-    retry, and source reporting all read; `supervise.py` commits the terminal
-    row and hands back the row itself.
-12. Never treat the normalized event as the record — `events` carries a
-    truncated payload, so a viewer or parser that trusts it loses detail; the
-    raw log is the source of truth and `traces.py` stores the byte offset and
-    length of the line each event came from.
-13. Never let the core know a source — the adapter LEFT the repository
-    (the work-bridge project), so the rule is absolute: no module imports a
-    source client, none is named for one, none reads a source's config table, and
-    `runs.ref` / `nod_requests.ref` are opaque strings the core stores and
-    never parses; `tests/test_boundary.py` asserts all of it.
-14. Never attempt delivery before the durable write — a record that exists
-    only in a return value dies with the first unreachable server, and the
-    caller is told a human is needed while what they asked for is destroyed;
-    `profile_edit` writes its escalation row first and the bridge files it
-    later.
+An integration may discover resources, choose a Group and Profile, optionally
+supply a write-only CWD, submit self-contained executable Context, correlate
+with opaque `ref`, control or answer the
+run, and consume evidence. It must not read Orchestra's database, inject
+source-system fields, or interpret callbacks as durable delivery.
 
-## Non-goals
+Workbridge is the only component expected to know both Slash Work and
+Orchestra. Workbridge owns root routing, source request/lease semantics, work
+policy, profile choice, second opinions, verification, acceptance, source
+lifecycle, and Git landing/merge. It communicates only through v2 HTTP with a
+service token. Orchestra never imports Workbridge and never waits for it.
 
-- Rebuilding the legacy Operator, immutable contracts, councils, rosters,
-  staffing teams, capacity budgets, or a general event-replay engine.
-- Making harness-native tools look identical.
-- A dynamic harness plug-in system before another real adapter needs it.
-- Process-level containment or distributed multi-machine scheduling.
-- Making any source mandatory for direct execution.
-- Linux service-manager integration in the current release.
+## 18. Explicit deletions
+
+V2 contains no compatibility implementation for:
+
+- Nod client, configuration, or schema;
+- source caches, claims, leases, writeback, handoff, or delivery watermarks;
+- generic control seats, control turns, or `runs.layer`;
+- resolver, merge judge, reviewer, landing, or landing receipts;
+- project-as-workspace/group overload;
+- shared fleet keys, federation, node registration, or remote workers; or
+- v1 database/API readers, aliases, or dual-write paths.
+
+Old history remains an inert archive. The clean v2 instance imports only
+operator configuration that maps unambiguously to v2 concepts.

@@ -1,366 +1,387 @@
-"""A run asks for help: bounded child runs on weaker profiles.
+"""Durable, bounded child-run delegation.
 
-Ported from the original Orchestra (``orchestra_cli/child_runs.py``), where
-this worked, and lost in the move — the current tree kept only the validator,
-which W-0291 later removed as a phantom surface because nothing launched
-behind it. The reason to have it back is the one the owner names: sometimes a
-cheap model should take a bounded piece while the expensive one keeps the
-mission.
-
-BROKERED, NEVER SELF-LAUNCHED. A worker calls ``orchestra spawn`` and all
-that does is WRITE a request. The parent's own supervisor claims it, checks
-the bounds, creates the batch, and starts it. The enforcement point is this
-code, never the model's judgment, and a worker cannot start a process from
-inside its own sandbox.
-
-Three bounds, all in code and all reserved under one write lock so two
-concurrent requests cannot both pass: how deep the tree may go, how many
-children one run may ever have, and how many may run at once. Dispatch has
-no concurrency cap of its own, so the spawn tree is the one path by which
-run count grows without a human ticking anything.
-
-WEAKER ONLY. A tiered parent may hand work down, never up: asking for a
-stronger model is asking for a different decomposition, which is a question
-for the human who set the mission, not a thing a run may award itself.
-
-When a batch settles the lead is told ONCE: a message if it is still running,
-a continuation run if it already finished. Nothing is merged for it — the
-lead reads the branches and decides.
+A worker can request children, but it never launches them. The daemon claims
+the request, admits ordinary v2 runs, and lets the normal FIFO scheduler decide
+when they start.
 """
+from __future__ import annotations
+
 import json
-import os
 import sqlite3
-from pathlib import Path
-from typing import Callable
+import uuid
+from collections.abc import Sequence
 
-from orchestra import brief, config, db, paths, project, worktree
-
-REQUESTED_BY = "spawn"
-DEFAULTS = {"child_max_depth": 1, "child_max_per_run": 3, "child_max_active": 3}
+from orchestra import db, fleet_config, runs
+from orchestra.contracts import RunRequest, child_tier_allowed
 
 
-def _limit(cfg: dict, name: str) -> int:
-    value = (cfg.get("settings") or {}).get(name, DEFAULTS[name])
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise SystemExit(f"orchestra: settings.{name} must be a non-negative integer")
-    return value
+class DelegationError(ValueError):
+    pass
 
 
-def limits(cfg: dict) -> tuple[int, int, int]:
-    """``(max_depth, max_per_run, max_active)``."""
-    return tuple(_limit(cfg, name) for name in
-                 ("child_max_depth", "child_max_per_run", "child_max_active"))
+def _parent(con: sqlite3.Connection, run_id: int):
+    row = runs.find(con, int(run_id))
+    if row is None:
+        raise DelegationError(f"no run {run_id}")
+    return row
 
 
-def validate_targets(cfg: dict, parent, targets: list[str]) -> None:
-    """Every target must be staffable here, and none may outrank the parent.
-
-    The project's ENABLED SET binds a second time here (W-0187): a running
-    agent staffing a fresh child is staffing, so the child's profile must be
-    one this project enabled. The PARENT keeps whatever preset it launched
-    with, whatever the enabled set has done since.
-    """
-    enabled = config.enabled_profiles(cfg)
-    parent_tier = config.tier_of((cfg.get("profiles") or {})
-                                 .get(parent["profile"], {}).get("tier"))
-    for target in targets:
-        if target == parent["profile"]:
-            raise SystemExit(
-                f"orchestra: run {parent['id']} is already {target}; a child "
-                "run is for handing work DOWN, not for a second copy")
-        if target not in enabled:
-            raise SystemExit(
-                f"orchestra: {target} is not enabled for this project — "
-                f"enabled: {', '.join(sorted(enabled)) or '(none)'}")
-        target_tier = config.tier_of(enabled[target].get("tier"))
-        if parent_tier is not None and target_tier is not None \
-                and target_tier > parent_tier:
-            raise SystemExit(
-                f"orchestra: {target} (tier {target_tier}) outranks "
-                f"{parent['profile']} (tier {parent_tier}). A stronger model "
-                "is a different decomposition — ask the human who set the "
-                "mission, do not award it to yourself")
+def _targets(value: Sequence[str]) -> list[str]:
+    if isinstance(value, (str, bytes)):
+        raise DelegationError("profiles must be an array")
+    targets = [str(item or "").strip() for item in value]
+    if not targets or any(not item for item in targets):
+        raise DelegationError("at least one explicit child profile is required")
+    return targets
 
 
-def validate_parent(con, cfg: dict, run_id: int, identity_run: int | None):
-    """The row this request may act for, or SystemExit saying why not."""
-    parent = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-    if parent is None:
-        raise SystemExit(f"orchestra: no run {run_id}")
-    if identity_run is not None and identity_run != run_id:
-        raise SystemExit(f"orchestra: run {identity_run} may ask for help for "
-                         f"itself, not for run {run_id}")
-    if parent["status"] != "running":
-        raise SystemExit(f"orchestra: run {run_id} is {parent['status']}, "
-                         "not running")
-    if parent["layer"]:
-        raise SystemExit("orchestra: a control turn does not spawn work")
-    max_depth, _, _ = limits(cfg)
-    if int(parent["child_depth"] or 0) + 1 > max_depth:
-        raise SystemExit(
-            f"orchestra: child depth limit reached ({max_depth}); raise "
-            "settings.child_max_depth deliberately to allow recursion")
-    return parent
-
-
-def enqueue(con, parent, targets: list[str], mission: str, *,
-            title: str | None = None, context: str | None = None,
-            shared_workdir: bool = False) -> int:
-    """Record the request. This is all a worker may do."""
-    cur = con.execute(
-        "INSERT INTO spawn_requests(lead_run, requested_by, targets_json, "
-        "mission, title, context, shared_workdir, status, created_at) "
-        "VALUES(?,?,?,?,?,?,?,'pending',?)",
-        (parent["id"], parent["profile"], json.dumps(targets), mission, title,
-         context, int(shared_workdir), db.now()))
-    con.commit()
-    return int(cur.lastrowid)
-
-
-def create(con, root: Path, cfg: dict, parent, targets: list[str],
-           mission: str, *, title: str | None = None,
-           context: str | None = None, shared_workdir: bool = False,
-           spawn_request_id: int | None = None) -> list[int]:
-    """Create one bounded batch of child rows. The caller starts them."""
-    if not targets:
-        raise SystemExit("orchestra: a spawn needs at least one --to target")
-    _, max_total, max_active = limits(cfg)
-    validate_targets(cfg, parent, targets)
-    staffed = [(name, config.staff_profile(cfg, name)) for name in targets]
-
-    # The whole batch is reserved under ONE write lock: two concurrent
-    # requests must not both read the counts, both pass, and both allocate.
-    run_ids: list[int] = []
-    con.execute("BEGIN IMMEDIATE")
+def _setting(con: sqlite3.Connection, key: str, default: int) -> int:
     try:
-        current = con.execute("SELECT status FROM runs WHERE id=?",
-                              (parent["id"],)).fetchone()
-        if current is None or current["status"] != "running":
-            raise SystemExit(f"orchestra: run {parent['id']} is no longer running")
-        total = con.execute("SELECT COUNT(*) n FROM runs WHERE parent_run=? "
-                            "AND requested_by=?",
-                            (parent["id"], REQUESTED_BY)).fetchone()["n"]
-        active = con.execute(
-            f"SELECT COUNT(*) n FROM runs WHERE parent_run=? AND requested_by=? "
-            f"AND status NOT IN {db.TERMINAL_SQL}",
-            (parent["id"], REQUESTED_BY)).fetchone()["n"]
-        if total + len(targets) > max_total:
-            raise SystemExit(f"orchestra: run {parent['id']} may have "
-                             f"{max_total} children in total")
-        if active + len(targets) > max_active:
-            raise SystemExit(f"orchestra: run {parent['id']} may have "
-                             f"{max_active} children running at once")
-        for name, profile in staffed:
-            cur = con.execute(
-                "INSERT INTO runs(profile, backend, model, title, ref, "
-                "requested_by, workdir, project_id, parent_run, "
-                "spawn_request_id, child_depth, status, started_at, "
-                f"project_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,'spawning',?,"
-                f"{db.NEXT_PROJECT_SEQ})",
-                (name, profile["backend"], profile.get("model"),
-                 (title or mission)[:80], parent["ref"], REQUESTED_BY,
-                 str(root), parent["project_id"], parent["id"],
-                 spawn_request_id, int(parent["child_depth"] or 0) + 1,
-                 db.now(), parent["project_id"]))
-            run_ids.append(int(cur.lastrowid))
-        con.execute("COMMIT")
+        return int(fleet_config.fleet_setting(con, key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _depth(con: sqlite3.Connection, run_id: int) -> int:
+    """Count only delegation edges; retries and continuations keep depth."""
+    row = con.execute(
+        "WITH RECURSIVE ancestry(id,depth) AS ("
+        "SELECT id,0 FROM runs WHERE id=? UNION ALL "
+        "SELECT source.id,ancestry.depth + CASE "
+        "WHEN current.parent_run_id IS NOT NULL THEN 1 ELSE 0 END "
+        "FROM ancestry JOIN runs current ON current.id=ancestry.id "
+        "JOIN runs source ON source.id=COALESCE(current.parent_run_id,"
+        "current.retry_of_run_id,current.continuation_of_run_id)) "
+        "SELECT MAX(depth) FROM ancestry",
+        (int(run_id),),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def _tier(parent) -> int:
+    try:
+        snapshot = json.loads(parent["profile_snapshot"] or "{}")
+    except (TypeError, ValueError):
+        snapshot = {}
+    try:
+        return int(snapshot.get("tier", parent["profile_tier"]))
+    except (TypeError, ValueError) as exc:
+        raise DelegationError("parent profile snapshot has no valid tier") from exc
+
+
+def _validate(con: sqlite3.Connection, parent, targets: list[str], *,
+              already_reserved: bool = False) -> None:
+    if parent["status"] in db.RUN_TERMINAL:
+        raise DelegationError(f"run {parent['id']} is {parent['status']}")
+    if _depth(con, int(parent["id"])) + 1 > _setting(
+            con, "delegation_max_depth", 2):
+        raise DelegationError("delegation depth limit reached")
+    maximum = _setting(con, "delegation_max_children", 3)
+    existing = int(con.execute(
+        "SELECT COUNT(*) FROM runs WHERE parent_run_id=?", (parent["id"],)
+    ).fetchone()[0])
+    pending = int(con.execute(
+        "SELECT COALESCE(SUM(json_array_length(targets_json)-COALESCE("
+        "json_array_length(child_run_ids_json),0)),0) "
+        "FROM child_requests WHERE parent_run_id=? AND status IN "
+        "('pending','processing')", (parent["id"],)
+    ).fetchone()[0])
+    reserved = existing + pending + (0 if already_reserved else len(targets))
+    if reserved > maximum:
+        raise DelegationError(
+            f"parent child-run limit is {maximum}; {existing + pending} already reserved")
+    active = len(active_children(con, int(parent["id"])))
+    active_limit = _setting(con, "delegation_max_active_children", 3)
+    active_reserved = active + pending + (0 if already_reserved else len(targets))
+    if active_reserved > active_limit:
+        raise DelegationError(
+            f"parent active-child limit is {active_limit}; "
+            f"{active + pending} already reserved")
+    parent_tier = _tier(parent)
+    for selector in targets:
+        profile = fleet_config.find_profile(con, selector)
+        if profile is None or profile["archived"] or not profile["enabled"]:
+            raise DelegationError(f"child profile {selector!r} is unavailable")
+        runtime = fleet_config.find_runtime(con, profile["runtime_id"])
+        if runtime is None or runtime["archived"] or not runtime["enabled"]:
+            raise DelegationError(
+                f"child profile {selector!r} runtime is unavailable")
+        if not child_tier_allowed(parent_tier, int(profile["tier"])):
+            raise DelegationError(
+                f"tier {parent_tier} parent cannot delegate upward "
+                f"to tier {profile['tier']}")
+
+
+def enqueue(
+    con: sqlite3.Connection,
+    parent_run_id: int,
+    profiles: Sequence[str],
+    context: str,
+    *,
+    requested_by: str | None = None,
+    title: str | None = None,
+    request_id: str | None = None,
+) -> tuple[dict, bool]:
+    """Persist an idempotent request for explicitly profiled child runs."""
+    context = str(context or "").strip()
+    if not context:
+        raise DelegationError("child context is required")
+    targets = _targets(profiles)
+    request_id = str(request_id or "").strip() or str(uuid.uuid4())
+    requested_by = str(requested_by or f"run:{int(parent_run_id)}").strip()
+    if len(request_id) > 200:
+        raise DelegationError("request_id exceeds 200 characters")
+    if not requested_by or len(requested_by) > 128:
+        raise DelegationError("requested_by must be 1 to 128 characters")
+    clean_title = (title or "").strip() or None
+    if clean_title and len(clean_title) > 200:
+        raise DelegationError("title exceeds 200 characters")
+    owns_transaction = not con.in_transaction
+    if not owns_transaction and not db.in_api_mutation(con):
+        raise RuntimeError("child request admission requires a clean transaction")
+    if owns_transaction:
+        con.execute("BEGIN IMMEDIATE")
+    try:
+        existing = con.execute(
+            "SELECT * FROM child_requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if existing is not None:
+            expected = {
+                "parent_run_id": int(parent_run_id),
+                "requested_by": requested_by,
+                "targets_json": json.dumps(targets, separators=(",", ":")),
+                "mission": context,
+                "title": clean_title,
+                "context": None,
+            }
+            changed = [key for key, value in expected.items()
+                       if existing[key] != value]
+            if changed:
+                raise DelegationError(
+                    "request_id already names a different child request: "
+                    + ", ".join(changed))
+            con.commit()
+            return dict(existing), False
+        parent = _parent(con, int(parent_run_id))
+        _validate(con, parent, targets)
+        cursor = con.execute(
+            "INSERT INTO child_requests(request_id,parent_run_id,requested_by,"
+             "targets_json,mission,title,context,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (request_id, int(parent_run_id), requested_by,
+             json.dumps(targets, separators=(",", ":")), context,
+             clean_title, None, db.now()),
+        )
+        db.record_control(
+            con, actor=requested_by, action="run.delegate", outcome="queued",
+            target_type="run", target_id=parent_run_id, request_id=request_id,
+            detail={"profiles": targets},
+        )
+        row = con.execute(
+            "SELECT * FROM child_requests WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+        con.commit()
     except BaseException:
-        con.execute("ROLLBACK")
+        if con.in_transaction:
+            con.rollback()
         raise
-
-    try:
-        for run_id, (_name, profile) in zip(run_ids, staffed):
-            run = con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
-            workdir, branch = str(parent["workdir"]), None
-            if not shared_workdir:
-                # Branched from the PARENT's branch: the child starts from the
-                # work its lead has already done, not from main.
-                wt, branch = worktree.create(
-                    root, run_id, project.dir_key_for(con, run),
-                    start_point=parent["branch"] or None,
-                    backend=profile["backend"])
-                workdir = str(wt)
-            text = brief.compose_child(root, run, profile, mission,
-                                       parent=parent, context=context,
-                                       workdir=workdir, cfg=cfg)
-            bp, lp = project.run_artifacts(con, run)
-            bp.write_text(text)
-            lp.touch()
-            con.execute(
-                "UPDATE runs SET brief_path=?, log_path=?, workdir=?, branch=?, "
-                "repo=? WHERE id=?",
-                (str(bp), str(lp), workdir, branch, str(root), run_id))
-            con.commit()
-    except BaseException as exc:
-        con.execute(
-            "UPDATE runs SET status='failed', finished_at=?, summary=? "
-            f"WHERE id IN ({','.join('?' * len(run_ids))}) AND status='spawning'",
-            (db.now(), f"Child batch setup failed: {str(exc)[:500]}", *run_ids))
-        con.commit()
-        raise
-    return run_ids
+    return dict(row), True
 
 
-def process_pending(con, root: Path, cfg: dict, lead_run: int,
-                    launcher: Callable[[Path, int], None]) -> list[dict]:
-    """Claim and launch this lead's requests, from OUTSIDE its sandbox."""
+def process_pending(con: sqlite3.Connection, parent_run_id: int | None = None,
+                    *, limit: int = 20) -> list[dict]:
+    """Turn durable requests into ordinary queued runs; launch nothing."""
+    where = " AND parent_run_id=?" if parent_run_id is not None else ""
+    bounded = max(1, min(int(limit), 100))
+    params = (int(parent_run_id), bounded) if parent_run_id is not None \
+        else (bounded,)
+    requests = list(con.execute(
+        "SELECT * FROM child_requests WHERE (status='pending' OR "
+        "(status='processing' AND COALESCE(json_array_length("
+        "child_run_ids_json),0)<json_array_length(targets_json)))" + where +
+        " ORDER BY id LIMIT ?", params))
     results: list[dict] = []
-    for request in list(con.execute(
-            "SELECT * FROM spawn_requests WHERE lead_run=? AND status='pending' "
-            "ORDER BY id", (lead_run,))):
-        claimed = con.execute(
-            "UPDATE spawn_requests SET status='processing' "
-            "WHERE id=? AND status='pending'", (request["id"],))
-        con.commit()
-        if claimed.rowcount != 1:
-            continue  # another supervisor pass took it
-        child_ids: list[int] = []
+    for request in requests:
+        if request["status"] == "pending":
+            claimed = con.execute(
+                "UPDATE child_requests SET status='processing',processed_at=? "
+                "WHERE id=? AND status='pending'", (db.now(), request["id"])
+            )
+            con.commit()
+            if claimed.rowcount != 1:
+                continue
         try:
+            child_ids = [int(value) for value in json.loads(
+                request["child_run_ids_json"] or "[]")]
+        except (TypeError, ValueError):
+            child_ids = []
+        try:
+            parent = _parent(con, int(request["parent_run_id"]))
             targets = json.loads(request["targets_json"])
-            if not isinstance(targets, list) or not all(
-                    isinstance(t, str) and t for t in targets):
-                raise ValueError("spawn request has invalid targets")
-            parent = con.execute("SELECT * FROM runs WHERE id=?",
-                                 (lead_run,)).fetchone()
-            if parent is None or parent["status"] != "running":
-                raise RuntimeError(f"run {lead_run} is no longer running")
-            # A project that is not a repository has no worktree to give, and
-            # that is a note on the request, not a refusal of the help.
-            fallback = not bool(request["shared_workdir"]) \
-                and not (root / ".git").exists()
-            warning = ("project is not a git repository; the children share "
-                       "the lead's workdir") if fallback else None
-            child_ids = create(
-                con, root, cfg, parent, targets, request["mission"],
-                title=request["title"], context=request["context"],
-                shared_workdir=bool(request["shared_workdir"]) or fallback,
-                spawn_request_id=int(request["id"]))
-            for child_id in child_ids:
-                try:
-                    launcher(root, child_id)
-                except Exception as exc:
-                    con.execute(
-                        "UPDATE runs SET status='failed', finished_at=?, "
-                        "summary=? WHERE id=? AND status='spawning'",
-                        (db.now(), f"Child supervisor launch failed: {exc}",
-                         child_id))
+            for index in range(1, len(targets) + 1):
+                existing = runs.find_by_request(
+                    con, f"child-request:{request['id']}:{index}")
+                if existing is None:
+                    continue
+                existing_id = int(existing["id"])
+                if index <= len(child_ids):
+                    if child_ids[index - 1] != existing_id:
+                        raise DelegationError(
+                            "child request recovery found conflicting run ids")
+                elif index == len(child_ids) + 1:
+                    child_ids.append(existing_id)
             con.execute(
-                "UPDATE spawn_requests SET status='accepted', "
-                "child_run_ids_json=?, error=?, processed_at=? WHERE id=?",
-                (json.dumps(child_ids), warning, db.now(), request["id"]))
+                "UPDATE child_requests SET child_run_ids_json=? WHERE id=?",
+                (json.dumps(child_ids, separators=(",", ":")), request["id"]),
+            )
             con.commit()
-            results.append({"id": int(request["id"]), "status": "accepted",
-                            "child_run_ids": child_ids, "warning": warning})
-        except (Exception, SystemExit) as exc:
-            error = str(exc)[:1000] or exc.__class__.__name__
+            _validate(con, parent, targets, already_reserved=True)
+            for index, profile in enumerate(targets, start=1):
+                if index <= len(child_ids):
+                    continue
+                child, _ = runs.submit(con, RunRequest.from_mapping({
+                    "request_id": f"child-request:{request['id']}:{index}",
+                    "group": parent["group_slug"],
+                    "profile": profile,
+                    "context": request["mission"],
+                    "title": request["title"],
+                    "requested_by": request["requested_by"],
+                    "observer": "inherit",
+                    "parent_run_id": int(parent["id"]),
+                }))
+                child_ids.append(int(child["id"]))
+                con.execute(
+                    "UPDATE child_requests SET child_run_ids_json=? WHERE id=?",
+                    (json.dumps(child_ids, separators=(",", ":")), request["id"]),
+                )
+                con.commit()
+            results.append({"request_id": int(request["id"]),
+                            "child_run_ids": child_ids, "status": "processing"})
+        except BaseException as exc:
             con.execute(
-                "UPDATE spawn_requests SET status='failed', "
-                "child_run_ids_json=?, error=?, processed_at=? WHERE id=?",
-                (json.dumps(child_ids), error, db.now(), request["id"]))
+                "UPDATE child_requests SET status='failed',error=?,"
+                "child_run_ids_json=? WHERE id=?",
+                (str(exc)[:1000], json.dumps(child_ids, separators=(",", ":")),
+                 request["id"]),
+            )
             con.commit()
-            results.append({"id": int(request["id"]), "status": "failed",
-                            "child_run_ids": child_ids, "error": error})
+            results.append({"request_id": int(request["id"]),
+                            "child_run_ids": child_ids, "status": "failed",
+                            "error": str(exc)[:1000]})
     return results
 
 
-def fail_unprocessed(con, lead_run: int, reason: str) -> None:
-    """A lead that ended owes its unclaimed requests an answer."""
-    con.execute(
-        "UPDATE spawn_requests SET status='failed', error=?, processed_at=? "
-        "WHERE lead_run=? AND status IN ('pending','processing')",
-        (reason[:1000], db.now(), lead_run))
-    con.commit()
-
-
-def _batch_prompt(lead_id: int, children: list) -> str:
-    said = "\n".join(
-        f"- run {c['id']} ({c['profile']}) {c['status']}"
-        f"; branch {c['branch'] or '(shared workdir)'}"
-        f"; summary: {(c['summary'] or '(none)')[:500]}" for c in children)
-    return (f"Every child run you asked for has settled. Read their branches "
-            f"and results, take what is useful, and verify the combined "
-            f"outcome yourself. Do not merge blindly.\n\n{said}")
-
-
-def maybe_wake_lead(con, root: Path, trigger_run_id: int) -> int | None:
-    """Tell a lead ONCE that its batch settled. Returns a run to launch, if any.
-
-    A lead still running gets a message on its next safe boundary; a lead
-    that already finished gets a continuation of its own session. The
-    ``notified_at`` / ``child_wakeup_*`` stamps are claimed inside the write
-    lock, so two children settling together wake it once.
-    """
-    trigger = con.execute("SELECT * FROM runs WHERE id=?",
-                          (trigger_run_id,)).fetchone()
-    if trigger is None:
-        return None
-    candidates: list[tuple[int, int | None]] = []
-    if trigger["parent_run"] and trigger["requested_by"] == REQUESTED_BY:
-        candidates.append((int(trigger["parent_run"]),
-                           int(trigger["spawn_request_id"])
-                           if trigger["spawn_request_id"] else None))
-    for request in con.execute("SELECT id FROM spawn_requests WHERE lead_run=?",
-                               (trigger_run_id,)):
-        candidates.append((trigger_run_id, int(request["id"])))
-
-    for lead_id, request_id in dict.fromkeys(candidates):
-        con.execute("BEGIN IMMEDIATE")
+def settle_requests(con: sqlite3.Connection) -> list[int]:
+    """Mark spawned batches settled once every named child is terminal."""
+    settled: list[int] = []
+    for request in con.execute(
+        "SELECT * FROM child_requests WHERE status='processing' ORDER BY id"
+    ):
         try:
-            lead = con.execute("SELECT * FROM runs WHERE id=?",
-                               (lead_id,)).fetchone()
-            request = con.execute("SELECT * FROM spawn_requests WHERE id=?",
-                                  (request_id,)).fetchone() if request_id else None
-            children = list(con.execute(
-                "SELECT * FROM runs WHERE spawn_request_id=? ORDER BY id",
-                (request_id,))) if request_id else list(con.execute(
-                    "SELECT * FROM runs WHERE parent_run=? AND requested_by=? "
-                    "ORDER BY id", (lead_id, REQUESTED_BY)))
-            notified = bool(request["notified_at"]) if request else bool(
-                lead and (lead["child_wakeup_run"] or lead["child_wakeup_message"]))
-            ready = bool(
-                lead is not None and children and not notified
-                and lead["session_ref"]
-                and (request is None or request["status"] == "accepted")
-                and lead["status"] in ("running", "interrupt", "done", "failed")
-                and all(c["status"] in db.RUN_TERMINAL for c in children))
-            if not ready:
-                con.execute("COMMIT")
-                continue
-            prompt = _batch_prompt(lead_id, children)
-            if lead["status"] in ("running", "interrupt"):
-                try:
-                    offset = os.path.getsize(lead["log_path"])
-                except (OSError, TypeError):
-                    offset = 0
-                cur = con.execute(
-                    "INSERT INTO messages(sender, body, run_id, kind, "
-                    "created_at, delivery_offset) "
-                    "VALUES('orchestra',?,?,'interrupt',?,?)",
-                    (prompt, lead_id, db.now(), offset))
-                _claim(con, request_id, lead_id, "message", int(cur.lastrowid))
-                con.execute("COMMIT")
-                return None
-            from orchestra import supervise  # cycle: supervise imports this
-            wake_id = supervise.create_followup(
-                con, root, dict(lead), lead["requested_by"], prompt,
-                title=f"child results for run {lead_id}")
-            if wake_id is not None:
-                _claim(con, request_id, lead_id, "run", int(wake_id))
-            con.execute("COMMIT")
-            return wake_id
-        except BaseException:
-            con.execute("ROLLBACK")
-            raise
-    return None
+            ids = [int(value) for value in json.loads(
+                request["child_run_ids_json"] or "[]")]
+            target_count = len(json.loads(request["targets_json"] or "[]"))
+        except (TypeError, ValueError):
+            ids = []
+            target_count = 0
+        if not ids or len(ids) != target_count:
+            continue
+        placeholders = ",".join("?" for _ in ids)
+        active = con.execute(
+            "WITH RECURSIVE lineage(id) AS ("
+            f"SELECT id FROM runs WHERE id IN ({placeholders}) UNION ALL "
+            "SELECT r.id FROM runs r JOIN lineage l ON "
+            "r.retry_of_run_id=l.id OR r.continuation_of_run_id=l.id) "
+            f"SELECT 1 FROM runs WHERE id IN (SELECT id FROM lineage) "
+            f"AND status NOT IN "
+            f"{db.TERMINAL_SQL} LIMIT 1", ids,
+        ).fetchone()
+        if active is None:
+            con.execute(
+                "UPDATE child_requests SET status='settled' WHERE id=? "
+                "AND status='processing'", (request["id"],)
+            )
+            settled.append(int(request["id"]))
+    if settled:
+        con.commit()
+    return settled
 
 
-def _claim(con, request_id: int | None, lead_id: int, kind: str, value: int) -> None:
-    """Stamp the one wakeup, so a second child settling cannot repeat it."""
-    if request_id:
-        con.execute(
-            f"UPDATE spawn_requests SET wakeup_{kind}=?, notified_at=? "
-            "WHERE id=? AND notified_at IS NULL", (value, db.now(), request_id))
-    else:
-        con.execute(
-            f"UPDATE runs SET child_wakeup_{kind}=? "
-            f"WHERE id=? AND child_wakeup_{kind} IS NULL", (value, lead_id))
+def active_children(con: sqlite3.Connection, parent_run_id: int) -> list[dict]:
+    return [dict(row) for row in con.execute(
+        "WITH RECURSIVE lineage(id) AS ("
+        "SELECT id FROM runs WHERE parent_run_id=? UNION ALL "
+        "SELECT r.id FROM runs r JOIN lineage l ON "
+        "r.retry_of_run_id=l.id OR r.continuation_of_run_id=l.id) "
+        f"SELECT * FROM runs WHERE id IN (SELECT id FROM lineage) "
+        f"AND status NOT IN "
+        f"{db.TERMINAL_SQL} ORDER BY id", (int(parent_run_id),)
+    )]
+
+
+def unsettled_requests(con: sqlite3.Connection, parent_run_id: int) -> bool:
+    return con.execute(
+        "SELECT 1 FROM child_requests WHERE parent_run_id=? "
+        "AND status IN ('pending','processing') LIMIT 1",
+        (int(parent_run_id),),
+    ).fetchone() is not None
+
+
+def result_generation(con: sqlite3.Connection,
+                      parent_run_id: int) -> str | None:
+    """Stable marker that changes for every request or direct-child wave."""
+    row = con.execute(
+        "SELECT (SELECT MAX(id) FROM child_requests WHERE parent_run_id=?) AS "
+        "request_id,(SELECT MAX(id) FROM runs WHERE parent_run_id=?) AS child_id",
+        (int(parent_run_id), int(parent_run_id)),
+    ).fetchone()
+    if row is None or (row["request_id"] is None and row["child_id"] is None):
+        return None
+    return f"r{int(row['request_id'] or 0)}-c{int(row['child_id'] or 0)}"
+
+
+def results_prompt(con: sqlite3.Connection, parent_run_id: int) -> str:
+    children = list(con.execute(
+        "WITH RECURSIVE lineage(id) AS ("
+        "SELECT id FROM runs WHERE parent_run_id=? UNION ALL "
+        "SELECT r.id FROM runs r JOIN lineage l ON "
+        "r.retry_of_run_id=l.id OR r.continuation_of_run_id=l.id) "
+        "SELECT r.*,g.name AS group_name FROM runs r JOIN run_groups g "
+        "ON g.group_id=r.group_id WHERE r.id IN (SELECT id FROM lineage) "
+        "ORDER BY r.id",
+        (int(parent_run_id),),
+    ))
+    failed = list(con.execute(
+        "SELECT id,error FROM child_requests WHERE parent_run_id=? "
+        "AND status='failed' ORDER BY id", (int(parent_run_id),)))
+    if not children and not failed:
+        return "Continue the original mission."
+    lines = ["Your delegated child runs have settled. Use their results and "
+             "continue the original mission:"]
+    for child in children:
+        evidence = []
+        if child["branch"]:
+            evidence.append(f"branch {child['branch']}")
+        if child["diff_path"]:
+            evidence.append(f"patch {child['diff_path']}")
+        suffix = f" ({', '.join(evidence)})" if evidence else ""
+        lines.append(
+            f"- {db.run_no(child)}: {child['status']}{suffix}\n"
+            f"  {str(child['summary'] or 'No summary captured.').strip()[:2000]}")
+    for request in failed:
+        lines.append(
+            f"- Delegation request {request['id']}: failed\n"
+            f"  {str(request['error'] or 'No error captured.').strip()[:1000]}")
+    return "\n".join(lines)
+
+
+def fail_unprocessed(con: sqlite3.Connection, parent_run_id: int,
+                     reason: str) -> int:
+    changed = con.execute(
+        "UPDATE child_requests SET status='failed',error=?,processed_at=COALESCE("
+        "processed_at,?) WHERE parent_run_id=? AND (status='pending' OR "
+        "(status='processing' AND COALESCE(json_array_length("
+        "child_run_ids_json),0)<json_array_length(targets_json)))",
+        (str(reason)[:1000], db.now(), int(parent_run_id)),
+    ).rowcount
+    con.commit()
+    return int(changed)

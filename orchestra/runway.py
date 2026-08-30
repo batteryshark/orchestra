@@ -1,9 +1,9 @@
-"""Provider runway adapters (DESIGN §11).
+"""Provider runway adapters (DESIGN §12).
 
 One adapter per provider, each returning the same ``Runway`` record. Four
 read a remote endpoint, two read CLI-owned local state.
 
-Key handling (W-0182): a key comes from OPENCODE'S OWN CREDENTIAL STORE,
+Credential handling: a key comes from OpenCode's own credential store,
 ``~/.local/share/opencode/auth.json``, falling back to a named environment
 variable. It is read inside the adapter, used for one request, and never
 returned, stored, printed, or logged. ``raw`` is assembled from named fields
@@ -13,30 +13,29 @@ only the label is ever safe to show.
 
 Failure model: every adapter fails soft. Unreachable, unauthorized, garbage
 JSON, or a local file whose shape drifted all yield a ``Runway`` with
-``remaining=None`` and a ``reason``. Adapters never raise (DESIGN §11:
+``remaining=None`` and a ``reason``. Adapters never raise (DESIGN §12:
 unknown runway means the provider is available and marked unknown; dispatch
 never blocks on a failed scraper).
 
-Windows, not providers, are the unit of a reading (W-0179): a provider is
+Windows, not providers, are the unit of a reading: a provider is
 ONE record carrying EVERY window it reports, because a 5-hour limit and a
 weekly limit are two facts about one plan. There is no ``limit`` on a
-window (W-0182) — every window is a percentage of itself, so a limit is
+window — every window is a percentage of itself, so a limit is
 always 100 and says nothing.
 
-Staleness survives only where it changes meaning (W-0182): a reading whose
-window has already reset is history, and says so. The age of a reading is
-kept on the record for the conductor, which must not trigger on old numbers,
-and is no longer narrated to the reader.
+Staleness survives only where it changes meaning: a reading whose window has
+already reset is history, and says so. The age remains machine-readable so
+clients do not act on old numbers, without cluttering the normal display.
 
-Two provider KINDS (W-0179). A ``plan`` provider (Claude, Codex, Kimi,
+Two provider kinds exist. A ``plan`` provider (Claude, Codex, Kimi,
 MiniMax, Grok) is a subscription: it shows consumption against its windows
 and never a price. Only an ``api`` provider (DeepSeek, anything billed per
 token) shows money — DeepSeek's account balance is the point of its card.
 
-A plan may still bank something spendable, though (W-0184): Codex and Grok
-both hold usage RESETS, which are not money and belong on a plan's card. Any
-adapter can put a finished phrase in ``raw["credits"]`` and every surface
-renders it in the one block DeepSeek's balance already used.
+A plan may still bank something spendable: Codex and Grok
+both hold usage RESETS, which are not money and belong on a plan's card.
+Adapters put their scrubbed display text plus any known count and expiry in
+``raw["credits"]``; public projections whitelist only those three fields.
 """
 import functools
 import selectors
@@ -50,7 +49,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,8 +106,7 @@ CLAUDE_CACHE = Path("~/.claude.json")
 CODEX_SESSIONS = Path("~/.codex/sessions")
 CODEX_SCAN_FILES = 5  # a just-started session has no token_count event yet
 
-# A reading older than this is a hint, not a budget. The conductor refuses to
-# trigger on one; the surfaces no longer narrate it.
+# A reading older than this is a hint, not a budget.
 STALE_AFTER_H = 1
 
 # Subscriptions. Everything else is billed per token and may show money.
@@ -133,7 +130,7 @@ class Runway:
     ``kind`` says whether money exists for this provider at all, ``stale``
     that a window in the reading has already reset, and ``windows`` carries
     EVERY window the provider reports. The scalar fields are the tightest
-    live window — dispatch and the conductor need one number. For an ``api``
+    live window — compact clients need one number. For an ``api``
     provider with no window they are the account balance and its currency.
     """
     provider: str
@@ -286,10 +283,10 @@ def window_label(minutes) -> str:
 def make_window(label: str, remaining: float, resets_at: str | None) -> dict:
     """One reported window: a percentage of itself and when it refills.
 
-    No ``limit`` (W-0182) — a window's limit is always 100% of the window, so
+    No ``limit`` — a window's limit is always 100% of the window, so
     the field carried no information. STALE means the reset has already passed;
-    the flag stays because the conductor must not trigger on a number that is
-    really history, but nothing narrates it to the reader. The daemon polls on
+    the flag prevents clients acting on a number that is really history, but
+    nothing narrates it to the reader. The daemon polls on
     its own schedule, so a reading that old is a fault to fix, not a caption to
     write (owner, 2026-08-14).
     """
@@ -320,9 +317,7 @@ def as_of_now(window: dict) -> dict:
 
 def from_windows(provider: str, windows: list[dict], as_of: str | None = None,
                  raw: dict | None = None) -> Runway:
-    """Scalar fields = the tightest window that has NOT itself reset, since
-    that is the one dispatch and the conductor care about; ``windows`` carries
-    all of them for display."""
+    """Use the tightest live window as the compact scalar; retain all windows."""
     live = [w for w in windows if not expired(w["resets_at"])] or windows
     tight = min(live, key=lambda w: w["remaining"])
     return Runway(provider, remaining=tight["remaining"], unit=tight["unit"],
@@ -332,7 +327,7 @@ def from_windows(provider: str, windows: list[dict], as_of: str | None = None,
 
 
 def until_text(iso: str | None) -> str:
-    """Days, hours and minutes (W-0182). "in 2d 7h 41m" is a plan; "in 55h"
+    """Days, hours and minutes. "in 2d 7h 41m" is a plan; "in 55h"
     is arithmetic the reader has to do."""
     left = _seconds_until(iso)
     if left is None:
@@ -447,7 +442,7 @@ def parse_deepseek(data: dict) -> Runway:
 def deepseek(auth_path: Path | str = OPENCODE_AUTH,
              url: str = DEEPSEEK_BALANCE_URL) -> Runway:
     """Prepaid balance — no window, so no resets_at. DeepSeek is the one
-    provider billed per token, so its money IS its runway (W-0182)."""
+    provider billed per token, so its money is its runway."""
     data, err = _get_json(url, "deepseek", auth_path=auth_path)
     return unknown("deepseek", err) if err else parse_deepseek(data)
 
@@ -465,7 +460,7 @@ def parse_kimi(data: dict) -> Runway:
     """``limits[]``: one entry per rolling window, each with a limit, what is
     left of it, and when it refills. Both sides arrive as decimal STRINGS.
 
-    ``usage`` is a SECOND window, not a summary of the first (W-0184): on a
+    ``usage`` is a second window, not a summary of the first: on a
     Kimi For Coding plan ``limits[]`` carries only the 5-hour burst window,
     and the plan-wide quota the owner actually runs out of lives in ``usage``,
     with its own reset. Reporting only ``limits`` hid a window that was
@@ -812,7 +807,9 @@ def parse_xai(data: dict, resets: dict | None = None) -> Runway:
     window = make_window(window_label(minutes), max(0.0, 100.0 - used), ends)
     raw = {"period": period.get("type"), "starts_at": starts}
     if resets is not None:
-        raw["credits"] = _reset_credits_text(resets)
+        raw["credits"] = _credit_summary(
+            _reset_credits_text(resets), resets.get("available"),
+            resets.get("soonest_expiry"))
     return from_windows("xai", [window], raw=_scrub(raw))
 
 
@@ -823,6 +820,14 @@ def _reset_credits_text(resets: dict) -> str:
     text = f"{count} banked reset credit" + ("" if count == 1 else "s")
     return f"{text} · soonest expires {resets['soonest_expiry'][:10]}" \
         if resets.get("soonest_expiry") else text
+
+
+def _credit_summary(text: str, count=None, expires_at=None) -> dict:
+    """The only banked-credit metadata safe and useful outside an adapter."""
+    count = count if isinstance(count, int) and not isinstance(count, bool) \
+        and count >= 0 else None
+    return {"text": text, "count": count,
+            "expires_at": expires_at if isinstance(expires_at, str) else None}
 
 
 @soft("xai")
@@ -879,7 +884,7 @@ def _xai_resets(token: str) -> dict | None:
 def parse_claude(data: dict, now_ms: float | None = None) -> Runway:
     """``cachedUsageUtilization``: percent USED per window, plus resets_at.
 
-    BOTH windows are reported (W-0179). A 5-hour limit and a weekly limit are
+    Both windows are reported. A 5-hour limit and a weekly limit are
     two separate facts about the account; returning only the tighter one hid
     the other. The cache lags — hours, sometimes a day — so an old reading is
     flagged stale rather than suppressed.
@@ -1154,7 +1159,7 @@ def parse_codex(lines) -> Runway:
     """Last ``token_count`` event of a rollout JSONL: rate_limits from the
     live response headers.
 
-    ``primary`` and ``secondary`` are both reported when present (W-0179);
+    ``primary`` and ``secondary`` are both reported when present;
     on a weekly-only account secondary is null and one window is the whole
     truth. Each is named by its ``window_minutes`` — 10080 reads "weekly".
 
@@ -1191,11 +1196,11 @@ def parse_codex(lines) -> Runway:
     return from_windows("codex", windows, as_of=as_of, raw=_scrub({
         "plan_type": limits.get("plan_type"),
         "rate_limit_reached_type": limits.get("rate_limit_reached_type"),
-        "credits": _codex_credits_text(limits.get("credits")),
+        "credits": _codex_credits(limits.get("credits")),
     }))
 
 
-def _codex_reset_credits(result: dict) -> str | None:
+def _codex_reset_credits(result: dict) -> dict | None:
     """Banked rate-limit resets, from the app server's OWN list of them.
 
     ``rateLimits.credits.balance`` is a different thing and reads "0" while
@@ -1218,23 +1223,25 @@ def _codex_reset_credits(result: dict) -> str | None:
     expiries = sorted(c["expiresAt"] for c in live
                       if isinstance(c.get("expiresAt"), (int, float)))
     if not expiries:
-        return text
-    soonest = datetime.fromtimestamp(expiries[0], timezone.utc)
-    return f"{text} · soonest expires {soonest.strftime('%Y-%m-%d')}"
+        return _credit_summary(text, len(live))
+    soonest = _iso(expiries[0])
+    return _credit_summary(
+        f"{text} · soonest expires {soonest[:10]}", len(live), soonest)
 
 
-def _codex_credits_text(credits) -> str | None:
+def _codex_credits(credits) -> dict | None:
     """The plan's own ``credits`` block, used only when the app server gave
     no reset list — a session-file recording carries this and nothing else."""
     if not isinstance(credits, dict):
         return None
     if credits.get("unlimited"):
-        return "unlimited resets"
+        return _credit_summary("unlimited resets")
     try:
         count = int(float(credits["balance"]))
     except (KeyError, TypeError, ValueError):
         return None
-    return f"{count} banked reset" + ("" if count == 1 else "s")
+    return _credit_summary(
+        f"{count} banked reset" + ("" if count == 1 else "s"), count)
 
 
 def parse_codex_live(result: dict) -> Runway:
@@ -1261,7 +1268,7 @@ def parse_codex_live(result: dict) -> Runway:
         "plan_type": limits.get("planType"),
         "rate_limit_reached_type": limits.get("rateLimitReachedType"),
         "credits": _codex_reset_credits(result)
-                   or _codex_credits_text(limits.get("credits")),
+                   or _codex_credits(limits.get("credits")),
     }))
 
 
@@ -1272,7 +1279,7 @@ def read_codex_app_server(timeout: float = 20.0) -> dict:
     newest one is as old as the last time Codex happened to write a
     token_count event. That was 23 hours stale and showed 100% headroom while
     the account was actually at 11% -- a number that decides whether to
-    dispatch. Asking is the only way to know.
+    admit another run. An explicit reading is the only way to know.
     """
     exe = which_exe("codex")
     if not exe:
@@ -1360,166 +1367,174 @@ def _codex_from_sessions(sessions_dir: Path | str = CODEX_SESSIONS) -> Runway:
     return result  # newest files carried no usable snapshot; last reason wins
 
 
-# --- polling and storage ----------------------------------------------------
-
-ADAPTERS = (claude, codex, deepseek, kimi, minimax, xai)
-
-
-def skipped(cfg: dict | None) -> set:
-    """Providers the owner has no plan with, from ``[runway] skip``.
-
-    A provider whose subscription has lapsed refuses every request forever, and
-    an adapter cannot tell that apart from an outage — so it reports the
-    provider's own error code, and both surfaces show an orange "Not reported"
-    that reads as a fault. Saying so in config turns a permanent false alarm
-    into a fact, and stops polling something that cannot answer.
-    """
-    names = ((cfg or {}).get("runway") or {}).get("skip") or []
-    return {str(n).strip().lower() for n in names if str(n).strip()}
-
-
-def in_use(cfg: dict | None) -> set:
-    """Providers an ENABLED profile actually spends against.
-
-    A plan nobody is staffed on is not this workspace's business: kimi and
-    minimax sat on the board forever showing "–", indistinguishable from a
-    provider that was failing to answer. The board is for what is being
-    spent, so a provider no profile routes to is not shown at all (the CLI's
-    `orchestra runway` still polls every adapter, so nothing is unfindable).
-    """
-    from orchestra import config  # local: config imports paths, not runway
-
-    return {provider_of(p.get("backend") or "", p.get("model"))
-            for p in config.enabled_profiles(cfg or {}).values()
-            if p.get("backend")}
-
-
-def shown(cfg: dict | None) -> set:
-    """The adapters the board polls: in use, and not explicitly skipped.
-
-    A config that names NO profiles cannot say what is in use, so it hides
-    nothing — an unreadable or half-written config must not silently blank
-    the board, which would look exactly like every provider going quiet.
-    """
-    names = {a.__name__ for a in ADAPTERS}
-    used = in_use(cfg) & names
-    return (used or names) - skipped(cfg)
-
-
-def poll_all(cfg: dict | None = None, all_providers: bool = False) -> list[Runway]:
-    """Four of the six adapters are network-bound and independent, so they run
-    together: polled in series a refresh costs the SUM of the timeouts, which
-    is what a human waits behind on the dashboard's refresh button. Every
-    adapter is already @soft, so a worker thread cannot raise out of the pool.
-
-    ``all_providers`` polls every adapter, which is what the CLI does — the
-    board polls only what it will show (``shown``), so a plan nobody is
-    staffed on costs neither a request nor a row that reads as a fault.
-    """
-    live = ADAPTERS if all_providers else [
-        a for a in ADAPTERS if a.__name__ in shown(cfg)]
-    if not live:
-        return []
-    with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
-        results = list(pool.map(lambda adapter: adapter(), live))
-    return sorted(results, key=lambda r: r.provider)
-
-
-def record(con, results) -> None:
-    """Append one row per poll (schema v4) so a later view can show pace and
-    time-to-reset. Unknowns are stored too — the gap is data.
-
-    ponytail: ``limit_value`` is left unwritten, not dropped (W-0182 removed
-    the field — a window's limit is always 100% of itself). Reclaim the
-    column the next time this table needs a migration for another reason.
-    """
-    con.executemany(
-        "INSERT INTO runway_polls(provider, remaining, unit, "
-        "resets_at, as_of, reason, raw, windows, polled_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
-        [(r.provider, r.remaining, r.unit, r.resets_at, r.as_of,
-          r.reason, json.dumps(_scrub(r.raw)), json.dumps(r.windows), db.now())
-         for r in results])
-    con.commit()
-
-
-def _amount(remaining: float, unit: str) -> str:
-    """A percentage is headroom; anything else is an account balance."""
-    return f"{remaining:.0f}% left" if unit == "percent" \
-        else f"{remaining:g} {unit}".strip()
-
-
 def credits_text(raw) -> str | None:
-    """The credits block's line, whatever a provider banks there: DeepSeek's
-    money, Codex's banked resets, Grok's banked reset credits (W-0184). Every
-    adapter that has one writes it as a finished phrase, so no surface has to
-    know which provider means what."""
-    text = raw.get("credits") if isinstance(raw, dict) else None
+    """Return a provider's already-scrubbed reset-credit summary, if any."""
+    value = raw.get("credits") if isinstance(raw, dict) else None
+    text = value.get("text") if isinstance(value, dict) else value
     return text if isinstance(text, str) and text else None
 
 
-def latest_polls(con) -> list[dict]:
-    """Newest poll per provider (DESIGN §11). Unknowns included: the gap is
-    data, and unknown never blocks anything."""
-    return [dict(r) for r in con.execute(
-        "SELECT provider, remaining, limit_value, unit, resets_at, reason, "
-        "as_of, MAX(id) AS id FROM runway_polls GROUP BY provider ORDER BY provider")]
+# --- v2 named sources ------------------------------------------------------
+
+BUILTIN_SOURCE_ADAPTERS = {
+    "claude": claude,
+    "codex": codex,
+    "deepseek": deepseek,
+    "kimi": kimi,
+    "minimax": minimax,
+    "xai": xai,
+}
 
 
-def exhaustion(entry: dict | None) -> str | None:
-    """Why this poll is a quota wall, or None if a new run may still spend.
+def _source_json(source, key: str) -> dict:
+    raw = source[key] if key in source.keys() else None
+    if raw in (None, ""):
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"runway source {key} must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"runway source {key} must be a JSON object")
+    return value
 
-    Unknown and stale mean available (DESIGN §11). Remaining of 0 on a live
-    reading is the wall. ponytail: join at read time; a per-profile table if
-    two accounts share a provider and need separate burns.
-    """
-    if not entry or entry.get("remaining") is None:
+
+def _source_argv(source) -> list[str]:
+    raw = source["command_json"] if "command_json" in source.keys() else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError("custom runway command must be a JSON argv array") from exc
+    if not isinstance(raw, list) or not raw or any(
+            not isinstance(value, str) or not value for value in raw):
+        raise ValueError("custom runway command must be a non-empty JSON argv array")
+    return raw
+
+
+def _custom_source(source, runner=subprocess.run) -> Runway:
+    """Run a local argv adapter. JSON goes in and comes out; no shell exists."""
+    config = _source_json(source, "config_json")
+    timeout = max(1, min(int(config.get("timeout_seconds", 20)), 120))
+    public = {
+        "source_id": source["source_id"],
+        "provider": source["provider"],
+        "account": source["account"],
+        "lane": source["lane"],
+    }
+    result = runner(
+        _source_argv(source), input=json.dumps(public), capture_output=True,
+        text=True, timeout=timeout, check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()[:300]
+        return unknown(source["provider"],
+                       f"custom adapter exited {result.returncode}" +
+                       (f": {detail}" if detail else ""))
+    if len(result.stdout.encode("utf-8")) > 1024 * 1024:
+        return unknown(source["provider"], "custom adapter output exceeded 1 MiB")
+    try:
+        value = json.loads(result.stdout)
+    except ValueError:
+        return unknown(source["provider"], "custom adapter returned invalid JSON")
+    if not isinstance(value, dict):
+        return unknown(source["provider"], "custom adapter must return a JSON object")
+    remaining = value.get("remaining")
+    if remaining is not None and (isinstance(remaining, bool) or not isinstance(
+            remaining, (int, float))):
+        return unknown(source["provider"], "custom adapter remaining must be numeric")
+    windows = value.get("windows", [])
+    if not isinstance(windows, list):
+        return unknown(source["provider"], "custom adapter windows must be an array")
+    return Runway(
+        provider=source["provider"], remaining=remaining,
+        unit=str(value.get("unit") or ""), resets_at=_iso(value.get("resets_at")),
+        as_of=_iso(value.get("as_of")) or db.now(),
+        reason=str(value.get("reason") or "") or None,
+        windows=_scrub(windows), raw=_scrub(value.get("raw") or {}),
+    )
+
+
+def poll_source(source, *, runner=subprocess.run) -> dict:
+    """Poll one managed provider/account/lane source and return a DB reading."""
+    adapter = source["adapter"]
+    if adapter == "command":
+        reading = _custom_source(source, runner=runner)
+    else:
+        function = BUILTIN_SOURCE_ADAPTERS.get(adapter)
+        if function is None:
+            reading = unknown(source["provider"], f"unknown adapter {adapter!r}")
+        else:
+            reading = function()
+    config = _source_json(source, "config_json")
+    fresh_seconds = max(60, min(int(config.get("fresh_seconds", 3600)), 86400))
+    polled = datetime.now(timezone.utc)
+    as_of = reading.as_of or polled.isoformat()
+    try:
+        observed = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        observed = polled
+        as_of = polled.isoformat()
+    definitive = bool(reading.known and reading.reason is None and not reading.stale)
+    return {
+        "source_id": source["source_id"],
+        "remaining": reading.remaining,
+        "limit_value": 100.0 if reading.unit == "percent" else None,
+        "unit": reading.unit,
+        "resets_at": reading.resets_at,
+        "as_of": as_of,
+        "fresh_until": datetime.fromtimestamp(
+            min(polled.timestamp(), observed.timestamp()) + fresh_seconds,
+            timezone.utc).isoformat(),
+        "definitive": definitive,
+        "reason": reading.reason,
+        "windows": reading.windows,
+        "raw": _scrub(reading.raw),
+        "polled_at": polled.isoformat(),
+    }
+
+
+def record_source_reading(con, reading: dict) -> int:
+    cursor = con.execute(
+        "INSERT INTO runway_readings(source_id,remaining,limit_value,unit,resets_at,"
+        "as_of,fresh_until,definitive,reason,windows_json,raw_json,polled_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (reading["source_id"], reading["remaining"], reading["limit_value"],
+         reading["unit"], reading["resets_at"], reading["as_of"],
+         reading["fresh_until"], int(reading["definitive"]), reading["reason"],
+         json.dumps(reading["windows"], separators=(",", ":")),
+         json.dumps(reading["raw"], separators=(",", ":")), reading["polled_at"]),
+    )
+    con.commit()
+    return int(cursor.lastrowid)
+
+
+def source_hold(reading: dict | None, *, now: datetime | None = None) -> str | None:
+    """Only a fresh, definitive zero is allowed to hold queued work."""
+    if not reading or not reading.get("definitive"):
         return None
-    age = age_hours(entry.get("as_of"))
-    if (age is not None and age >= STALE_AFTER_H) or expired(entry.get("resets_at")):
+    remaining = reading.get("remaining")
+    if remaining is None or remaining > 0:
         return None
-    if entry["remaining"] > 0:
+    try:
+        fresh_until = datetime.fromisoformat(reading["fresh_until"])
+    except (KeyError, TypeError, ValueError):
         return None
-    return entry_text(entry)
-
-
-def profile_burns(profiles: dict, polls: dict) -> dict[str, str]:
-    """Profile name → exhaustion reason. Absent means the account can still run."""
-    out = {}
-    for name, profile in profiles.items():
-        provider = provider_of(profile.get("backend", "opencode"),
-                               profile.get("model"))
-        reason = exhaustion(polls.get(provider))
-        if reason:
-            out[name] = reason
-    return out
-
-
-def entry_text(entry: dict) -> str:
-    """One poll ROW (a database dict, not a ``Runway``) as one readable
-    phrase. Shared by every packet a model reads, so the conductor's runway
-    block and the staffing turn's per-profile line say the same thing."""
-    if entry.get("remaining") is None:
-        return f"unknown ({entry.get('reason') or 'no reading'})"
-    body = _amount(entry["remaining"], entry.get("unit") or "")
-    body += f", resets {until_text(entry.get('resets_at'))}"
-    age = age_hours(entry.get("as_of"))
-    if age is not None and age >= STALE_AFTER_H:
-        body += f" (stale: as of {age_text(age)} ago)"
-    return body
-
-
-def format_lines(r: Runway) -> list[str]:
-    """One line PER WINDOW (W-0179), not one per provider: Claude's 5-hour
-    and weekly limits are two rows under one provider name. Banked credits
-    ride on the first row, where a note column already existed."""
-    if not r.known:
-        return [f"{r.provider:<10} {'-':<8} {'unknown':<14} {'-':<14} {r.reason}"]
-    rows = r.windows or [{"label": "balance", "remaining": r.remaining,
-                          "unit": r.unit, "resets_at": r.resets_at}]
-    note = credits_text(r.raw)
-    return [f"{r.provider:<10} {w['label']:<8} "
-            f"{_amount(w['remaining'], w['unit']):<14} "
-            f"{until_text(w['resets_at']):<14} "
-            f"{note if i == 0 and note else ''}".rstrip()
-            for i, w in enumerate(rows)]
+    current = now or datetime.now(timezone.utc)
+    if fresh_until.tzinfo is None:
+        fresh_until = fresh_until.replace(tzinfo=timezone.utc)
+    reset = reading.get("resets_at")
+    try:
+        reset_at = datetime.fromisoformat(str(reset).replace("Z", "+00:00")) \
+            if reset else None
+        if reset_at is not None and reset_at.tzinfo is None:
+            reset_at = reset_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        reset_at = None
+    if fresh_until <= current or (reset_at is not None and reset_at <= current):
+        return None
+    return "runway exhausted until " + (reading.get("resets_at") or "the next poll")

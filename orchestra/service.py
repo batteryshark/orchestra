@@ -47,7 +47,7 @@ def build_plist() -> dict:
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
     # Only forward the overrides that are actually set: launchd gives the job
     # a bare environment, so an unset override must stay unset, not become "".
-    for name in ("ORCHESTRA_HOME", "ORCHESTRA_CONFIG"):
+    for name in ("ORCHESTRA_HOME",):
         value = paths.env(name)
         if value:
             env[name] = value

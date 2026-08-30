@@ -1,59 +1,97 @@
-# Orchestra for iOS
+# Orchestra for Apple devices
 
-The iOS app is a small mirror of Orchestra's run list and normalized trace
-stream. It can stop a live run or send it a `tell`; push notifications,
-decisions, and source record editing deliberately remain outside the app.
+The shared SwiftUI client targets iPhone, iPad, and native macOS against the
+Orchestra v2 API. It is an operator client for one selected standalone
+instance, not a work tracker or cross-node scheduler.
 
-Open `Orchestra.xcodeproj` in Xcode and run the `Orchestra` scheme. In
-Settings, enter the daemon URL (including its port) and the shared
-`X-Orchestra-Key`. The URL is stored in app preferences and the key is stored
-as a this-device-only Keychain item. The bundle identifier and Keychain
-service keep the shipped `com.batteryshark.dromond` string so an installed app
-upgrades in place and finds its saved secrets; everything visible is
-Orchestra. The app also moves a key saved under the older
-`com.batteryshark.maestro` service into the current service without asking
-for it again.
+## Information architecture
 
-Orchestra commonly serves plain HTTP over an encrypted tailnet, so the app
-permits user-supplied HTTP endpoints. Do not point it at an untrusted network:
-the shared key is an HTTP header and TLS is still required when the transport
-itself is not trusted.
+iPhone exposes Runs, Inbox, Groups, Runway, and More. iPad and macOS use a
+sidebar with Runs, Inbox, Groups, Profiles, Runway, Fleet, and Settings. Runs
+open on their Thread, with Activity, Overview, Artifacts, Changes, Raw Log,
+Lineage, Facts/Usage, and Observer detail available as supporting evidence.
 
-`OrchestraTests/Fixtures/snapshot-v6.json` pins the oldest supported contract;
-the v7 fixture proves that a newer snapshot still decodes. The daemon's current
-snapshot may be newer still. Raise `Snapshot.minimumVersion` only when the app
-intentionally drops compatibility with older snapshots.
+The client can:
 
-## Install it on your iPhone
+- show instance identity, daemon health, pause/capacity, visible queue holds,
+  profiles and runway freshness;
+- start a titled run with a group, worker profile, one executable context body,
+  and an optional write-only working-directory override;
+- filter/search by group, profile, and status;
+- show contextual and fleet-wide run/usage/cost statistics;
+- create and edit profiles/runtimes, inspect host-side model discovery without
+  automatic mutation, and configure the full Observer policy;
+- configure fleet capacity/delegation bounds and create, edit, enable, refresh,
+  or archive named runway sources without reading private argv/config back;
+- configure a group's optional default working directory without ever reading
+  the private host path back;
+- follow run threads and bounded raw-log tails, collapse reasoning/tool detail,
+  reveal machine receipts on demand, and explicitly open/share the full log;
+- Tell, Interrupt, Stop, Stop Tree, Check, Retry, and Continue;
+- answer blocking attention and approve/reject profile proposals;
+- inspect the fleet Inbox/Outbox ledger with pending, delivered, and
+  undeliverable receipts, then open the owning run thread;
+- preview common text, Markdown, image, PDF, audio, and video artifacts and
+  download other immutable outputs; and
+- inspect Git branch/checkpoint/patch/diff evidence without offering write-back.
 
+SSE supplies live invalidations/evidence. A slow refresh reconciles the
+snapshot and current resource pages after suspension, network loss, or proxy
+interruption. Streams are never treated as durable delivery.
+
+## Pair a device
+
+In an authenticated operator client, create a short-lived pairing code and
+pairing URI. Paste the URI or enter its code on the new device.
+The one-time exchange returns a revocable
+device token stored as a this-device-only Keychain item; the code and token
+must never be logged or placed in app preferences.
+
+The client pins `instance_id` beside the endpoint. If it changes, stop and ask
+the operator to pair with the reset/replaced instance. Do not silently treat it
+as the same fleet.
+
+Orchestra expects a trusted private network plus TLS/reverse proxy when the
+transport is not already encrypted. The app may permit an explicitly chosen
+HTTP endpoint on a trusted encrypted tailnet, with a clear warning. Orchestra
+does not provide relay, public ingress, or APNs.
+
+Active clients use local notifications and badge counts. Guaranteed background
+push belongs to an external callback adapter.
+
+## Contract tests
+
+Fixtures pin v2 envelope, snapshot, paged run/feed, Inbox, run detail,
+artifact, and control shapes. Decoder tests must cover unknown additive fields,
+all run states and hold/wait values, missing optional evidence, and an unexpected
+`instance_id`. The contract source is `/api/v2/openapi.json`.
+
+## Build the native apps
+
+The Xcode project contains an iPhone/iPad target and a separate native macOS
+target. Both compile the same SwiftUI source set; the Mac app is not Catalyst.
+
+```sh
+xcodebuild -project ios/Orchestra.xcodeproj -scheme Orchestra \
+  -destination 'generic/platform=iOS' build
+xcodebuild -project ios/Orchestra.xcodeproj -scheme 'Orchestra macOS' build
 ```
+
+## Install on a paired iPhone
+
+```sh
 ./ios/deploy.sh
 ```
 
-Builds Release, signs it, and installs on the first paired iPhone — no Xcode
-window. `--list` shows what is paired; pass a device id to pick one. The team
-id is read from the Apple Development certificate in your keychain, so nothing
-about the developer account lives in this repository; `ORCHESTRA_TEAM`
-overrides it. A locked phone installs fine and refuses to launch, which the
-script reports rather than treating as a failure.
+The script builds Release, signs it, and installs on the first paired iPhone.
+`--list` shows devices; pass a device id to choose one.
 
-## Install on a phone that is somewhere else
+## Install remotely through a tailnet
 
-```
+```sh
 ./ios/ota.sh
 ```
 
-Builds, signs, and publishes the app at
-`https://<machine>.<tailnet>.ts.net/ios-installer/orchestra/`;
-`ORCHESTRA_OTA_PATH` overrides the leaf. Open the URL on the phone and tap Install;
-iOS fetches it directly. `--off` stops serving.
-
-Apple's own wireless install needs mDNS on the local link, which Tailscale does
-not carry, so `deploy.sh` only works on the same network. This goes the other
-way: iOS installs a signed build from any HTTPS URL it trusts, and
-`tailscale serve` provides one with a real certificate. The phone's UDID has to
-be in the development profile already, which the first cabled install does.
-
-It adds the installer path to the tailnet serve config and leaves anything
-already served at `/` alone. `ORCHESTRA_OTA_PORT` changes the local serving
-port.
+This builds, signs, and publishes an install page through the operator's
+existing encrypted network. The phone must already be provisioned. OTA
+distribution does not alter Orchestra's authentication or network boundary.

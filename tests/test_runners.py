@@ -123,7 +123,7 @@ class BackendEnvTests(unittest.TestCase):
         for profile in ({"backend": "claude", "lane": "api"},
                         {"backend": "codex"}):
             with self.subTest(profile=profile):
-                self.assertIs(runners.apply_backend_env(profile, env), env)
+                self.assertEqual(runners.apply_backend_env(profile, env), env)
 
     def test_profile_env_points_a_base_url_and_leaves_other_vars(self) -> None:
         env = {"KEEP": "1", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
@@ -152,10 +152,10 @@ class LogParsingTests(unittest.TestCase):
             for line in lines))
         return tmp, log
 
-    def usage(self, backend: str, lines: list) -> dict:
+    def usage(self, backend: str, lines: list, model: str | None = None) -> dict:
         tmp, log = self.write_log(lines)
         try:
-            return runners.parse_usage(str(log), backend)
+            return runners.parse_usage(str(log), backend, model)
         finally:
             tmp.cleanup()
 
@@ -182,13 +182,15 @@ class LogParsingTests(unittest.TestCase):
                     "cache_creation_input_tokens": 3,
                     "cache_read_input_tokens": 2}},
             ], {"tokens_in": 14, "tokens_out": 6, "tokens_total": 20,
-                "cost_usd": 0.123457, "usage_source": "claude"}),
+                "tokens_cache_read": 2, "tokens_cache_write": 3,
+                "cost_usd": None, "usage_source": "claude"}),
             ("codex", [
                 {"type": "turn.completed", "usage": {
                     "input_tokens": 10, "output_tokens": 2}},
                 {"type": "turn.completed", "usage": {
                     "input_tokens": 4, "output_tokens": 1, "total_tokens": 5}},
             ], {"tokens_in": 14, "tokens_out": 3, "tokens_total": 17,
+                "tokens_cache_read": None, "tokens_cache_write": None,
                 "cost_usd": None, "usage_source": "codex"}),
             ("opencode", [
                 {"part": {"type": "step-finish", "cost": 0.1,
@@ -198,6 +200,7 @@ class LogParsingTests(unittest.TestCase):
                           "tokens": {"total": 8, "input": 4, "output": 1,
                                      "cache": {"read": 3}}}},
             ], {"tokens_in": 20, "tokens_out": 3, "tokens_total": 23,
+                "tokens_cache_read": 6, "tokens_cache_write": None,
                 "cost_usd": 0.3, "usage_source": "opencode"}),
             ("reasonix", [
                 {"kind": "usage", "usage": {"promptTokens": 999}},
@@ -206,22 +209,33 @@ class LogParsingTests(unittest.TestCase):
                      "input_tokens": 10, "output_tokens": 2,
                      "cache_read_input_tokens": 8}},
             ], {"tokens_in": 10, "tokens_out": 2, "tokens_total": 12,
+                "tokens_cache_read": None, "tokens_cache_write": None,
                 "cost_usd": 0.004013, "usage_source": "reasonix"}),
             ("reasonix-eur", [
                 {"type": "result", "total_cost": 12.5, "currency": "EUR",
                  "usage": {"input_tokens": 10, "output_tokens": 2}},
             ], {"tokens_in": 10, "tokens_out": 2, "tokens_total": 12,
+                "tokens_cache_read": None, "tokens_cache_write": None,
                 "cost_usd": None, "usage_source": "reasonix"}),
             ("codex-zero", [
                 {"type": "turn.completed", "usage": {
                     "input_tokens": 0, "output_tokens": 0}},
             ], {"tokens_in": 0, "tokens_out": 0, "tokens_total": 0,
+                "tokens_cache_read": None, "tokens_cache_write": None,
                 "cost_usd": None, "usage_source": "codex"}),
         )
         for label, lines, expected in cases:
             backend = label.split("-", 1)[0]
             with self.subTest(case=label):
                 self.assertEqual(self.usage(backend, lines), expected)
+
+    def test_subscription_models_never_report_metered_api_cost(self) -> None:
+        line = {"part": {"type": "step-finish", "cost": 1.25,
+                         "tokens": {"total": 12, "input": 10, "output": 2}}}
+        self.assertIsNone(self.usage(
+            "opencode", [line], "xai/grok-4.6")["cost_usd"])
+        self.assertEqual(self.usage(
+            "opencode", [line], "deepseek/deepseek-chat")["cost_usd"], 1.25)
 
     def test_unrecognized_usage_degrades_to_null(self) -> None:
         cases = (

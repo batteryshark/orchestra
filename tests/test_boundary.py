@@ -1,77 +1,68 @@
-"""The source boundary became structure: the adapter LEFT the repository.
-
-The old rule allowed five adapter modules to know the one source.
-The eviction moved them to the sibling work-bridge project — a consumer of
-Orchestra's library and API — so the rule is now absolute: nothing in
-``orchestra/`` names a source, imports a source client, or reads a
-``[work]`` config table. Orchestra is a runner; every caller is a caller.
-"""
+"""Structural ratchets for Orchestra's clean fleet-runner boundary."""
 import ast
+import re
 import unittest
 from pathlib import Path
 
-CORE = Path(__file__).resolve().parent.parent / "orchestra"
 
-# The modules the eviction removed. Their return, under any of these names,
-# is the coupling growing back.
-EVICTED = {"work_client", "sweeper", "conductor", "verify", "findings",
-           "router", "refine"}
+ROOT = Path(__file__).resolve().parent.parent
+CORE = ROOT / "orchestra"
+CLIENTS = (CORE / "dashboard.html", *sorted((ROOT / "ios" / "Orchestra").glob("*.swift")))
+REMOVED_MODULES = {
+    "dispatch", "handoff", "hooks", "instrumentation", "merge", "nod",
+    "profile_edit", "project", "resolver", "review",
+}
+FORBIDDEN_RUNTIME_TERMS = (
+    "slash work", "workbridge", "nod", "handoff", "landing",
+    "control seat", "federation", "project_id",
+)
+LEGACY_WORK_ID = re.compile(r"\b[WI]-\d{4}\b", re.I)
 
-# The Nod client's importers, frozen. This is a RATCHET: Nod is a specific
-# external notification product, three of these are core modules (merge,
-# messaging, observer), and nothing else may join the list — shrink it,
-# never grow it. Every caller already degrades to None through
-# ``nod.from_cfg``; the next step is fewer importers, not more.
-NOD_IMPORTERS = {"cli", "daemon", "merge", "messaging", "observer",
-                 "profile_edit"}
 
-
-def _imports(path: Path, names: set[str]) -> set[str]:
-    tree = ast.parse(path.read_text(), str(path))
+def imported_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
     found = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            found |= {a.name.rsplit(".", 1)[-1] for a in node.names}
+            found.update(alias.name.rsplit(".", 1)[-1] for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            mod = (node.module or "").rsplit(".", 1)[-1]
-            found.add(mod)
+            found.add((node.module or "").rsplit(".", 1)[-1])
             if (node.module or "").startswith("orchestra") or node.level:
-                found |= {a.name for a in node.names}
-    return found & names
+                found.update(alias.name for alias in node.names)
+    return found
 
 
 class BoundaryTests(unittest.TestCase):
-    def test_the_evicted_modules_stay_evicted(self):
-        present = {p.stem for p in CORE.glob("*.py")} & EVICTED
-        self.assertEqual(present, set(),
-                         f"{sorted(present)} came back: the source automation "
-                         "lives in work-bridge, not here")
+    def test_retired_subsystems_are_physically_absent_and_unimported(self):
+        present = {path.stem for path in CORE.glob("*.py")} & REMOVED_MODULES
+        self.assertEqual(present, set())
+        imported = {
+            path.name: sorted(imported_names(path) & REMOVED_MODULES)
+            for path in CORE.glob("*.py")
+        }
+        self.assertEqual({name: hits for name, hits in imported.items() if hits}, {})
 
-    def test_nothing_imports_an_evicted_name(self):
-        found = {p.stem: sorted(_imports(p, EVICTED))
-                 for p in CORE.glob("*.py")}
-        offending = {stem: names for stem, names in found.items() if names}
-        self.assertEqual(offending, {},
-                         "the core reaches no source and hosts no adapter; "
-                         "a caller integrates through the library and API")
+    def test_active_runtime_and_clients_have_no_workflow_product_vocabulary(self):
+        # migration.py is an explicit offline reader for retiring v1 state; it
+        # never enters the daemon, API, scheduler, or clients.
+        files = [path for path in CORE.glob("*.py") if path.name != "migration.py"]
+        files.extend(CLIENTS)
+        offending = {}
+        for path in files:
+            text = path.read_text(encoding="utf-8").lower()
+            hits = [term for term in FORBIDDEN_RUNTIME_TERMS if re.search(
+                rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])", text)]
+            if LEGACY_WORK_ID.search(text):
+                hits.append("legacy work-item id")
+            if hits:
+                offending[str(path.relative_to(ROOT))] = hits
+        self.assertEqual(offending, {})
 
-    def test_no_module_reads_a_work_config_table(self):
-        offending = [p.name for p in CORE.glob("*.py")
-                     if 'get("work")' in p.read_text()
-                     or "['work']" in p.read_text()
-                     or '["work"]' in p.read_text()]
-        self.assertEqual(offending, [],
-                         "a [work] table is the bridge's to read, not the "
-                         "runner's")
-
-    def test_the_nod_client_gains_no_new_importers(self):
-        found = {p.stem for p in CORE.glob("*.py")
-                 if p.stem != "nod" and _imports(p, {"nod"})}
-        self.assertEqual(found - NOD_IMPORTERS, set(),
-                         f"new Nod coupling in {sorted(found - NOD_IMPORTERS)}: "
-                         "the human-loop client is a specific external "
-                         "product; route through an existing importer, or "
-                         "shrink this set — never grow it")
+    def test_schema_has_only_runner_control_plane_concepts(self):
+        schema = (CORE / "db.py").read_text(encoding="utf-8").lower()
+        for term in (*FORBIDDEN_RUNTIME_TERMS, "projects", "source_claim",
+                     "writeback", "acceptance_gate"):
+            self.assertNotIn(term, schema)
 
 
 if __name__ == "__main__":
