@@ -1,3 +1,5 @@
+> **Archived.** Orchestra Next replaced this version with a rewrite that runs every agent through one execution engine, so this repo is no longer maintained. Work continues in [orchestra-next](https://github.com/batteryshark/orchestra-next).
+
 # Orchestra
 
 Orchestra is a self-hosted agent fleet runner for one machine. Submit an
